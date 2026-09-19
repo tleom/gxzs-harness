@@ -3,6 +3,8 @@ import { PlatformClient } from '../src/index.js'
 
 function create(fetchImpl) {
   vi.stubEnv('TEST_PLATFORM_TOKEN', 'secret')
+  vi.stubEnv('GXZS_HOST_GENERATION', '7')
+  vi.stubEnv('GXZS_HOST_INSTANCE_ID', 'host-7')
   return new PlatformClient({ baseUrl: 'http://platform/internal/workbench/', tokenEnv: 'TEST_PLATFORM_TOKEN', timeoutMs: 1000 }, { fetchImpl })
 }
 
@@ -20,7 +22,8 @@ describe('restricted platform client', () => {
     const client = create(fetchImpl)
     await client.request({ owner: { ownerId: 't:1' }, method: 'GET', route: 'files/preview', query: '?path=a.docx' })
     expect(fetchImpl).toHaveBeenCalledWith('http://platform/internal/workbench/files/preview?path=a.docx', expect.objectContaining({
-      headers: expect.objectContaining({ authorization: 'Bearer secret', 'x-gxzs-owner': 't:1' }), redirect: 'error',
+      headers: expect.objectContaining({ authorization: 'Bearer secret', 'x-gxzs-owner': 't:1',
+        'x-gxzs-host-generation': '7', 'x-gxzs-host-instance': 'host-7' }), redirect: 'error',
     }))
   })
 

@@ -6,6 +6,8 @@ export const Config = z.object({
   baseUrl: z.string().default(''),
   tokenEnv: z.string().default('GXZS_PLATFORM_INTERNAL_TOKEN'),
   timeoutMs: z.number().default(90_000),
+  generationEnv: z.string().default('GXZS_HOST_GENERATION'),
+  instanceEnv: z.string().default('GXZS_HOST_INSTANCE_ID'),
 })
 
 const ROUTES = new Set([
@@ -19,7 +21,12 @@ export class PlatformClient {
   constructor(config, { fetchImpl = globalThis.fetch } = {}) {
     this.baseUrl = (config.baseUrl ?? '').replace(/\/+$/, '')
     this.token = process.env[config.tokenEnv]
-    if (this.baseUrl && !this.token) throw new Error(`${config.tokenEnv} is required`)
+    const generationEnv = config.generationEnv ?? 'GXZS_HOST_GENERATION'
+    const instanceEnv = config.instanceEnv ?? 'GXZS_HOST_INSTANCE_ID'
+    this.generation = process.env[generationEnv]
+    this.instance = process.env[instanceEnv]
+    if (this.baseUrl && (!this.token || !/^\d+$/.test(this.generation ?? '') || !this.instance))
+      throw new Error(`${config.tokenEnv}, ${generationEnv} and ${instanceEnv} are required`)
     if (this.baseUrl) {
       const url = new URL(this.baseUrl)
       if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash)
@@ -38,6 +45,8 @@ export class PlatformClient {
       headers: {
         authorization: `Bearer ${this.token}`,
         'x-gxzs-owner': owner.ownerId,
+        'x-gxzs-host-generation': this.generation,
+        'x-gxzs-host-instance': this.instance,
         ...(contentType ? { 'content-type': contentType } : {}),
       },
       body: body.length ? body : undefined,
