@@ -6,12 +6,22 @@ const root = path.resolve('.tmp/config-check')
 const home = path.join(root, 'home')
 const profileSource = path.resolve('profiles/workbench')
 const profileTarget = path.join(home, 'profiles/workbench')
+const packages = [
+  'workbench-adapter', 'workbench-control-commands', 'workbench-file-manager',
+  'workbench-platform-client', 'workbench-sandbox-skills', 'workbench-mcp-tools',
+]
 rmSync(root, { recursive: true, force: true })
 mkdirSync(path.dirname(profileTarget), { recursive: true })
 cpSync(profileSource, profileTarget, {
   recursive: true,
   filter: (source) => !source.includes(`${path.sep}node_modules`),
 })
+for (const name of packages) {
+  cpSync(path.resolve('packages', name), path.join(home, 'packages', name), {
+    recursive: true,
+    filter: (source) => !source.includes(`${path.sep}node_modules`),
+  })
+}
 
 const cli = path.resolve('profiles/workbench/node_modules/.bin/dsh')
 const result = spawnSync(cli, ['--profile', 'workbench', '--dump-config'], {
