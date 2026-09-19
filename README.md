@@ -1,0 +1,24 @@
+# gxzs Harness
+
+`gxzs-harness` replaces the current custom Dify Agent runtime with DeepSeek Harness while keeping upstream `@deepseek-ai/*` packages unmodified.
+
+## Product boundary
+
+- DSH owns the agent loop, sessions, tools, sandbox execution, planning, goals, compaction and subagents.
+- This repository owns authenticated HTTP/SSE compatibility, durable workbench projections, tenant routing and platform integrations.
+- Dify is not a second agent runtime. During migration it may remain only as a knowledge-base service exposed through a tenant-aware MCP server.
+- Platform services continue to own identity, authorization, file sharing, Office preview, speech transcription, quotas and audit.
+
+See `docs/architecture.md` and `docs/workbench-migration-matrix.md` before adding a route. Knowledge-base integration is currently deferred; runtime knowledge catalogs are empty.
+
+Persistence uses Node's built-in `node:sqlite` with WAL and full synchronous transactions. The API is experimental on Node 22; verified locally on Node 22.23.2. No native addon compilation is required.
+
+## Commands
+
+```bash
+pnpm install --frozen-lockfile
+pnpm check
+pnpm check:config
+```
+
+`pnpm check:config` performs a real DSH `--dump-config` check and therefore requires the profile dependencies installed from the lockfile.

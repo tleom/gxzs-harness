@@ -1,0 +1,22 @@
+{
+  "name": "gxzs-harness",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.7.0",
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "scripts": {
+    "check": "pnpm check:syntax && pnpm test && pnpm check:plugin",
+    "check:syntax": "node scripts/check-syntax.mjs",
+    "check:plugin": "node scripts/check-plugin.mjs",
+    "check:config": "node scripts/check-config.mjs",
+    "test": "vitest run",
+    "test:coverage": "vitest run --coverage"
+  },
+  "devDependencies": {
+    "@vitest/coverage-v8": "3.2.4",
+    "vitest": "3.2.4"
+  }
+}

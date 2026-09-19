@@ -1,0 +1,75 @@
+- id: session-telemetry-otel
+  disabled: true
+
+- id: sandbox
+  disabled: true
+
+- id: fs-sandbox
+  disabled: true
+
+- id: subprocess
+  disabled: true
+
+- id: sandbox-policy
+  config:
+    mode: !!js process.env.DSH_PERMISSION_MODE ?? 'danger-full-access'
+    workspaceRoot: !!js process.env.GXZS_SANDBOX_WORKSPACE ?? '/workspace'
+
+- insert:
+    - id: gxzs-ssh
+      name: '@deepseek-ai/dsh-ssh'
+      config:
+        host: !!js process.env.GXZS_SANDBOX_SSH_HOST
+        node: !!js process.env.GXZS_SANDBOX_NODE ?? '/usr/local/bin/node'
+        helper: !!js process.env.GXZS_SANDBOX_HELPER ?? '/opt/dsh/node_modules/@deepseek-ai/dsh-ssh/lib/helper.js'
+        helperHash: !!js process.env.GXZS_SANDBOX_HELPER_HASH
+        workspace: !!js process.env.GXZS_SANDBOX_WORKSPACE ?? '/workspace'
+        requestTimeoutMs: 30000
+        maxFrameBytes: 67108864
+        maxPending: 128
+        leaseMs: 30000
+    - id: gxzs-fs-ssh
+      name: '@deepseek-ai/dsh-fs-ssh'
+    - id: gxzs-sandbox-ssh
+      name: '@deepseek-ai/dsh-sandbox-ssh'
+    - id: gxzs-subprocess-ssh
+      name: '@deepseek-ai/dsh-subprocess-ssh'
+    - id: gxzs-skill-filesystem
+      name: '@deepseek-ai/dsh-skill-filesystem'
+      config:
+        providerName: gxzs-filesystem
+        includeDefaultRoots: true
+        dshHome: !!js process.env.DSH_HOME
+        customSkillDirs: !!js process.env.GXZS_GLOBAL_SKILL_DIR?.split(',').filter(Boolean) ?? []
+        watch: true
+    - id: gxzs-workbench-control-commands
+      name: '@gxzs/dsh-workbench-control-commands'
+    - id: gxzs-workbench-file-manager
+      name: '@gxzs/dsh-workbench-file-manager'
+      config:
+        baseUrl: !!js process.env.GXZS_SANDBOX_MANAGER_URL
+        workspaceId: !!js process.env.GXZS_SANDBOX_WORKSPACE_ID
+        tokenEnv: GXZS_SANDBOX_MANAGER_TOKEN
+        timeoutMs: 90000
+    - id: gxzs-workbench-sandbox-skills
+      name: '@gxzs/dsh-workbench-sandbox-skills'
+    - id: gxzs-workbench-platform-client
+      name: '@gxzs/dsh-workbench-platform-client'
+      config:
+        baseUrl: !!js process.env.GXZS_PLATFORM_INTERNAL_URL ?? ''
+        tokenEnv: GXZS_PLATFORM_INTERNAL_TOKEN
+        timeoutMs: 90000
+    - id: gxzs-workbench-adapter
+      name: '@gxzs/dsh-workbench-adapter'
+      config:
+        basePath: /ai/workbench
+        databasePath: !!js (process.env.DSH_HOME ?? process.cwd()) + '/workbench.sqlite3'
+        workspace: !!js process.env.GXZS_SANDBOX_WORKSPACE ?? '/workspace'
+        ownerId: !!js process.env.GXZS_HOST_OWNER_ID
+        assertionIssuer: !!js process.env.GXZS_ASSERTION_ISSUER
+        assertionAudiencePath: !!js process.env.GXZS_ASSERTION_AUDIENCE_PATH ?? '/ai/workbench'
+        assertionKeyEnv: GXZS_ASSERTION_SIGNING_KEY
+        migrationTokenEnv: GXZS_MIGRATION_TOKEN
+        humanInputTimeoutSeconds: 60
+    - id: gxzs-workbench-mcp-tools
+      name: '@gxzs/dsh-workbench-mcp-tools'

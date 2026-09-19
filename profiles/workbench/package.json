@@ -1,0 +1,29 @@
+{
+  "name": "@gxzs/dsh-workbench-profile",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "dsh": {
+    "profile": {
+      "bundles": [
+        "@deepseek-ai/dsh-base",
+        "@deepseek-ai/dsh-web-app"
+      ]
+    }
+  },
+  "dependencies": {
+    "@deepseek-ai/dsh": "0.1.6-alpha.2",
+    "@deepseek-ai/dsh-skill-filesystem": "0.1.6-alpha.2",
+    "@deepseek-ai/dsh-ssh": "0.1.6-alpha.2",
+    "@deepseek-ai/dsh-fs-ssh": "0.1.6-alpha.2",
+    "@deepseek-ai/dsh-sandbox-ssh": "0.1.6-alpha.2",
+    "@deepseek-ai/dsh-subprocess-ssh": "0.1.6-alpha.2",
+    "@deepseek-ai/dsh-mcp-client": "0.1.6-alpha.2",
+    "@gxzs/dsh-workbench-adapter": "file:../../packages/workbench-adapter",
+    "@gxzs/dsh-workbench-control-commands": "file:../../packages/workbench-control-commands",
+    "@gxzs/dsh-workbench-file-manager": "file:../../packages/workbench-file-manager",
+    "@gxzs/dsh-workbench-platform-client": "file:../../packages/workbench-platform-client",
+    "@gxzs/dsh-workbench-sandbox-skills": "file:../../packages/workbench-sandbox-skills",
+    "@gxzs/dsh-workbench-mcp-tools": "file:../../packages/workbench-mcp-tools"
+  }
+}

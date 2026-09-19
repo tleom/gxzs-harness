@@ -1,0 +1,13 @@
+node_modules/
+coverage/
+dist/
+*.log
+*.db
+*.db-shm
+*.db-wal
+.env
+.tmp/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+.DS_Store
