@@ -13,7 +13,7 @@ import { WorkbenchRuntime } from './runtime.js'
 import { WorkbenchService } from './service.js'
 
 export const name = 'workbench-adapter'
-export const inject = ['webServer', 'sessionController', 'agents', 'commands', 'skills', 'tokenMeter', 'workbenchFileManager', 'workbenchPlatformClient']
+export const inject = ['webServer', 'sessionController', 'agents', 'commands', 'skills', 'systemPrompt', 'tokenMeter', 'workbenchFileManager', 'workbenchPlatformClient']
 
 export const Config = z.object({
   basePath: z.string().default('/ai/workbench'),
@@ -47,6 +47,10 @@ export function apply(ctx, config) {
     signingKey: process.env[config.assertionKeyEnv],
   })
 
+  ctx.effect(() => ctx.systemPrompt.section({
+    name: 'gxzs:identity', order: 1, text: '你的名字是公信智能办案助手。',
+  }), 'gxzs assistant identity')
+
   const projectAssistantStream = createAssistantStreamProjector(database, config.ownerId)
   ctx.on('user-questions/request', humanInput.handleRequest, { global: true, prepend: true })
   ctx.on('agent/assistant-stream', projectAssistantStream, { global: true })
@@ -68,11 +72,12 @@ export function apply(ctx, config) {
   }, { global: true })
 
   const buildCatalog = async (owner) => {
-    const catalog = await ctx.sessionController.modelCatalog()
+    const [catalog, mcpTools, skills] = await Promise.all([
+      ctx.sessionController.modelCatalog(), service.mcpCatalog(owner), service.listSkills(),
+    ])
     const models = (catalog.groups ?? []).flatMap((group) => (group.models ?? []).map((model) => ({
       id: `${group.id}/${model.id}`, name: model.name || model.id, provider: group.id, description: model.description,
     })))
-    const mcpTools = await service.mcpCatalog(owner)
     return {
       activity_protocol: 1, human_input_protocol: 1, followup_protocol: 1,
       control_protocol: 1, resources_protocol: 1, command_resources_protocol: 0,
@@ -80,7 +85,11 @@ export function apply(ctx, config) {
       models, tools: mcpTools.map((tool) => ({
         id: tool.id, name: tool.name, description: tool.description, scope: tool.scope,
         provider: tool.provider, provider_name: tool.provider_name, tool_name: tool.tool_name, runtime_name: tool.runtime_name,
-      })), skills: [], knowledge: [],
+      })),
+      skills: skills.map((skill) => ({
+        ...skill, id: skill.scope === 'personal' ? `personal:${skill.id}` : skill.id,
+      })),
+      knowledge: [],
     }
   }
 

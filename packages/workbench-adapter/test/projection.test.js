@@ -188,7 +188,7 @@ describe('DSH session event projection', () => {
         max_rounds: 6, rounds_started: 2, reason: null,
         started_at: 10, active_since: 12, last_run_id: null,
       },
-      plan: { active: true },
+      plan: { active: true, pending: false },
       compaction: { id: 'c1', phase: 'compacted', message: 'summary', before_tokens: 200, after_tokens: null },
     })
   })

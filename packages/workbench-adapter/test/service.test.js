@@ -311,6 +311,16 @@ describe('followup and control service', () => {
     })).resolves.toMatchObject({ state: { plan: { objective: '调查证据' } } })
   })
 
+  it('returns an immediate pending inactive state for a queued plan exit', async () => {
+    const { owner, chat, service } = setup()
+    const entered = await service.issueCommand(owner, chat.id, {
+      command: '/plan 调查证据', expected_revision: 0, request_key: 'plan-enter',
+    })
+    await expect(service.issueCommand(owner, chat.id, {
+      command: '/plan off', expected_revision: entered.state.revision, request_key: 'plan-exit',
+    })).resolves.toMatchObject({ state: { plan: { active: false, pending: true } } })
+  })
+
   it('executes only supported native DSH commands with revision CAS', async () => {
     const { owner, chat, service, commands, agent } = setup()
     await expect(service.issueCommand(owner, chat.id, { command: '/goal pause', expected_revision: 0, request_key: 'goal-1' })).resolves.toMatchObject({ message: 'ok' })

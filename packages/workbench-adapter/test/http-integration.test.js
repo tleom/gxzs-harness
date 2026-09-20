@@ -44,7 +44,10 @@ function setup() {
       request: vi.fn(async () => ({ status: 200, headers: new Headers({ 'content-type': 'application/json' }), bytes: Buffer.from('{"data":{"text":"ok"}}') })),
       json: vi.fn(async () => ({ tools: [] })),
     },
-    agents: { get: (id) => sessions.has(id) ? { session: sessions.get(id) } : undefined }, commands: {}, skills: { list: async () => [], get: async () => undefined },
+    agents: { get: (id) => sessions.has(id) ? { session: sessions.get(id) } : undefined }, commands: {},
+    skills: { list: vi.fn(async () => []), get: async () => undefined },
+    tokenMeter: { measure: vi.fn(() => ({ totalTokens: 0, baseline: { kind: 'none' } })) },
+    systemPrompt: { section: vi.fn(() => () => {}) },
     on: vi.fn(), emit: vi.fn(), reflect: { provide: vi.fn() },
     effect: (factory) => cleanups.push(factory()),
   }
@@ -108,6 +111,24 @@ describe('authenticated workbench HTTP handler', () => {
     await expect(call(handler, key, 'GET', '/catalog')).resolves.toMatchObject({
       status: 200,
       body: { data: { resources_protocol: 1 } },
+    })
+  })
+
+  it('publishes personal skills and the GXZS assistant identity', async () => {
+    const { handler, key, context } = setup()
+    context.skills.list.mockResolvedValueOnce([
+      { name: 'legal-draft', description: '法律文书', source: 'user-dsh', provider: 'gxzs-sandbox-personal' },
+      { name: 'global-skill', description: '全局技能', source: 'bundled', provider: 'gxzs' },
+    ])
+    await expect(call(handler, key, 'GET', '/catalog')).resolves.toMatchObject({
+      status: 200,
+      body: { data: { skills: [
+        { id: 'personal:legal-draft', scope: 'personal' },
+        { id: 'global-skill', scope: 'global' },
+      ] } },
+    })
+    expect(context.systemPrompt.section).toHaveBeenCalledWith({
+      name: 'gxzs:identity', order: 1, text: '你的名字是公信智能办案助手。',
     })
   })
 

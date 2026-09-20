@@ -318,10 +318,12 @@ export class WorkbenchService {
       if (!execution) throw httpError(400, '命令不存在或参数无效')
       if (execution.result?.kind === 'error') throw httpError(409, execution.result.text)
       const plan = /^\/plan\s+(.+)$/.exec(line)?.[1]?.trim()
-      if (plan && plan !== 'off') {
+      if (plan) {
         const current = this.database.getControl(owner.ownerId, chatId)
         this.database.updateControlBySession(chat.sessionId, {
-          plan: { ...current.plan, objective: plan },
+          plan: plan === 'off'
+            ? { ...current.plan, active: false, pending: true }
+            : { ...current.plan, objective: plan },
         })
       }
       const result = { state: this.database.getControl(owner.ownerId, chatId), message: execution.result?.text ?? '', run: null }
