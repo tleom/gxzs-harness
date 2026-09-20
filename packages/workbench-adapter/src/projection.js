@@ -65,6 +65,17 @@ export function projectSessionEvent(database, sessionId, event, expectedOwnerId)
     return undefined
   }
 
+  if (event.type === 'session/title') {
+    const title = typeof event.data?.title === 'string' ? event.data.title : ''
+    if (!title) return undefined
+    database.updateChat(chat.ownerId, chat.id, { title })
+    const run = database.activeRun(chat.ownerId, chat.id)
+    if (!run) return undefined
+    return database.appendEvent(chat.ownerId, run.id, {
+      event: 'workbench_chat_title', chat_id: chat.id, title,
+    })
+  }
+
   if (['todo/write', 'goal/change', 'plan/mode', 'compaction/start', 'compaction/summary', 'compaction/end'].includes(event.type))
     return projectControlEvent(database, chat, sessionId, event)
 

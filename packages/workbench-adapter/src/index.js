@@ -13,7 +13,7 @@ import { WorkbenchRuntime } from './runtime.js'
 import { WorkbenchService } from './service.js'
 
 export const name = 'workbench-adapter'
-export const inject = ['webServer', 'sessionController', 'fs', 'agents', 'commands', 'skills', 'workbenchFileManager', 'workbenchPlatformClient']
+export const inject = ['webServer', 'sessionController', 'agents', 'commands', 'skills', 'workbenchFileManager', 'workbenchPlatformClient']
 
 export const Config = z.object({
   basePath: z.string().default('/ai/workbench'),
@@ -64,7 +64,7 @@ export function apply(ctx, config) {
     const mcpTools = await service.mcpCatalog(owner)
     return {
       activity_protocol: 1, human_input_protocol: 1, followup_protocol: 1,
-      control_protocol: 1, resources_protocol: 0, command_resources_protocol: 0,
+      control_protocol: 1, resources_protocol: 1, command_resources_protocol: 0,
       default_selection: { model: catalog.default ? `${catalog.default.provider}/${catalog.default.model}` : models[0]?.id ?? '', tools: [], skills: [], knowledge: [], model_parameters: {}, tool_parameters: {} },
       models, tools: mcpTools.map((tool) => ({
         id: tool.id, name: tool.name, description: tool.description, scope: tool.scope,
@@ -73,21 +73,17 @@ export function apply(ctx, config) {
     }
   }
 
-  let workspaceTarget
-  const confinedTarget = async (requested) => {
-    const absolute = resolveWorkspacePath(config.workspace, requested)
-    workspaceTarget ??= await ctx.fs.resolve(config.workspace, { cwd: config.workspace })
-    const target = await ctx.fs.resolve(absolute, { cwd: config.workspace })
-    if (!ctx.fs.contains(workspaceTarget, target)) throw httpError(403, '文件路径超出工作区')
-    return { absolute, target }
-  }
-
-  const managerPath = (value) => {
+  const managerPath = (value, { allowRoot = false } = {}) => {
     const requested = String(value ?? '')
     if (!requested) throw httpError(400, '缺少 path')
     const absolute = resolveWorkspacePath(config.workspace, requested)
-    const prefix = `${config.workspace.replace(/\/+$/, '')}/`
-    if (absolute === config.workspace || !absolute.startsWith(prefix)) throw httpError(403, '工作区根目录不可修改')
+    const root = config.workspace.replace(/\/+$/, '')
+    if (absolute === root) {
+      if (allowRoot) return '.'
+      throw httpError(403, '工作区根目录不可修改')
+    }
+    const prefix = `${root}/`
+    if (!absolute.startsWith(prefix)) throw httpError(403, '文件路径超出工作区')
     return absolute.slice(prefix.length)
   }
 
@@ -104,12 +100,6 @@ export function apply(ctx, config) {
     res.writeHead(result.status, headers)
     res.end(Buffer.from(result.bytes))
   }
-
-  const fileDto = (requestedPath, info) => ({
-    name: requestedPath.split('/').filter(Boolean).at(-1) || '/', path: requestedPath,
-    kind: info.type === 'directory' ? 'directory' : 'file', size: info.size ?? 0,
-    version: info.version == null ? null : String(info.version), downloadable: info.type !== 'directory',
-  })
 
   const routes = [
     ['POST', /^\/migration\/import$/, async ({ req, json }, res) => {
@@ -138,7 +128,10 @@ export function apply(ctx, config) {
       })
       sendJson(res, 201, { data: service.getChat(owner, chat.id) })
     }],
-    ['GET', /^\/chats\/([\w-]+)$/, async ({ owner }, res, match) => sendJson(res, 200, { data: service.getChat(owner, match[1]) })],
+    ['GET', /^\/chats\/([\w-]+)$/, async ({ owner }, res, match) => {
+      await service.ensureChatDirectory(owner, match[1])
+      sendJson(res, 200, { data: service.getChat(owner, match[1]) })
+    }],
     ['PATCH', /^\/chats\/([\w-]+)$/, async ({ owner, json }, res, match) => sendJson(res, 200, { data: await service.updateChat(owner, match[1], json) })],
     ['DELETE', /^\/chats\/([\w-]+)$/, async ({ owner }, res, match) => {
       await service.deleteChat(owner, match[1])
@@ -197,21 +190,15 @@ export function apply(ctx, config) {
       await proxyPlatform(context, res, 'audio')
     }],
     ['GET', /^\/files$/, async ({ url }, res) => {
-      const requested = url.searchParams.get('path') || config.workspace
-      const { target } = await confinedTarget(requested)
-      const info = await ctx.fs.stat(target)
-      if (!info) throw httpError(404, '路径不存在')
-      if (info.type !== 'directory') return sendJson(res, 200, { data: { entries: [fileDto(requested, info)] } })
-      const entries = await ctx.fs.listDir(target)
-      sendJson(res, 200, { data: { entries: entries.map((entry) => fileDto(`${requested.replace(/\/+$/, '')}/${entry.name}`, entry)) } })
+      const requested = managerPath(url.searchParams.get('path') || '.', { allowRoot: true })
+      const result = await ctx.workbenchFileManager.operate({ operation: 'list', path: requested })
+      sendJson(res, 200, { data: result })
     }],
     ['GET', /^\/files\/stat$/, async ({ url }, res) => {
-      const requested = url.searchParams.get('path') || ''
-      if (!requested) throw httpError(400, '缺少 path 参数')
-      const { target } = await confinedTarget(requested)
-      const info = await ctx.fs.stat(target)
-      if (!info) throw httpError(404, '路径不存在')
-      sendJson(res, 200, { data: fileDto(requested, info) })
+      const requested = managerPath(url.searchParams.get('path'), { allowRoot: true })
+      const result = await ctx.workbenchFileManager.operate({ operation: 'stat', path: requested })
+      if (result.kind === 'missing') throw httpError(404, '路径不存在')
+      sendJson(res, 200, { data: result })
     }],
     ['POST', /^\/files$/, async ({ json }, res) => {
       const requested = managerPath(json.path)
@@ -232,27 +219,27 @@ export function apply(ctx, config) {
       sendJson(res, 200, { data: result })
     }],
     ['GET', /^\/files\/download$/, async ({ url }, res) => {
-      const requested = url.searchParams.get('path') || ''
-      const { target } = await confinedTarget(requested)
-      const info = await ctx.fs.stat(target)
-      if (!info || info.type !== 'file') throw httpError(404, '文件不存在')
-      const bytes = await ctx.fs.readBytes(target, undefined, 128 * 1024 * 1024)
+      const requested = managerPath(url.searchParams.get('path'))
+      const result = await ctx.workbenchFileManager.operate({ operation: 'get', path: requested })
+      const bytes = Buffer.from(result.data, 'base64')
       res.writeHead(200, {
         'content-type': 'application/octet-stream', 'content-length': bytes.byteLength,
-        'content-disposition': `attachment; filename*=UTF-8''${encodeURIComponent(requested.split('/').at(-1) || 'download')}`,
-        etag: `"${String(info.version)}"`, 'cache-control': 'no-store',
+        'content-disposition': `attachment; filename*=UTF-8''${encodeURIComponent(result.name || requested.split('/').at(-1) || 'download')}`,
+        etag: `"${String(result.version)}"`, 'cache-control': 'no-store',
       })
-      res.end(Buffer.from(bytes))
+      res.end(bytes)
     }],
     ['GET', /^\/files\/text$/, async ({ url }, res) => {
-      const requested = url.searchParams.get('path') || ''
-      const { target } = await confinedTarget(requested)
-      const info = await ctx.fs.stat(target)
-      if (!info || info.type !== 'file') throw httpError(404, '文件不存在')
-      if ((info.size ?? 0) > 2 * 1024 * 1024) throw httpError(400, '在线编辑支持 2 MiB 以内的 UTF-8 文本文件')
-      const text = await ctx.fs.readText(target)
+      const requested = managerPath(url.searchParams.get('path'))
+      const result = await ctx.workbenchFileManager.operate({ operation: 'get', path: requested })
+      if (result.kind === 'directory') throw httpError(400, '文件不是 UTF-8 文本，请下载后编辑')
+      const bytes = Buffer.from(result.data, 'base64')
+      if (bytes.length > 2 * 1024 * 1024) throw httpError(400, '在线编辑支持 2 MiB 以内的 UTF-8 文本文件')
+      let text
+      try { text = new TextDecoder('utf-8', { fatal: true }).decode(bytes) }
+      catch { throw httpError(400, '文件不是 UTF-8 文本，请下载后编辑') }
       if (text.includes('\0')) throw httpError(400, '文件不是 UTF-8 文本，请下载后编辑')
-      sendJson(res, 200, { data: { text, version: String(info.version) } })
+      sendJson(res, 200, { data: { text, version: String(result.version) } })
     }],
     ['GET', /^\/runs\/([\w-]+)\/events$/, async ({ owner, req, url }, res, match) => {
       streamRunEvents({
