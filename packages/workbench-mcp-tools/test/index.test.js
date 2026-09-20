@@ -40,6 +40,13 @@ describe('platform MCP proxy tools', () => {
     expect(platform.json.mock.calls.filter(([request]) => request.route === 'mcp/call')).toHaveLength(0)
   })
 
+  it.each([502, 503])('starts without MCP tools when the optional platform returns %s', async (status) => {
+    const { ctx, definitions } = setup()
+    ctx.workbenchPlatformClient.json.mockRejectedValueOnce(Object.assign(new Error('unavailable'), { status }))
+    await expect(apply(ctx)).resolves.toBeUndefined()
+    expect(definitions.size).toBe(0)
+  })
+
   it('rejects invalid JSON schemas before registering a partial catalog', async () => {
     const { ctx } = setup()
     ctx.workbenchPlatformClient.json.mockResolvedValueOnce({ tools: [{ ...catalogTool, inputSchema: { type: 'string' } }] })
