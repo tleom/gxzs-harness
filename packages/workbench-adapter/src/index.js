@@ -13,7 +13,7 @@ import { WorkbenchRuntime } from './runtime.js'
 import { WorkbenchService } from './service.js'
 
 export const name = 'workbench-adapter'
-export const inject = ['webServer', 'sessionController', 'agents', 'commands', 'skills', 'workbenchFileManager', 'workbenchPlatformClient']
+export const inject = ['webServer', 'sessionController', 'agents', 'commands', 'skills', 'tokenMeter', 'workbenchFileManager', 'workbenchPlatformClient']
 
 export const Config = z.object({
   basePath: z.string().default('/ai/workbench'),
@@ -53,7 +53,18 @@ export function apply(ctx, config) {
   ctx.on('agent/inbox/claimed', (payload) => projectInboxClaim(database, payload, config.ownerId), { global: true })
 
   ctx.on('session/event', (session, event) => {
-    projectSessionEvent(database, session?.id ?? session?.header?.id, event, config.ownerId)
+    let context
+    if (session && ['assistant/message', 'request/context'].includes(event.type)) {
+      const requestContext = session.requestContext()
+      const measurement = ctx.tokenMeter.measure(session)
+      context = {
+        used_tokens: measurement.totalTokens,
+        window_tokens: requestContext?.contextWindow ?? null,
+        estimated: measurement.baseline.kind !== 'usage',
+        model: requestContext ? `${requestContext.provider}/${requestContext.model}` : '',
+      }
+    }
+    projectSessionEvent(database, session?.id ?? session?.header?.id, event, config.ownerId, context)
   }, { global: true })
 
   const buildCatalog = async (owner) => {

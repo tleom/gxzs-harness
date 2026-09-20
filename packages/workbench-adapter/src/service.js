@@ -307,12 +307,23 @@ export class WorkbenchService {
     const line = String(body.command ?? '').trim()
     if (!/^\/(?:goal|plan|compact)(?:\s|$)/.test(line) && !(allowTodoClear && line === '/todos-clear'))
       throw httpError(400, '不支持的工作台命令')
-    const agent = this.agents.get(chat.sessionId)
-    if (!agent) throw httpError(409, '会话当前不在线，请先发送一条消息')
+    let agent = this.agents.get(chat.sessionId)
+    if (!agent) {
+      await this.sessions.create({ sessionId: chat.sessionId, cwd: this.workspace })
+      agent = this.agents.get(chat.sessionId)
+    }
+    if (!agent) throw httpError(409, '会话暂时无法恢复，请稍后重试')
     const operation = (async () => {
       const execution = await this.commands.execute(agent, line, [], new AbortController().signal)
       if (!execution) throw httpError(400, '命令不存在或参数无效')
       if (execution.result?.kind === 'error') throw httpError(409, execution.result.text)
+      const plan = /^\/plan\s+(.+)$/.exec(line)?.[1]?.trim()
+      if (plan && plan !== 'off') {
+        const current = this.database.getControl(owner.ownerId, chatId)
+        this.database.updateControlBySession(chat.sessionId, {
+          plan: { ...current.plan, objective: plan },
+        })
+      }
       const result = { state: this.database.getControl(owner.ownerId, chatId), message: execution.result?.text ?? '', run: null }
       return this.database.saveCommandReceipt(owner.ownerId, chatId, requestKey, result)
     })()
