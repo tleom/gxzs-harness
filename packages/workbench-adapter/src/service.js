@@ -212,7 +212,7 @@ export class WorkbenchService {
       if (!Array.isArray(tools)) throw httpError(502, '平台 MCP 目录格式无效')
       return tools.map(normalizeMcpResource)
     } catch (error) {
-      if (!required && error?.status === 503) return []
+      if (!required && [502, 503].includes(error?.status)) return []
       throw error
     }
   }

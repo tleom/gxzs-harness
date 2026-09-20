@@ -68,6 +68,14 @@ describe('followup and control service', () => {
     expect(fileManager.personalResources).toHaveBeenLastCalledWith({ ...payload, name: 'demo' })
   })
 
+  it.each([502, 503])('handles temporary platform MCP status %s by request criticality', async (status) => {
+    const { service, platformClient } = setup()
+    const error = Object.assign(new Error('unavailable'), { status })
+    platformClient.json.mockRejectedValue(error)
+    await expect(service.mcpCatalog({ ownerId: 'tenant:user' })).resolves.toEqual([])
+    await expect(service.mcpCatalog({ ownerId: 'tenant:user' }, { required: true })).rejects.toBe(error)
+  })
+
   it('freezes selected global and personal MCP tool revisions on each run', async () => {
     const { database, owner, chat, service, platformClient } = setup()
     const tools = [
