@@ -199,7 +199,7 @@ function projectControlEvent(database, chat, sessionId, event) {
     } }
   } else if (event.type === 'plan/mode') {
     const current = database.getControl(chat.ownerId, chat.id)
-    update = { plan: { ...current.plan, active: Boolean(event.data?.active) } }
+    update = { plan: { ...current.plan, active: Boolean(event.data?.active), pending: false } }
   } else if (event.type === 'compaction/summary') {
     update = { compaction: {
       id: event.data?.compactionId ?? '', phase: 'compacting', message: contentText(event.data?.summary),
