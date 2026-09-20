@@ -130,6 +130,20 @@ describe('DSH session event projection', () => {
     expect(events.at(-1)).toMatchObject({ event: 'workbench_surface_replace', start_seq: 2, end_seq: 8, replacement_seq: 99 })
   })
 
+  it('projects DSH titles into chat history and the active run stream', () => {
+    const { database, chat, run } = setup()
+    const event = projectSessionEvent(database, chat.sessionId, {
+      type: 'session/title', data: { title: '合同证据整理', messageSeqs: [0], source: { kind: 'fallback' } },
+    })
+    expect(database.getChat(chat.ownerId, chat.id).title).toBe('合同证据整理')
+    expect(event).toMatchObject({
+      event: 'workbench_chat_title', chat_id: chat.id, title: '合同证据整理',
+    })
+    expect(database.eventsAfter(chat.ownerId, run.id, 0)).toContainEqual(expect.objectContaining({
+      event: 'workbench_chat_title', title: '合同证据整理',
+    }))
+  })
+
   it('folds session control events without requiring a turn', () => {
     const { database, chat } = setup()
     projectSessionEvent(database, chat.sessionId, { type: 'todo/write', data: { todos: [{ content: '调查', status: 'in_progress' }] } })

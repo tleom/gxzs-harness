@@ -18,7 +18,14 @@ export class WorkbenchService {
 
   async createChat(owner, workspace, selection) {
     const created = await this.sessions.create({ cwd: workspace })
-    return this.database.createChat({ ownerId: owner.ownerId, sessionId: created.sessionId, selection })
+    const chat = this.database.createChat({ ownerId: owner.ownerId, sessionId: created.sessionId, selection })
+    await this.ensureChatDirectory(owner, chat.id)
+    return chat
+  }
+
+  async ensureChatDirectory(owner, chatId) {
+    this.requireChat(owner, chatId)
+    await this.fileManager.operate({ operation: 'mkdir', path: `conversations/${chatId}` })
   }
 
   async updateChat(owner, chatId, body) {
@@ -41,9 +48,10 @@ export class WorkbenchService {
   async updateConfig(owner, chatId, body) {
     return this.withChatMutation(chatId, async () => {
       const chat = this.requireChat(owner, chatId)
+      const selection = normalizeSelection(body.selection)
+      if (JSON.stringify(selection) === JSON.stringify(chat.selection)) return this.getChat(owner, chatId)
       if (body.version !== chat.version) throw httpError(409, '配置版本已改变，请刷新后重试')
       if (this.database.activeRun(owner.ownerId, chatId)) throw httpError(409, '任务运行时不能修改模型配置')
-      const selection = normalizeSelection(body.selection)
       await this.freezeMcpTools(owner, selection.tools)
       const route = splitModel(selection.model)
       const catalog = await this.sessions.modelCatalog()

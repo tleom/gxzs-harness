@@ -102,7 +102,7 @@ describe('followup and control service', () => {
     const { database, owner, chat, service, sessionController } = setup()
     sessionController.rename.mockRejectedValueOnce(new Error('unavailable'))
     await expect(service.updateChat(owner, chat.id, { title: 'new' })).rejects.toThrow('unavailable')
-    expect(database.getChat(owner.ownerId, chat.id).title).toBe('新对话')
+    expect(database.getChat(owner.ownerId, chat.id).title).toBe('新会话')
   })
 
   it('commits configuration only after DSH model selection succeeds', async () => {
@@ -116,14 +116,27 @@ describe('followup and control service', () => {
     expect(sessionController.selectModel).toHaveBeenLastCalledWith({ sessionId: chat.sessionId, provider: 'p', model: 'm', reasoningEffort: 'high' })
   })
 
-  it('serializes two configuration writes against the same version', async () => {
+  it('coalesces two identical configuration writes against the same version', async () => {
     const { owner, chat, service, sessionController } = setup()
     const results = await Promise.allSettled([
       service.updateConfig(owner, chat.id, { version: 1, selection: { model: 'p/m' } }),
       service.updateConfig(owner, chat.id, { version: 1, selection: { model: 'p/m' } }),
     ])
-    expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1)
+    expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(2)
+    expect(results.map((result) => result.status === 'fulfilled' && result.value.version)).toEqual([2, 2])
     expect(sessionController.selectModel).toHaveBeenCalledOnce()
+  })
+
+  it('accepts a stale retry when its normalized selection already matches', async () => {
+    const { database, owner, chat, service, sessionController } = setup()
+    const selection = { model: 'p/m', tools: [], skills: [], knowledge: [], model_parameters: {}, tool_parameters: {} }
+    await service.updateConfig(owner, chat.id, { version: 1, selection })
+    sessionController.selectModel.mockClear()
+    await expect(service.updateConfig(owner, chat.id, { version: 1, selection })).resolves.toMatchObject({
+      version: 2, selection,
+    })
+    expect(database.getChat(owner.ownerId, chat.id).version).toBe(2)
+    expect(sessionController.selectModel).not.toHaveBeenCalled()
   })
 
   it('serializes run admission behind configuration selection', async () => {

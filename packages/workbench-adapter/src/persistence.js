@@ -188,7 +188,7 @@ export class WorkbenchDatabase {
     return this.getRun(ownerId, id)
   }
 
-  createChat({ ownerId, sessionId, selection, title = '新对话', id = randomUUID(), now = Date.now() }) {
+  createChat({ ownerId, sessionId, selection, title = '新会话', id = randomUUID(), now = Date.now() }) {
     const create = this.transaction(() => {
       this.db.prepare(`INSERT INTO chats
         (id, owner_id, session_id, title, selection_json, created_at, updated_at)

@@ -27,9 +27,18 @@ function setup() {
     },
     fs: {}, workbenchFileManager: {
       workspaceId: '33333333-3333-4333-8333-333333333333',
-      operate: vi.fn(async (payload) => payload.operation === 'manifest'
-        ? { version: 'tree-v1', items: 0, size: 0, files: [] }
-        : { path: payload.path, version: 'v1', deleted: payload.operation === 'delete' }),
+      operate: vi.fn(async (payload) => {
+        if (payload.operation === 'manifest') return { version: 'tree-v1', items: 0, size: 0, files: [] }
+        if (payload.operation === 'list') return {
+          path: payload.path,
+          entries: [{ name: 'a.bin', path: `${payload.path}/a.bin`, kind: 'file', size: 2, version: null, downloadable: true }],
+        }
+        if (payload.operation === 'stat') return {
+          name: 'a.bin', path: payload.path, kind: 'file', size: 2, version: 'sha256-v1', downloadable: true,
+        }
+        if (payload.operation === 'get') return { name: 'a.bin', data: 'AP8=', version: 'sha256-v1' }
+        return { path: payload.path, version: 'v1', deleted: payload.operation === 'delete' }
+      }),
     },
     workbenchPlatformClient: {
       request: vi.fn(async () => ({ status: 200, headers: new Headers({ 'content-type': 'application/json' }), bytes: Buffer.from('{"data":{"text":"ok"}}') })),
@@ -94,6 +103,14 @@ describe('authenticated workbench HTTP handler', () => {
     await expect(call(handler, key, 'GET', '/identity')).resolves.toMatchObject({ status: 200, body: { user: { id: '42', name: '用户' }, workspaceId: 't' } })
   })
 
+  it('advertises the implemented personal resource management protocol', async () => {
+    const { handler, key } = setup()
+    await expect(call(handler, key, 'GET', '/catalog')).resolves.toMatchObject({
+      status: 200,
+      body: { data: { resources_protocol: 1 } },
+    })
+  })
+
   it('rejects missing assertions before routing', async () => {
     const { handler, key } = setup()
     await expect(call(handler, key, 'GET', '/chats', undefined, false)).resolves.toMatchObject({ status: 401 })
@@ -123,20 +140,47 @@ describe('authenticated workbench HTTP handler', () => {
     await expect(call(handler, key, 'POST', '/files/directories', { path: '../escape' })).resolves.toMatchObject({ status: 403 })
   })
 
+  it('uses sandbox-manager metadata as the file version authority', async () => {
+    const { handler, key, context } = setup()
+    const listing = await call(handler, key, 'GET', '/files?path=case')
+    expect(listing).toMatchObject({ status: 200, body: { data: { entries: [{ path: 'case/a.bin', version: null }] } } })
+    const stat = await call(handler, key, 'GET', '/files/stat?path=case%2Fa.bin')
+    expect(stat).toMatchObject({ status: 200, body: { data: { path: 'case/a.bin', version: 'sha256-v1' } } })
+    await call(handler, key, 'DELETE', '/files', { path: 'case/a.bin', version: stat.body.data.version })
+    expect(context.workbenchFileManager.operate).toHaveBeenLastCalledWith({
+      operation: 'delete', path: 'case/a.bin', version: 'sha256-v1',
+    })
+  })
+
   it('blocks file deletion while any owner run is active', async () => {
     const { handler, key, context } = setup()
     const chat = await call(handler, key, 'POST', '/chats', {})
     await call(handler, key, 'POST', `/chats/${chat.body.data.id}/runs`, { query: 'work', request_key: 'run-1', version: 1 })
+    context.workbenchFileManager.operate.mockClear()
     const deleted = await call(handler, key, 'DELETE', '/files', { path: 'case/a.bin', version: 'v1' })
     expect(deleted).toMatchObject({ status: 409 })
     expect(context.workbenchFileManager.operate).not.toHaveBeenCalled()
+  })
+
+  it('creates and repairs owner chat directories', async () => {
+    const { handler, key, context } = setup()
+    const created = await call(handler, key, 'POST', '/chats', {})
+    const chatId = created.body.data.id
+    expect(context.workbenchFileManager.operate).toHaveBeenCalledWith({
+      operation: 'mkdir', path: `conversations/${chatId}`,
+    })
+    context.workbenchFileManager.operate.mockClear()
+    await call(handler, key, 'GET', `/chats/${chatId}`)
+    expect(context.workbenchFileManager.operate).toHaveBeenCalledWith({
+      operation: 'mkdir', path: `conversations/${chatId}`,
+    })
   })
 
   it('creates and lists owner-scoped chats with the expected envelope', async () => {
     const { handler, key } = setup()
     const created = await call(handler, key, 'POST', '/chats', {})
     expect(created.status).toBe(201)
-    expect(created.body.data).toMatchObject({ title: '新对话', version: 1, runs: [], selection: { model: 'p/m' } })
+    expect(created.body.data).toMatchObject({ title: '新会话', version: 1, runs: [], selection: { model: 'p/m' } })
     const listed = await call(handler, key, 'GET', '/chats')
     expect(listed.body.data).toHaveLength(1)
     expect(listed.body.data[0].id).toBe(created.body.data.id)
