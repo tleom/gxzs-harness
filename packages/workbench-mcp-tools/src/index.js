@@ -13,7 +13,7 @@ export async function apply(ctx) {
         owner: { ownerId: ctx.workbenchRuntime.ownerId }, method: 'GET', route: 'mcp/catalog',
       })
     } catch (error) {
-      if (error?.status === 503) payload = { tools: [] }
+      if ([502, 503].includes(error?.status)) payload = { tools: [] }
       else throw error
     }
     const catalog = normalizeCatalog(payload.data?.tools ?? payload.tools ?? [])
