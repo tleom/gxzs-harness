@@ -1,0 +1,127 @@
+# 部署环境变量
+
+所有密钥放入部署平台 Secret、Docker secret 或权限为 `0600` 的宿主机 env 文件。不要提交真实值。
+
+## 1. `gxzs-ai` / Java 后端
+
+```dotenv
+AI_WORKBENCH_ENABLED=true
+
+# Java签发给DSH host的请求断言。两项必须与每个host完全一致。
+DIFY_GXZS_ISSUER=gxzs
+DIFY_GXZS_SIGNING_KEY=<base64，解码后至少32字节>
+
+# Java平台代理主密钥。只留在Java；每个host使用其派生token。
+GXZS_PLATFORM_INTERNAL_KEY=<base64，解码后至少32字节>
+
+# 独立sandbox-manager
+GXZS_SANDBOX_MANAGER_URL=http://gxzs-sandbox-manager:5010
+GXZS_SANDBOX_MANAGER_TOKEN=<随机高熵bearer>
+
+# 公开分享和OAuth callback的外部根地址，无路径尾斜杠也可。
+GXZS_AI_PUBLIC_BASE_URL=https://ai.example.com
+
+# OpenAI兼容的 /audio/transcriptions 接口。没有STT时留空会返回409。
+GXZS_SPEECH_URL=https://speech.example.com/v1/audio/transcriptions
+GXZS_SPEECH_TOKEN=<provider bearer>
+GXZS_SPEECH_MODEL=sensevoice
+GXZS_SPEECH_MAX_BYTES=15728640
+
+# 32个ASCII字符，用于数据库中MCP client secret/token/header凭据的AES加密。
+GXZS_MCP_CREDENTIAL_KEY=<恰好32字符>
+# 逗号分隔的精确hostname；全局MCP和OAuth token endpoint均必须命中。
+GXZS_MCP_ALLOWED_HOSTS=mcp.example.com,oauth.example.com
+
+# host claim/heartbeat/session索引内部接口的独立bearer。
+GXZS_ORCHESTRATOR_TOKEN=<随机高熵bearer>
+```
+
+生成建议：
+
+```bash
+openssl rand -base64 32  # DIFY_GXZS_SIGNING_KEY
+openssl rand -base64 32  # GXZS_PLATFORM_INTERNAL_KEY
+openssl rand -base64 48  # manager/orchestrator bearer
+openssl rand -hex 16     # GXZS_MCP_CREDENTIAL_KEY，正好32字符
+```
+
+## 2. 独立 `sandbox-manager`
+
+```dotenv
+WORKBENCH_SANDBOX_MANAGER_TOKEN=<与Java和DSH host一致>
+WORKBENCH_SANDBOX_IMAGE=gxzs/harness-sandbox:p0-sshd
+WORKBENCH_SANDBOX_NETWORK=gxzs-ai-sandboxes
+WORKBENCH_SANDBOX_PREFIX=gxzs-wb
+WORKBENCH_MANAGER_STATE=/state
+# Java根地址；manager会调用 /internal/ai/mcp/authorize。
+WORKBENCH_MCP_API_URL=http://gxzs-backend:8080
+```
+
+manager需要：
+
+- 持久卷挂载到`/state`；
+- Docker socket或等价的受限容器编排接口；
+- 仅内网暴露5010；
+- Java和manager之间共享`GXZS_SANDBOX_MANAGER_TOKEN`；
+- 与用户sandbox处于可管理的Docker网络，但不要公开5010。
+
+## 3. 每个owner一个DSH host
+
+```dotenv
+DSH_HOME=/srv/dsh
+DSH_TELEMETRY_DISABLED=1
+DSH_PERMISSION_MODE=danger-full-access
+
+GXZS_HOST_OWNER_ID=<tenantId:userId>
+GXZS_HOST_GENERATION=<正整数，从1递增>
+GXZS_HOST_INSTANCE_ID=<该代次唯一实例ID>
+
+GXZS_ASSERTION_ISSUER=gxzs
+GXZS_ASSERTION_SIGNING_KEY=<与Java DIFY_GXZS_SIGNING_KEY一致>
+GXZS_ASSERTION_AUDIENCE_PATH=/ai/workbench
+
+GXZS_SANDBOX_MANAGER_URL=http://gxzs-sandbox-manager:5010
+GXZS_SANDBOX_MANAGER_TOKEN=<与Java/manager一致>
+GXZS_SANDBOX_WORKSPACE_ID=<平台分配的固定UUID>
+GXZS_SANDBOX_WORKSPACE=/workspace
+GXZS_SANDBOX_SSH_HOST=<OpenSSH config中的sandbox别名>
+GXZS_SANDBOX_NODE=/usr/local/bin/node
+GXZS_SANDBOX_HELPER=/opt/dsh/node_modules/@deepseek-ai/dsh-ssh/lib/helper.js
+GXZS_SANDBOX_HELPER_HASH=<部署镜像中helper.js的64位小写SHA-256>
+
+GXZS_PLATFORM_INTERNAL_URL=http://gxzs-backend:8080/internal/workbench
+GXZS_PLATFORM_INTERNAL_TOKEN=<由Java平台主密钥按owner/generation/instance派生>
+```
+
+派生每个host的token：
+
+```bash
+GXZS_PLATFORM_INTERNAL_KEY='<Java主密钥>' \
+node scripts/derive-host-token.mjs '<tenantId:userId>' '<generation>' '<instance-id>'
+```
+
+把输出写入该host的`GXZS_PLATFORM_INTERNAL_TOKEN`。不要把`GXZS_PLATFORM_INTERNAL_KEY`放进host。
+
+模型provider所需API key继续按DSH对应provider的环境变量注入，不放进`settings.yaml`、workspace或sandbox。
+
+## 4. 必须保持一致的值
+
+| Java | DSH host / manager |
+| --- | --- |
+| `DIFY_GXZS_ISSUER` | `GXZS_ASSERTION_ISSUER` |
+| `DIFY_GXZS_SIGNING_KEY` | `GXZS_ASSERTION_SIGNING_KEY` |
+| `GXZS_SANDBOX_MANAGER_TOKEN` | manager和host同名token |
+| `GXZS_PLATFORM_INTERNAL_KEY` | 仅用于派生host token，不复制主密钥 |
+| `GXZS_ORCHESTRATOR_TOKEN` | host编排器调用Java内部索引接口时使用 |
+
+## 5. 启用顺序
+
+1. 应用`gxzs-ai`中的两份数据库migration。
+2. 启动独立sandbox-manager并验证`ensure/files/manifest`。
+3. 为owner创建sandbox和DSH home。
+4. claim host generation并启动heartbeat。
+5. 用派生token启动DSH host和内部relay。
+6. 部署`gxzs-ai`，保持`AI_WORKBENCH_ENABLED=false`做健康检查。
+7. 设置`AI_WORKBENCH_ENABLED=true`，先灰度一个owner。
+8. 验证旧chat、文件、SSE、新消息、预览、分享、语音和MCP。
+9. drain旧Dify，再停止API/worker/web/agent；观察期内保留数据库和volume作为回滚源。
