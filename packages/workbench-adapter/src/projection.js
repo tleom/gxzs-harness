@@ -42,7 +42,7 @@ export function createAssistantStreamProjector(database, expectedOwnerId) {
   }
 }
 
-export function projectSessionEvent(database, sessionId, event, expectedOwnerId) {
+export function projectSessionEvent(database, sessionId, event, expectedOwnerId, context) {
   const chat = database.getChatBySession(sessionId)
   if (!chat || (expectedOwnerId && chat.ownerId !== expectedOwnerId)) return undefined
 
@@ -73,6 +73,14 @@ export function projectSessionEvent(database, sessionId, event, expectedOwnerId)
     if (!run) return undefined
     return database.appendEvent(chat.ownerId, run.id, {
       event: 'workbench_chat_title', chat_id: chat.id, title,
+    })
+  }
+
+  if (event.type === 'request/context' && context) {
+    const run = database.activeRun(chat.ownerId, chat.id)
+    if (!run) return undefined
+    return database.appendEvent(chat.ownerId, run.id, {
+      event: 'workbench_context', workbench_run_id: run.id, phase: 'request', ...context,
     })
   }
 
@@ -140,9 +148,12 @@ export function projectSessionEvent(database, sessionId, event, expectedOwnerId)
         }
       }
       const usage = event.data?.usage
-      if (usage) return append({
+      if (context || usage) return append({
         event: 'workbench_context', workbench_run_id: run.id, phase: 'usage',
-        used_tokens: usage.totalTokens ?? (usage.inputTokens ?? 0) + (usage.outputTokens ?? 0), estimated: false,
+        ...(context ?? {
+          used_tokens: usage.totalTokens ?? (usage.inputTokens ?? 0) + (usage.outputTokens ?? 0),
+          window_tokens: null, estimated: false, model: '',
+        }),
       })
       return undefined
     }
@@ -172,8 +183,21 @@ function adoptMessage(database, sessionId, message) {
 function projectControlEvent(database, chat, sessionId, event) {
   let update
   if (event.type === 'todo/write') update = { todos: event.data?.todos ?? [] }
-  else if (event.type === 'goal/change') update = { goal: event.data?.operation === 'clear' ? null : event.data?.goal ?? null }
-  else if (event.type === 'plan/mode') {
+  else if (event.type === 'goal/change') {
+    const goal = event.data?.goal
+    update = { goal: event.data?.operation === 'clear' || !goal ? null : {
+      id: goal.id,
+      revision: goal.revision,
+      objective: goal.objective,
+      phase: goal.phase,
+      reason: goal.blockedReason?.message ?? null,
+      max_rounds: goal.maxGoalRounds ?? null,
+      rounds_started: event.data?.roundsStarted ?? 0,
+      last_run_id: null,
+      started_at: Number.isFinite(event.data?.createdAt) ? Math.floor(event.data.createdAt / 1000) : null,
+      active_since: Number.isFinite(event.data?.updatedAt) ? Math.floor(event.data.updatedAt / 1000) : null,
+    } }
+  } else if (event.type === 'plan/mode') {
     const current = database.getControl(chat.ownerId, chat.id)
     update = { plan: { ...current.plan, active: Boolean(event.data?.active) } }
   } else if (event.type === 'compaction/summary') {

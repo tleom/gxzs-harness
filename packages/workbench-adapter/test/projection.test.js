@@ -144,10 +144,38 @@ describe('DSH session event projection', () => {
     }))
   })
 
+  it('projects complete token-meter readings for the context gauge', () => {
+    const { database, chat, run } = setup()
+    bind(database, chat, run)
+    const requestContext = {
+      used_tokens: 1200, window_tokens: 128000, estimated: true, model: 'bailian/qwen3.8-flash',
+    }
+    expect(projectSessionEvent(database, chat.sessionId, {
+      type: 'request/context', data: { provider: 'bailian', model: 'qwen3.8-flash', contextWindow: 128000 },
+    }, undefined, requestContext)).toMatchObject({
+      event: 'workbench_context', phase: 'request', ...requestContext,
+    })
+    const settledContext = { ...requestContext, used_tokens: 1600, estimated: false }
+    projectSessionEvent(database, chat.sessionId, {
+      type: 'assistant/message',
+      data: { turn: 1, step: 1, usage: { inputTokens: 1500, outputTokens: 100 }, message: { content: [] } },
+    }, undefined, settledContext)
+    expect(database.eventsAfter(chat.ownerId, run.id, 0).at(-1)).toMatchObject({
+      event: 'workbench_context', phase: 'usage', ...settledContext,
+    })
+  })
+
   it('folds session control events without requiring a turn', () => {
     const { database, chat } = setup()
     projectSessionEvent(database, chat.sessionId, { type: 'todo/write', data: { todos: [{ content: '调查', status: 'in_progress' }] } })
-    projectSessionEvent(database, chat.sessionId, { type: 'goal/change', data: { operation: 'create', goal: { id: 'g1', objective: '完成迁移', phase: 'active' } } })
+    projectSessionEvent(database, chat.sessionId, {
+      type: 'goal/change',
+      data: {
+        kind: 'goal/change', version: 1, operation: 'create', roundsStarted: 2,
+        createdAt: 10_000, updatedAt: 12_000,
+        goal: { id: 'g1', revision: 3, objective: '完成迁移', phase: 'active', maxGoalRounds: 6 },
+      },
+    })
     projectSessionEvent(database, chat.sessionId, { type: 'plan/mode', data: { active: true } })
     projectSessionEvent(database, chat.sessionId, { type: 'compaction/start', data: { compactionId: 'c1', turn: null } })
     projectSessionEvent(database, chat.sessionId, { type: 'compaction/summary', data: { compactionId: 'c1', summary: [{ type: 'text', text: 'summary' }], shadowedTokenCount: 200 } })
@@ -155,7 +183,11 @@ describe('DSH session event projection', () => {
     expect(database.getControl(chat.ownerId, chat.id)).toMatchObject({
       revision: 6,
       todos: [{ content: '调查', status: 'in_progress' }],
-      goal: { id: 'g1', objective: '完成迁移', phase: 'active' },
+      goal: {
+        id: 'g1', revision: 3, objective: '完成迁移', phase: 'active',
+        max_rounds: 6, rounds_started: 2, reason: null,
+        started_at: 10, active_since: 12, last_run_id: null,
+      },
       plan: { active: true },
       compaction: { id: 'c1', phase: 'compacted', message: 'summary', before_tokens: 200, after_tokens: null },
     })

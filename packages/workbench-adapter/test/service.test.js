@@ -294,6 +294,23 @@ describe('followup and control service', () => {
     expect(sessionController.cancel).toHaveBeenCalledWith({ sessionId: chat.sessionId })
   })
 
+  it('resumes a cold DSH session before executing a control command', async () => {
+    const { owner, chat, service, sessionController, agents, commands, agent } = setup()
+    agents.get.mockReturnValueOnce(undefined).mockReturnValue(agent)
+    await expect(service.issueCommand(owner, chat.id, {
+      command: '/goal pause', expected_revision: 0, request_key: 'cold-goal',
+    })).resolves.toMatchObject({ message: 'ok' })
+    expect(sessionController.create).toHaveBeenCalledWith({ sessionId: chat.sessionId, cwd: '/workspace' })
+    expect(commands.execute).toHaveBeenCalledWith(agent, '/goal pause', [], expect.any(AbortSignal))
+  })
+
+  it('persists the accepted plan objective in control state', async () => {
+    const { owner, chat, service } = setup()
+    await expect(service.issueCommand(owner, chat.id, {
+      command: '/plan 调查证据', expected_revision: 0, request_key: 'plan-objective',
+    })).resolves.toMatchObject({ state: { plan: { objective: '调查证据' } } })
+  })
+
   it('executes only supported native DSH commands with revision CAS', async () => {
     const { owner, chat, service, commands, agent } = setup()
     await expect(service.issueCommand(owner, chat.id, { command: '/goal pause', expected_revision: 0, request_key: 'goal-1' })).resolves.toMatchObject({ message: 'ok' })
