@@ -138,7 +138,10 @@ export class WorkbenchService {
       const chat = this.requireChat(owner, chatId)
       if (this.database.activeRun(owner.ownerId, chatId))
         throw httpError(409, '会话正在执行任务，请停止后再删除')
-      await this.fileManager.operate({ operation: 'delete', path: `conversations/${chat.id}` })
+      const path = `conversations/${chat.id}`
+      const entry = await this.fileManager.operate({ operation: 'stat', path })
+      if (entry.kind !== 'missing')
+        await this.fileManager.operate({ operation: 'delete', path, version: entry.version })
       this.database.deleteChat(owner.ownerId, chatId)
     })
   }

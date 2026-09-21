@@ -56,7 +56,7 @@ export function apply(ctx, config) {
     owner: { ownerId: config.ownerId }, method: 'GET', route: 'workbench/config',
   }).then((payload) => {
     const text = payload?.data?.system_prompt
-    if (typeof text === 'string' && text.trim()) publishedPrompt = text.trim()
+    if (payload?.data?.enabled === true && typeof text === 'string' && text.trim()) publishedPrompt = text.trim()
   }).catch(() => {})
 
   const projectAssistantStream = createAssistantStreamProjector(database, config.ownerId)

@@ -65,7 +65,7 @@ async function call(handler, key, method, route, value, authenticated = true, us
   const now = Math.floor(Date.now() / 1000)
   const header = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url')
   const payload = Buffer.from(JSON.stringify({
-    iss: 'gxzs', aud: 'dify-workbench', sub: `t:${userId}`, tenant_id: 't', user_id: userId, name: '用户',
+    iss: 'gxzs', aud: 'agent-workbench', sub: `t:${userId}`, tenant_id: 't', user_id: userId, name: '用户',
     iat: now, exp: now + 60, jti: randomUUID(), method,
     target: `/console/api/workbench${route}`, body_sha256: createHash('sha256').update(body).digest('hex'),
     content_type: 'application/json', last_event_id: '',
