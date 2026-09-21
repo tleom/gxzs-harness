@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "scripts": {
+    "postinstall": "node prepare-presets.mjs"
+  },
   "dsh": {
     "profile": {
       "bundles": [
@@ -24,6 +27,7 @@
     "@gxzs/dsh-workbench-file-manager": "file:../../packages/workbench-file-manager",
     "@gxzs/dsh-workbench-platform-client": "file:../../packages/workbench-platform-client",
     "@gxzs/dsh-workbench-sandbox-skills": "file:../../packages/workbench-sandbox-skills",
+    "@gxzs/dsh-workbench-sandbox-runtime": "file:../../packages/workbench-sandbox-runtime",
     "@gxzs/dsh-workbench-mcp-tools": "file:../../packages/workbench-mcp-tools"
   }
 }

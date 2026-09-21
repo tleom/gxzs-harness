@@ -72,6 +72,11 @@ export class WorkbenchDatabase {
       );
       CREATE INDEX IF NOT EXISTS runs_chat_created ON runs(chat_id, created_at, id);
       CREATE INDEX IF NOT EXISTS runs_owner_status ON runs(owner_id, status);
+      CREATE TABLE IF NOT EXISTS run_submissions (
+        run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
+        content_json TEXT NOT NULL,
+        dispatched INTEGER NOT NULL DEFAULT 0
+      );
       CREATE UNIQUE INDEX IF NOT EXISTS runs_session_message ON runs(session_id, message_id) WHERE message_id IS NOT NULL;
       CREATE TABLE IF NOT EXISTS pending_turns (
         session_id TEXT NOT NULL,
@@ -206,6 +211,10 @@ export class WorkbenchDatabase {
     return row ? decodeChat(row) : undefined
   }
 
+  rebindFailedRunSession(ownerId, runId, sessionId) {
+    this.db.prepare("UPDATE runs SET session_id = ? WHERE owner_id = ? AND id = ? AND status = 'failed'").run(sessionId, ownerId, runId)
+  }
+
   getChatBySession(sessionId) {
     const row = this.db.prepare('SELECT * FROM chats WHERE session_id = ? AND deleted_at IS NULL').get(sessionId)
     return row ? decodeChat(row) : undefined
@@ -259,6 +268,10 @@ export class WorkbenchDatabase {
       const queueOrder = this.db.prepare(`SELECT COALESCE(MAX(queue_order), 0) + 1 AS value
         FROM runs WHERE chat_id = ? AND status IN ('queued', 'running', 'waiting_input', 'stopping')`)
         .get(chatId).value
+      const active = this.activeRun(ownerId, chatId)
+      const queued = this.db.prepare("SELECT COUNT(*) AS count FROM runs WHERE owner_id = ? AND chat_id = ? AND status = 'queued' AND id != ?")
+        .get(ownerId, chatId, active?.id ?? '').count
+      if (queued >= 3) throw Object.assign(new Error('最多排队三条消息'), { status: 409 })
       this.db.prepare(`INSERT INTO runs
         (id, owner_id, chat_id, session_id, request_key, query, attachments_json, mcp_tools_json, status, selection_json,
          parent_run_id, queue_order, created_at, updated_at)
@@ -340,7 +353,7 @@ export class WorkbenchDatabase {
   }
 
   listRuns(ownerId, chatId) {
-    return this.db.prepare('SELECT * FROM runs WHERE owner_id = ? AND chat_id = ? ORDER BY created_at, id')
+    return this.db.prepare('SELECT * FROM runs WHERE owner_id = ? AND chat_id = ? ORDER BY created_at, rowid')
       .all(ownerId, chatId).map(decodeRun)
   }
 
@@ -495,6 +508,20 @@ export class WorkbenchDatabase {
       .all(runId, after, limit).map((row) => JSON.parse(row.payload_json))
   }
 
+  runTiming(ownerId, runId) {
+    const run = this.getRun(ownerId, runId)
+    if (!run) throw notFound('任务不存在')
+    const timing = this.db.prepare(`SELECT
+      MIN(CASE WHEN json_extract(payload_json, '$.status') = 'running' OR json_extract(payload_json, '$.event') IN ('message', 'agent_message', 'workbench_activity') THEN created_at END) AS started,
+      MIN(CASE WHEN json_extract(payload_json, '$.event') = 'workbench_end' THEN created_at END) AS ended,
+      MAX(created_at) AS last_event FROM run_events WHERE run_id = ?`).get(runId)
+    const ended = TERMINAL.has(run.status) ? timing.ended ?? timing.last_event ?? run.updatedAt : null
+    return {
+      completed_at: ended == null ? null : ended / 1000,
+      elapsed_seconds: ended != null && timing.started != null ? Math.max(0, ended - timing.started) / 1000 : null,
+    }
+  }
+
   allEvents(ownerId, runId) {
     const events = []
     let sequence = 0
@@ -506,19 +533,61 @@ export class WorkbenchDatabase {
     }
   }
 
+  steeringEvents(ownerId, runId) {
+    if (!this.getRun(ownerId, runId)) throw notFound('任务不存在')
+    return this.db.prepare(`SELECT payload_json FROM run_events WHERE run_id = ?
+      AND json_extract(payload_json, '$.event') IN ('workbench_steering', 'workbench_steered') ORDER BY seq`)
+      .all(runId).map((row) => JSON.parse(row.payload_json))
+  }
+
+  saveSubmission(ownerId, runId, content, retry = false) {
+    if (!this.getRun(ownerId, runId)) throw notFound('任务不存在')
+    if (retry) this.db.prepare('DELETE FROM run_submissions WHERE run_id=?').run(runId)
+    this.db.prepare('INSERT INTO run_submissions(run_id, content_json) VALUES (?, ?) ON CONFLICT(run_id) DO NOTHING')
+      .run(runId, JSON.stringify({ content, ticketId: randomUUID() }))
+  }
+
+  submissions(ownerId) {
+    return this.db.prepare(`SELECT s.* FROM run_submissions s JOIN runs r ON r.id=s.run_id
+      WHERE r.owner_id=? ORDER BY r.created_at,r.rowid`).all(ownerId)
+      .map((row) => {
+        const value = JSON.parse(row.content_json)
+        return { runId: row.run_id, content: value.content, ticketId: value.ticketId, dispatched: Boolean(row.dispatched) }
+      })
+  }
+
+  submission(ownerId, runId) { return this.submissions(ownerId).find((item) => item.runId === runId) }
+
+  dispatchSubmission(ownerId, runId) {
+    if (!this.getRun(ownerId, runId)) throw notFound('任务不存在')
+    this.db.prepare('UPDATE run_submissions SET dispatched=1 WHERE run_id=?').run(runId)
+  }
+
+  finishSubmission(ownerId, runId) {
+    if (!this.getRun(ownerId, runId)) throw notFound('任务不存在')
+    this.db.prepare('DELETE FROM run_submissions WHERE run_id=?').run(runId)
+  }
+
   transitionRun(ownerId, runId, status, error, now = Date.now()) {
     const result = this.db.prepare('UPDATE runs SET status = ?, error = ?, updated_at = ? WHERE id = ? AND owner_id = ?')
       .run(status, error ?? null, now, runId, ownerId)
     if (result.changes !== 1) throw notFound('任务不存在')
+    if (status === 'discarded' || status === 'steered') {
+      const removed = this.getRun(ownerId, runId)
+      this.db.prepare('UPDATE runs SET parent_run_id = ? WHERE owner_id = ? AND chat_id = ? AND parent_run_id = ?')
+        .run(removed.parentRunId ?? null, ownerId, removed.chatId, runId)
+    }
     return this.getRun(ownerId, runId)
   }
 
   recoverInterrupted(now = Date.now()) {
     const recover = this.transaction(() => {
       const rows = this.db.prepare(`SELECT id, owner_id FROM runs
-        WHERE status NOT IN ('completed', 'failed', 'cancelled', 'interrupted', 'discarded', 'steered')`).all()
+        WHERE status NOT IN ('completed', 'failed', 'cancelled', 'interrupted', 'discarded', 'steered')
+        AND id NOT IN (SELECT run_id FROM run_submissions WHERE dispatched=0)`).all()
       this.db.prepare(`UPDATE runs SET status = 'interrupted', error = COALESCE(error, ?), updated_at = ?
-        WHERE status NOT IN ('completed', 'failed', 'cancelled', 'interrupted', 'discarded', 'steered')`)
+        WHERE status NOT IN ('completed', 'failed', 'cancelled', 'interrupted', 'discarded', 'steered')
+        AND id NOT IN (SELECT run_id FROM run_submissions WHERE dispatched=0)`)
         .run('适配层进程重启，任务已中断', now)
       this.db.prepare(`UPDATE pending_inputs SET status = 'aborted', settled_at = ? WHERE status = 'pending'`).run(now)
       return rows

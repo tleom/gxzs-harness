@@ -1,6 +1,29 @@
 - id: session-telemetry-otel
   disabled: true
 
+- id: system-prompt
+  config:
+    includeHarnessIdentity: false
+
+# Web access is provided by the selected platform MCP tools.
+- id: tool-web
+  disabled: true
+
+- id: web-search-deepseek
+  disabled: true
+
+- id: web-fetch-http
+  disabled: true
+
+- id: agent-presets
+  config:
+    default: standard
+    includeShippedRoot: false
+    includeUserRoot: true
+    roots:
+      - path: !!js (process.env.DSH_HOME ?? process.cwd()) + '/profiles/workbench/presets'
+        trust: system
+
 - id: sandbox
   disabled: true
 
@@ -9,6 +32,14 @@
 
 - id: subprocess
   disabled: true
+
+- id: spill-local
+  disabled: true
+
+- id: ptc-runtime
+  config:
+    nodeExecutable: !!js process.env.GXZS_SANDBOX_NODE ?? '/usr/local/bin/node'
+    bootstrapPath: !!js process.env.GXZS_SANDBOX_PTC_BOOTSTRAP ?? '/opt/dsh/node_modules/@deepseek-ai/dsh-ptc-runtime-node/lib/process.js'
 
 - id: sandbox-policy
   config:
@@ -33,7 +64,13 @@
     - id: gxzs-sandbox-ssh
       name: '@deepseek-ai/dsh-sandbox-ssh'
     - id: gxzs-subprocess-ssh
-      name: '@deepseek-ai/dsh-subprocess-ssh'
+      name: '@gxzs/dsh-workbench-sandbox-runtime/subprocess'
+      config:
+        ripgrepExecutable: !!js process.env.GXZS_SANDBOX_RG ?? '/usr/bin/rg'
+    - id: gxzs-spill-sandbox
+      name: '@gxzs/dsh-workbench-sandbox-runtime/spill'
+      config:
+        workspace: !!js process.env.GXZS_SANDBOX_WORKSPACE ?? '/workspace'
     - id: gxzs-skill-filesystem
       name: '@deepseek-ai/dsh-skill-filesystem'
       config:

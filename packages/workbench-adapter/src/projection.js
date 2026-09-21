@@ -66,6 +66,9 @@ export function projectSessionEvent(database, sessionId, event, expectedOwnerId,
   }
 
   if (event.type === 'session/title') {
+    // The adapter sets the first-message fallback before dispatch. DSH's fallback
+    // includes model-only attachment context; only accept its generated/user titles.
+    if (event.data?.source?.kind === 'fallback') return undefined
     const title = typeof event.data?.title === 'string' ? event.data.title : ''
     if (!title) return undefined
     database.updateChat(chat.ownerId, chat.id, { title })
@@ -112,6 +115,8 @@ export function projectSessionEvent(database, sessionId, event, expectedOwnerId,
       database.transitionRun(chat.ownerId, run.id, status, error)
       return append({ event: 'workbench_end', status, error })
     }
+    case 'deliverables/presented':
+      return append({ event: 'workbench_presented', files: event.data?.files ?? [] })
     case 'tool/call':
       database.startToolCall(chat.ownerId, run.id, String(event.data?.callId ?? ''), String(event.data?.name ?? ''))
       return append({
@@ -134,10 +139,17 @@ export function projectSessionEvent(database, sessionId, event, expectedOwnerId,
           tool_name: toolName, activity_id: callId,
           stage: event.data?.error || block?.isError ? 'error' : 'returned',
           output: contentText(block?.content ?? event.data?.message?.content),
+          ...(event.data?.meta === undefined ? {} : { result_meta: event.data.meta }),
         },
       })
     }
     case 'assistant/message': {
+      const content = event.data?.message?.content ?? []
+      if (event.surfaceOp == null || event.surfaceOp === 'append') append({
+        event: 'workbench_assistant_final', turn: event.data.turn, step: event.data.step,
+        has_reply: content.some((block) => block.type === 'text' && block.text?.trim()),
+        has_tool_calls: content.some((block) => block.type === 'tool-call'),
+      })
       if (!database.isStreamedStep(chat.ownerId, run.id, event.data.turn, event.data.step)) {
         for (const [index, block] of (event.data?.message?.content ?? []).entries()) {
           if ((block?.type === 'text' || block?.type === 'reasoning') && typeof block.text === 'string' && block.text)
@@ -194,8 +206,6 @@ function projectControlEvent(database, chat, sessionId, event) {
       max_rounds: goal.maxGoalRounds ?? null,
       rounds_started: event.data?.roundsStarted ?? 0,
       last_run_id: null,
-      started_at: Number.isFinite(event.data?.createdAt) ? Math.floor(event.data.createdAt / 1000) : null,
-      active_since: Number.isFinite(event.data?.updatedAt) ? Math.floor(event.data.updatedAt / 1000) : null,
     } }
   } else if (event.type === 'plan/mode') {
     const current = database.getControl(chat.ownerId, chat.id)

@@ -28,7 +28,7 @@ Public prefix: `/ai/workbench`. Priority: P0 is required for traffic switch, P1 
 | POST `/runs/{run_id}/steer` | Followup | Adapter | P1 | DSH steer mode and active target validation |
 | POST `/runs/{run_id}/input-supplement` | Followup | Adapter | P1 | Derived run and supplement lineage |
 | POST `/runs/{run_id}/feedbacks` | Feedback | Platform service | P1 | Like/dislike/null without external telemetry |
-| POST `/runs/{run_id}/regenerate` | Branching | Adapter | P1 | Idempotent branch with parent lineage |
+| POST `/runs/{run_id}/fork` | Fork conversation | Adapter | P1 | Idempotent new conversation with model and display history through the selected answer |
 | GET `/files` | Files | Adapter fs seam | P0 | Confined list and stable metadata |
 | POST `/files` | Files | Adapter + fixed-workspace manager capability | P0/P1 | Binary upload, version CAS and atomic write; implemented, live manager validation pending |
 | DELETE `/files` | Files | Adapter + fixed-workspace manager capability | P1 | Confined versioned deletion; implemented, live manager validation pending |

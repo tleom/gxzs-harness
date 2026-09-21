@@ -35,6 +35,111 @@ function setup() {
 }
 
 describe('followup and control service', () => {
+  it('persists capacity-waiting tasks without sending them to DSH and allows cancellation', async () => {
+    const { service, owner, chat, database, sessionController } = setup()
+    service.scheduler = { enqueue: (run, content) => database.saveSubmission(owner.ownerId, run.id, content) }
+    const run = await service.submitRun(owner, chat.id, { query: 'wait for capacity' })
+    expect(database.submission(owner.ownerId, run.id).dispatched).toBe(false)
+    expect(sessionController.prompt).not.toHaveBeenCalled()
+    expect(service.chatSummary(owner, chat)).toMatchObject({ has_active_run: true, is_running: false })
+    expect(await service.stopRun(owner, run.id)).toMatchObject({ status: 'cancelled' })
+    expect(sessionController.cancel).not.toHaveBeenCalled()
+  })
+
+  it('direct-sends a locally queued message into the running turn only on explicit steering', async () => {
+    const { service, owner, chat, database, sessionController } = setup()
+    const active = await service.submitRun(owner, chat.id, { query: 'active' })
+    database.transitionRun(owner.ownerId, active.id, 'running')
+    sessionController.prompt.mockClear()
+    service.scheduler = { enqueue: (run, content) => database.saveSubmission(owner.ownerId, run.id, content) }
+    const next = await service.submitRun(owner, chat.id, { query: 'supplement' })
+    expect(sessionController.prompt).not.toHaveBeenCalled()
+    expect(await service.steer(owner, next.id, active.id)).toMatchObject({ status: 'steered', steer_target_run_id: active.id })
+    expect(sessionController.prompt.mock.calls[0][0]).toMatchObject({ mode: 'steer', requestId: next.id })
+  })
+
+  it('queues normal messages in order and steers only on an explicit request', async () => {
+    const { service, owner, chat, database, sessionController } = setup()
+    const active = await service.submitRun(owner, chat.id, { query: 'active', request_key: 'active' })
+    database.transitionRun(owner.ownerId, active.id, 'running')
+    const first = await service.submitRun(owner, chat.id, { query: 'first', request_key: 'first' })
+    const second = await service.submitRun(owner, chat.id, { query: 'second', request_key: 'second', parent_run_id: active.id })
+    expect(first).toMatchObject({ status: 'queued', parent_run_id: active.id })
+    expect(second).toMatchObject({ status: 'queued', parent_run_id: first.id })
+    expect(sessionController.prompt.mock.calls.every(([request]) => request.mode === 'queue')).toBe(true)
+    expect(sessionController.updateQueue).not.toHaveBeenCalled()
+    database.adoptInboxMessage(chat.sessionId, first.id, 'message-first')
+    const direct = await service.steer(owner, first.id, active.id)
+    expect(direct).toMatchObject({ status: 'steered', steer_target_run_id: active.id })
+    expect(sessionController.updateQueue).toHaveBeenCalledWith({ sessionId: chat.sessionId, itemId: 'message-first', action: { kind: 'steer' } })
+    expect(database.getRun(owner.ownerId, second.id).parentRunId).toBe(active.id)
+    expect(service.getChat(owner, chat.id).runs.find((run) => run.id === active.id).steering_messages).toMatchObject([{ id: first.id, query: 'first' }])
+    expect(service.followups(owner, chat.id, [first.id]).runs.find((run) => run.id === first.id).steer_target_run_id).toBe(active.id)
+    await expect(service.steer(owner, first.id, active.id)).resolves.toMatchObject({ status: 'steered', steer_target_run_id: active.id })
+    expect(sessionController.updateQueue).toHaveBeenCalledTimes(1)
+  })
+
+  it('enforces queue capacity and repairs the message chain after deleting a queued message', async () => {
+    const { service, owner, chat, database } = setup()
+    const active = await service.submitRun(owner, chat.id, { query: 'active' })
+    database.transitionRun(owner.ownerId, active.id, 'running')
+    const first = await service.submitRun(owner, chat.id, { query: 'first' })
+    const second = await service.submitRun(owner, chat.id, { query: 'second' })
+    await service.submitRun(owner, chat.id, { query: 'third' })
+    await expect(service.submitRun(owner, chat.id, { query: 'fourth' })).rejects.toMatchObject({ status: 409 })
+    database.adoptInboxMessage(chat.sessionId, first.id, 'message-first')
+    await service.removeQueued(owner, first.id)
+    expect(database.getRun(owner.ownerId, second.id).parentRunId).toBe(active.id)
+    await expect(service.submitRun(owner, chat.id, { query: 'replacement' })).resolves.toMatchObject({ status: 'queued' })
+  })
+
+  it('reserves the starting task separately from three queued follow-ups', async () => {
+    const { service, owner, chat, sessionController } = setup()
+    const first = await service.submitRun(owner, chat.id, { query: 'starting' })
+    for (const query of ['one', 'two', 'three']) await service.submitRun(owner, chat.id, { query })
+    await expect(service.submitRun(owner, chat.id, { query: 'four' })).rejects.toMatchObject({ status: 409 })
+    await expect(service.steer(owner, first.id, first.id)).rejects.toMatchObject({ status: 409 })
+    expect(sessionController.updateQueue).not.toHaveBeenCalled()
+  })
+  it('creates each sandbox conversation directory before creating its DSH session', async () => {
+    const { service, owner, fileManager, sessionController } = setup()
+    sessionController.create.mockResolvedValueOnce({ sessionId: 'first' }).mockResolvedValueOnce({ sessionId: 'second' })
+    const first = await service.createChat(owner, '/workspace', {})
+    const second = await service.createChat(owner, '/workspace', {})
+    expect(first.id).not.toBe(second.id)
+    for (const chat of [first, second]) {
+      expect(fileManager.operate).toHaveBeenCalledWith({ operation: 'mkdir', path: `conversations/${chat.id}` })
+      expect(sessionController.create).toHaveBeenCalledWith({ cwd: `/workspace/conversations/${chat.id}` })
+    }
+    expect(fileManager.operate.mock.invocationCallOrder[0]).toBeLessThan(sessionController.create.mock.invocationCallOrder[0])
+  })
+
+  it('moves an idle legacy session to its conversation directory with history intact', async () => {
+    const { service, owner, chat, agents, database, sessionController } = setup()
+    const history = [{ seq: 0, type: 'example', data: { text: 'preserved' } }]
+    const dispose = vi.fn()
+    service.sessionQuery = { observeSession: vi.fn(async () => ({ header: { cwd: '/workspace' }, events: history, projections: { values: { agentPreset: 'standard' } }, [Symbol.dispose]: dispose })) }
+    service.agentPresets = { resolve: vi.fn(async () => ({ id: 'standard' })), mount: vi.fn() }
+    service.agentDefaultModel = { currentSelection: () => ({ provider: 'p', model: 'm' }) }
+    agents.get.mockReturnValue({ session: { header: { cwd: '/workspace' } } })
+    agents.create = vi.fn(async () => ({}))
+    const run = await service.submitRun(owner, chat.id, { query: 'continue' })
+    const created = agents.create.mock.calls[0][0]
+    expect(created).toMatchObject({ seed: history, inheritedEventCount: 1, meta: { cwd: `/workspace/conversations/${chat.id}`, parentSession: chat.sessionId, isSeeded: true } })
+    expect(database.getChat(owner.ownerId, chat.id).sessionId).toBe(created.sessionId)
+    expect(sessionController.prompt).toHaveBeenCalledWith(expect.objectContaining({ sessionId: created.sessionId, requestId: run.id }), expect.any(AbortSignal))
+    expect(dispose).toHaveBeenCalledOnce()
+  })
+
+  it('does not switch a running legacy conversation to another session', async () => {
+    const { service, owner, chat, agents, database, sessionController } = setup()
+    agents.get.mockReturnValue({ session: { header: { cwd: '/workspace' } } })
+    const { run } = database.createRun({ ownerId: owner.ownerId, chatId: chat.id, sessionId: chat.sessionId, query: 'active', selection: {} })
+    database.transitionRun(owner.ownerId, run.id, 'running')
+    await expect(service.submitRun(owner, chat.id, { query: 'next' })).rejects.toMatchObject({ status: 409 })
+    expect(database.getChat(owner.ownerId, chat.id).sessionId).toBe(chat.sessionId)
+    expect(sessionController.prompt).not.toHaveBeenCalled()
+  })
   it('persists a skipped-question supplement and deduplicates retries after a failed dispatch', async () => {
     const { database, owner, chat, service, sessionController } = setup()
     const { run } = database.createRun({ ownerId: owner.ownerId, chatId: chat.id, sessionId: chat.sessionId, query: 'q', selection: { model: 'p/m', tools: [] } })
@@ -53,6 +158,27 @@ describe('followup and control service', () => {
     ])
     await expect(service.supplement(owner, run.id, { ...body, request_id: 'missing' })).rejects.toMatchObject({ status: 404 })
   })
+  it.each(['running', 'completed'])('sends a historical answer as an interruption or followup when the task is %s', async (status) => {
+    const { database, owner, chat, service, sessionController } = setup()
+    const { run } = database.createRun({ ownerId: owner.ownerId, chatId: chat.id, sessionId: chat.sessionId, query: '任务', selection: {} })
+    database.createPendingInput(owner.ownerId, run.id, { requestId: 'late-answer', payload: { tool_name: 'ask_user_question', args: { fields: [{ name: 'format', label: '交付格式？' }] } }, deadlineAt: null })
+    database.settlePendingInput(owner.ownerId, run.id, 'late-answer', 'skipped')
+    database.transitionRun(owner.ownerId, run.id, status)
+    const body = { request_id: 'late-answer', values: { format: 'Word' } }
+    const result = await service.supplement(owner, run.id, body)
+    expect(sessionController.prompt.mock.calls[0][0]).toMatchObject({ mode: status === 'running' ? 'steer' : 'queue' })
+    const text = sessionController.prompt.mock.calls[0][0].content[0].text
+    expect(text).toContain('交付格式？')
+    expect(text).toContain('Word')
+    expect(result.status).toBe(status === 'running' ? 'steered' : 'queued')
+    if (status === 'running') {
+      expect(result.steer_target_run_id).toBe(run.id)
+      expect(service.getRun(owner, run.id).steering_messages).toMatchObject([{ query: 'Word' }])
+    }
+    await service.supplement(owner, run.id, body)
+    expect(sessionController.prompt).toHaveBeenCalledTimes(1)
+  })
+
   it.each(['ask_user_question', 'exit_plan_mode'])('keeps %s visible across followup refreshes and preserves settled history', (toolName) => {
     const { database, owner, chat, service } = setup()
     const { run } = database.createRun({ ownerId: owner.ownerId, chatId: chat.id, sessionId: chat.sessionId, query: 'q', selection: {} })
@@ -217,49 +343,8 @@ describe('followup and control service', () => {
     expect(sessionController.prompt).not.toHaveBeenCalled()
   })
 
-  it('regenerates a first turn in a fresh session without inheriting its answer', async () => {
-    const { database, owner, chat, service, sessionController } = setup()
-    const { run: source } = database.createRun({ ownerId: owner.ownerId, chatId: chat.id, sessionId: chat.sessionId, query: 'original', selection: {} })
-    database.bindRunMessage(chat.sessionId, source.id, 1, 'm1')
-    database.setRunSourceSeq(owner.ownerId, source.id, 'source_start_seq', 1)
-    database.setRunSourceSeq(owner.ownerId, source.id, 'source_end_seq', 9)
-    database.transitionRun(owner.ownerId, source.id, 'completed')
-    const regenerated = await service.regenerate(owner, source.id, { request_key: 'regen-1', query: 'edited' })
-    expect(sessionController.create).toHaveBeenCalledWith({ cwd: '/workspace' })
-    expect(sessionController.fork).not.toHaveBeenCalled()
-    expect(regenerated).toMatchObject({ parent_run_id: source.id, query: 'edited', status: 'queued' })
-    expect(database.getChat(owner.ownerId, chat.id).sessionId).toBe('session-new')
-  })
 
-  it('forks regeneration after the preceding completed turn', async () => {
-    const { database, owner, chat, service, sessionController } = setup()
-    const { run: previous } = database.createRun({ ownerId: owner.ownerId, chatId: chat.id, sessionId: chat.sessionId, query: 'previous', selection: {} })
-    database.bindRunMessage(chat.sessionId, previous.id, 1, 'm1')
-    database.setRunSourceSeq(owner.ownerId, previous.id, 'source_end_seq', 9)
-    database.transitionRun(owner.ownerId, previous.id, 'completed')
-    const { run: source } = database.createRun({ ownerId: owner.ownerId, chatId: chat.id, sessionId: chat.sessionId, query: 'source', selection: {} })
-    database.bindRunMessage(chat.sessionId, source.id, 2, 'm2')
-    database.setRunSourceSeq(owner.ownerId, source.id, 'source_end_seq', 19)
-    database.transitionRun(owner.ownerId, source.id, 'completed')
-    const regenerated = await service.regenerate(owner, source.id, { request_key: 'regen-2' })
-    expect(sessionController.fork).toHaveBeenCalledWith({ sessionId: chat.sessionId, atSeq: 9 })
-    expect(regenerated.parent_run_id).toBe(source.id)
-    expect(database.getChat(owner.ownerId, chat.id).sessionId).toBe('session-fork')
-  })
 
-  it('retries failed regeneration on the same child session and run', async () => {
-    const { database, owner, chat, service, sessionController } = setup()
-    const { run: source } = database.createRun({ ownerId: owner.ownerId, chatId: chat.id, sessionId: chat.sessionId, query: 'source', selection: {} })
-    database.bindRunMessage(chat.sessionId, source.id, 1, 'm1')
-    database.transitionRun(owner.ownerId, source.id, 'completed')
-    sessionController.prompt.mockRejectedValueOnce(new Error('temporary')).mockResolvedValueOnce({ accepted: true })
-    const first = await service.regenerate(owner, source.id, { request_key: 'regen-retry' })
-    expect(first.status).toBe('failed')
-    const second = await service.regenerate(owner, source.id, { request_key: 'regen-retry' })
-    expect(second).toMatchObject({ id: first.id, status: 'queued' })
-    expect(sessionController.create).toHaveBeenCalledOnce()
-    expect(sessionController.prompt.mock.calls.map(([request]) => request.requestId)).toEqual([first.id, first.id])
-  })
 
   it('stores feedback locally without telemetry and enforces owner access', () => {
     const { database, owner, chat, service } = setup()
@@ -317,6 +402,29 @@ describe('followup and control service', () => {
     const content = sessionController.prompt.mock.calls[0][0].content
     expect(content[0].text).toContain('/workspace/case/notes.txt')
     expect(content[1]).toMatchObject({ type: 'image', mediaType: 'image/png', name: 'evidence.png' })
+    expect(service.getChat(owner, chat.id).title).toBe('分析附件')
+  })
+
+  it.each(['1.png', 'notes.txt'])('uses the full workspace path for a textless %s first message', async (name) => {
+    const { database, owner, chat, service, fileManager, sessionController } = setup()
+    const bytes = name.endsWith('.png') ? Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 1]) : Buffer.from('notes')
+    fileManager.operate.mockResolvedValue({ name, version: 'v1', data: bytes.toString('base64') })
+    const run = await service.submitRun(owner, chat.id, { query: '', files: [{ path: `conversations/${chat.id}/${name}`, version: 'v1' }] })
+    const title = `/workspace/conversations/${chat.id}/${name}`
+    expect(service.getChat(owner, chat.id).title).toBe(title)
+    expect(sessionController.prompt.mock.calls[0][0].content[0]).toEqual({ type: 'text', text: title })
+    expect(database.allEvents(owner.ownerId, run.id)).toContainEqual(expect.objectContaining({ event: 'workbench_chat_title', title }))
+    await service.submitRun(owner, chat.id, { query: '后续消息' })
+    expect(service.getChat(owner, chat.id).title).toBe(title)
+  })
+
+  it('uses the first human text verbatim and preserves explicit names', async () => {
+    const { owner, chat, service, sessionController } = setup()
+    await service.submitRun(owner, chat.id, { query: '检索资料，核对结论' })
+    expect(service.getChat(owner, chat.id).title).toBe('检索资料，核对结论')
+    expect(sessionController.rename).not.toHaveBeenCalled()
+    await service.submitRun(owner, chat.id, { query: '再检查一下' })
+    expect(service.getChat(owner, chat.id).title).toBe('检索资料，核对结论')
   })
 
   it('rejects changed attachments before creating or prompting a run', async () => {
@@ -383,7 +491,7 @@ describe('followup and control service', () => {
     await expect(service.issueCommand(owner, chat.id, {
       command: '/goal pause', expected_revision: 0, request_key: 'cold-goal',
     })).resolves.toMatchObject({ message: 'ok' })
-    expect(sessionController.create).toHaveBeenCalledWith({ sessionId: chat.sessionId, cwd: '/workspace' })
+    expect(sessionController.create).toHaveBeenCalledWith({ sessionId: chat.sessionId, cwd: `/workspace/conversations/${chat.id}` })
     expect(commands.execute).toHaveBeenCalledWith(agent, '/goal pause', [], expect.any(AbortSignal))
   })
 
@@ -410,5 +518,172 @@ describe('followup and control service', () => {
     expect(commands.execute).toHaveBeenCalledWith(agent, '/goal pause', [], expect.any(AbortSignal))
     await expect(service.issueCommand(owner, chat.id, { command: '/unknown', expected_revision: 0, request_key: 'unknown-1' })).rejects.toMatchObject({ status: 400 })
     await expect(service.issueCommand(owner, chat.id, { command: '/plan', expected_revision: 9, request_key: 'plan-1' })).rejects.toMatchObject({ status: 409 })
+  })
+})
+
+
+describe('explicit resource mentions', () => {
+  it('delivers selected plugin and skill instructions without changing user text or title, and retains them on fork', async () => {
+    const { service, owner, chat, database, sessionController, skills } = setup()
+    const tool = { id: 'law', runtime_name: 'global_law_search', provider_name: '法律检索', name: '检索' }
+    vi.spyOn(service, 'freezeMcpTools').mockResolvedValue([tool])
+    skills.list.mockResolvedValue([{ name: 'legal-review', description: '审查' }])
+    const mentions = { tools: ['law'], skills: ['legal-review'], knowledge: [] }
+    const run = await service.submitRun(owner, chat.id, { query: '融资租赁', resource_mentions: mentions })
+    expect(run.query).toBe('融资租赁')
+    expect(run.resource_mentions).toEqual(mentions)
+    expect(database.getChat(owner.ownerId, chat.id).title).toBe('融资租赁')
+    const content = sessionController.prompt.mock.calls[0][0].content
+    expect(content[0].text).toBe('融资租赁')
+    expect(content[1].text).toContain('global_law_search')
+    expect(content[1].text).toContain('legal-review')
+    expect(content[1].text).toContain('不要把插件当作技能加载')
+    database.bindRunMessage(chat.sessionId, run.id, 1, 'm1')
+    database.transitionRun(owner.ownerId, run.id, 'completed')
+    database.setRunSourceSeq(owner.ownerId, run.id, 'source_end_seq', 9)
+    const child = await service.fork(owner, run.id, { request_key: 'resource-fork' })
+    expect(child.runs[0].resource_mentions).toEqual(mentions)
+    expect(sessionController.prompt).toHaveBeenCalledTimes(1)
+  })
+
+  it('preserves explicit mentions on failed-send retry and rejects a changed retry payload', async () => {
+    const { service, owner, chat, sessionController, skills } = setup()
+    skills.list.mockResolvedValue([{ name: 'legal-review' }])
+    sessionController.prompt.mockRejectedValueOnce(new Error('offline'))
+    const body = { query: '核对', request_key: 'mention-retry', resource_mentions: { skills: ['legal-review'] } }
+    const failed = await service.submitRun(owner, chat.id, body)
+    expect(failed.status).toBe('failed')
+    await expect(service.submitRun(owner, chat.id, { ...body, resource_mentions: {} })).rejects.toMatchObject({ status: 409 })
+    const retried = await service.submitRun(owner, chat.id, body)
+    expect(retried.id).toBe(failed.id)
+    expect(retried.status).toBe('queued')
+    expect(sessionController.prompt.mock.calls[1][0].content).toEqual(sessionController.prompt.mock.calls[0][0].content)
+    expect(service.getRun(owner, retried.id).resource_mentions.skills).toEqual(['legal-review'])
+  })
+
+  it('does not turn available resources into explicit requests and rejects unavailable mentions', async () => {
+    const { service, owner, chat, sessionController } = setup()
+    const ordinary = await service.submitRun(owner, chat.id, { query: '你好' })
+    expect(ordinary.resource_mentions).toEqual({ tools: [], skills: [], knowledge: [] })
+    expect(sessionController.prompt.mock.calls[0][0].content).toEqual([{ type: 'text', text: '你好' }])
+    await expect(service.submitRun(owner, chat.id, { query: '检索', resource_mentions: { tools: ['missing'] } })).rejects.toMatchObject({ status: 409 })
+    await expect(service.submitRun(owner, chat.id, { query: '审查', resource_mentions: { skills: ['missing'] } })).rejects.toMatchObject({ status: 409 })
+    expect(sessionController.prompt).toHaveBeenCalledTimes(1)
+  })
+})
+
+
+describe('submission cancellation', () => {
+  it('persists cancellation before admission and checks ownership', async () => {
+    const { service, owner, chat, sessionController } = setup()
+    await expect(service.stopSubmission({ ...owner, ownerId: 'other:user' }, chat.id, 'request-a')).rejects.toMatchObject({ status: 404 })
+    await expect(service.stopSubmission(owner, chat.id, 'request-a')).resolves.toMatchObject({ accepted: true })
+    await expect(service.submitRun(owner, chat.id, { query: 'late', request_key: 'request-a' })).rejects.toMatchObject({ status: 409 })
+    expect(sessionController.prompt).not.toHaveBeenCalled()
+  })
+  it('cancels during slow tool discovery before any prompt is dispatched', async () => {
+    const { service, owner, chat, sessionController } = setup()
+    let release
+    service.freezeMcpTools = vi.fn(() => new Promise(resolve => { release = resolve }))
+    const submission = service.submitRun(owner, chat.id, { query: 'slow', request_key: 'slow-key' })
+    const rejected = expect(submission).rejects.toMatchObject({ status: 409 })
+    await vi.waitFor(() => expect(service.freezeMcpTools).toHaveBeenCalled())
+    await service.stopSubmission(owner, chat.id, 'slow-key')
+    release([])
+    await rejected
+    expect(sessionController.prompt).not.toHaveBeenCalled()
+  })
+  it('does not report cancelled when the engine refuses the stop', async () => {
+    const { service, owner, chat, database, sessionController } = setup()
+    const run = await service.submitRun(owner, chat.id, { query: 'active' })
+    database.transitionRun(owner.ownerId, run.id, 'running')
+    sessionController.cancel.mockImplementationOnce(() => { throw new Error('unavailable') })
+    expect(() => service.stopRun(owner, run.id)).toThrow()
+    expect(service.getRun(owner, run.id).status).toBe('running')
+    expect(service.stopRun(owner, run.id).status).toBe('stopping')
+  })
+})
+
+
+describe('forked conversations', () => {
+  function history() {
+    const context = setup()
+    const { database, owner, chat } = context
+    const make = (query, parent, turn, end) => {
+      const { run } = database.createRun({ ownerId: owner.ownerId, chatId: chat.id, sessionId: chat.sessionId, query, selection: { model: 'p/m' }, parentRunId: parent?.id, now: turn * 10000 })
+      database.bindRunMessage(chat.sessionId, run.id, turn, `message-${turn}`)
+      database.setRunSourceSeq(owner.ownerId, run.id, 'source_end_seq', end)
+      database.appendEvent(owner.ownerId, run.id, { event: 'workbench_status', status: 'running' }, turn * 10000 + 1000)
+      database.appendEvent(owner.ownerId, run.id, { event: 'message', answer: `answer ${query}` }, turn * 10000 + 2000)
+      database.transitionRun(owner.ownerId, run.id, 'completed', undefined, turn * 10000 + 6000)
+      database.appendEvent(owner.ownerId, run.id, { event: 'workbench_end', status: 'completed' }, turn * 10000 + 6000)
+      return run
+    }
+    const first = make('first', null, 1, 9)
+    const second = make('second', first, 2, 19)
+    const third = make('third', second, 3, 29)
+    return { ...context, first, second, third }
+  }
+
+  it('forks at the selected answer, preserves history and continues in the new session', async () => {
+    const { service, owner, chat, database, sessionController, second } = history()
+    const original = service.getChat(owner, chat.id)
+    const child = await service.fork(owner, second.id, { request_key: 'fork-1' })
+    expect(sessionController.fork).toHaveBeenCalledWith({ sessionId: chat.sessionId, atSeq: 19 })
+    expect(child.id).not.toBe(chat.id)
+    expect(child.runs.map(run => run.query)).toEqual(['first', 'second'])
+    expect(child.runs[1].parent_run_id).toBe(child.runs[0].id)
+    expect(child.runs[1].events).toEqual(expect.arrayContaining([expect.objectContaining({ answer: 'answer second' })]))
+    expect(service.getChat(owner, chat.id)).toEqual(original)
+    expect(database.getChat(owner.ownerId, chat.id).sessionId).toBe('session-1')
+    const followup = await service.submitRun(owner, child.id, { query: 'followup' })
+    expect(followup.parent_run_id).toBe(child.runs[1].id)
+    expect(sessionController.prompt).toHaveBeenLastCalledWith(expect.objectContaining({ sessionId: 'session-fork', requestId: followup.id }), expect.any(AbortSignal))
+    expect(sessionController.prompt).toHaveBeenCalledTimes(1)
+    const retry = await service.fork(owner, second.id, { request_key: 'fork-1' })
+    expect(retry.id).toBe(child.id)
+    expect(sessionController.fork).toHaveBeenCalledTimes(1)
+  })
+
+  it('seeds only events through the selected turn and assigns a new output directory', async () => {
+    const { service, owner, chat, agents, second, sessionController } = history()
+    const events = [{ seq: 0 }, { seq: 19 }, { seq: 20 }]
+    const dispose = vi.fn()
+    service.sessionQuery = { observeSession: vi.fn(async () => ({ header: { agentPreset: 'standard' }, events, [Symbol.dispose]: dispose })) }
+    service.agentPresets = { resolve: vi.fn(async () => ({ id: 'standard' })), mount: vi.fn() }
+    service.agentDefaultModel = { currentSelection: () => ({ provider: 'p', model: 'm' }) }
+    agents.create = vi.fn()
+    const child = await service.fork(owner, second.id, { request_key: 'seed' })
+    expect(agents.create).toHaveBeenCalledWith(expect.objectContaining({ seed: events.slice(0, 2), inheritedEventCount: 2, meta: expect.objectContaining({ cwd: `/workspace/conversations/${child.id}`, parentSession: chat.sessionId }) }))
+    expect(sessionController.prompt).not.toHaveBeenCalled()
+    expect(dispose).toHaveBeenCalledOnce()
+  })
+
+  it('can fork inherited answers again and keeps original event boundaries', async () => {
+    const { service, owner, second, sessionController } = history()
+    sessionController.fork.mockResolvedValueOnce({ sessionId: 'child-1' }).mockResolvedValueOnce({ sessionId: 'child-2' })
+    const child = await service.fork(owner, second.id, { request_key: 'a' })
+    const grandchild = await service.fork(owner, child.runs[0].id, { request_key: 'b' })
+    expect(grandchild.runs.map(run => run.query)).toEqual(['first'])
+    expect(sessionController.fork).toHaveBeenLastCalledWith({ sessionId: 'session-1', atSeq: 9 })
+  })
+
+  it('rejects other owners, unfinished answers and deleted chats', async () => {
+    const { service, database, owner, chat, second, sessionController } = history()
+    await expect(service.fork({ ownerId: 'other' }, second.id, { request_key: 'x' })).rejects.toMatchObject({ status: 404 })
+    database.transitionRun(owner.ownerId, second.id, 'running')
+    await expect(service.fork(owner, second.id, { request_key: 'x' })).rejects.toMatchObject({ status: 409 })
+    database.transitionRun(owner.ownerId, second.id, 'completed')
+    database.deleteChat(owner.ownerId, chat.id)
+    await expect(service.fork(owner, second.id, { request_key: 'x' })).rejects.toMatchObject({ status: 404 })
+    expect(sessionController.fork).not.toHaveBeenCalled()
+  })
+
+  it('reports execution duration without queue delay or later feedback edits', () => {
+    const { service, database, owner, second } = history()
+    const before = service.getRun(owner, second.id)
+    expect(before).toMatchObject({ created_at: 20, completed_at: 26, elapsed_seconds: 5, can_fork: true })
+    database.setFeedback(owner.ownerId, second.id, 'like', 99000)
+    expect(service.getRun(owner, second.id)).toMatchObject({ created_at: 20, completed_at: 26, elapsed_seconds: 5 })
   })
 })

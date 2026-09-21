@@ -130,11 +130,22 @@ describe('authenticated workbench HTTP handler', () => {
     expect(context.systemPrompt.section).toHaveBeenCalledWith(expect.objectContaining({
       name: 'gxzs:identity', order: 1, text: expect.any(Function),
     }))
+    const resources = context.systemPrompt.section.mock.calls.find(([section]) => section.name === 'gxzs:resource-kinds')?.[0]
+    expect(resources.text()).toContain('MCP 插件通过已注册的工具函数直接调用')
+    expect(resources.text()).toContain('不能作为 skill 的技能名')
   })
 
   it('rejects missing assertions before routing', async () => {
     const { handler, key } = setup()
     await expect(call(handler, key, 'GET', '/chats', undefined, false)).resolves.toMatchObject({ status: 401 })
+  })
+
+  it('protects live MCP authorization with signed owner-bound requests', async () => {
+    const { handler, key } = setup()
+    const route = '/runs/missing/mcp-authorization?resource_id=global%3Amcp%3Aweb%3Asearch&version=v1'
+    await expect(call(handler, key, 'GET', route)).resolves.toMatchObject({ status: 200, body: { data: { authorized: false } } })
+    await expect(call(handler, key, 'GET', route, undefined, false)).resolves.toMatchObject({ status: 401 })
+    await expect(call(handler, key, 'GET', route, undefined, true, '99')).resolves.toMatchObject({ status: 403 })
   })
 
   it('rejects another validly signed user at the host boundary', async () => {
@@ -206,4 +217,39 @@ describe('authenticated workbench HTTP handler', () => {
     expect(listed.body.data).toHaveLength(1)
     expect(listed.body.data[0].id).toBe(created.body.data.id)
   })
+})
+
+
+it('authenticates submission cancellation and fences a delayed POST', async () => {
+  const { handler, key } = setup()
+  const created = await call(handler, key, 'POST', '/chats', {})
+  const id = created.body.data.id
+  const route = `/chats/${id}/runs/stop`
+  await expect(call(handler, key, 'POST', route, { request_key: 'slow-request' }, false)).resolves.toMatchObject({ status: 401 })
+  await expect(call(handler, key, 'POST', route, { request_key: 'slow-request' }, true, 'other')).resolves.toMatchObject({ status: 403 })
+  await expect(call(handler, key, 'POST', route, { request_key: 'slow-request' })).resolves.toMatchObject({ status: 200, body: { data: { accepted: true } } })
+  await expect(call(handler, key, 'POST', `/chats/${id}/runs`, { query: 'late message', request_key: 'slow-request' })).resolves.toMatchObject({ status: 409 })
+})
+
+
+it('opens a fork through the authenticated HTTP API and rejects anonymous requests', async () => {
+  const { handler, key, context } = setup()
+  context.sessionController.fork = vi.fn(async () => ({ sessionId: 'fork-session' }))
+  const onEvent = context.on.mock.calls.find(([name]) => name === 'session/event')[1]
+  const onClaim = context.on.mock.calls.find(([name]) => name === 'agent/inbox/claimed')[1]
+  // The mock session registry exposes the newly created session via agents.get.
+  const originalGet = context.agents.get
+  context.sessionController.create = async () => ({ sessionId: 'http-source-session' })
+  const sourceChat = (await call(handler, key, 'POST', '/chats', {})).body.data.id
+  context.agents.get = (value) => value === 'http-source-session' ? { id: value, session: { id: value, seq: 0 } } : originalGet(value)
+  const sourceRun = (await call(handler, key, 'POST', `/chats/${sourceChat}/runs`, { query: 'fork source' })).body.data.id
+  onEvent({ id: 'http-source-session' }, { type: 'turn/start', seq: 1, data: { turn: 1 } })
+  onClaim({ agent: { id: 'http-source-session' }, message: { id: 'message-one', source: { kind: 'user', rpcId: sourceRun } }, turn: 1 })
+  onEvent({ id: 'http-source-session' }, { type: 'turn/end', seq: 8, data: { turn: 1, reason: { kind: 'completed' } } })
+  expect((await call(handler, key, 'POST', `/runs/${sourceRun}/fork`, { request_key: 'fork-http' }, false)).status).toBe(401)
+  const fork = await call(handler, key, 'POST', `/runs/${sourceRun}/fork`, { request_key: 'fork-http' })
+  expect(fork.status).toBe(201)
+  expect(fork.body.data.id).not.toBe(sourceChat)
+  expect(fork.body.data.runs).toMatchObject([{ query: 'fork source', status: 'completed' }])
+  expect(context.sessionController.fork).toHaveBeenCalledWith({ sessionId: 'http-source-session', atSeq: 8 })
 })

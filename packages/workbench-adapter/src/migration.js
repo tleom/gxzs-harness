@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto'
 import { createAssistantMessage, createUserMessage } from '@deepseek-ai/dsh-llm'
 import { httpError } from './http.js'
+import { resolveWorkspacePath } from './paths.js'
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 const TERMINAL = new Set(['completed', 'failed', 'cancelled', 'interrupted'])
@@ -38,7 +39,8 @@ export class MigrationImporter {
   async importChat(chat) {
     const sessionId = `session-${chat.id}`
     const preexisting = this.agents.get(sessionId)
-    await this.sessions.create({ sessionId, cwd: this.workspace })
+    await this.fileManager.operate({ operation: 'mkdir', path: `conversations/${chat.id}` })
+    await this.sessions.create({ sessionId, cwd: resolveWorkspacePath(this.workspace, `conversations/${chat.id}`) })
     const agent = this.agents.get(sessionId)
     if (!agent?.session) throw httpError(503, '迁移会话创建后不可用')
     const existing = this.database.getChat(this.ownerId, chat.id)

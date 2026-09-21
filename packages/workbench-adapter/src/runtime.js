@@ -13,4 +13,11 @@ export class WorkbenchRuntime extends Service {
     const resource = (run.mcpTools ?? []).find((item) => item.id === resourceId && item.version === version)
     return resource ? { runId: run.id, ownerId: run.ownerId, resource } : undefined
   }
+
+  authorizeRunMcp(ownerId, runId, resourceId, version) {
+    if (ownerId !== this.ownerId) return false
+    const run = this.database.getRun(ownerId, runId)
+    if (!run) return false
+    return this.authorizeMcp(run.sessionId, resourceId, version)?.runId === runId
+  }
 }

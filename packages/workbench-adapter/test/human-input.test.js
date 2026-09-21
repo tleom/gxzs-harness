@@ -28,7 +28,7 @@ describe('durable human input bridge', () => {
     bridge.touch(chat.ownerId, run.id, pending.requestId)
     expect(bridge.timeout(chat.ownerId, run.id, pending.requestId)).toMatchObject({ status: 'pending', interacted: true, deadlineAt: null })
     bridge.skip(chat.ownerId, run.id, pending.requestId)
-    await expect(waiting).rejects.toMatchObject({ code: 'ASK_CANCELLED' })
+    await expect(waiting).resolves.toMatchObject({ answers: [{ id: 'environment', selected: [], custom: expect.stringContaining('未提供回答') }] })
   })
 
   it('expires an untouched question and ignores repeated expiry', async () => {
@@ -39,9 +39,46 @@ describe('durable human input bridge', () => {
     try {
       expect(bridge.timeout(chat.ownerId, run.id, pending.requestId).status).toBe('skipped')
       expect(bridge.timeout(chat.ownerId, run.id, pending.requestId).status).toBe('skipped')
-      await expect(waiting).rejects.toMatchObject({ code: 'ASK_CANCELLED' })
+      await expect(waiting).resolves.toMatchObject({ answers: [{ id: 'environment', selected: [], custom: expect.stringContaining('自动跳过') }] })
+      expect(database.getRun(chat.ownerId, run.id).status).toBe('running')
+      expect(database.getPendingInput(chat.ownerId, run.id).answer).toBeNull()
     } finally { clock.mockRestore() }
   })
+  it('automatically resumes at 60 seconds without a browser timeout request', async () => {
+    vi.useFakeTimers()
+    try {
+      const { database, chat, run, bridge, request } = setup()
+      request.questions.push({ id: 'format', question: '什么格式？' })
+      const waiting = bridge.handleRequest(request, vi.fn())
+      await vi.advanceTimersByTimeAsync(59_999)
+      expect(database.getPendingInput(chat.ownerId, run.id).status).toBe('pending')
+      await vi.advanceTimersByTimeAsync(1)
+      const answer = await waiting
+      expect(answer.answers.map((item) => item.id)).toEqual(['environment', 'format'])
+      for (const item of answer.answers) {
+        expect(item.selected).toEqual([])
+        expect(item.custom).toContain('非用户回答')
+        expect(item.custom).toContain('根据已有信息自行判断')
+      }
+      expect(database.getPendingInput(chat.ownerId, run.id).status).toBe('skipped')
+      expect(database.getRun(chat.ownerId, run.id).status).toBe('running')
+      expect(bridge.pendings.size).toBe(0)
+    } finally { vi.useRealTimers() }
+  })
+
+  it('keeps actual cancellation distinct and never approves an unanswered plan', async () => {
+    const { database, chat, run, bridge, request } = setup()
+    request.questions[0].intent = { kind: 'plan-review', approve: 'prod' }
+    const waiting = bridge.handleRequest(request, vi.fn())
+    bridge.skip(chat.ownerId, run.id, database.getPendingInput(chat.ownerId, run.id).requestId)
+    await expect(waiting).rejects.toMatchObject({ code: 'ASK_CANCELLED' })
+    const other = setup()
+    const controller = new AbortController()
+    const aborted = other.bridge.handleRequest({ ...other.request, signal: controller.signal }, vi.fn())
+    controller.abort()
+    await expect(aborted).rejects.toMatchObject({ code: 'ASK_ABORTED' })
+  })
+
   it('persists waiting state and resumes the in-process question', async () => {
     const { database, chat, run, bridge, request } = setup()
     const waiting = bridge.handleRequest(request, vi.fn())
@@ -68,7 +105,7 @@ describe('durable human input bridge', () => {
     await vi.waitFor(() => expect(next.database.getPendingInput(next.chat.ownerId, next.run.id)).not.toBeNull())
     const skipped = next.database.getPendingInput(next.chat.ownerId, next.run.id)
     next.bridge.skip(next.chat.ownerId, next.run.id, skipped.requestId)
-    await expect(skippedWaiting).rejects.toMatchObject({ code: 'ASK_CANCELLED' })
+    await expect(skippedWaiting).resolves.toMatchObject({ answers: [{ id: 'environment', selected: [], custom: expect.stringContaining('未提供回答') }] })
     expect(() => next.bridge.resume(next.chat.ownerId, next.run.id, { request_id: skipped.requestId, values: { environment: 'prod' } }))
       .toThrow('该问题已关闭')
   })
@@ -81,6 +118,6 @@ describe('durable human input bridge', () => {
     bridge.touch(chat.ownerId, run.id, pending.requestId)
     expect(database.getPendingInput(chat.ownerId, run.id)).toMatchObject({ interacted: true, deadlineAt: null })
     bridge.skip(chat.ownerId, run.id, pending.requestId)
-    await expect(waiting).rejects.toMatchObject({ code: 'ASK_CANCELLED' })
+    await expect(waiting).resolves.toMatchObject({ answers: [{ id: 'environment', selected: [], custom: expect.stringContaining('未提供回答') }] })
   })
 })
