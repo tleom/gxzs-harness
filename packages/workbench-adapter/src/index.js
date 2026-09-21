@@ -47,9 +47,17 @@ export function apply(ctx, config) {
     signingKey: process.env[config.assertionKeyEnv],
   })
 
+  let publishedPrompt = '你的名字是公信智能办案助手。'
   ctx.effect(() => ctx.systemPrompt.section({
-    name: 'gxzs:identity', order: 1, text: '你的名字是公信智能办案助手。',
+    name: 'gxzs:identity', order: 1, text: () => publishedPrompt,
   }), 'gxzs assistant identity')
+  // The platform owns the published prompt. Keep the fallback until refresh.
+  void ctx.workbenchPlatformClient.json({
+    owner: { ownerId: config.ownerId }, method: 'GET', route: 'workbench/config',
+  }).then((payload) => {
+    const text = payload?.data?.system_prompt
+    if (typeof text === 'string' && text.trim()) publishedPrompt = text.trim()
+  }).catch(() => {})
 
   const projectAssistantStream = createAssistantStreamProjector(database, config.ownerId)
   ctx.on('user-questions/request', humanInput.handleRequest, { global: true, prepend: true })
@@ -83,8 +91,10 @@ export function apply(ctx, config) {
       control_protocol: 1, resources_protocol: 1, command_resources_protocol: 0,
       default_selection: { model: catalog.default ? `${catalog.default.provider}/${catalog.default.model}` : models[0]?.id ?? '', tools: [], skills: [], knowledge: [], model_parameters: {}, tool_parameters: {} },
       models, tools: mcpTools.map((tool) => ({
-        id: tool.id, name: tool.name, description: tool.description, scope: tool.scope,
-        provider: tool.provider, provider_name: tool.provider_name, tool_name: tool.tool_name, runtime_name: tool.runtime_name,
+        id: tool.id, name: tool.name, display_name: tool.display_name,
+        description: tool.description, scope: tool.scope,
+        group: tool.group, provider: tool.provider, provider_name: tool.provider_name,
+        tool_name: tool.tool_name, runtime_name: tool.runtime_name,
       })),
       skills: skills.map((skill) => ({
         ...skill, id: skill.scope === 'personal' ? `personal:${skill.id}` : skill.id,

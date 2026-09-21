@@ -20,7 +20,10 @@ function setup() {
   const agents = { get: vi.fn(() => agent) }
   const commands = { execute: vi.fn(async () => ({ result: { text: 'ok' }, commandId: 'c1' })) }
   const fileManager = {
-    operate: vi.fn(async () => { throw new Error('unexpected file operation') }),
+    operate: vi.fn(async ({ operation }) => {
+      if (operation === 'delete' || operation === 'mkdir') return { deleted: true }
+      throw new Error('unexpected file operation')
+    }),
     personalResources: vi.fn(async () => ({ memory: { content: '', version: null }, skills: [], warnings: [] })),
     personalMcp: vi.fn(async () => ({ mcp: [], warnings: [] })),
   }
@@ -88,6 +91,18 @@ describe('followup and control service', () => {
     expect(database.getRun(owner.ownerId, run.id).mcpTools).toEqual(tools.map((tool) => expect.objectContaining(tool)))
     platformClient.json.mockResolvedValue({ tools: [{ ...tools[0], version: 'g2' }] })
     expect(database.getRun(owner.ownerId, run.id).mcpTools.map((tool) => tool.version)).toEqual(['g1', 'p1'])
+  })
+
+  it('preserves MCP provider identity for plugin grouping', async () => {
+    const { service, platformClient, owner } = setup()
+    platformClient.json.mockResolvedValue({ tools: [{
+      id: 'global:mcp:web-search:search', runtime_name: 'global_mcp_search', version: '1',
+      scope: 'global', group: 'mcp', provider: 'global:mcp:web-search', provider_name: '联网搜索',
+      server_id: 'web-search', tool_name: 'search', description: 'Search', inputSchema: { type: 'object' },
+    }] })
+    await expect(service.mcpCatalog(owner)).resolves.toMatchObject([{
+      group: 'mcp', provider: 'global:mcp:web-search', provider_name: '联网搜索',
+    }])
   })
 
   it('rejects unavailable MCP selections before committing chat configuration', async () => {
