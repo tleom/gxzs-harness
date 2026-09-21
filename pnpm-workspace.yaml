@@ -2,7 +2,7 @@ packages:
   - packages/*
 
 allowBuilds:
-  '@deepseek-ai/dsh-subprocess-local': set this to true or false
+  '@deepseek-ai/dsh-subprocess-local': true
   esbuild: true
-  koffi: set this to true or false
-  node-pty: set this to true or false
+  koffi: true
+  node-pty: true

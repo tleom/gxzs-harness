@@ -4,14 +4,6 @@
   "private": true,
   "type": "module",
   "packageManager": "pnpm@11.7.0",
-  "pnpm": {
-    "onlyBuiltDependencies": [
-      "@deepseek-ai/dsh-subprocess-local",
-      "esbuild",
-      "koffi",
-      "node-pty"
-    ]
-  },
   "engines": {
     "node": "^22.19.0 || >=24.0.0"
   },
