@@ -3,7 +3,7 @@ import { createHash, createHmac, timingSafeEqual } from 'node:crypto'
 const REQUIRED = ['iss', 'aud', 'sub', 'tenant_id', 'user_id', 'iat', 'exp', 'jti', 'method', 'target', 'body_sha256', 'content_type', 'last_event_id']
 
 export class AssertionVerifier {
-  constructor({ issuer, audience = 'dify-workbench', signingKey, clockSkewSeconds = 5, replayCache, now = () => Math.floor(Date.now() / 1000) }) {
+  constructor({ issuer, audience = 'agent-workbench', signingKey, clockSkewSeconds = 5, replayCache, now = () => Math.floor(Date.now() / 1000) }) {
     this.issuer = issuer
     this.audience = audience
     this.key = decodeKey(signingKey)

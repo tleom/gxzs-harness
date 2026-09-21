@@ -8,7 +8,7 @@ const now = 1_700_000_000
 function sign(overrides = {}) {
   const body = overrides.body ?? Buffer.from('{"query":"test"}')
   const claims = {
-    iss: 'gxzs-backend', aud: 'dify-workbench', sub: 'tenant-a:42', tenant_id: 'tenant-a',
+    iss: 'gxzs-backend', aud: 'agent-workbench', sub: 'tenant-a:42', tenant_id: 'tenant-a',
     user_id: '42', name: '用户', iat: now, exp: now + 60, jti: 'request-1', method: 'POST',
     target: '/workbench/chats/abc/runs', body_sha256: createHash('sha256').update(body).digest('hex'),
     content_type: 'application/json', last_event_id: '', ...overrides.claims,

@@ -21,6 +21,7 @@ function setup() {
   const commands = { execute: vi.fn(async () => ({ result: { text: 'ok' }, commandId: 'c1' })) }
   const fileManager = {
     operate: vi.fn(async ({ operation }) => {
+      if (operation === 'stat') return { kind: 'directory', version: 'tree-v1' }
       if (operation === 'delete' || operation === 'mkdir') return { deleted: true }
       throw new Error('unexpected file operation')
     }),
@@ -237,6 +238,25 @@ describe('followup and control service', () => {
     await service.deleteChat(owner, chat.id)
     expect(service.listChats(owner)).toEqual([])
     expect(() => service.getRun(owner, run.id)).toThrow('任务不存在')
+  })
+
+  it('deletes the checked directory version and preserves chat on a conflict', async () => {
+    const { owner, chat, service, fileManager } = setup()
+    fileManager.operate.mockResolvedValueOnce({ kind: 'directory', version: 'tree-v2' })
+      .mockRejectedValueOnce(Object.assign(new Error('changed'), { status: 409 }))
+    await expect(service.deleteChat(owner, chat.id)).rejects.toMatchObject({ status: 409 })
+    expect(fileManager.operate).toHaveBeenLastCalledWith({ operation: 'delete', path: `conversations/${chat.id}`, version: 'tree-v2' })
+    expect(service.listChats(owner)).toHaveLength(1)
+    fileManager.operate.mockResolvedValueOnce({ kind: 'missing' })
+    await service.deleteChat(owner, chat.id)
+    expect(service.listChats(owner)).toHaveLength(0)
+  })
+
+  it('rejects deleting an active chat before accessing its files', async () => {
+    const { database, owner, chat, service, fileManager } = setup()
+    database.createRun({ ownerId: owner.ownerId, chatId: chat.id, sessionId: chat.sessionId, query: 'q', selection: {} })
+    await expect(service.deleteChat(owner, chat.id)).rejects.toMatchObject({ status: 409 })
+    expect(fileManager.operate).not.toHaveBeenCalled()
   })
 
   it('admits verified sandbox images natively and carries non-image paths as data', async () => {
