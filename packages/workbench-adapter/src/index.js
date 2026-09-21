@@ -202,7 +202,7 @@ export function apply(ctx, config) {
       sendJson(res, 200, { data: service.getRun(owner, match[1]) })
     }],
     ['POST', /^\/runs\/([\w-]+)\/input-timeout$/, async ({ owner, json }, res, match) => {
-      humanInput.skip(owner.ownerId, match[1], json.request_id)
+      humanInput.timeout(owner.ownerId, match[1], json.request_id)
       sendJson(res, 200, { data: service.getRun(owner, match[1]) })
     }],
     ['POST', /^\/runs\/([\w-]+)\/input-interaction$/, async ({ owner, json }, res, match) => {

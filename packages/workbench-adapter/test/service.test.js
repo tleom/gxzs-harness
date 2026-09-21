@@ -35,6 +35,46 @@ function setup() {
 }
 
 describe('followup and control service', () => {
+  it('persists a skipped-question supplement and deduplicates retries after a failed dispatch', async () => {
+    const { database, owner, chat, service, sessionController } = setup()
+    const { run } = database.createRun({ ownerId: owner.ownerId, chatId: chat.id, sessionId: chat.sessionId, query: 'q', selection: { model: 'p/m', tools: [] } })
+    database.createPendingInput(owner.ownerId, run.id, { requestId: 'question', payload: { request_id: 'question', tool_name: 'ask_user_question', args: { fields: [{ name: 'q', label: 'Question' }] } }, deadlineAt: null })
+    database.settlePendingInput(owner.ownerId, run.id, 'question', 'skipped')
+    const body = { request_id: 'question', values: { q: 'answer' }, custom_fields: ['q'] }
+    sessionController.prompt.mockRejectedValueOnce(new Error('temporary dispatch failure'))
+    await expect(service.supplement(owner, run.id, body)).rejects.toThrow('temporary dispatch failure')
+    const accepted = await service.supplement(owner, run.id, body)
+    const repeated = await service.supplement(owner, run.id, body)
+    expect(repeated.id).toBe(accepted.id)
+    expect(sessionController.prompt).toHaveBeenCalledTimes(2)
+    expect(sessionController.prompt.mock.calls[0][0].requestId).toBe(sessionController.prompt.mock.calls[1][0].requestId)
+    expect(service.getRun(owner, run.id).human_input_history).toMatchObject([
+      { request_id: 'question', status: 'submitted', values: { q: 'answer' }, custom_fields: ['q'], supplement_run_id: accepted.id },
+    ])
+    await expect(service.supplement(owner, run.id, { ...body, request_id: 'missing' })).rejects.toMatchObject({ status: 404 })
+  })
+  it.each(['ask_user_question', 'exit_plan_mode'])('keeps %s visible across followup refreshes and preserves settled history', (toolName) => {
+    const { database, owner, chat, service } = setup()
+    const { run } = database.createRun({ ownerId: owner.ownerId, chatId: chat.id, sessionId: chat.sessionId, query: 'q', selection: {} })
+    const payload = { request_id: 'first', tool_call_id: 'first', tool_name: toolName, args: { fields: [{ name: 'q', label: 'Question', type: 'paragraph' }] } }
+    database.createPendingInput(owner.ownerId, run.id, { requestId: 'first', payload, deadlineAt: Date.now() + 60000 })
+    const detail = service.getRun(owner, run.id)
+    const polled = service.followups(owner, chat.id, [run.id]).runs.find((value) => value.id === run.id)
+    expect({ ...detail, ...polled }).toMatchObject({ status: 'waiting_input', pending: payload, human_input: { request_id: 'first', interacted: false } })
+    database.touchPendingInput(owner.ownerId, run.id, 'first')
+    expect(service.followups(owner, chat.id, [run.id]).runs[0].human_input).toMatchObject({ interacted: true, deadline_at: null })
+    database.settlePendingInput(owner.ownerId, run.id, 'first', 'skipped')
+    database.createPendingInput(owner.ownerId, run.id, { requestId: 'second', payload: { ...payload, request_id: 'second' }, deadlineAt: null })
+    database.settlePendingInput(owner.ownerId, run.id, 'second', 'submitted', { answers: [{ id: 'q', selected: [], custom: 'answer' }] })
+    const refreshed = service.getRun(owner, run.id)
+    expect(refreshed.pending).toBeNull()
+    expect(refreshed.human_input_history).toMatchObject([
+      { request_id: 'first', status: 'skipped', skipped_fields: ['q'] },
+      { request_id: 'second', status: 'submitted', values: { q: 'answer' }, custom_fields: ['q'] },
+    ])
+    expect(service.followups(owner, chat.id, [run.id]).runs[0].human_input_history).toEqual(refreshed.human_input_history)
+    expect(() => database.listPendingInputs('other:user', run.id)).toThrow('任务不存在')
+  })
   it('aggregates personal skills and MCP while keeping global skills readonly', async () => {
     const { service, fileManager, skills } = setup()
     fileManager.personalResources.mockResolvedValueOnce({

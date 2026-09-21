@@ -20,6 +20,28 @@ function setup(timeoutSeconds = 60) {
 }
 
 describe('durable human input bridge', () => {
+  it('ignores early and stale timeout requests after interaction but still permits explicit skip', async () => {
+    const { database, chat, run, bridge, request } = setup()
+    const waiting = bridge.handleRequest(request, vi.fn())
+    const pending = database.getPendingInput(chat.ownerId, run.id)
+    expect(bridge.timeout(chat.ownerId, run.id, pending.requestId).status).toBe('pending')
+    bridge.touch(chat.ownerId, run.id, pending.requestId)
+    expect(bridge.timeout(chat.ownerId, run.id, pending.requestId)).toMatchObject({ status: 'pending', interacted: true, deadlineAt: null })
+    bridge.skip(chat.ownerId, run.id, pending.requestId)
+    await expect(waiting).rejects.toMatchObject({ code: 'ASK_CANCELLED' })
+  })
+
+  it('expires an untouched question and ignores repeated expiry', async () => {
+    const { database, chat, run, bridge, request } = setup()
+    const waiting = bridge.handleRequest(request, vi.fn())
+    const pending = database.getPendingInput(chat.ownerId, run.id)
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(pending.deadlineAt + 1)
+    try {
+      expect(bridge.timeout(chat.ownerId, run.id, pending.requestId).status).toBe('skipped')
+      expect(bridge.timeout(chat.ownerId, run.id, pending.requestId).status).toBe('skipped')
+      await expect(waiting).rejects.toMatchObject({ code: 'ASK_CANCELLED' })
+    } finally { clock.mockRestore() }
+  })
   it('persists waiting state and resumes the in-process question', async () => {
     const { database, chat, run, bridge, request } = setup()
     const waiting = bridge.handleRequest(request, vi.fn())

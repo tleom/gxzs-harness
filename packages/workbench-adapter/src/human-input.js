@@ -20,7 +20,7 @@ export class HumanInputBridge {
     this.pendings.set(id, pending)
     this.database.createPendingInput(chat.ownerId, run.id, { requestId: id, payload, deadlineAt })
     this.database.appendEvent(chat.ownerId, run.id, { event: 'workbench_status', status: 'waiting_input' })
-    pending.timer = setTimeout(() => this.skip(chat.ownerId, run.id, id), this.timeoutSeconds * 1000)
+    pending.timer = setTimeout(() => this.timeout(chat.ownerId, run.id, id), this.timeoutSeconds * 1000)
     pending.timer.unref?.()
     const abort = () => this.abort(pending)
     request.signal?.addEventListener('abort', abort, { once: true })
@@ -54,6 +54,12 @@ export class HumanInputBridge {
     if (pending?.timer) { clearTimeout(pending.timer); pending.timer = undefined }
     this.database.touchPendingInput(ownerId, runId, requestId)
     return this.database.getPendingInput(ownerId, runId)
+  }
+
+  timeout(ownerId, runId, requestId) {
+    const { stored } = this.resolve(ownerId, runId, requestId)
+    if (stored.status !== 'pending' || stored.interacted || stored.deadlineAt == null || stored.deadlineAt > Date.now()) return stored
+    return this.skip(ownerId, runId, requestId)
   }
 
   resolve(ownerId, runId, requestId) {

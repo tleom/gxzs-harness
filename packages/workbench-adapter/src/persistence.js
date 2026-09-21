@@ -406,6 +406,20 @@ export class WorkbenchDatabase {
     return row ? decodePending(row) : null
   }
 
+  listPendingInputs(ownerId, runId) {
+    if (!this.getRun(ownerId, runId)) throw notFound('任务不存在')
+    return this.db.prepare(`SELECT p.* FROM pending_inputs p
+      JOIN runs r ON r.id = p.run_id WHERE p.run_id = ? AND r.owner_id = ?
+      ORDER BY p.created_at, p.rowid`).all(runId, ownerId).map(decodePending)
+  }
+
+  recordInputSupplement(ownerId, runId, requestId, answer) {
+    if (!this.getRun(ownerId, runId)) throw notFound('任务不存在')
+    this.db.prepare(`UPDATE pending_inputs SET status = 'submitted', answer_json = ?
+      WHERE request_id = ? AND run_id = ? AND status = 'skipped'`)
+      .run(JSON.stringify(answer), requestId, runId)
+  }
+
   settlePendingInput(ownerId, runId, requestId, outcome, answer, now = Date.now(), { resumeRun = true } = {}) {
     return this.transaction(() => {
       if (!this.getRun(ownerId, runId)) throw notFound('任务不存在')
