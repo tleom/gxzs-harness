@@ -69,12 +69,17 @@ export async function forkChat(service, owner, sourceRunId, body) {
         for (const event of db.db.prepare('SELECT * FROM run_events WHERE run_id = ? ORDER BY seq').all(run.id))
           insert('run_events', { ...event, run_id: ids.get(run.id), payload_json: JSON.stringify(remap(JSON.parse(event.payload_json))) })
       }
-      for (const input of inputs) insert('pending_inputs', {
+      for (const input of inputs) {
+        const supplementId = input.answer_json ? JSON.parse(input.answer_json).supplement_run_id : null
+        const copiedSupplement = supplementId && ids.has(supplementId)
+        const answer = copiedSupplement ? JSON.parse(input.answer_json) : null
+        insert('pending_inputs', {
         ...input, request_id: ids.get(input.request_id), run_id: ids.get(input.run_id),
-        status: input.status === 'pending' ? 'aborted' : input.status,
+        status: copiedSupplement ? input.status : 'skipped',
         payload_json: JSON.stringify(remap(JSON.parse(input.payload_json))),
-        answer_json: input.answer_json ? JSON.stringify(remap(JSON.parse(input.answer_json))) : null,
-      })
+        answer_json: answer ? JSON.stringify(remap(answer)) : null,
+        })
+      }
       db.saveCommandReceipt(owner.ownerId, chat.id, key, { chatId: id })
     })()
     return service.getChat(owner, id)

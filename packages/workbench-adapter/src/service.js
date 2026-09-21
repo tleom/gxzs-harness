@@ -179,6 +179,8 @@ export class WorkbenchService {
     const files = Array.isArray(body.files) ? body.files : []
     if (!query.trim() && !files.length) throw httpError(400, '消息内容不能为空')
     const requestKey = typeof body.request_key === 'string' ? body.request_key : undefined
+    if (requestKey !== undefined && (requestKey.length === 0 || requestKey.length > 128 || requestKey.includes('\0')))
+      throw httpError(400, 'request_key 格式无效')
     const cancelled = () => requestKey && this.database.getCommandReceipt(owner.ownerId, chatId, `run-stop:${requestKey}`)
     const checkCancelled = () => { if (cancelled()) throw httpError(409, '消息已取消') }
     checkCancelled()
@@ -225,7 +227,12 @@ export class WorkbenchService {
     this.database.appendEvent(owner.ownerId, run.id, { event: 'workbench_status', status: 'queued' })
     if (this.scheduler) {
       checkCancelled()
-      await this.scheduler.enqueue(run, admitted.content, !created)
+      try { await this.scheduler.enqueue(run, admitted.content, !created) }
+      catch (error) {
+        this.database.transitionRun(owner.ownerId, run.id, 'failed', `任务提交失败：${error?.message ?? error}`)
+        this.database.appendEvent(owner.ownerId, run.id, { event: 'workbench_end', status: 'failed', error: `任务提交失败：${error?.message ?? error}` })
+        throw error
+      }
       return runDto(this.database.getRun(owner.ownerId, run.id))
     }
     try {
@@ -399,7 +406,7 @@ export class WorkbenchService {
 
   async stopSubmission(owner, chatId, requestKey) {
     this.requireChat(owner, chatId)
-    if (typeof requestKey !== 'string' || !/^[\w-]{1,128}$/.test(requestKey))
+    if (typeof requestKey !== 'string' || requestKey.length === 0 || requestKey.length > 128 || requestKey.includes('\0'))
       throw httpError(400, 'request_key 格式无效')
     // Persist independently of admission's chat lock: cancellation must win
     // even while attachments, model setup or sandbox discovery are stalled.

@@ -97,7 +97,7 @@ export class TaskScheduler {
         // its slot and stop execution; recovery must confirm the terminal state.
         const current = this.database.getRun(this.ownerId, item.runId)
         if (!current) {
-          this.database.finishSubmission(this.ownerId, item.runId)
+          this.database.removeSubmission(item.runId)
           continue
         }
         if (admitted && !TERMINAL.has(current.status) && !this.database.submission(this.ownerId, item.runId)?.dispatched) {

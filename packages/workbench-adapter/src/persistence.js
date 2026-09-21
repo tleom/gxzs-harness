@@ -511,10 +511,15 @@ export class WorkbenchDatabase {
   runTiming(ownerId, runId) {
     const run = this.getRun(ownerId, runId)
     if (!run) throw notFound('任务不存在')
-    const timing = this.db.prepare(`SELECT
-      MIN(CASE WHEN json_extract(payload_json, '$.status') = 'running' OR json_extract(payload_json, '$.event') IN ('message', 'agent_message', 'workbench_activity') THEN created_at END) AS started,
-      MIN(CASE WHEN json_extract(payload_json, '$.event') = 'workbench_end' THEN created_at END) AS ended,
-      MAX(created_at) AS last_event FROM run_events WHERE run_id = ?`).get(runId)
+    const rows = this.db.prepare('SELECT seq, payload_json, created_at FROM run_events WHERE run_id = ? ORDER BY seq').all(runId)
+    const ends = rows.filter((row) => JSON.parse(row.payload_json).event === 'workbench_end')
+    const lastEnd = ends.at(-1)
+    const previousEndSeq = ends.at(-2)?.seq ?? -1
+    const start = rows.find((row) => row.seq > previousEndSeq && row.seq <= (lastEnd?.seq ?? Infinity) && (() => {
+      const value = JSON.parse(row.payload_json)
+      return value.status === 'running' || ['message', 'agent_message', 'workbench_activity'].includes(value.event)
+    })())
+    const timing = { started: start?.created_at ?? null, ended: lastEnd?.created_at ?? null, last_event: rows.at(-1)?.created_at ?? null }
     const ended = TERMINAL.has(run.status) ? timing.ended ?? timing.last_event ?? run.updatedAt : null
     return {
       completed_at: ended == null ? null : ended / 1000,
@@ -565,6 +570,10 @@ export class WorkbenchDatabase {
 
   finishSubmission(ownerId, runId) {
     if (!this.getRun(ownerId, runId)) throw notFound('任务不存在')
+    this.db.prepare('DELETE FROM run_submissions WHERE run_id=?').run(runId)
+  }
+
+  removeSubmission(runId) {
     this.db.prepare('DELETE FROM run_submissions WHERE run_id=?').run(runId)
   }
 
