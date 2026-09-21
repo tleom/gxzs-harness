@@ -11,6 +11,8 @@ export function adaptInputSchema(source) {
     if (result.properties) result.properties = Object.fromEntries(Object.entries(result.properties).map(([key, value]) => [key, project(value)]))
     if (result.items) result.items = project(result.items)
     if (typeof result.additionalProperties === 'object') result.additionalProperties = project(result.additionalProperties)
+    for (const key of ['anyOf', 'allOf', 'oneOf']) if (Array.isArray(result[key])) result[key] = result[key].map(project)
+    if (result.not) result.not = project(result.not)
     return result
   }
   const validate = (schema, value, path = '$') => {
@@ -24,6 +26,21 @@ export function adaptInputSchema(source) {
     if (Array.isArray(value)) value.forEach((item, index) => validate(schema.items, item, `${path}[${index}]`))
     else if (value && typeof value === 'object') for (const [key, item] of Object.entries(value)) {
       validate(schema.properties?.[key] ?? (typeof schema.additionalProperties === 'object' ? schema.additionalProperties : undefined), item, `${path}.${key}`)
+    }
+    for (const key of ['anyOf', 'allOf', 'oneOf']) {
+      if (!Array.isArray(schema[key])) continue
+      if (key === 'allOf') schema[key].forEach((branch) => validate(branch, value, path))
+      else if (key === 'oneOf' || key === 'anyOf') {
+        const matches = schema[key].filter((branch) => {
+          try { validate(branch, value, path); return true } catch { return false }
+        })
+        if ((key === 'oneOf' && matches.length !== 1) || (key === 'anyOf' && matches.length === 0))
+          throw new Error(`MCP argument ${path} violates ${key}`)
+      }
+    }
+    if (schema.not) {
+      try { validate(schema.not, value, path) } catch { return }
+      throw new Error(`MCP argument ${path} violates not`)
     }
     // JSON Schema format is an annotation; the MCP server validates formats it requires.
   }

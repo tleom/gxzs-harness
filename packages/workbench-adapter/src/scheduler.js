@@ -14,7 +14,7 @@ export class TaskScheduler {
       this.retrying.add(run.id)
       try {
         await this.pendingTick
-        if (this.database.submission(this.ownerId, run.id)) await this.request(run, 'release')
+        if (this.database.submission(this.ownerId, run.id)) await this.request(run, 'release', true)
       }
       catch (error) {
         this.database.transitionRun(this.ownerId, run.id, 'failed', '调度连接尚未恢复，请稍后重试')
@@ -29,11 +29,11 @@ export class TaskScheduler {
     void this.tick()
   }
 
-  async request(run, action) {
+  async request(run, action, retry = false) {
     const ticketId = this.database.submission(this.ownerId, run.id)?.ticketId
     const value = await this.platformClient.json({
       owner: { ownerId: this.ownerId }, method: 'POST', route: 'scheduling',
-      body: Buffer.from(JSON.stringify({ action, run_id: run.id, ticket_id: ticketId, chat_id: run.chatId })), contentType: 'application/json',
+      body: Buffer.from(JSON.stringify({ action, run_id: run.id, ticket_id: ticketId, chat_id: run.chatId, retry })), contentType: 'application/json',
     })
     return value.data ?? value
   }
@@ -96,6 +96,10 @@ export class TaskScheduler {
         // Admission outages leave queued work queued. Once dispatched, retain
         // its slot and stop execution; recovery must confirm the terminal state.
         const current = this.database.getRun(this.ownerId, item.runId)
+        if (!current) {
+          this.database.finishSubmission(this.ownerId, item.runId)
+          continue
+        }
         if (admitted && !TERMINAL.has(current.status) && !this.database.submission(this.ownerId, item.runId)?.dispatched) {
           this.database.transitionRun(this.ownerId, item.runId, 'failed', '任务运行配置失败，请检查模型后重试')
           this.database.appendEvent(this.ownerId, item.runId, { event: 'workbench_end', status: 'failed', error: '任务运行配置失败，请检查模型后重试' })

@@ -21,9 +21,9 @@ export function appendResourceInstructions(content, mentions, tools, skills) {
     resources.push({ kind: 'MCP 插件工具', plugin: tool.provider_name ?? tool.server_id, name: tool.display_name ?? tool.name ?? tool.tool_name, tool: tool.runtime_name })
   }
   for (const id of mentions.skills) {
-    const skill = skills.find((item) => item.name === id && item.enabled !== false)
+    const skill = skills.find((item) => item.enabled !== false && (item.id === id || item.name === id || `personal:${item.name}` === id))
     if (!skill) throw httpError(409, `引用的技能已不可用：${id}`)
-    resources.push({ kind: '技能', name: skill.name })
+    resources.push({ kind: '技能', name: skill.name, id: skill.id ?? skill.name })
   }
   if (!resources.length) return content
   return [...content, { type: 'text', text: [

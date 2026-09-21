@@ -43,6 +43,14 @@ def test_restart_cancel_and_no_expiry_overcommit(tmp_path):
     queue.close()
 
 
+def test_retry_requeues_released_run(tmp_path):
+    queue = Admission(str(tmp_path / 'queue.db'))
+    assert queue.request('a', 1, 'host', 'r', 'chat', 'acquire')['state'] == 'running'
+    queue.request('a', 1, 'host', 'r', 'chat', 'release', retry=True)
+    assert queue.request('a', 1, 'host', 'r', 'chat', 'acquire')['state'] == 'running'
+    queue.close()
+
+
 def test_concurrent_owners_never_exceed_capacity(tmp_path):
     queue = Admission(str(tmp_path / 'queue.db'))
     def acquire(i):

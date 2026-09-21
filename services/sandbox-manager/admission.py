@@ -16,7 +16,7 @@ class Admission:
             state TEXT NOT NULL, heartbeat REAL NOT NULL, UNIQUE(owner,run))''')
         self.db.commit()
 
-    def request(self, owner, generation, instance, run, chat, action):
+    def request(self, owner, generation, instance, run, chat, action, retry=False):
         if action not in ('acquire', 'renew', 'release') or not all((owner, instance, run, chat)) or generation < 1:
             raise ValueError('Invalid scheduling request')
         with self.guard, self.db:
@@ -28,13 +28,18 @@ class Admission:
             now = time.time()
             if action == 'release':
                 if row:
-                    self.db.execute("UPDATE task_admission SET state='done',heartbeat=? WHERE seq=?", (now, row['seq']))
+                    self.db.execute("UPDATE task_admission SET state=?,heartbeat=? WHERE seq=?", ('retry' if retry else 'done', now, row['seq']))
                 else:
                     self.db.execute("INSERT INTO task_admission(owner,run,generation,instance,chat,state,heartbeat) VALUES(?,?,?,?,?,'done',?)", (owner, run, generation, instance, chat, now))
             elif action == 'acquire' and not row:
                 self.db.execute("INSERT INTO task_admission(owner,run,generation,instance,chat,state,heartbeat) VALUES(?,?,?,?,?,'waiting',?)", (owner, run, generation, instance, chat, now))
             elif row:
-                self.db.execute('UPDATE task_admission SET heartbeat=? WHERE seq=?', (now, row['seq']))
+                # A retry reuses the durable run identity. Requeue a released
+                # admission row instead of leaving it terminal forever.
+                self.db.execute(
+                    "UPDATE task_admission SET state=?, heartbeat=? WHERE seq=?",
+                    ('waiting' if action == 'acquire' and row['state'] == 'retry' else row['state'], now, row['seq'])
+                )
             if action == 'acquire':
                 # Reserve only for this polling host. Do not grant absent hosts
                 # slots while releasing another task; preserve eligible FIFO.

@@ -218,7 +218,7 @@ export class WorkbenchService {
     if (!created) this.database.transitionRun(owner.ownerId, run.id, 'queued')
     // Use the submitted human text, never the attachment instructions sent to DSH.
     if (created && chat.title === '新会话' && this.database.listRuns(owner.ownerId, chatId).length === 1) {
-      const title = query.trim() || admitted.attachments.map((file) => resolveWorkspacePath(this.workspace, file.path)).join('\n')
+      const title = (query.trim() || admitted.attachments.map((file) => resolveWorkspacePath(this.workspace, file.path)).join('\n') || '新会话').slice(0, 200)
       this.database.updateChat(owner.ownerId, chatId, { title })
       this.database.appendEvent(owner.ownerId, run.id, { event: 'workbench_chat_title', chat_id: chatId, title, title_source: 'fallback' })
     }
@@ -449,9 +449,12 @@ export class WorkbenchService {
       : Object.values(body.values ?? {}).filter((value) => typeof value === 'string' && value).join('\n')
     if (!answer) throw httpError(400, '补充回答不能为空')
     const chat = this.requireChat(owner, source.chatId)
+    const requestKey = `input-supplement:${input.requestId}`
+    const existing = this.database.findRunByRequestKey(owner.ownerId, chat.id, requestKey)
+    if (existing && existing.query !== answer) throw httpError(409, '该补答请求已使用不同的回答')
     const { run, created } = this.database.createRun({
       ownerId: owner.ownerId, chatId: chat.id, sessionId: chat.sessionId,
-      query: answer, mcpTools: await this.freezeMcpTools(owner, source.selection.tools), selection: source.selection, requestKey: `input-supplement:${input.requestId}`,
+      query: answer, mcpTools: existing?.mcpTools ?? await this.freezeMcpTools(owner, source.selection.tools), selection: source.selection, requestKey,
       parentRunId: source.id,
     })
     if (created || (run.status === 'queued' && !run.messageId)) {

@@ -172,7 +172,7 @@ class Hosts:
                     raise ValueError('Scheduling host is stopped')
             (self.root.parent / workspace).touch()
             return self.admission.request(payload['owner_id'], int(payload['generation']), payload['instance_id'],
-                                          payload['run_id'], payload['chat_id'], payload['action'])
+                                          payload['run_id'], payload['chat_id'], payload['action'], bool(payload.get('retry')))
 
     def _maintain_one(self, record):
         try:
