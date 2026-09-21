@@ -22,6 +22,24 @@ function setup({ authorized = true } = {}) {
 }
 
 describe('platform MCP proxy tools', () => {
+  it('registers bounded external schemas while validating bounds before proxy I/O', async () => {
+    const { ctx, definitions, platform } = setup()
+    const inputSchema = { type: 'object', properties: {
+      references: { type: 'object', properties: { values: { type: 'array', items: { type: 'string' }, minItems: 1, maxItems: 2 } } },
+      max_results: { type: 'integer', minimum: 1, maximum: 20 },
+      start_date: { type: 'string', format: 'date' },
+    } }
+    platform.json.mockResolvedValueOnce({ tools: [{ ...catalogTool, inputSchema }] })
+    await apply(ctx)
+    const tool = definitions.get(catalogTool.runtime_name)
+    expect(tool.parameters.properties.max_results).toMatchObject({ type: 'integer', description: 'minimum: 1; maximum: 20' })
+    expect(inputSchema.properties.max_results.maximum).toBe(20)
+    const exec = { agent: { id: 's1' }, signal: new AbortController().signal }
+    await expect(tool.execute({ max_results: 21 }, exec)).rejects.toThrow('maximum')
+    await expect(tool.execute({ references: { values: [] } }, exec)).rejects.toThrow('minItems')
+    expect(platform.json.mock.calls.filter(([request]) => request.route === 'mcp/call')).toHaveLength(0)
+    await expect(tool.execute({ max_results: 5, references: { values: ['one'] } }, exec)).resolves.toBeDefined()
+  })
   it('registers catalog tools and proxies only frozen authorized calls', async () => {
     const { ctx, definitions, platform } = setup()
     await apply(ctx)
