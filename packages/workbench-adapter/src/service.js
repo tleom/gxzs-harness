@@ -363,7 +363,7 @@ export class WorkbenchService {
 
   followups(owner, chatId, tracked) {
     this.requireChat(owner, chatId)
-    return { runs: this.database.followups(owner.ownerId, chatId, tracked).map((run) => runDto(run)) }
+    return { runs: this.database.followups(owner.ownerId, chatId, tracked).map((run) => this.inputRunDto(owner, run)) }
   }
 
   stopRun(owner, runId) {
@@ -385,6 +385,10 @@ export class WorkbenchService {
   async supplement(owner, sourceRunId, body) {
     const source = this.database.getRun(owner.ownerId, sourceRunId)
     if (!source) throw httpError(404, '任务不存在')
+    const input = this.database.listPendingInputs(owner.ownerId, sourceRunId).find((value) => value.requestId === body.request_id)
+    if (!input) throw httpError(404, '问题不存在')
+    if (input.answer?.supplement_run_id) return this.getRun(owner, input.answer.supplement_run_id)
+    if (input.status !== 'skipped') throw httpError(409, '只有已跳过的问题可以补答')
     const answer = typeof body.action === 'string' && body.action
       ? body.action
       : Object.values(body.values ?? {}).filter((value) => typeof value === 'string' && value).join('\n')
@@ -392,13 +396,17 @@ export class WorkbenchService {
     const chat = this.requireChat(owner, source.chatId)
     const { run, created } = this.database.createRun({
       ownerId: owner.ownerId, chatId: chat.id, sessionId: chat.sessionId,
-      query: answer, mcpTools: await this.freezeMcpTools(owner, source.selection.tools), selection: source.selection, requestKey: body.request_key,
+      query: answer, mcpTools: await this.freezeMcpTools(owner, source.selection.tools), selection: source.selection, requestKey: `input-supplement:${input.requestId}`,
       parentRunId: source.id,
     })
-    if (created) {
-      this.database.appendEvent(owner.ownerId, run.id, { event: 'workbench_status', status: 'queued' })
+    if (created || (run.status === 'queued' && !run.messageId)) {
+      if (created) this.database.appendEvent(owner.ownerId, run.id, { event: 'workbench_status', status: 'queued' })
       await this.sessions.prompt({ requestId: run.id, sessionId: run.sessionId, mode: 'queue', content: [{ type: 'text', text: answer }] }, new AbortController().signal)
     }
+    this.database.recordInputSupplement(owner.ownerId, sourceRunId, input.requestId, {
+      values: body.values ?? {}, action: body.action ?? null,
+      custom_fields: body.custom_fields ?? [], skipped_fields: body.skipped_fields ?? [], supplement_run_id: run.id,
+    })
     return runDto(this.database.getRun(owner.ownerId, run.id))
   }
 
@@ -425,8 +433,25 @@ export class WorkbenchService {
   getRun(owner, runId) {
     const run = this.database.getRun(owner.ownerId, runId)
     if (!run) throw httpError(404, '任务不存在')
-    const pending = this.database.getPendingInput(owner.ownerId, run.id)
-    return runDto(run, this.database.allEvents(owner.ownerId, run.id), pending)
+    return this.inputRunDto(owner, run, this.database.allEvents(owner.ownerId, run.id))
+  }
+
+  inputRunDto(owner, run, events = []) {
+    const inputs = this.database.listPendingInputs(owner.ownerId, run.id)
+    return {
+      ...runDto(run, events, inputs.at(-1)),
+      human_input_history: inputs.filter((input) => ['skipped', 'submitted'].includes(input.status)).map((input) => {
+        const answers = input.answer?.answers ?? []
+        const values = input.answer?.values ?? Object.fromEntries(answers.map((answer) => [answer.id, answer.custom ?? answer.selected?.[0] ?? '']))
+        return {
+          ...input.payload, request_id: input.requestId, status: input.status, values,
+          action: input.answer?.action ?? (input.payload.tool_name === 'exit_plan_mode' ? Object.values(values)[0] || null : null),
+          custom_fields: input.answer?.custom_fields ?? answers.filter((answer) => answer.custom).map((answer) => answer.id),
+          skipped_fields: input.answer?.skipped_fields ?? (input.payload.args.fields ?? []).filter((field) => !values[field.name]).map((field) => field.name),
+          ...(input.answer?.supplement_run_id ? { supplement_run_id: input.answer.supplement_run_id } : {}),
+        }
+      }),
+    }
   }
 
   requireChat(owner, chatId) {
