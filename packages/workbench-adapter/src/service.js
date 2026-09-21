@@ -41,7 +41,13 @@ export class WorkbenchService {
         if (body[field] !== undefined && typeof body[field] !== 'boolean') throw httpError(400, `${field} 必须是布尔值`)
         if (body[field] !== undefined) patch[field] = body[field]
       }
-      return this.chatSummary(owner, this.database.updateChat(owner.ownerId, chatId, patch))
+      const updated = this.database.updateChat(
+        owner.ownerId,
+        chatId,
+        patch,
+        body.title === undefined ? chat.updatedAt : undefined,
+      )
+      return this.chatSummary(owner, updated)
     })
   }
 
@@ -128,8 +134,11 @@ export class WorkbenchService {
   }
 
   async deleteChat(owner, chatId) {
-    return this.withChatMutation(chatId, () => {
-      this.requireChat(owner, chatId)
+    return this.withChatMutation(chatId, async () => {
+      const chat = this.requireChat(owner, chatId)
+      if (this.database.activeRun(owner.ownerId, chatId))
+        throw httpError(409, '会话正在执行任务，请停止后再删除')
+      await this.fileManager.operate({ operation: 'delete', path: `conversations/${chat.id}` })
       this.database.deleteChat(owner.ownerId, chatId)
     })
   }
@@ -178,12 +187,17 @@ export class WorkbenchService {
     const existingKeys = existing?.attachments?.map((file) => ({ path: file.path, version: file.version }))
     if (existing && (existing.query !== query || JSON.stringify(existingKeys) !== JSON.stringify(fileKeys)))
       throw httpError(409, 'request_key 已用于不同的任务内容')
+    const parentRunId = body.continue_run_id ?? body.parent_run_id
+    if (parentRunId != null) {
+      const parent = this.database.getRun(owner.ownerId, parentRunId)
+      if (!parent || parent.chatId !== chatId) throw httpError(409, '上级任务不属于当前会话')
+    }
     const mcpTools = existing?.mcpTools ?? await this.freezeMcpTools(owner, chat.selection.tools)
     const admitted = await admitSandboxAttachments({ fileManager: this.fileManager, workspace: this.workspace, query, files })
     const { run, created } = this.database.createRun({
       ownerId: owner.ownerId, chatId, sessionId: chat.sessionId, query, attachments: admitted.attachments, mcpTools,
       selection: chat.selection, requestKey,
-      parentRunId: typeof body.continue_run_id === 'string' ? body.continue_run_id : undefined,
+      parentRunId,
     })
     if (!created && run.status !== 'failed') return runDto(run, this.database.allEvents(owner.ownerId, run.id))
     if (!created) this.database.transitionRun(owner.ownerId, run.id, 'queued')
@@ -431,8 +445,10 @@ function normalizeMcpResource(value) {
   return {
     id: value.id, runtime_name: value.runtime_name, version: value.version, manifest_version: value.manifest_version ?? '',
     scope: value.scope, server_id: value.server_id, tool_name: value.tool_name,
-    name: value.name ?? value.tool_name, description: value.description, inputSchema: value.inputSchema,
-    provider: value.provider ?? 'mcp', provider_name: value.provider_name ?? value.server_id,
+    name: value.name ?? value.tool_name, display_name: value.display_name ?? value.name,
+    description: value.description, inputSchema: value.inputSchema,
+    group: value.group ?? 'mcp', provider: value.provider ?? 'mcp',
+    provider_name: value.provider_name ?? value.server_id,
   }
 }
 

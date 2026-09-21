@@ -15,6 +15,7 @@ const ROUTES = new Set([
   'GET files/shares', 'POST files/shares', 'DELETE files/shares',
   'POST audio',
   'GET mcp/catalog', 'POST mcp/call',
+  'GET workbench/config',
 ])
 
 export class PlatformClient {

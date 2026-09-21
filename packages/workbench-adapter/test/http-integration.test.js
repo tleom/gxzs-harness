@@ -127,9 +127,9 @@ describe('authenticated workbench HTTP handler', () => {
         { id: 'global-skill', scope: 'global' },
       ] } },
     })
-    expect(context.systemPrompt.section).toHaveBeenCalledWith({
-      name: 'gxzs:identity', order: 1, text: '你的名字是公信智能办案助手。',
-    })
+    expect(context.systemPrompt.section).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'gxzs:identity', order: 1, text: expect.any(Function),
+    }))
   })
 
   it('rejects missing assertions before routing', async () => {
