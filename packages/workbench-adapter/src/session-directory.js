@@ -11,7 +11,7 @@ export async function copySessionDirectory({ agents, sessionQuery, agentPresets,
       sessionId: childId, seed: events, inheritedEventCount: events.length,
       meta: { cwd, parentSession: sessionId, isSeeded: true, agentPreset: preset.id },
       agentOptions: agentDefaultModel.currentSelection(),
-      setup: (agentCtx) => agentPresets.mount(agentCtx, preset.id),
+      setup: async (agentCtx) => { await agentPresets.mount(agentCtx, preset.id) },
     })
     return { sessionId: childId }
   } finally { source[Symbol.dispose]?.() }

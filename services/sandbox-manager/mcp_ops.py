@@ -153,7 +153,7 @@ def load(rootfd, name):
     return configuration(raw), version(raw)
 
 
-def snapshot(rootfd):
+def snapshot(rootfd, selected=None):
     warnings = []
     try:
         settings = mapping(rootfd, SETTINGS)
@@ -169,7 +169,7 @@ def snapshot(rootfd):
     mcpfd, cachefd = directory(rootfd, "mcp"), directory(rootfd, ".mcp-cache")
     items = []
     try:
-        for name in sorted(os.listdir(mcpfd)):
+        for name in ([server_name(selected)] if selected is not None else sorted(os.listdir(mcpfd))):
             item = {
                 "id": name,
                 "name": name,
@@ -212,7 +212,7 @@ def personal_mcp(payload, root="/workspace"):
     rootfd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
         if operation == "mcp_list":
-            return snapshot(rootfd)
+            return snapshot(rootfd, payload.get('name'))
         name = server_name(payload.get("name"))
         if operation == "mcp_save":
             content = payload.get("content")

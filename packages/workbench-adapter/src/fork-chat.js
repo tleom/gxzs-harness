@@ -1,6 +1,16 @@
 import { randomUUID } from 'node:crypto'
 import { httpError } from './http.js'
-import { copySessionDirectory } from './session-directory.js'
+import path from 'node:path'
+import { resolveWorkspacePath } from './paths.js'
+
+// Mirrors DSH sessions/service.ts increasedForkTitle (client-only, not exported).
+function increasedForkTitle(title) {
+  const ascii = /^(.*?)\((\d+)\)$/u.exec(title)
+  if (ascii) return `${ascii[1]}(${BigInt(ascii[2]) + 1n})`
+  const fullWidth = /^(.*?)（(\d+)）$/u.exec(title)
+  if (fullWidth) return `${fullWidth[1]}（${BigInt(fullWidth[2]) + 1n}）`
+  return `${title} (1)`
+}
 
 /** Fork the model event log and the corresponding visible conversation together. */
 export async function forkChat(service, owner, sourceRunId, body) {
@@ -36,11 +46,17 @@ export async function forkChat(service, owner, sourceRunId, body) {
       }
     }
     const id = randomUUID()
-    await service.fileManager.operate({ operation: 'mkdir', path: `conversations/${id}` })
-    // Production has sessionQuery: seeded sessions get their own output directory.
-    const child = service.sessionQuery
-      ? await copySessionDirectory(service, origin.sessionId, service.chatDirectory(id), origin.endSeq)
-      : await service.sessions.fork({ sessionId: origin.sessionId, atSeq: origin.endSeq })
+    // The native fork owns turn boundaries, IDs, presets and history. Its cwd is inherited.
+    let cwd = service.chatDirectory(chat.id, chat.directory)
+    if (service.sessionQuery) {
+      const observed = await service.sessionQuery.observeSession(origin.sessionId)
+      try { cwd = observed.header.cwd ?? cwd } finally { observed[Symbol.dispose]?.() }
+    }
+    const absolute = resolveWorkspacePath(service.workspace, cwd)
+    const directory = path.posix.relative(service.workspace, absolute) || '.'
+    const child = await service.sessions.fork({ sessionId: origin.sessionId, atSeq: origin.endSeq })
+    const title = increasedForkTitle(chat.title)
+    await service.sessions.rename({ sessionId: child.sessionId, title })
     const ids = new Map(chain.map((run) => [run.id, randomUUID()]))
     ids.set(chat.id, id)
     const inputs = chain.flatMap((run) => db.db.prepare('SELECT * FROM pending_inputs WHERE run_id = ?').all(run.id))
@@ -48,7 +64,7 @@ export async function forkChat(service, owner, sourceRunId, body) {
     const remap = (value) => {
       if (typeof value === 'string') return ids.get(value) ?? value
       if (Array.isArray(value)) return value.map(remap)
-      if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, remap(item)]))
+      if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, key === 'native' ? item : remap(item)]))
       return value
     }
     const insert = (table, row) => {
@@ -58,7 +74,7 @@ export async function forkChat(service, owner, sourceRunId, body) {
     db.transaction(() => {
       const now = Date.now()
       const { fork_source: _, ...selection } = source.selection
-      db.importChat({ id, ownerId: owner.ownerId, sessionId: child.sessionId, title: `${chat.title} · 分叉`.slice(0, 200), selection, createdAt: now, updatedAt: now })
+      db.importChat({ id, ownerId: owner.ownerId, sessionId: child.sessionId, title, selection, directory, createdAt: now, updatedAt: now })
       for (const run of chain) {
         const row = db.db.prepare('SELECT * FROM runs WHERE id = ? AND owner_id = ?').get(run.id, owner.ownerId)
         insert('runs', {

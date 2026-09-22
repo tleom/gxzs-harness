@@ -1,0 +1,99 @@
+{
+  "note": "Synthetic all-zero test key only. Freeze test clock at issued_at_ms or regenerate exp/deadline/signature; this fixture expires. Java HMAC sorts top-level grant keys.",
+  "issued_at_ms": 1790067843000,
+  "test_key_base64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+  "authorization": {
+    "purpose": "dsh-mcp-call",
+    "owner_id": "audit:7",
+    "workspace_id": "22222222-2222-4222-8222-222222222222",
+    "binding_id": "11111111-1111-4111-8111-111111111111",
+    "run_id": "11111111-1111-4111-8111-111111111111",
+    "resource_id": "personal:mcp:demo:search",
+    "version": "v1",
+    "manifest_version": "m1",
+    "runtime_version": "v1",
+    "arguments": {
+      "query": "fixture"
+    },
+    "request_key": "call-1",
+    "deadline_ms": 1790068193000,
+    "exp": 1790067963,
+    "jti": "33333333-3333-4333-8333-333333333333",
+    "signature": "ztFJykyQ2gWYw3CiO_g2XlyX-s-lrvGTF0VUtuxB8-U"
+  },
+  "validate_callback": {
+    "authorization": {
+      "purpose": "dsh-mcp-call",
+      "owner_id": "audit:7",
+      "workspace_id": "22222222-2222-4222-8222-222222222222",
+      "binding_id": "11111111-1111-4111-8111-111111111111",
+      "run_id": "11111111-1111-4111-8111-111111111111",
+      "resource_id": "personal:mcp:demo:search",
+      "version": "v1",
+      "manifest_version": "m1",
+      "runtime_version": "v1",
+      "arguments": {
+        "query": "fixture"
+      },
+      "request_key": "call-1",
+      "deadline_ms": 1790068193000,
+      "exp": 1790067963,
+      "jti": "33333333-3333-4333-8333-333333333333",
+      "signature": "ztFJykyQ2gWYw3CiO_g2XlyX-s-lrvGTF0VUtuxB8-U"
+    },
+    "action": "validate"
+  },
+  "consume_callback": {
+    "authorization": {
+      "purpose": "dsh-mcp-call",
+      "owner_id": "audit:7",
+      "workspace_id": "22222222-2222-4222-8222-222222222222",
+      "binding_id": "11111111-1111-4111-8111-111111111111",
+      "run_id": "11111111-1111-4111-8111-111111111111",
+      "resource_id": "personal:mcp:demo:search",
+      "version": "v1",
+      "manifest_version": "m1",
+      "runtime_version": "v1",
+      "arguments": {
+        "query": "fixture"
+      },
+      "request_key": "call-1",
+      "deadline_ms": 1790068193000,
+      "exp": 1790067963,
+      "jti": "33333333-3333-4333-8333-333333333333",
+      "signature": "ztFJykyQ2gWYw3CiO_g2XlyX-s-lrvGTF0VUtuxB8-U"
+    },
+    "action": "consume"
+  },
+  "manager_payload": {
+    "operation": "mcp_call",
+    "name": "demo",
+    "version": "v1",
+    "manifest_version": "m1",
+    "tool": "search",
+    "arguments": {
+      "query": "fixture"
+    },
+    "request_key": "11111111-1111-4111-8111-111111111111:call-1",
+    "deadline_ms": 1790068193000,
+    "authorization": {
+      "purpose": "dsh-mcp-call",
+      "owner_id": "audit:7",
+      "workspace_id": "22222222-2222-4222-8222-222222222222",
+      "binding_id": "11111111-1111-4111-8111-111111111111",
+      "run_id": "11111111-1111-4111-8111-111111111111",
+      "resource_id": "personal:mcp:demo:search",
+      "version": "v1",
+      "manifest_version": "m1",
+      "runtime_version": "v1",
+      "arguments": {
+        "query": "fixture"
+      },
+      "request_key": "call-1",
+      "deadline_ms": 1790068193000,
+      "exp": 1790067963,
+      "jti": "33333333-3333-4333-8333-333333333333",
+      "signature": "ztFJykyQ2gWYw3CiO_g2XlyX-s-lrvGTF0VUtuxB8-U"
+    }
+  }
+}

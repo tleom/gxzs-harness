@@ -17,8 +17,11 @@ Persistence uses Node's built-in `node:sqlite` with WAL and full synchronous tra
 
 ```bash
 pnpm install --frozen-lockfile
+npm ci --prefix profiles/workbench --no-audit --no-fund
 pnpm check
 pnpm check:config
 ```
 
 `pnpm check:config` performs a real DSH `--dump-config` check and therefore requires the profile dependencies installed from the lockfile.
+
+The native lifecycle integration tests also load the locked DSH profile and use a local fake model. Linux manager/MCP tests and all three image builds run separately in CI. See `docs/repair-contract-20260922.md` for the current cross-repository protocol and `services/sandbox/README.md` for the sandbox build source.

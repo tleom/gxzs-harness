@@ -56,7 +56,7 @@
 
 ## Data policy
 
-The adapter uses schema 3 for fresh hosts and supports explicit legacy bundle import. Existing schema-1/schema-2 adapter validation databases are rejected before startup. Dify workbench chats/runs/events are exported in bounded owner-scoped pages and imported with preserved ids; user files remain in the same verified workspace UUID. Old source data remains available for rollback until migration acceptance. Process restart marks live runs interrupted and closes pending questions; it does not pretend an in-process tool promise survived.
+The adapter uses schema 3. Obsolete schema-1/schema-2 databases are rejected before startup. The one-time Dify bundle importer and automatic session-directory migration have been removed; existing database rows and workspace files are not deleted. Frontend and adapter now exchange native questions/answers and workbench_activity events and must be updated together. Process restart marks live runs interrupted and closes pending questions; it does not pretend an in-process tool promise survived.
 
 ## Release state
 

@@ -11,6 +11,7 @@ import { WorkbenchRuntime } from '../src/runtime.js'
       const { run } = database.createRun({ ownerId: 't:1', chatId: chat.id, sessionId: 's1', query: 'q', selection: {}, mcpTools: [{ id: 'personal:server:search', version: 'v1' }] })
       database.transitionRun('t:1', run.id, 'running')
       const runtime = new WorkbenchRuntime(new Context(), database, 't:1')
+      runtime.agents = new Map([['s1', { id: 's1' }]])
       expect(runtime.authorizeRunMcp('t:1', run.id, 'personal:server:search', 'v1')).toBe(true)
       expect(runtime.authorizeRunMcp('t:2', run.id, 'personal:server:search', 'v1')).toBe(false)
       expect(runtime.authorizeRunMcp('t:1', 'missing', 'personal:server:search', 'v1')).toBe(false)

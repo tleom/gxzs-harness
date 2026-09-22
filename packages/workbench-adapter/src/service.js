@@ -1,14 +1,18 @@
-import yaml from 'js-yaml'
+import { platformToolName } from '@gxzs/dsh-workbench-mcp-tools/names'
+import { readSkillDefinition, skillDisplayName } from '@gxzs/dsh-workbench-sandbox-skills/definition'
 import { randomUUID } from 'node:crypto'
+import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { admitSandboxAttachments } from './attachments.js'
 import { normalizeResourceMentions, appendResourceInstructions } from './resource-mentions.js'
 import { httpError } from './http.js'
 import { resolveWorkspacePath } from './paths.js'
-import { copySessionDirectory } from './session-directory.js'
 import { forkChat } from './fork-chat.js'
+import { toAnswer } from './human-input.js'
+import { requireDatabaseModel } from './database-models.js'
+import { currentExecutionRun, fenceMcpExecutions } from './scheduler.js'
 
 export class WorkbenchService {
-  constructor({ database, sessionController, agents, commands, skills, fileManager, platformClient, workspace, sessionQuery, agentPresets, agentDefaultModel, scheduler }) {
+  constructor({ database, sessionController, agents, commands, skills, fileManager, platformClient, workspace, sessionQuery, agentPresets, agentDefaultModel, modelSettings, scheduler, attachments, goals }) {
     this.database = database
     this.sessions = sessionController
     this.agents = agents
@@ -20,9 +24,12 @@ export class WorkbenchService {
     this.sessionQuery = sessionQuery
     this.agentPresets = agentPresets
     this.agentDefaultModel = agentDefaultModel
+    this.modelSettings = modelSettings
     this.inflightCommands = new Map()
     this.chatMutations = new Map()
     this.scheduler = scheduler
+    this.attachments = attachments
+    this.goals = goals
   }
 
   async createChat(owner, workspace, selection) {
@@ -33,11 +40,11 @@ export class WorkbenchService {
     return chat
   }
 
-  chatDirectory(chatId) { return resolveWorkspacePath(this.workspace, `conversations/${chatId}`) }
+  chatDirectory(chatId, directory) { return resolveWorkspacePath(this.workspace, directory ?? `conversations/${chatId}`) }
 
-  async ensureChatSession(owner, chat, { allowActive = false } = {}) {
+  async ensureChatSession(owner, chat) {
     await this.ensureChatDirectory(owner, chat.id)
-    const cwd = this.chatDirectory(chat.id)
+    const cwd = this.chatDirectory(chat.id, chat.directory)
     const live = this.agents.get(chat.sessionId)
     let header = live?.session?.header
     if (!header && this.sessionQuery) {
@@ -48,22 +55,15 @@ export class WorkbenchService {
         if (error?.code !== 'SESSION_QUERY_SESSION_NOT_FOUND') throw error
       }
     }
-    if (header && header.cwd !== cwd) {
-      if (this.database.activeRun(owner.ownerId, chat.id)) {
-        if (allowActive) return chat
-        throw httpError(409, '当前任务结束后才能更新对话工作目录')
-      }
-      const child = await copySessionDirectory(this, chat.sessionId, cwd)
-      this.database.switchChatSession(owner.ownerId, chat.id, chat.sessionId, child.sessionId)
-      return this.requireChat(owner, chat.id)
-    }
+    if (header && header.cwd !== cwd)
+      throw httpError(409, '会话工作目录与当前配置不一致，请新建对话')
     if (!live) await this.sessions.create({ sessionId: chat.sessionId, cwd })
     return chat
   }
 
   async ensureChatDirectory(owner, chatId) {
-    this.requireChat(owner, chatId)
-    await this.fileManager.operate({ operation: 'mkdir', path: `conversations/${chatId}` })
+    const chat = this.requireChat(owner, chatId)
+    await this.fileManager.operate({ operation: 'mkdir', path: chat.directory ?? `conversations/${chatId}` })
   }
 
   async updateChat(owner, chatId, body) {
@@ -98,9 +98,7 @@ export class WorkbenchService {
       if (this.database.activeRun(owner.ownerId, chatId)) throw httpError(409, '任务运行时不能修改模型配置')
       await this.freezeMcpTools(owner, selection.tools)
       const route = splitModel(selection.model)
-      const catalog = await this.sessions.modelCatalog()
-      if (!(catalog.groups ?? []).some((group) => group.id === route.provider && (group.models ?? []).some((model) => model.id === route.model)))
-        throw httpError(400, '模型不存在或当前不可用')
+      await requireDatabaseModel(this.platformClient, this.sessions, owner, selection.model, this.modelSettings)
       await this.sessions.selectModel({ sessionId: chat.sessionId, ...route, ...(selection.model_parameters.reasoning_effort ? { reasoningEffort: selection.model_parameters.reasoning_effort } : {}) })
       this.database.updateChatConfig(owner.ownerId, chatId, chat.version, selection)
       return this.getChat(owner, chatId)
@@ -115,11 +113,8 @@ export class WorkbenchService {
     return this.getRun(owner, runId)
   }
 
-  async modelParameters(modelId) {
-    const route = splitModel(modelId)
-    const catalog = await this.sessions.modelCatalog()
-    const model = (catalog.groups ?? []).find((group) => group.id === route.provider)?.models?.find((item) => item.id === route.model)
-    if (!model) throw httpError(404, '模型不存在或当前不可用')
+  async modelParameters(modelId, owner) {
+    const model = await requireDatabaseModel(this.platformClient, this.sessions, owner, modelId, this.modelSettings)
     if (!model.reasoning?.efforts?.length) return {}
     return { reasoning_effort: {
       type: 'string', options: model.reasoning.efforts.map((effort) => effort.id),
@@ -130,13 +125,43 @@ export class WorkbenchService {
   async deleteChat(owner, chatId) {
     return this.withChatMutation(chatId, async () => {
       const chat = this.requireChat(owner, chatId)
-      if (this.database.activeRun(owner.ownerId, chatId))
-        throw httpError(409, '会话正在执行任务，请停止后再删除')
-      const path = `conversations/${chat.id}`
-      const entry = await this.fileManager.operate({ operation: 'stat', path })
-      if (entry.kind !== 'missing')
-        await this.fileManager.operate({ operation: 'delete', path, version: entry.version })
-      this.database.deleteChat(owner.ownerId, chatId)
+      this.scheduler?.deletingChats.add(chatId)
+      try {
+        // Drain an in-flight admission before cancelling; otherwise its prompt
+        // could arrive after cancellation and restart the deleted conversation.
+        await this.scheduler?.pendingTick
+        const agent = this.agents.get(chat.sessionId)
+        const cancelling = this.database.listRuns(owner.ownerId, chatId)
+          .filter(run => ['running', 'waiting_input', 'stopping'].includes(run.status) || this.database.submission(owner.ownerId, run.id)?.dispatched
+            || this.database.pendingRunFences(owner.ownerId).some(value => value.id === run.id))
+        for (const run of cancelling) this.database.requireRunFence(owner.ownerId, run.id)
+        if (agent) {
+          const goal = this.goals?.get(agent)
+          if (goal?.phase === 'active') this.goals.pause(agent, { id: goal.id, revision: goal.revision })
+          agent.cancel({ kind: 'user' }, { keepInbox: false })
+        }
+        const confirmation = await fenceMcpExecutions(this.platformClient, owner, cancelling.map(run => run.id))
+        if (agent) await agent.whenIdle()
+        for (const run of cancelling) this.database.confirmRunFence(owner.ownerId, run.id, confirmation)
+        for (const run of this.database.listRuns(owner.ownerId, chatId)) {
+          if (['queued', 'running', 'waiting_input', 'stopping'].includes(run.status))
+            this.database.transitionRun(owner.ownerId, run.id, 'cancelled')
+          if (this.scheduler && this.database.submission(owner.ownerId, run.id)) {
+            await this.scheduler.request(run, 'release')
+            this.database.finishSubmission(owner.ownerId, run.id)
+          }
+        }
+        const path = chat.directory ?? `conversations/${chat.id}`
+        // Native forks share their source workspace. Delete files only for the last reference.
+        const shared = this.database.listChats(owner.ownerId).some((other) => other.id !== chat.id && (other.directory ?? `conversations/${other.id}`) === path)
+        if (shared || path === '.') { this.database.deleteChat(owner.ownerId, chatId); return }
+        const entry = await this.fileManager.operate({ operation: 'stat', path })
+        if (entry.kind !== 'missing')
+          await this.fileManager.operate({ operation: 'delete', path, version: entry.version })
+        this.database.deleteChat(owner.ownerId, chatId)
+      } finally {
+        this.scheduler?.deletingChats.delete(chatId)
+      }
     })
   }
 
@@ -161,6 +186,7 @@ export class WorkbenchService {
     const active = this.database.activeRun(owner.ownerId, chat.id)
     return {
       id: chat.id, title: chat.title, version: chat.version, pinned: chat.pinned, favorited: chat.favorited,
+      file_directory: chat.directory ?? `conversations/${chat.id}`,
       created_at: Math.floor(chat.createdAt / 1000), updated_at: Math.floor(chat.updatedAt / 1000),
       has_active_run: Boolean(active), is_running: ['running', 'stopping'].includes(active?.status), needs_input: active?.status === 'waiting_input',
     }
@@ -172,52 +198,51 @@ export class WorkbenchService {
 
   async admitRun(owner, chatId, body) {
     let chat = this.requireChat(owner, chatId)
+    const requestKey = typeof body.request_key === 'string' ? body.request_key : undefined
+    if (requestKey !== undefined && (requestKey.length === 0 || requestKey.length > 128 || requestKey.includes('\0')))
+      throw httpError(400, 'request_key 格式无效')
+    // A submission key is an immutable receipt, including failed executions.
+    // Explicit retries submit a new key and retain parent_run_id for lineage.
+    const existing = this.database.findRunByRequestKey(owner.ownerId, chatId, requestKey)
+    if (existing) return this.getRun(owner, existing.id)
     if (body.version !== undefined && body.version !== chat.version)
       throw httpError(409, '配置版本已改变，请刷新后重试')
     const query = String(body.query ?? '')
     const mentions = normalizeResourceMentions(body.resource_mentions)
     const files = Array.isArray(body.files) ? body.files : []
     if (!query.trim() && !files.length) throw httpError(400, '消息内容不能为空')
-    const requestKey = typeof body.request_key === 'string' ? body.request_key : undefined
-    if (requestKey !== undefined && (requestKey.length === 0 || requestKey.length > 128 || requestKey.includes('\0')))
-      throw httpError(400, 'request_key 格式无效')
     const cancelled = () => requestKey && this.database.getCommandReceipt(owner.ownerId, chatId, `run-stop:${requestKey}`)
     const checkCancelled = () => { if (cancelled()) throw httpError(409, '消息已取消') }
     checkCancelled()
-    const existing = this.database.findRunByRequestKey(owner.ownerId, chatId, requestKey)
-    if (existing && existing.status !== 'failed') return runDto(existing, this.database.allEvents(owner.ownerId, existing.id))
-    const fileKeys = files.map((file) => ({ path: file?.path, version: file?.version }))
-    const existingKeys = existing?.attachments?.map((file) => ({ path: file.path, version: file.version }))
-    if (existing && (existing.query !== query || JSON.stringify(normalizeResourceMentions(existing.selection.resource_mentions)) !== JSON.stringify(mentions) || JSON.stringify(existingKeys) !== JSON.stringify(fileKeys)))
-      throw httpError(409, 'request_key 已用于不同的任务内容')
-    let parentRunId = body.continue_run_id ?? body.parent_run_id ?? this.database.listRuns(owner.ownerId, chatId)
+    await requireDatabaseModel(this.platformClient, this.sessions, owner, chat.selection.model, this.modelSettings)
+    let parentRunId = body.retry_of ?? body.continue_run_id ?? body.parent_run_id ?? this.database.listRuns(owner.ownerId, chatId)
       .filter((run) => !['discarded', 'steered'].includes(run.status)).at(-1)?.id
     if (parentRunId != null) {
       const parent = this.database.getRun(owner.ownerId, parentRunId)
       if (!parent || parent.chatId !== chatId) throw httpError(409, '上级任务不属于当前会话')
+      if (body.retry_of && !['failed', 'interrupted', 'cancelled'].includes(parent.status))
+        throw Object.assign(httpError(409, '原任务尚未失败或中断'), { code: 'STALE_RUN' })
     }
     // Admission is serialized per chat: a normal follow-up belongs after the
     // actual queue tail, even if the client's active-run snapshot is stale.
-    if (!body.continue_run_id) {
+    if (!body.continue_run_id && !body.retry_of) {
       const tail = this.database.listRuns(owner.ownerId, chatId)
         .filter((run) => ['queued', 'running', 'waiting_input', 'stopping'].includes(run.status)).at(-1)
       if (tail) parentRunId = tail.id
     }
-    const mcpTools = existing?.mcpTools ?? await this.freezeMcpTools(owner, chat.selection.tools)
+    const mcpTools = await this.freezeMcpTools(owner, chat.selection.tools)
     checkCancelled()
     const admitted = await admitSandboxAttachments({ fileManager: this.fileManager, workspace: this.workspace, query, files })
     admitted.content = await this.resourceContent(admitted.content, mentions, mcpTools)
     checkCancelled()
     chat = await this.ensureChatSession(owner, chat)
     checkCancelled()
-    if (existing && existing.sessionId !== chat.sessionId) this.database.rebindFailedRunSession(owner.ownerId, existing.id, chat.sessionId)
     const { run, created } = this.database.createRun({
       ownerId: owner.ownerId, chatId, sessionId: chat.sessionId, query, attachments: admitted.attachments, mcpTools,
       selection: { ...chat.selection, resource_mentions: mentions }, requestKey,
       parentRunId,
     })
-    if (!created && run.status !== 'failed') return runDto(run, this.database.allEvents(owner.ownerId, run.id))
-    if (!created) this.database.transitionRun(owner.ownerId, run.id, 'queued')
+    if (!created) return this.getRun(owner, run.id)
     // Use the submitted human text, never the attachment instructions sent to DSH.
     if (created && chat.title === '新会话' && this.database.listRuns(owner.ownerId, chatId).length === 1) {
       const title = (query.trim() || admitted.attachments.map((file) => resolveWorkspacePath(this.workspace, file.path)).join('\n') || '新会话').slice(0, 200)
@@ -227,7 +252,7 @@ export class WorkbenchService {
     this.database.appendEvent(owner.ownerId, run.id, { event: 'workbench_status', status: 'queued' })
     if (this.scheduler) {
       checkCancelled()
-      try { await this.scheduler.enqueue(run, admitted.content, !created) }
+      try { await this.scheduler.enqueue(run, admitted.content) }
       catch (error) {
         this.database.transitionRun(owner.ownerId, run.id, 'failed', `任务提交失败：${error?.message ?? error}`)
         this.database.appendEvent(owner.ownerId, run.id, { event: 'workbench_end', status: 'failed', error: `任务提交失败：${error?.message ?? error}` })
@@ -291,17 +316,17 @@ export class WorkbenchService {
       this.fileManager.personalMcp({ operation: 'mcp_list' }),
       this.listSkills(),
     ])
-    const skills = (personal.skills ?? []).map((skill) => {
+    const skills = await Promise.all((personal.skills ?? []).map(async (skill) => {
       try {
-        const metadata = skillMetadata(skill.content)
+        const metadata = await readSkillDefinition(skill.content, { id: skill.id })
         if (metadata.name !== skill.id) throw new Error('技能目录名与 name 不一致')
-        return { ...skill, ...metadata, scope: 'personal', readonly: false }
+        return { ...skill, ...metadata, content: skill.content, scope: 'personal', readonly: false }
       } catch (error) {
         return { ...skill, name: skill.id, description: '', enabled: false, scope: 'personal', readonly: false, error: error.message }
       }
-    })
+    }))
     return {
-      memory: personal.memory ?? { content: '', version: null }, skills, mcp: mcp.mcp ?? [],
+      skills, mcp: mcp.mcp ?? [],
       warnings: [...(personal.warnings ?? []), ...(mcp.warnings ?? [])],
       global: { files: [], tools: [], knowledge: [], skills: globalSkills.filter((skill) => skill.scope === 'global') },
     }
@@ -312,22 +337,22 @@ export class WorkbenchService {
     if (typeof operation !== 'string') throw httpError(400, '缺少资源操作')
     if (operation === 'skill_inspect') {
       const inspected = await this.fileManager.personalResources(body)
-      const metadata = skillMetadata(inspected.content)
+      const metadata = await readImportedSkill(inspected.content)
       const snapshot = await this.fileManager.personalResources({ operation: 'list' })
       const previous = (snapshot.skills ?? []).find((skill) => skill.id === metadata.name)
-      return { name: metadata.name, version: previous?.version ?? null }
+      return { name: metadata.name, displayName: metadata.displayName, version: previous?.version ?? null }
     }
     if (operation === 'skill_import') {
       const inspected = await this.fileManager.personalResources({ ...body, operation: 'skill_inspect' })
-      const metadata = skillMetadata(inspected.content)
+      const metadata = await readImportedSkill(inspected.content)
       return this.fileManager.personalResources({ ...body, name: metadata.name })
     }
     if (operation === 'skill_update') {
-      const metadata = skillMetadata(body.content)
+      const metadata = await readImportedSkill(body.content)
       if (metadata.name !== body.name) throw httpError(400, '编辑时不能修改技能 name')
     }
     if (operation.startsWith('mcp_')) return this.fileManager.personalMcp(body)
-    if (!['memory_update', 'skill_import', 'skill_update', 'skill_uninstall', 'skill_toggle', 'skill_pin'].includes(operation))
+    if (!['skill_import', 'skill_update', 'skill_uninstall', 'skill_toggle', 'skill_pin'].includes(operation))
       throw httpError(400, '不支持的个人资源操作')
     return this.fileManager.personalResources(body)
   }
@@ -335,7 +360,7 @@ export class WorkbenchService {
   async listSkills() {
     const skills = await this.skills.list({ cwd: this.workspace })
     return skills.map((skill) => ({
-      id: skill.name, name: skill.name, description: skill.description, path: skill.path ?? '',
+      id: skill.name, name: skill.name, displayName: skillDisplayName(skill), metadata: skill.metadata, source: skill.source, invocation: skill.invocation, description: skill.description, path: skill.path ?? '',
       enabled: true, readonly: skill.source === 'custom' || skill.source === 'bundled',
       scope: skill.source === 'custom' || skill.source === 'bundled' ? 'global' : 'personal',
       provider: skill.provider,
@@ -345,7 +370,7 @@ export class WorkbenchService {
   async inspectSkill(name) {
     const skill = await this.skills.get(name, { cwd: this.workspace })
     if (!skill) throw httpError(404, '技能不存在')
-    return { id: skill.name, name: skill.name, description: skill.description, path: skill.path ?? '', content: skill.content,
+    return { id: skill.name, name: skill.name, displayName: skillDisplayName(skill), metadata: skill.metadata, source: skill.source, invocation: skill.invocation, description: skill.description, path: skill.path ?? '', content: skill.content,
       enabled: true, readonly: skill.source === 'custom' || skill.source === 'bundled',
       scope: skill.source === 'custom' || skill.source === 'bundled' ? 'global' : 'personal' }
   }
@@ -365,25 +390,52 @@ export class WorkbenchService {
     const line = String(body.command ?? '').trim()
     if (!/^\/(?:goal|plan|compact)(?:\s|$)/.test(line) && !(allowTodoClear && line === '/todos-clear'))
       throw httpError(400, '不支持的工作台命令')
-    const operation = (async () => {
-      chat = await this.withChatMutation(chatId, () => this.ensureChatSession(owner, this.requireChat(owner, chatId), { allowActive: true }))
+    const operation = this.withChatMutation(chatId, async () => {
+      const latestControl = this.database.getControl(owner.ownerId, chatId)
+      if (body.expected_revision !== undefined && body.expected_revision !== latestControl.revision)
+        throw httpError(409, '控制状态版本已改变，请刷新后重试')
+      chat = await this.ensureChatSession(owner, this.requireChat(owner, chatId))
       const agent = this.agents.get(chat.sessionId)
       if (!agent) throw httpError(409, '会话暂时无法恢复，请稍后重试')
-      const execution = await this.commands.execute(agent, line, [], new AbortController().signal)
-      if (!execution) throw httpError(400, '命令不存在或参数无效')
-      if (execution.result?.kind === 'error') throw httpError(409, execution.result.text)
-      const plan = /^\/plan\s+(.+)$/.exec(line)?.[1]?.trim()
-      if (plan) {
-        const current = this.database.getControl(owner.ownerId, chatId)
-        this.database.updateControlBySession(chat.sessionId, {
-          plan: plan === 'off'
-            ? { ...current.plan, active: false, pending: true }
-            : { ...current.plan, objective: plan },
-        })
+      const startsGoal = /^\/goal\s+/.test(line) && !/^\/goal\s+(?:pause|clear)\s*$/.test(line)
+      let goalRun
+      let createdGoalRun = false
+      if (startsGoal) {
+        if (agent.status !== 'running' && chat.selection.model) {
+          await requireDatabaseModel(this.platformClient, this.sessions, owner, chat.selection.model, this.modelSettings)
+          await this.sessions.selectModel({ sessionId: chat.sessionId, ...splitModel(chat.selection.model),
+            ...(chat.selection.model_parameters?.reasoning_effort ? { reasoningEffort: chat.selection.model_parameters.reasoning_effort } : {}) })
+        }
+        goalRun = this.database.activeRunBySession(chat.sessionId)
+        if (!goalRun || goalRun.status !== 'running') {
+          const mcpTools = await this.freezeMcpTools(owner, chat.selection.tools ?? [])
+          goalRun = this.database.createRun({ ownerId: owner.ownerId, chatId, sessionId: chat.sessionId,
+            query: line, selection: chat.selection, mcpTools, requestKey: `goal:${requestKey}` }).run
+          createdGoalRun = true
+          this.database.appendEvent(owner.ownerId, goalRun.id, { event: 'workbench_status', status: 'queued' })
+        }
+        this.database.setGoalRun(chat.sessionId, goalRun.id)
       }
-      const result = { state: this.database.getControl(owner.ownerId, chatId), message: execution.result?.text ?? '', run: null }
+      let execution
+      try {
+        execution = await this.commands.execute(agent, line, [], new AbortController().signal)
+        if (!execution) throw httpError(400, '命令不存在或参数无效')
+        if (execution.result?.kind === 'error') throw httpError(409, execution.result.text)
+      } catch (error) {
+        if (createdGoalRun) {
+          this.database.transitionRun(owner.ownerId, goalRun.id, 'failed', error.message)
+          this.database.appendEvent(owner.ownerId, goalRun.id, { event: 'workbench_end', status: 'failed', error: error.message })
+        }
+        throw error
+      }
+      const state = await this.getControl(owner, chatId)
+      if (createdGoalRun && state.goal?.phase !== 'active') {
+        this.database.transitionRun(owner.ownerId, goalRun.id, 'completed')
+        this.database.appendEvent(owner.ownerId, goalRun.id, { event: 'workbench_end', status: 'completed' })
+      }
+      const result = { state, message: execution.result?.text ?? '', run: goalRun ? this.getRun(owner, goalRun.id) : null }
       return this.database.saveCommandReceipt(owner.ownerId, chatId, requestKey, result)
-    })()
+    })
     this.inflightCommands.set(key, operation)
     try { return await operation }
     finally { this.inflightCommands.delete(key) }
@@ -394,9 +446,14 @@ export class WorkbenchService {
     return result.state
   }
 
-  getControl(owner, chatId) {
-    this.requireChat(owner, chatId)
-    return this.database.getControl(owner.ownerId, chatId)
+  async getControl(owner, chatId) {
+    const chat = this.requireChat(owner, chatId)
+    const state = this.database.getControl(owner.ownerId, chatId)
+    if (!this.sessionQuery) return state
+    const source = await this.sessionQuery.observeSession(chat.sessionId)
+    try {
+      return { ...state, plan: source.projections?.values?.plan ?? { active: false, pending: false } }
+    } finally { source[Symbol.dispose]?.() }
   }
 
   followups(owner, chatId, tracked) {
@@ -408,10 +465,15 @@ export class WorkbenchService {
     this.requireChat(owner, chatId)
     if (typeof requestKey !== 'string' || requestKey.length === 0 || requestKey.length > 128 || requestKey.includes('\0'))
       throw httpError(400, 'request_key 格式无效')
+    const run = this.database.findRunByRequestKey(owner.ownerId, chatId, requestKey)
+    if (run && this.database.submission(owner.ownerId, run.id)?.dispatched !== false) {
+      // The native boundary has been crossed. Do not create an admission tombstone
+      // or remove an inbox item as a side effect of cancelling the Session.
+      return { accepted: true, run: await this.stopRun(owner, run.id) }
+    }
     // Persist independently of admission's chat lock: cancellation must win
     // even while attachments, model setup or sandbox discovery are stalled.
     this.database.saveCommandReceipt(owner.ownerId, chatId, `run-stop:${requestKey}`, { cancelled: true })
-    const run = this.database.findRunByRequestKey(owner.ownerId, chatId, requestKey)
     if (run) {
       try { return { accepted: true, run: await this.stopRun(owner, run.id) } }
       catch (error) {
@@ -422,25 +484,31 @@ export class WorkbenchService {
     return { accepted: true, run: null }
   }
 
-  stopRun(owner, runId) {
+  async stopRun(owner, runId) {
     const run = this.database.getRun(owner.ownerId, runId)
     if (!run) throw httpError(404, '任务不存在')
-    if (['completed', 'failed', 'cancelled', 'interrupted', 'discarded', 'steered'].includes(run.status)) return runDto(run)
-    if (this.scheduler && !this.database.submission(owner.ownerId, run.id)?.dispatched && run.status === 'queued') {
+    if (this.scheduler && this.database.submission(owner.ownerId, run.id)?.dispatched === false && run.status === 'queued') {
       return runDto(this.database.transitionRun(owner.ownerId, run.id, 'cancelled'))
     }
-    const active = this.database.activeRun(owner.ownerId, run.chatId)
-    if (active?.id !== run.id) {
-      if (!run.messageId) throw httpError(409, '排队消息尚未持久化，请稍后重试')
-      return this.sessions.updateQueue({ sessionId: run.sessionId, itemId: run.messageId, action: { kind: 'remove' } })
-        .then(() => runDto(this.database.transitionRun(owner.ownerId, run.id, 'cancelled')))
+    // Native cancel retains the inbox. Only native events change the turn cache;
+    // an acknowledgement is not a terminal state and creates no `stopping` state.
+    const agent = this.agents.get(run.sessionId)
+    const goal = agent && this.goals?.get(agent)
+    const active = currentExecutionRun(this.database, this.agents, run.sessionId)
+      ?? (goal?.phase === 'active' ? this.database.goalRun(run.sessionId) : undefined)
+    if ((active && active.id !== run.id) || (!active && (goal?.phase === 'active' || agent?.status === 'running')))
+      throw httpError(409, '当前任务已改变，请刷新后重试', 'STALE_RUN')
+    const runIds = run.status !== 'queued' || active?.id === run.id ? [run.id] : []
+    for (const id of runIds) this.database.requireRunFence(owner.ownerId, id)
+    let nativeError
+    try {
+      if (goal?.phase === 'active') this.goals.pause(agent, { id: goal.id, revision: goal.revision })
+      this.sessions.cancel({ sessionId: run.sessionId })
     }
-    this.database.transitionRun(owner.ownerId, run.id, 'stopping')
-    try { this.sessions.cancel({ sessionId: run.sessionId }) }
-    catch (error) {
-      this.database.transitionRun(owner.ownerId, run.id, run.status)
-      throw httpError(502, `暂停请求未确认，请重试：${error?.message ?? error}`)
-    }
+    catch (error) { nativeError = error }
+    const confirmation = await fenceMcpExecutions(this.platformClient, owner, runIds)
+    for (const id of runIds) this.database.confirmRunFence(owner.ownerId, id, confirmation)
+    if (nativeError) throw httpError(502, `暂停请求未确认，请重试：${nativeError?.message ?? nativeError}`)
     return runDto(this.database.getRun(owner.ownerId, run.id))
   }
 
@@ -450,10 +518,9 @@ export class WorkbenchService {
     const input = this.database.listPendingInputs(owner.ownerId, sourceRunId).find((value) => value.requestId === body.request_id)
     if (!input) throw httpError(404, '问题不存在')
     if (input.answer?.supplement_run_id) return this.getRun(owner, input.answer.supplement_run_id)
-    if (input.status !== 'skipped') throw httpError(409, '只有已跳过的问题可以补答')
-    const answer = typeof body.action === 'string' && body.action
-      ? body.action
-      : Object.values(body.values ?? {}).filter((value) => typeof value === 'string' && value).join('\n')
+    if (!['skipped', 'timeout', 'aborted'].includes(input.status)) throw httpError(409, '只有已跳过的问题可以补答')
+    const nativeAnswer = toAnswer(input.payload.questions ?? [], body)
+    const answer = nativeAnswer.answers.map((item) => [...item.selected, item.custom].filter(Boolean).join('\n')).filter(Boolean).join('\n')
     if (!answer) throw httpError(400, '补充回答不能为空')
     const chat = this.requireChat(owner, source.chatId)
     const requestKey = `input-supplement:${input.requestId}`
@@ -466,33 +533,40 @@ export class WorkbenchService {
     })
     if (created || (run.status === 'queued' && !run.messageId)) {
       if (created) this.database.appendEvent(owner.ownerId, run.id, { event: 'workbench_status', status: 'queued' })
-      const fields = input.payload.args?.fields ?? []
-      const context = fields.map((field) => ({ question: field.label, answer: body.values?.[field.name] ?? null }))
+      const context = (input.payload.questions ?? []).map((question) => ({ question: question.question, answer: nativeAnswer.answers.find((item) => item.id === question.id) }))
       const content = [{ type: 'text', text: `用户补答了之前跳过的提问，请结合这些新信息继续处理当前任务，必要时修正之前的假设。\n${JSON.stringify(context)}\n补充回答：${answer}` }]
-      const active = this.database.activeRun(owner.ownerId, chat.id)
-      if (active && active.id !== run.id && ['running', 'waiting_input'].includes(active.status)) {
-        await this.sessions.prompt({ requestId: run.id, sessionId: active.sessionId, mode: 'steer', content }, new AbortController().signal)
-        this.database.transitionRun(owner.ownerId, run.id, 'steered')
-        this.database.appendEvent(owner.ownerId, run.id, { event: 'workbench_steered', steer_target_run_id: active.id })
-        this.database.appendEvent(owner.ownerId, active.id, {
-          event: 'workbench_steering', steering_id: run.id, query: answer, attachments: [],
-        })
-      } else if (this.scheduler) await this.scheduler.enqueue(run, content)
+      if (this.scheduler) await this.scheduler.enqueue(run, content)
       else await this.sessions.prompt({ requestId: run.id, sessionId: run.sessionId, mode: 'queue', content }, new AbortController().signal)
     }
     this.database.recordInputSupplement(owner.ownerId, sourceRunId, input.requestId, {
-      values: body.values ?? {}, action: body.action ?? null,
-      custom_fields: body.custom_fields ?? [], skipped_fields: body.skipped_fields ?? [], supplement_run_id: run.id,
+      ...nativeAnswer, supplement_run_id: run.id,
     })
     return this.getRun(owner, run.id)
+  }
+
+  async editQueued(owner, runId, body) {
+    const run = this.database.getRun(owner.ownerId, runId)
+    if (!run) throw httpError(404, '任务不存在')
+    const text = body.content?.[0]?.text
+    if (!Array.isArray(body.content) || body.content.length !== 1 || body.content[0].type !== 'text' || typeof text !== 'string' || !text.trim())
+      throw httpError(400, '排队编辑仅接受非空文本')
+    if (run.attachments?.length || normalizeResourceMentions(run.selection.resource_mentions).skills.length || normalizeResourceMentions(run.selection.resource_mentions).tools.length)
+      throw httpError(409, '包含附件或资源选择的消息暂不支持文本编辑')
+    // Editing has exactly the same admission boundary as DSH updateQueue:
+    // only an inbox occurrence can be edited, never a currently executing turn.
+    if (!run.messageId) throw httpError(409, '消息尚未进入会话队列')
+    await this.sessions.updateQueue({ sessionId: run.sessionId, itemId: run.messageId, action: { kind: 'edit', content: body.content } })
+    // Update the display cache only after the native inbox accepts the edit.
+    this.database.db.prepare('UPDATE runs SET query = ? WHERE id = ? AND owner_id = ?').run(text, run.id, owner.ownerId)
+    return this.getRun(owner, runId)
   }
 
   async removeQueued(owner, runId) {
     const run = this.database.getRun(owner.ownerId, runId)
     if (!run) throw httpError(404, '任务不存在')
     if (run.status === 'discarded') return runDto(run)
-    if (run.status !== 'queued') throw httpError(409, '只有排队中的消息可以删除')
-    if (this.scheduler && !this.database.submission(owner.ownerId, run.id)?.dispatched)
+    if (run.status !== 'queued') throw httpError(409, '消息已离开队列，请刷新后重试', 'STALE_RUN')
+    if (this.scheduler && this.database.submission(owner.ownerId, run.id)?.dispatched === false)
       return runDto(this.database.transitionRun(owner.ownerId, run.id, 'discarded'))
     if (!run.messageId) throw httpError(409, '排队消息尚未持久化，请稍后重试')
     await this.sessions.updateQueue({ sessionId: run.sessionId, itemId: run.messageId, action: { kind: 'remove' } })
@@ -500,6 +574,12 @@ export class WorkbenchService {
   }
 
   async steer(owner, runId, targetRunId) {
+    const original = this.database.getRun(owner.ownerId, runId)
+    if (!original) throw httpError(404, '任务不存在')
+    return this.withChatMutation(original.chatId, () => this.steerQueued(owner, runId, targetRunId))
+  }
+
+  async steerQueued(owner, runId, targetRunId) {
     const run = this.database.getRun(owner.ownerId, runId)
     if (!run) throw httpError(404, '任务不存在')
     if (run.status === 'steered') {
@@ -507,15 +587,34 @@ export class WorkbenchService {
       if (accepted.steer_target_run_id === targetRunId) return accepted
       throw httpError(409, '消息已直接发送到其他任务')
     }
-    const active = this.database.activeRun(owner.ownerId, run.chatId)
-    if (!active || active.id !== targetRunId || !['running', 'waiting_input'].includes(active.status)) throw httpError(409, '目标任务已不再运行')
-    if (run.status !== 'queued') throw httpError(409, '排队消息尚不能插话')
-    const pending = this.scheduler && this.database.submission(owner.ownerId, run.id)
+    // Image admission may await I/O. Perform it before the final synchronous
+    // check and native mutation so target completion cannot race the check.
+    let pending = this.scheduler && this.database.submission(owner.ownerId, run.id)
+    const content = pending && !pending.dispatched
+      ? this.attachments ? await this.attachments.admitPromptContent(pending.content) : pending.content
+      : undefined
+    await this.scheduler?.pendingTick
+    const active = this.database.getRun(owner.ownerId, targetRunId)
+    const current = this.database.getRun(owner.ownerId, runId)
+    const agent = this.agents.get(run.sessionId)
+    const turnStart = agent?.session?.snapshotEvents?.().findLast(event => event.type === 'turn/start')
+    const bound = turnStart && this.database.runForTurn(run.sessionId, turnStart.data.turn)
+    if (!active || active.sessionId !== run.sessionId || active.id === run.id
+      || !['running', 'waiting_input'].includes(active.status) || current?.status !== 'queued'
+      || agent?.status !== 'running' || bound?.id !== active.id
+      || !this.scheduler?.hasAdmission(run.sessionId))
+      throw Object.assign(httpError(409, '目标任务已结束或正在切换，请刷新后重试'), { code: 'STALE_RUN' })
+    pending = this.database.submission(owner.ownerId, runId)
     if (pending && !pending.dispatched) {
-      await this.sessions.prompt({ requestId: run.id, sessionId: active.sessionId, mode: 'steer', content: pending.content }, new AbortController().signal)
+      if (!content || content.some(part => part.type === 'image' && !part.attachment))
+        throw httpError(503, '图片尚未完成原生接入，请稍后重试')
+      agent.steer(createUserMessage({ content, source: { kind: 'user', rpcId: run.id } }))
+      this.database.finishSubmission(owner.ownerId, run.id)
     } else {
-      if (!run.messageId) throw httpError(409, '排队消息尚不能插话')
-      await this.sessions.updateQueue({ sessionId: run.sessionId, itemId: run.messageId, action: { kind: 'steer' } })
+      const message = [...agent.inbox.nextTurn, ...agent.inbox.nextStep].find(item => item.id === current.messageId)
+      if (!message) throw Object.assign(httpError(409, '排队消息已被接收，请刷新后重试'), { code: 'STALE_RUN' })
+      agent.inbox.remove(message.id)
+      agent.steer(message)
     }
     this.database.transitionRun(owner.ownerId, run.id, 'steered')
     this.database.appendEvent(owner.ownerId, run.id, { event: 'workbench_steered', steer_target_run_id: targetRunId })
@@ -533,7 +632,8 @@ export class WorkbenchService {
 
   inputRunDto(owner, run, events = []) {
     const inputs = this.database.listPendingInputs(owner.ownerId, run.id)
-    const steering = this.database.steeringEvents(owner.ownerId, run.id)
+    const steering = events.length ? events.filter(event => event.event === 'workbench_steering' || event.event === 'workbench_steered')
+      : this.database.steeringEvents(owner.ownerId, run.id)
     return {
       ...runDto(run, events, inputs.at(-1)),
       ...this.database.runTiming(owner.ownerId, run.id),
@@ -541,14 +641,12 @@ export class WorkbenchService {
       steering_messages: steering.filter((event) => event.event === 'workbench_steering').map((event) => ({
         id: event.steering_id, query: event.query, attachments: event.attachments ?? [],
       })),
-      human_input_history: inputs.filter((input) => ['skipped', 'submitted'].includes(input.status)).map((input) => {
+      human_input_history: inputs.filter((input) => ['skipped', 'timeout', 'aborted', 'submitted'].includes(input.status)).map((input) => {
         const answers = input.answer?.answers ?? []
-        const values = input.answer?.values ?? Object.fromEntries(answers.map((answer) => [answer.id, answer.custom ?? answer.selected?.[0] ?? '']))
         return {
-          ...input.payload, request_id: input.requestId, status: input.status, values,
-          action: input.answer?.action ?? (input.payload.tool_name === 'exit_plan_mode' ? Object.values(values)[0] || null : null),
-          custom_fields: input.answer?.custom_fields ?? answers.filter((answer) => answer.custom).map((answer) => answer.id),
-          skipped_fields: input.answer?.skipped_fields ?? (input.payload.args.fields ?? []).filter((field) => !values[field.name]).map((field) => field.name),
+          ...input.payload, request_id: input.requestId,
+          answers,
+          outcome: input.status, status: ['timeout', 'aborted'].includes(input.status) ? 'skipped' : input.status,
           ...(input.answer?.supplement_run_id ? { supplement_run_id: input.answer.supplement_run_id } : {}),
         }
       }),
@@ -572,26 +670,13 @@ function normalizeMcpResource(value) {
   if (typeof value.server_id !== 'string' || typeof value.tool_name !== 'string' || typeof value.description !== 'string') throw httpError(502, '平台 MCP 工具元数据无效')
   if (!value.inputSchema || typeof value.inputSchema !== 'object' || Array.isArray(value.inputSchema)) throw httpError(502, '平台 MCP 参数 schema 无效')
   return {
-    id: value.id, runtime_name: value.runtime_name, version: value.version, manifest_version: value.manifest_version ?? '',
+    id: value.id, runtime_name: platformToolName(value), version: value.version, manifest_version: value.manifest_version ?? '',
     scope: value.scope, server_id: value.server_id, tool_name: value.tool_name,
-    name: value.name ?? value.tool_name, display_name: value.display_name ?? value.name,
+    name: platformToolName(value), display_name: platformToolName(value),
     description: value.description, inputSchema: value.inputSchema,
     group: value.group ?? 'mcp', provider: value.provider ?? 'mcp',
     provider_name: value.provider_name ?? value.server_id,
   }
-}
-
-function skillMetadata(content) {
-  if (typeof content !== 'string' || Buffer.byteLength(content) > 65_536) throw new Error('SKILL.md 无效或超过 64 KiB')
-  const lines = content.replace(/^\uFEFF/, '').split(/\r?\n/)
-  if (lines[0]?.trim() !== '---') throw new Error('SKILL.md 缺少 YAML 文件头')
-  const end = lines.findIndex((line, index) => index > 0 && line.trim() === '---')
-  if (end < 0) throw new Error('SKILL.md YAML 文件头不完整')
-  const metadata = yaml.load(lines.slice(1, end).join('\n'), { schema: yaml.JSON_SCHEMA })
-  if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) throw new Error('SKILL.md 文件头无效')
-  if (typeof metadata.name !== 'string' || !/^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/.test(metadata.name)) throw new Error('技能 name 无效')
-  if (typeof metadata.description !== 'string' || !metadata.description.trim() || metadata.description.length > 2000) throw new Error('技能 description 无效')
-  return { name: metadata.name, description: metadata.description.trim() }
 }
 
 function splitModel(value) {
@@ -626,6 +711,7 @@ export function runDto(run, events = [], pending = null) {
     can_fork: ['completed', 'failed', 'cancelled', 'interrupted'].includes(run.status) && Number.isInteger(run.selection?.fork_source?.endSeq ?? run.sourceEndSeq),
     resource_mentions: normalizeResourceMentions(run.selection?.resource_mentions),
     status: run.status, error: run.error, feedback: run.feedback ?? null, events, events_cursor: `${run.seq}-0`,
+    stop_confirmation: run.stopConfirmation ?? null,
     queue_order: run.queueOrder, parent_run_id: run.parentRunId ?? null,
     activity_protocol: 1, followup_protocol: 1, message_id: run.messageId ?? null, attachments: run.attachments ?? [],
     pending: waiting?.payload ?? null,
@@ -635,4 +721,10 @@ export function runDto(run, events = [], pending = null) {
       interacted: waiting.interacted, server_now: Math.floor(Date.now() / 1000),
     } : null,
   }
+}
+
+// HTTP admission maps provider validation errors; parsing remains owned by DSH.
+async function readImportedSkill(content) {
+  try { return await readSkillDefinition(content) }
+  catch (error) { throw httpError(400, error.message) }
 }

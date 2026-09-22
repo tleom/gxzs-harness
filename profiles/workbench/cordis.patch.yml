@@ -106,7 +106,6 @@
         assertionIssuer: !!js process.env.GXZS_ASSERTION_ISSUER
         assertionAudiencePath: !!js process.env.GXZS_ASSERTION_AUDIENCE_PATH ?? '/ai/workbench'
         assertionKeyEnv: GXZS_ASSERTION_SIGNING_KEY
-        migrationTokenEnv: GXZS_MIGRATION_TOKEN
         humanInputTimeoutSeconds: 60
     - id: gxzs-workbench-mcp-tools
       name: '@gxzs/dsh-workbench-mcp-tools'

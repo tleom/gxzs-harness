@@ -45,7 +45,6 @@ const result = spawnSync(cli, ['--profile', 'workbench', '--dump-config'], {
     GXZS_PLATFORM_INTERNAL_URL: 'http://platform.internal:8080/internal/workbench',
     GXZS_PLATFORM_INTERNAL_TOKEN: 'config-check-platform-token',
     GXZS_ASSERTION_SIGNING_KEY: Buffer.alloc(32, 1).toString('base64'),
-    GXZS_MIGRATION_TOKEN: 'config-check-migration-token',
   },
   encoding: 'utf8',
   shell: process.platform === 'win32',

@@ -2,6 +2,7 @@ import { createHash, createHmac, randomUUID } from 'node:crypto'
 import { Readable } from 'node:stream'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { apply } from '../src/index.js'
+import { publishedModels } from './model-fixture.js'
 
 const cleanups = []
 afterEach(() => cleanups.splice(0).forEach((cleanup) => cleanup()))
@@ -9,13 +10,12 @@ afterEach(() => cleanups.splice(0).forEach((cleanup) => cleanup()))
 function setup() {
   const key = Buffer.alloc(32, 9).toString('base64')
   vi.stubEnv('TEST_ASSERTION_KEY', key)
-  vi.stubEnv('TEST_MIGRATION_TOKEN', 'migration-secret')
   const sessions = new Map()
   let handler
   const context = {
     webServer: { register: vi.fn((route) => { handler = route.handler; return () => {} }) },
     sessionController: {
-      modelCatalog: async () => ({ default: { provider: 'p', model: 'm' }, groups: [] }),
+      modelCatalog: async () => ({ default: { provider: 'p', model: 'm' }, groups: [{ id: 'p', models: [{ id: 'm' }] }] }),
       create: async (request = {}) => {
         const sessionId = request.sessionId || randomUUID()
         sessions.set(sessionId, { seq: 0, append: vi.fn(function () { this.seq += 1; return { seq: this.seq - 1 } }) })
@@ -42,7 +42,7 @@ function setup() {
     },
     workbenchPlatformClient: {
       request: vi.fn(async () => ({ status: 200, headers: new Headers({ 'content-type': 'application/json' }), bytes: Buffer.from('{"data":{"text":"ok"}}') })),
-      json: vi.fn(async () => ({ tools: [] })),
+      json: vi.fn(async ({ route }) => route === 'workbench/config' ? publishedModels() : ({ tools: [] })),
     },
     agents: { get: (id) => sessions.has(id) ? { session: sessions.get(id) } : undefined }, commands: {},
     skills: { list: vi.fn(async () => []), get: async () => undefined },
@@ -54,7 +54,7 @@ function setup() {
   apply(context, {
     basePath: '/ai/workbench', databasePath: ':memory:', workspace: '/workspace',
     assertionIssuer: 'gxzs', assertionAudiencePath: '/console/api/workbench', assertionKeyEnv: 'TEST_ASSERTION_KEY',
-    ownerId: 't:42', migrationTokenEnv: 'TEST_MIGRATION_TOKEN', humanInputTimeoutSeconds: 60,
+    ownerId: 't:42', humanInputTimeoutSeconds: 60,
   })
   cleanups.push(() => vi.unstubAllEnvs())
   return { handler, key, context }
@@ -89,16 +89,19 @@ async function call(handler, key, method, route, value, authenticated = true, us
 }
 
 describe('authenticated workbench HTTP handler', () => {
-  it('requires a second migration token in addition to the owner assertion', async () => {
+  it('reports live but unready until native recovery and MCP bootstrap are complete', async () => {
+    const { handler, key, context } = setup()
+    await expect(call(handler, key, 'GET', '/health', undefined, false)).resolves.toMatchObject({ status: 503, body: { live: true, ready: false } })
+    const runtime = context.reflect.provide.mock.calls.find(([name]) => name === 'workbenchRuntime')[1]
+    runtime.mcpCatalogState = { ready: true, status: 'ready' }
+    await expect(call(handler, key, 'GET', '/health', undefined, false)).resolves.toMatchObject({ status: 200, body: { live: true, ready: true, recovery: 'ready' } })
+    runtime.mcpCatalogState = { ready: false, status: 'unavailable' }
+    await expect(call(handler, key, 'GET', '/health', undefined, false)).resolves.toMatchObject({ status: 503, body: { live: true, ready: false, resources: 'unavailable' } })
+  })
+
+  it('does not expose the retired migration endpoint', async () => {
     const { handler, key } = setup()
-    const bundle = {
-      version: 1, source_id: 'empty-batch', owner_id: 't:42',
-      workspace: { id: '33333333-3333-4333-8333-333333333333', tree_version: 'tree-v1', files: 0, bytes: 0, samples: [] },
-      chats: [],
-    }
-    await expect(call(handler, key, 'POST', '/migration/import', bundle)).resolves.toMatchObject({ status: 401 })
-    await expect(call(handler, key, 'POST', '/migration/import', bundle, true, '42', { 'x-gxzs-migration-token': 'migration-secret' }))
-      .resolves.toMatchObject({ status: 200, body: { data: { source_id: 'empty-batch', chats: [] } } })
+    await expect(call(handler, key, 'POST', '/migration/import', {})).resolves.toMatchObject({ status: 501 })
   })
 
   it('returns a real assertion-derived identity without a data envelope', async () => {
@@ -114,7 +117,7 @@ describe('authenticated workbench HTTP handler', () => {
     })
   })
 
-  it('publishes personal skills and the GXZS assistant identity', async () => {
+  it('publishes personal skills and registers only the database prompt extension', async () => {
     const { handler, key, context } = setup()
     context.skills.list.mockResolvedValueOnce([
       { name: 'legal-draft', description: '法律文书', source: 'user-dsh', provider: 'gxzs-sandbox-personal' },
@@ -127,12 +130,12 @@ describe('authenticated workbench HTTP handler', () => {
         { id: 'global-skill', scope: 'global' },
       ] } },
     })
-    expect(context.systemPrompt.section).toHaveBeenCalledWith(expect.objectContaining({
-      name: 'gxzs:identity', order: 1, text: expect.any(Function),
-    }))
-    const resources = context.systemPrompt.section.mock.calls.find(([section]) => section.name === 'gxzs:resource-kinds')?.[0]
-    expect(resources.text()).toContain('MCP 插件通过已注册的工具函数直接调用')
-    expect(resources.text()).toContain('不能作为 skill 的技能名')
+    expect(context.systemPrompt.section).not.toHaveBeenCalled()
+    const assemble = context.on.mock.calls.find(([event]) => event === 'system-prompt/assemble')[1]
+    context.workbenchPlatformClient.json.mockResolvedValueOnce({ data: { enabled: true, system_prompt: '数据库规则' } })
+    const original = { sections: [{ name: 'deployment:persona-prefix', text: '原生身份' }], contexts: [], tools: [], variables: {} }
+    const result = await assemble(original, {}, async () => original)
+    expect(result.sections).toEqual([...original.sections, { name: 'gxzs:database-prompt', text: '数据库规则', interpolate: false }])
   })
 
   it('rejects missing assertions before routing', async () => {

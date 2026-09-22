@@ -7,10 +7,15 @@ import { encodeCursor } from './cursor.js'
 const TERMINAL = new Set(['completed', 'failed', 'cancelled', 'interrupted', 'discarded', 'steered'])
 
 export class WorkbenchDatabase {
-  constructor(filename, { onEvent } = {}) {
+  constructor(filename, { onEvent, streamFlushMs = 20, streamBatchBytes = 64 * 1024, onStreamError } = {}) {
     if (filename !== ':memory:') mkdirSync(dirname(filename), { recursive: true })
     this.db = new DatabaseSync(filename)
     this.onEvent = onEvent
+    this.onStreamError = onStreamError
+    this.streamFlushMs = streamFlushMs
+    this.streamBatchBytes = streamBatchBytes
+    this.pendingStream = []
+    this.pendingStreamBytes = 0
     this.db.exec('PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA busy_timeout = 5000;')
     this.migrate()
   }
@@ -25,12 +30,6 @@ export class WorkbenchDatabase {
       CREATE TABLE IF NOT EXISTS schema_migrations (
         version INTEGER PRIMARY KEY,
         applied_at INTEGER NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS migration_imports (
-        source_id TEXT PRIMARY KEY,
-        digest TEXT NOT NULL,
-        result_json TEXT NOT NULL,
-        imported_at INTEGER NOT NULL
       );
       CREATE TABLE IF NOT EXISTS chats (
         id TEXT PRIMARY KEY,
@@ -84,6 +83,26 @@ export class WorkbenchDatabase {
         start_seq INTEGER NOT NULL,
         PRIMARY KEY(session_id, turn_number)
       );
+      CREATE TABLE IF NOT EXISTS run_turns (
+        session_id TEXT NOT NULL,
+        turn_number INTEGER NOT NULL,
+        run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+        PRIMARY KEY(session_id, turn_number)
+      );
+      CREATE TABLE IF NOT EXISTS projected_native_events (
+        session_id TEXT NOT NULL,
+        source_seq INTEGER NOT NULL,
+        PRIMARY KEY(session_id, source_seq)
+      );
+      CREATE TABLE IF NOT EXISTS goal_runs (
+        session_id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE
+      );
+      CREATE TABLE IF NOT EXISTS run_fences (
+        run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
+        confirmed INTEGER NOT NULL DEFAULT 0,
+        result_json TEXT
+      );
       CREATE TABLE IF NOT EXISTS run_events (
         run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
         seq INTEGER NOT NULL,
@@ -135,62 +154,61 @@ export class WorkbenchDatabase {
     `)
     const versions = this.db.prepare('SELECT version FROM schema_migrations ORDER BY version').all().map((row) => row.version)
     if (versions.some((version) => version !== 3)) throw new Error('unsupported workbench database schema; provision a new empty database')
+    if (!this.db.prepare('PRAGMA table_info(chats)').all().some((column) => column.name === 'directory'))
+      this.db.exec('ALTER TABLE chats ADD COLUMN directory TEXT')
+    if (!this.db.prepare('PRAGMA table_info(run_fences)').all().some((column) => column.name === 'result_json'))
+      this.db.exec('ALTER TABLE run_fences ADD COLUMN result_json TEXT')
     this.db.prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (3, ?)').run(Date.now())
+    this.db.exec(`INSERT OR IGNORE INTO run_turns(session_id, turn_number, run_id)
+      SELECT session_id, turn_number, id FROM runs WHERE turn_number IS NOT NULL AND status NOT IN ('steered', 'discarded')`)
+    this.db.exec(`INSERT OR IGNORE INTO run_fences(run_id)
+      SELECT id FROM runs WHERE turn_number IS NOT NULL AND status IN ('completed','failed','cancelled','interrupted')`)
   }
 
   transaction(operation) {
     return () => {
+      if (this.inTransaction) return operation()
       this.db.exec('BEGIN IMMEDIATE')
+      this.inTransaction = true
+      this.pendingPublications = []
       try {
         const result = operation()
         this.db.exec('COMMIT')
+        this.inTransaction = false
+        const publications = this.pendingPublications
+        this.pendingPublications = []
+        for (const [runId, entry] of publications) this.publishEvent(runId, entry)
         return result
       } catch (error) {
-        this.db.exec('ROLLBACK')
+        if (this.inTransaction) this.db.exec('ROLLBACK')
+        this.pendingPublications = []
         throw error
+      } finally {
+        this.inTransaction = false
       }
     }
   }
 
-  close() { this.db.close() }
-
-  migrationResult(sourceId, digest) {
-    const row = this.db.prepare('SELECT digest, result_json FROM migration_imports WHERE source_id = ?').get(sourceId)
-    if (!row) return undefined
-    if (row.digest !== digest) throw Object.assign(new Error('迁移源内容已改变，请使用新的 source_id'), { status: 409 })
-    return JSON.parse(row.result_json)
+  close() {
+    this.flushStreamEvents()
+    clearTimeout(this.streamTimer)
+    this.db.close()
   }
 
-  recordMigration(sourceId, digest, result, now = Date.now()) {
-    this.db.prepare('INSERT INTO migration_imports(source_id, digest, result_json, imported_at) VALUES (?, ?, ?, ?)')
-      .run(sourceId, digest, JSON.stringify(result), now)
-    return result
+  publishEvent(runId, entry) {
+    try { this.onEvent?.(runId, entry) }
+    catch { /* Observers cannot roll back a committed cursor or trigger replay. */ }
   }
 
-  importChat({ id, ownerId, sessionId, title, pinned = false, favorited = false, selection, createdAt, updatedAt }) {
+  importChat({ id, ownerId, sessionId, title, pinned = false, favorited = false, selection, createdAt, updatedAt, directory = null }) {
     const existing = this.getChat(ownerId, id)
     if (existing) return existing
     this.db.prepare(`INSERT INTO chats
-      (id, owner_id, session_id, title, pinned, favorited, selection_json, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-      .run(id, ownerId, sessionId, title, Number(pinned), Number(favorited), JSON.stringify(selection), createdAt, updatedAt)
+      (id, owner_id, session_id, title, pinned, favorited, selection_json, created_at, updated_at, directory)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(id, ownerId, sessionId, title, Number(pinned), Number(favorited), JSON.stringify(selection), createdAt, updatedAt, directory)
     this.db.prepare('INSERT INTO control_state(chat_id, updated_at) VALUES (?, ?)').run(id, updatedAt)
     return this.getChat(ownerId, id)
-  }
-
-  importRun({ id, ownerId, chatId, sessionId, query, status, selection, parentRunId, createdAt, updatedAt, events }) {
-    const existing = this.getRun(ownerId, id)
-    if (existing) return existing
-    this.db.prepare(`INSERT INTO runs
-      (id, owner_id, chat_id, session_id, query, status, selection_json, parent_run_id, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-      .run(id, ownerId, chatId, sessionId, query, status, JSON.stringify(selection), parentRunId ?? null, createdAt, updatedAt)
-    for (const event of events ?? []) {
-      const payload = { ...event }
-      delete payload._id
-      this.appendEvent(ownerId, id, payload, createdAt)
-    }
-    return this.getRun(ownerId, id)
   }
 
   createChat({ ownerId, sessionId, selection, title = '新会话', id = randomUUID(), now = Date.now() }) {
@@ -268,10 +286,6 @@ export class WorkbenchDatabase {
       const queueOrder = this.db.prepare(`SELECT COALESCE(MAX(queue_order), 0) + 1 AS value
         FROM runs WHERE chat_id = ? AND status IN ('queued', 'running', 'waiting_input', 'stopping')`)
         .get(chatId).value
-      const active = this.activeRun(ownerId, chatId)
-      const queued = this.db.prepare("SELECT COUNT(*) AS count FROM runs WHERE owner_id = ? AND chat_id = ? AND status = 'queued' AND id != ?")
-        .get(ownerId, chatId, active?.id ?? '').count
-      if (queued >= 3) throw Object.assign(new Error('最多排队三条消息'), { status: 409 })
       this.db.prepare(`INSERT INTO runs
         (id, owner_id, chat_id, session_id, request_key, query, attachments_json, mcp_tools_json, status, selection_json,
          parent_run_id, queue_order, created_at, updated_at)
@@ -284,7 +298,8 @@ export class WorkbenchDatabase {
   }
 
   getRun(ownerId, id) {
-    const row = this.db.prepare(`SELECT r.* FROM runs r JOIN chats c ON c.id = r.chat_id
+    this.flushStreamEvents()
+    const row = this.db.prepare(`SELECT r.*, f.result_json AS stop_confirmation_json FROM runs r JOIN chats c ON c.id = r.chat_id LEFT JOIN run_fences f ON f.run_id=r.id
       WHERE r.id = ? AND r.owner_id = ? AND c.deleted_at IS NULL`).get(id, ownerId)
     return row ? decodeRun(row) : undefined
   }
@@ -311,6 +326,10 @@ export class WorkbenchDatabase {
     this.db.prepare(`UPDATE runs SET turn_number = ?, message_id = ?
       WHERE session_id = ? AND id = ? AND (turn_number IS NULL OR turn_number = ?)`)
       .run(turn, messageId, sessionId, requestId, turn)
+    const assigned = this.runForTurn(sessionId, turn)
+    if (!assigned) this.db.prepare(`INSERT OR IGNORE INTO run_turns(session_id, turn_number, run_id)
+      SELECT session_id, ?, id FROM runs WHERE session_id = ? AND id = ? AND status NOT IN ('steered', 'discarded')`)
+      .run(turn, sessionId, requestId)
     const start = this.db.prepare('SELECT start_seq FROM pending_turns WHERE session_id = ? AND turn_number = ?').get(sessionId, turn)
     if (start) this.db.prepare('UPDATE runs SET source_start_seq = ? WHERE session_id = ? AND id = ?').run(start.start_seq, sessionId, requestId)
     this.db.prepare('DELETE FROM pending_turns WHERE session_id = ? AND turn_number = ?').run(sessionId, turn)
@@ -318,19 +337,43 @@ export class WorkbenchDatabase {
     return row ? decodeRun(row) : undefined
   }
 
+  bindNativeTurn(run, turn) {
+    this.db.prepare('INSERT OR IGNORE INTO run_turns(session_id, turn_number, run_id) VALUES (?, ?, ?)')
+      .run(run.sessionId, turn, run.id)
+    const start = this.db.prepare('SELECT start_seq FROM pending_turns WHERE session_id=? AND turn_number=?').get(run.sessionId, turn)
+    this.db.prepare('UPDATE runs SET turn_number=COALESCE(turn_number, ?), source_start_seq=COALESCE(source_start_seq, ?) WHERE id=?')
+      .run(turn, start?.start_seq ?? null, run.id)
+    this.db.prepare('DELETE FROM pending_turns WHERE session_id=? AND turn_number=?').run(run.sessionId, turn)
+    return this.runForTurn(run.sessionId, turn)
+  }
+
+  setGoalRun(sessionId, runId) {
+    this.db.prepare('INSERT INTO goal_runs(session_id, run_id) VALUES (?, ?) ON CONFLICT(session_id) DO UPDATE SET run_id=excluded.run_id')
+      .run(sessionId, runId)
+  }
+
+  goalRun(sessionId) {
+    const row = this.db.prepare('SELECT r.* FROM runs r JOIN goal_runs g ON r.id=g.run_id WHERE g.session_id=?').get(sessionId)
+    return row ? decodeRun(row) : undefined
+  }
+
+  hasProjectedEvent(sessionId, seq) {
+    return Number.isInteger(seq) && Boolean(this.db.prepare('SELECT 1 FROM projected_native_events WHERE session_id=? AND source_seq=?').get(sessionId, seq))
+  }
+
+  markProjectedEvent(sessionId, seq) {
+    if (Number.isInteger(seq)) this.db.prepare('INSERT OR IGNORE INTO projected_native_events VALUES (?, ?)').run(sessionId, seq)
+  }
+
   setRunSourceSeq(ownerId, runId, field, seq) {
     if (!['source_start_seq', 'source_end_seq'].includes(field)) throw new TypeError('invalid source sequence field')
-    const result = this.db.prepare(`UPDATE runs SET ${field} = ? WHERE id = ? AND owner_id = ?`).run(seq, runId, ownerId)
+    const value = field === 'source_start_seq' ? `MIN(COALESCE(${field}, ?), ?)` : '?'
+    const result = this.db.prepare(`UPDATE runs SET ${field} = ${value} WHERE id = ? AND owner_id = ?`)
+      .run(...(field === 'source_start_seq' ? [seq, seq] : [seq]), runId, ownerId)
     if (result.changes !== 1) throw notFound('任务不存在')
   }
 
-  switchChatSession(ownerId, chatId, expectedSessionId, nextSessionId, now = Date.now()) {
-    const result = this.db.prepare(`UPDATE chats SET session_id = ?, updated_at = ?
-      WHERE id = ? AND owner_id = ? AND session_id = ? AND deleted_at IS NULL`)
-      .run(nextSessionId, now, chatId, ownerId, expectedSessionId)
-    if (result.changes !== 1) throw Object.assign(new Error('会话分支已改变，请刷新后重试'), { status: 409 })
-    return this.getChat(ownerId, chatId)
-  }
+
 
   previousRun(sessionId, turn) {
     const row = this.db.prepare(`SELECT * FROM runs WHERE session_id = ? AND turn_number < ? AND source_end_seq IS NOT NULL
@@ -339,8 +382,9 @@ export class WorkbenchDatabase {
   }
 
   runForTurn(sessionId, turn) {
-    const row = this.db.prepare(`SELECT * FROM runs WHERE session_id = ? AND turn_number = ?
-      AND status NOT IN ('steered', 'discarded') ORDER BY queue_order LIMIT 1`).get(sessionId, turn)
+    const row = this.db.prepare(`SELECT r.* FROM runs r LEFT JOIN run_turns t ON t.run_id=r.id
+      WHERE r.session_id = ? AND (t.turn_number = ? OR r.turn_number = ?)
+      AND r.status NOT IN ('steered', 'discarded') ORDER BY r.queue_order LIMIT 1`).get(sessionId, turn, turn)
     return row ? decodeRun(row) : undefined
   }
 
@@ -348,12 +392,14 @@ export class WorkbenchDatabase {
     if (!this.getChat(ownerId, chatId)) throw notFound('会话不存在或已被删除')
     if (tracked.length === 0) return []
     const placeholders = tracked.map(() => '?').join(', ')
-    return this.db.prepare(`SELECT * FROM runs WHERE owner_id = ? AND chat_id = ? AND id IN (${placeholders})`)
+    return this.db.prepare(`SELECT r.*, f.result_json AS stop_confirmation_json FROM runs r LEFT JOIN run_fences f ON f.run_id=r.id
+      WHERE r.owner_id = ? AND r.chat_id = ? AND r.id IN (${placeholders})`)
       .all(ownerId, chatId, ...tracked).map(decodeRun)
   }
 
   listRuns(ownerId, chatId) {
-    return this.db.prepare('SELECT * FROM runs WHERE owner_id = ? AND chat_id = ? ORDER BY created_at, rowid')
+    return this.db.prepare(`SELECT r.*, f.result_json AS stop_confirmation_json FROM runs r LEFT JOIN run_fences f ON f.run_id=r.id
+      WHERE r.owner_id = ? AND r.chat_id = ? ORDER BY r.created_at, r.rowid`)
       .all(ownerId, chatId).map(decodeRun)
   }
 
@@ -401,6 +447,9 @@ export class WorkbenchDatabase {
 
   createPendingInput(ownerId, runId, { requestId, payload, deadlineAt }, now = Date.now()) {
     if (!this.getRun(ownerId, runId)) throw notFound('任务不存在')
+    const calls = this.db.prepare(`SELECT call_id FROM tool_calls WHERE run_id = ? AND tool_name = ? AND status = 'started'`)
+      .all(runId, payload.tool_name)
+    if (calls.length === 1) payload = { ...payload, tool_call_id: calls[0].call_id }
     this.transaction(() => {
       this.db.prepare(`INSERT INTO pending_inputs
         (request_id, run_id, payload_json, status, deadline_at, created_at)
@@ -429,7 +478,7 @@ export class WorkbenchDatabase {
   recordInputSupplement(ownerId, runId, requestId, answer) {
     if (!this.getRun(ownerId, runId)) throw notFound('任务不存在')
     this.db.prepare(`UPDATE pending_inputs SET status = 'submitted', answer_json = ?
-      WHERE request_id = ? AND run_id = ? AND status = 'skipped'`)
+      WHERE request_id = ? AND run_id = ? AND status IN ('skipped', 'timeout', 'aborted')`)
       .run(JSON.stringify(answer), requestId, runId)
   }
 
@@ -486,18 +535,68 @@ export class WorkbenchDatabase {
   }
 
   appendEvent(ownerId, runId, payload, now = Date.now()) {
+    this.flushStreamEvents()
+    this.eventSequenceStatement ??= this.db.prepare('SELECT next_seq FROM runs WHERE id = ? AND owner_id = ?')
+    this.eventInsertStatement ??= this.db.prepare('INSERT INTO run_events(run_id, seq, payload_json, created_at) VALUES (?, ?, ?, ?)')
+    this.eventAdvanceStatement ??= this.db.prepare('UPDATE runs SET next_seq = next_seq + 1, updated_at = ? WHERE id = ?')
     const entry = this.transaction(() => {
-      const run = this.db.prepare('SELECT next_seq FROM runs WHERE id = ? AND owner_id = ?').get(runId, ownerId)
+      const run = this.eventSequenceStatement.get(runId, ownerId)
       if (!run) throw notFound('任务不存在')
       const sequence = run.next_seq
       const committed = { ...payload, _id: encodeCursor(sequence) }
-      this.db.prepare('INSERT INTO run_events(run_id, seq, payload_json, created_at) VALUES (?, ?, ?, ?)')
-        .run(runId, sequence, JSON.stringify(committed), now)
-      this.db.prepare('UPDATE runs SET next_seq = next_seq + 1, updated_at = ? WHERE id = ?').run(now, runId)
+      this.eventInsertStatement.run(runId, sequence, JSON.stringify(committed), now)
+      this.eventAdvanceStatement.run(now, runId)
       return committed
     })()
-    this.onEvent?.(runId, entry)
+    if (this.inTransaction) this.pendingPublications.push([runId, entry])
+    else this.publishEvent(runId, entry)
     return entry
+  }
+
+  /** Buffer only unpublished deltas; a cursor exists only after FULL commit. */
+  appendStreamEvent(ownerId, runId, payload, turn, step, now = Date.now()) {
+    if (this.streamFlushError) this.flushStreamEvents()
+    const bytes = Buffer.byteLength(JSON.stringify(payload), 'utf8')
+    this.pendingStream.push({ ownerId, runId, payload, turn, step, now, bytes })
+    this.pendingStreamBytes += bytes
+    if (this.pendingStreamBytes >= this.streamBatchBytes) return this.flushStreamEvents()
+    if (!this.streamTimer) {
+      this.streamTimer = setTimeout(() => {
+        this.streamTimer = undefined
+        try { this.flushStreamEvents() }
+        catch (error) { this.onStreamError?.(error) }
+      }, this.streamFlushMs)
+      this.streamTimer.unref?.()
+    }
+    return undefined
+  }
+
+  flushStreamEvents() {
+    if (this.flushingStream || !this.pendingStream.length) return
+    clearTimeout(this.streamTimer)
+    this.streamTimer = undefined
+    const batch = this.pendingStream.splice(0)
+    this.pendingStreamBytes = 0
+    this.flushingStream = true
+    try {
+      this.transaction(() => {
+        const marked = new Set()
+        for (const { ownerId, runId, payload, turn, step, now } of batch) {
+          const key = `${runId}:${turn}:${step}`
+          if (!marked.has(key)) {
+            this.markStreamedStep(ownerId, runId, turn, step)
+            marked.add(key)
+          }
+          this.appendEvent(ownerId, runId, payload, now)
+        }
+      })()
+      this.streamFlushError = undefined
+    } catch (error) {
+      this.pendingStream.unshift(...batch)
+      this.pendingStreamBytes += batch.reduce((total, entry) => total + entry.bytes, 0)
+      this.streamFlushError = error
+      throw error
+    } finally { this.flushingStream = false }
   }
 
   eventsAfter(ownerId, runId, after, limit = 1000) {
@@ -511,17 +610,21 @@ export class WorkbenchDatabase {
   runTiming(ownerId, runId) {
     const run = this.getRun(ownerId, runId)
     if (!run) throw notFound('任务不存在')
-    const rows = this.db.prepare('SELECT seq, payload_json, created_at FROM run_events WHERE run_id = ? ORDER BY seq').all(runId)
-    const ends = rows.filter((row) => JSON.parse(row.payload_json).event === 'workbench_end')
-    const lastEnd = ends.at(-1)
-    const previousEndSeq = ends.at(-2)?.seq ?? -1
-    const start = rows.find((row) => row.seq > previousEndSeq && row.seq <= (lastEnd?.seq ?? Infinity) && (() => {
-      const value = JSON.parse(row.payload_json)
-      return value.status === 'running' || ['message', 'agent_message', 'workbench_activity'].includes(value.event)
-    })())
-    const timing = { started: start?.created_at ?? null, ended: lastEnd?.created_at ?? null, last_event: rows.at(-1)?.created_at ?? null }
+    const timing = this.db.prepare(`WITH endings AS (
+      SELECT seq, created_at FROM run_events WHERE run_id=? AND json_extract(payload_json, '$.event')='workbench_end'
+      ORDER BY seq DESC LIMIT 2
+    ) SELECT
+      (SELECT created_at FROM run_events WHERE run_id=?
+        AND seq>COALESCE((SELECT seq FROM endings LIMIT 1 OFFSET 1), -1)
+        AND seq<=COALESCE((SELECT seq FROM endings LIMIT 1), 9223372036854775807)
+        AND (json_extract(payload_json, '$.status')='running' OR json_extract(payload_json, '$.event')='workbench_activity')
+        ORDER BY seq LIMIT 1) AS started,
+      (SELECT created_at FROM endings LIMIT 1) AS ended,
+      (SELECT created_at FROM run_events WHERE run_id=? ORDER BY seq DESC LIMIT 1) AS last_event`)
+      .get(runId, runId, runId)
     const ended = TERMINAL.has(run.status) ? timing.ended ?? timing.last_event ?? run.updatedAt : null
     return {
+      started_at: timing.started == null ? null : timing.started / 1000,
       completed_at: ended == null ? null : ended / 1000,
       elapsed_seconds: ended != null && timing.started != null ? Math.max(0, ended - timing.started) / 1000 : null,
     }
@@ -561,7 +664,32 @@ export class WorkbenchDatabase {
       })
   }
 
-  submission(ownerId, runId) { return this.submissions(ownerId).find((item) => item.runId === runId) }
+  submission(ownerId, runId) {
+    const row = this.db.prepare(`SELECT s.* FROM run_submissions s JOIN runs r ON r.id=s.run_id WHERE r.owner_id=? AND s.run_id=?`).get(ownerId, runId)
+    if (!row) return undefined
+    const value = JSON.parse(row.content_json)
+    return { runId: row.run_id, content: value.content, ticketId: value.ticketId, dispatched: Boolean(row.dispatched) }
+  }
+
+  ensureTicketGeneration(ownerId, runId, generation) {
+    const row = this.db.prepare(`SELECT s.content_json FROM run_submissions s JOIN runs r ON r.id=s.run_id WHERE r.owner_id=? AND r.id=?`).get(ownerId, runId)
+    if (!row) return
+    const value = JSON.parse(row.content_json)
+    if (value.generation === generation) return
+    // Rotation is only meaningful across a fenced host generation. The native
+    // request id stays unchanged; admission identity belongs to this host.
+    if (value.generation !== undefined) value.ticketId = randomUUID()
+    value.generation = generation
+    this.db.prepare('UPDATE run_submissions SET content_json=? WHERE run_id=?').run(JSON.stringify(value), runId)
+  }
+
+  rotateSubmissionTicket(ownerId, runId, generation) {
+    const row = this.db.prepare(`SELECT s.content_json FROM run_submissions s JOIN runs r ON r.id=s.run_id WHERE r.owner_id=? AND r.id=?`).get(ownerId, runId)
+    if (!row) return
+    const value = JSON.parse(row.content_json)
+    this.db.prepare('UPDATE run_submissions SET content_json=? WHERE run_id=?')
+      .run(JSON.stringify({ ...value, generation, ticketId: randomUUID() }), runId)
+  }
 
   dispatchSubmission(ownerId, runId) {
     if (!this.getRun(ownerId, runId)) throw notFound('任务不存在')
@@ -578,9 +706,17 @@ export class WorkbenchDatabase {
   }
 
   transitionRun(ownerId, runId, status, error, now = Date.now()) {
+    return this.transaction(() => this.transitionRunRecord(ownerId, runId, status, error, now))()
+  }
+
+  transitionRunRecord(ownerId, runId, status, error, now) {
+    const before = this.getRun(ownerId, runId)
     const result = this.db.prepare('UPDATE runs SET status = ?, error = ?, updated_at = ? WHERE id = ? AND owner_id = ?')
       .run(status, error ?? null, now, runId, ownerId)
     if (result.changes !== 1) throw notFound('任务不存在')
+    if (TERMINAL.has(status) && !['discarded', 'steered'].includes(status)
+      && (before.turnNumber !== undefined || ['running', 'waiting_input', 'stopping'].includes(before.status)))
+      this.requireRunFence(ownerId, runId)
     if (status === 'discarded' || status === 'steered') {
       const removed = this.getRun(ownerId, runId)
       this.db.prepare('UPDATE runs SET parent_run_id = ? WHERE owner_id = ? AND chat_id = ? AND parent_run_id = ?')
@@ -589,15 +725,47 @@ export class WorkbenchDatabase {
     return this.getRun(ownerId, runId)
   }
 
-  recoverInterrupted(now = Date.now()) {
+  requireRunFence(ownerId, runId) {
+    if (!this.getRun(ownerId, runId)) throw notFound('任务不存在')
+    this.db.prepare('INSERT INTO run_fences(run_id) VALUES (?) ON CONFLICT(run_id) DO UPDATE SET confirmed=0').run(runId)
+  }
+
+  pendingRunFences(ownerId) {
+    return this.db.prepare(`SELECT r.* FROM runs r JOIN run_fences f ON r.id=f.run_id JOIN chats c ON c.id=r.chat_id
+      WHERE r.owner_id=? AND f.confirmed=0 AND c.deleted_at IS NULL`).all(ownerId).map(decodeRun)
+  }
+
+  confirmRunFence(ownerId, runId, confirmation = { fenced: true, uncertain: false }) {
+    if (!this.getRun(ownerId, runId)) throw notFound('任务不存在')
+    const row = this.db.prepare('SELECT result_json FROM run_fences WHERE run_id=?').get(runId)
+    const previous = parseNullable(row?.result_json)
+    // Java/manager only fence platform tools. Native tools such as bash may
+    // still have an unsettled dispatch when that remote fence returns.
+    const nativePending = Boolean(this.db.prepare("SELECT 1 FROM tool_calls WHERE run_id=? AND status='started' LIMIT 1").get(runId))
+    // A later successful cleanup cannot prove an earlier unknown side effect
+    // did not commit. Preserve that uncertainty across retries and restarts.
+    const result = { fenced: confirmation.fenced === true, uncertain: previous?.uncertain === true || confirmation.uncertain === true || nativePending }
+    this.transaction(() => {
+      this.db.prepare('UPDATE run_fences SET confirmed=1, result_json=? WHERE run_id=?').run(JSON.stringify(result), runId)
+      if (JSON.stringify(previous) !== JSON.stringify(result)) this.appendEvent(ownerId, runId, {
+        event: 'workbench_stop_confirmation', stop_confirmation: result,
+        ...(result.uncertain ? { message: '任务已暂停，部分外部工具结果尚未确认，请先核对后再重试' } : {}),
+      })
+    })()
+    return result
+  }
+
+  recoverInterrupted(now = Date.now(), nativeQueued = []) {
     const recover = this.transaction(() => {
+      const keep = new Set(nativeQueued)
       const rows = this.db.prepare(`SELECT id, owner_id FROM runs
         WHERE status NOT IN ('completed', 'failed', 'cancelled', 'interrupted', 'discarded', 'steered')
-        AND id NOT IN (SELECT run_id FROM run_submissions WHERE dispatched=0)`).all()
-      this.db.prepare(`UPDATE runs SET status = 'interrupted', error = COALESCE(error, ?), updated_at = ?
-        WHERE status NOT IN ('completed', 'failed', 'cancelled', 'interrupted', 'discarded', 'steered')
-        AND id NOT IN (SELECT run_id FROM run_submissions WHERE dispatched=0)`)
-        .run('适配层进程重启，任务已中断', now)
+        AND id NOT IN (SELECT run_id FROM run_submissions WHERE dispatched=0)`).all().filter(row => !keep.has(row.id))
+      for (const row of rows) {
+        this.transitionRun(row.owner_id, row.id, 'interrupted', '适配层进程重启，任务已中断', now)
+        this.appendEvent(row.owner_id, row.id, { event: 'workbench_end', status: 'interrupted', error: '适配层进程重启，任务已中断' })
+      }
+      for (const runId of keep) this.db.prepare("UPDATE runs SET status='queued', error=NULL WHERE id=? AND status NOT IN ('discarded','steered','cancelled')").run(runId)
       this.db.prepare(`UPDATE pending_inputs SET status = 'aborted', settled_at = ? WHERE status = 'pending'`).run(now)
       return rows
     })
@@ -613,14 +781,16 @@ export class WorkbenchDatabase {
   activeRunBySession(sessionId) {
     const placeholders = [...TERMINAL].map(() => '?').join(', ')
     const row = this.db.prepare(`SELECT * FROM runs WHERE session_id = ? AND status NOT IN (${placeholders})
-      ORDER BY queue_order, created_at, id LIMIT 1`).get(sessionId, ...TERMINAL)
+      ORDER BY CASE WHEN status='queued' THEN 1 ELSE 0 END,
+        (SELECT MAX(turn_number) FROM run_turns WHERE run_id=runs.id) DESC, queue_order, created_at, id LIMIT 1`).get(sessionId, ...TERMINAL)
     return row ? decodeRun(row) : undefined
   }
 
   activeRun(ownerId, chatId) {
     const placeholders = [...TERMINAL].map(() => '?').join(', ')
     const row = this.db.prepare(`SELECT * FROM runs WHERE owner_id = ? AND chat_id = ?
-      AND status NOT IN (${placeholders}) ORDER BY queue_order, created_at, id LIMIT 1`)
+      AND status NOT IN (${placeholders}) ORDER BY CASE WHEN status='queued' THEN 1 ELSE 0 END,
+        (SELECT MAX(turn_number) FROM run_turns WHERE run_id=runs.id) DESC, queue_order, created_at, id LIMIT 1`)
       .get(ownerId, chatId, ...TERMINAL)
     return row ? decodeRun(row) : undefined
   }
@@ -628,7 +798,7 @@ export class WorkbenchDatabase {
 
 function decodeChat(row) {
   return {
-    id: row.id, ownerId: row.owner_id, sessionId: row.session_id, title: row.title,
+    id: row.id, ownerId: row.owner_id, sessionId: row.session_id, title: row.title, directory: row.directory ?? undefined,
     pinned: Boolean(row.pinned), favorited: Boolean(row.favorited), version: row.version, selection: JSON.parse(row.selection_json),
     createdAt: row.created_at, updatedAt: row.updated_at,
   }
@@ -639,6 +809,7 @@ function decodeRun(row) {
     id: row.id, ownerId: row.owner_id, chatId: row.chat_id, sessionId: row.session_id,
     requestKey: row.request_key ?? undefined, query: row.query, attachments: JSON.parse(row.attachments_json), mcpTools: JSON.parse(row.mcp_tools_json), status: row.status,
     error: row.error ?? undefined, feedback: row.feedback ?? null, selection: JSON.parse(row.selection_json),
+    stopConfirmation: parseNullable(row.stop_confirmation_json),
     parentRunId: row.parent_run_id ?? undefined, queueOrder: row.queue_order,
     turnNumber: row.turn_number ?? undefined, messageId: row.message_id ?? undefined,
     sourceStartSeq: row.source_start_seq ?? undefined, sourceEndSeq: row.source_end_seq ?? undefined,

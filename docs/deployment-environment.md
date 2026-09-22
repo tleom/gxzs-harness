@@ -7,7 +7,7 @@
 ```dotenv
 AI_WORKBENCH_ENABLED=true
 
-# Java签发给DSH host的请求断言。两项必须与每个host完全一致。
+# Java签发给DSH host的请求断言。主密钥不复制到host；按owner/代次/实例派生。
 DIFY_GXZS_ISSUER=gxzs
 DIFY_GXZS_SIGNING_KEY=<base64，解码后至少32字节>
 
@@ -48,8 +48,8 @@ openssl rand -hex 16     # GXZS_MCP_CREDENTIAL_KEY，正好32字符
 ## 2. 独立 `sandbox-manager`
 
 ```dotenv
-WORKBENCH_SANDBOX_MANAGER_TOKEN=<与Java和DSH host一致>
-WORKBENCH_SANDBOX_IMAGE=gxzs/harness-sandbox:p0-sshd
+WORKBENCH_SANDBOX_MANAGER_TOKEN=<只与Java共享的管理主凭据>
+WORKBENCH_SANDBOX_IMAGE=<已验证的sandbox镜像digest>
 WORKBENCH_SANDBOX_NETWORK=gxzs-ai-sandboxes
 WORKBENCH_SANDBOX_PREFIX=gxzs-wb
 WORKBENCH_MANAGER_STATE=/state
@@ -77,11 +77,11 @@ GXZS_HOST_GENERATION=<正整数，从1递增>
 GXZS_HOST_INSTANCE_ID=<该代次唯一实例ID>
 
 GXZS_ASSERTION_ISSUER=gxzs
-GXZS_ASSERTION_SIGNING_KEY=<与Java DIFY_GXZS_SIGNING_KEY一致>
+GXZS_ASSERTION_SIGNING_KEY=<manager按owner/generation/instance派生的base64 key>
 GXZS_ASSERTION_AUDIENCE_PATH=/ai/workbench
 
 GXZS_SANDBOX_MANAGER_URL=http://gxzs-sandbox-manager:5010
-GXZS_SANDBOX_MANAGER_TOKEN=<与Java/manager一致>
+GXZS_SANDBOX_MANAGER_TOKEN=<manager按owner/workspace/generation/instance派生的base64url token>
 GXZS_SANDBOX_WORKSPACE_ID=<平台分配的固定UUID>
 GXZS_SANDBOX_WORKSPACE=/workspace
 GXZS_SANDBOX_SSH_HOST=<OpenSSH config中的sandbox别名>
@@ -115,19 +115,19 @@ node scripts/derive-host-token.mjs '<tenantId:userId>' '<generation>' '<instance
 | Java | DSH host / manager |
 | --- | --- |
 | `DIFY_GXZS_ISSUER` | `GXZS_ASSERTION_ISSUER` |
-| `DIFY_GXZS_SIGNING_KEY` | `GXZS_ASSERTION_SIGNING_KEY` |
-| `GXZS_SANDBOX_MANAGER_TOKEN` | manager和host同名token |
+| `DIFY_GXZS_SIGNING_KEY` | manager据此派生`GXZS_ASSERTION_SIGNING_KEY`，host不持有主密钥 |
+| `GXZS_SANDBOX_MANAGER_TOKEN` | manager主凭据；host仅持有绑定owner和代次的派生token |
 | `GXZS_PLATFORM_INTERNAL_KEY` | 仅用于派生host token，不复制主密钥 |
 | `GXZS_ORCHESTRATOR_TOKEN` | host编排器调用Java内部索引接口时使用 |
 
 ## 5. 启用顺序
 
-1. 应用`gxzs-ai`中的两份数据库migration。
-2. 启动独立sandbox-manager并验证`ensure/files/manifest`。
-3. 为owner创建sandbox和DSH home。
-4. claim host generation并启动heartbeat。
-5. 用派生token启动DSH host和内部relay。
-6. 部署`gxzs-ai`，保持`AI_WORKBENCH_ENABLED=false`做健康检查。
-7. 设置`AI_WORKBENCH_ENABLED=true`，先灰度一个owner。
-8. 验证旧chat、文件、SSE、新消息、预览、分享、语音和MCP。
-9. drain旧Dify，再停止API/worker/web/agent；观察期内保留数据库和volume作为回滚源。
+1. 在批准的维护窗口内备份业务数据库、manager `/state`、owner DSH home 和 workspace/env 卷；准备已验证的三类镜像和可回滚源码版本。
+2. 按后端 migration 清单预览与执行数据库升级。根工作区 `sql/migrations/20260922_global_memory.sql` 不属于任何仓库提交；须单独交付。资源初始 disabled，验收后再启用。
+3. 升级 Java 和 manager，保留功能开关关闭。旧 host 持有共享主凭据，与新派生凭据协议存在兼容边界，必须完成 drain、fence 和受控换代，不能宣称普通滚动升级即可兼容。
+4. Java 先登记 owner 的 `provisioning` 代次；manager 创建沙箱、SSH、稳定 home 和 host，立即回报 endpoint。host 的 config/catalog 在此阶段允许受限 bootstrap。
+5. 原生会话恢复和完整 MCP catalog 均成功后，host `/health` 才报告 `ready:true`。manager 在锁外探活并回报 ready，Java 再放行任务。`live:true` 仅证明 HTTP 服务已启动。
+6. 先灰度一个 owner，核对旧 chat、文件、SSE、Goal、重试、停止、MCP、Office 预览及换代恢复。镜像中的 helper SHA-256 必须与 host 配置一致。
+7. 每个 owner 通过 `replace-host` 协议升级：活跃任务先 drain，确认 host/sandbox 都停止后 fence，再复用原 home/workspace/env。保留旧容器和卷作为回滚证据。
+
+本文件是部署契约，不是部署记录。参见 `repair-contract-20260922.md` 的精确签名和 MCP 协议；构建及验证入口见 `services/sandbox/README.md`。

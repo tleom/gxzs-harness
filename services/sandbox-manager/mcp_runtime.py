@@ -5,15 +5,59 @@ import queue
 import subprocess
 import threading
 import time
+import os
+import selectors
+import io
+from contextlib import nullcontext
 from pathlib import Path
 from uuid import UUID
+from mcp_authorization import validate_grant
 
 MAX_LINE = 8 * 1024 * 1024 + 1
 WORKERS = {}
 GUARD = threading.RLock()
 CALL_LOCKS = {}
 ACTIVE = set()
+LAST_USED = {}
+CLOSING = {}
 PATH = "/opt/user-env/current/python/bin:/opt/office/python/bin:/opt/user-env/current/node/node_modules/.bin:/opt/office/node/node_modules/.bin:/usr/local/bin:/usr/bin:/bin"
+
+
+def write_request(process, request, cancelled=None, timeout=5, guard=None, on_dispatch=None):
+    encoded = json.dumps(request, ensure_ascii=False).encode('utf-8') + b'\n'
+    if len(encoded) > 2 * 1024 * 1024:
+        return {'error': 'MCP 请求超过运行时限制，本次操作未执行', 'code': 'MCP_REQUEST_TOO_LARGE'}
+    fd = None
+    try:
+        if isinstance(process.stdin, io.BytesIO):
+            process.stdin.write(encoded)
+            if on_dispatch:
+                on_dispatch()
+            return None
+        with guard if guard is not None else nullcontext():
+            fd = os.dup(process.stdin.fileno())
+        os.set_blocking(fd, False)
+        remaining = memoryview(encoded)
+        deadline = time.monotonic() + timeout
+        with selectors.DefaultSelector() as selector:
+            selector.register(fd, selectors.EVENT_WRITE)
+            while remaining:
+                if (cancelled is not None and cancelled.is_set()) or time.monotonic() >= deadline:
+                    return {'error': 'MCP 请求发送已停止，执行结果未知', 'uncertain': True}
+                if selector.select(min(.1, max(0, deadline - time.monotonic()))):
+                    try:
+                        count = os.write(fd, remaining[:65536])
+                        if count and on_dispatch:
+                            on_dispatch()
+                        remaining = remaining[count:]
+                    except BlockingIOError:
+                        pass
+        return None
+    except (BrokenPipeError, OSError, ValueError):
+        return {'error': 'MCP 连接中断，执行结果未知；请先核实外部状态', 'uncertain': True}
+    finally:
+        if fd is not None:
+            os.close(fd)
 
 
 def module_source(*names):
@@ -102,16 +146,11 @@ class Worker:
             "uncertain": True,
         }
 
-    def send(self, payload):
-        try:
-            self.process.stdin.write(json.dumps(payload).encode() + b"\n")
-            self.process.stdin.flush()
-        except (BrokenPipeError, OSError):
-            return {
-                "error": "MCP 连接中断，执行结果未知；请先核实外部状态",
-                "uncertain": True,
-            }
-        return None
+    def send(self, payload, cancelled=None, on_dispatch=None):
+        # Runtime credentials never enter a user MCP worker. UTF-8 encoding also
+        # keeps an allowed 1 MiB Chinese argument within the 2 MiB input frame.
+        request = {key: payload[key] for key in ('operation', 'tool', 'arguments', 'manifest_version', 'deadline_ms') if key in payload}
+        return write_request(self.process, request, cancelled, guard=self.close_guard, on_dispatch=on_dispatch)
 
     def close(self):
         with self.close_guard:
@@ -123,39 +162,67 @@ class Worker:
                     pass
         try:
             self.process.wait(timeout=5)
+            return self.process.returncode == 0
         except subprocess.TimeoutExpired:
             # stdin EOF is observed concurrently by the sandbox worker, including
             # during a business call; the SDK then tears down its child process.
-            self.process.terminate()
+            return False
 
 
 class Invocation:
     def __init__(self, key, payload):
         self.key, self.name = key, payload["name"]
         self.cancelled, self.worker = threading.Event(), None
+        self.dispatch_started, self.dispatch_done, self.dispatched = threading.Event(), threading.Event(), threading.Event()
+        supplied_deadline = payload.get('deadline_ms', int(time.time() * 1000) + 350_000)
+        if not isinstance(supplied_deadline, (int, float)) or supplied_deadline > time.time() * 1000 + 350_000:
+            raise ValueError('Invalid MCP deadline')
+        self.deadline = time.monotonic() + max(0, (supplied_deadline - time.time() * 1000) / 1000)
         authorization = payload.get("authorization") or {}
         self.binding = authorization.get("binding_id")
         if payload["operation"] == "mcp_call":
-            if authorization.get("workspace_id") != key or not self.binding:
-                raise ValueError("MCP invocation requires an owned execution binding")
-            self.binding = str(UUID(self.binding))
+            self.binding = validate_grant(key, payload, 'personal:mcp:' + self.name + ':' + payload['tool'])
 
 
 def close_workers(workers):
+    outcomes = {}
+    outcome_guard = threading.Lock()
+    def close(worker):
+        confirmed = worker.close() is True
+        with outcome_guard:
+            outcomes[worker] = confirmed
     threads = [
-        threading.Thread(target=worker.close, daemon=True) for worker in set(workers)
+        threading.Thread(target=close, args=(worker,), daemon=True) for worker in set(workers)
     ]
     for thread in threads:
         thread.start()
     deadline = time.monotonic() + 6
     for thread in threads:
         thread.join(max(0, deadline - time.monotonic()))
+    with outcome_guard:
+        finished = dict(outcomes)
+    with GUARD:
+        for worker, confirmed in finished.items():
+            if confirmed:
+                CLOSING.pop(worker, None)
+    return len(finished) == len(set(workers)) and all(finished.values())
+
+
+def retire(worker, key, name, binding=None):
+    with GUARD:
+        if WORKERS.get((key, name)) is worker:
+            WORKERS.pop((key, name), None)
+        CLOSING[worker] = (key, name, binding)
+    return close_workers([worker])
 
 
 def invalidate(key, name=None, *, binding=None):
     """Cancel matching queued/in-flight calls without acquiring their call lock."""
-    workers = []
+    workers, calls = [], []
     with GUARD:
+        for worker, (workspace, server, run) in CLOSING.items():
+            if workspace == key and (name is None or server == name) and (binding is None or run is None or run == binding):
+                workers.append(worker)
         for call in list(ACTIVE):
             if (
                 call.key == key
@@ -163,16 +230,51 @@ def invalidate(key, name=None, *, binding=None):
                 and (binding is None or call.binding == binding)
             ):
                 call.cancelled.set()
+                calls.append(call)
                 if call.worker is not None:
                     workers.append(call.worker)
+                    CLOSING[call.worker] = (key, call.name, call.binding)
         for identity, worker in list(WORKERS.items()):
             if (
                 identity[0] == key
                 and (name is None or identity[1] == name)
                 and (binding is None or worker in workers)
             ):
-                workers.append(WORKERS.pop(identity))
-    close_workers(workers)
+                worker = WORKERS.pop(identity)
+                workers.append(worker)
+                CLOSING.setdefault(worker, (key, identity[1], binding))
+    confirmed = close_workers(workers)
+    wait_dispatch(calls)
+    return confirmed
+
+
+def wait_dispatch(calls):
+    deadline = time.monotonic() + 1
+    for call in calls:
+        if call.dispatch_started.is_set():
+            call.dispatch_done.wait(max(0, deadline - time.monotonic()))
+
+
+def send_bound(call, journal, digest, send):
+    """Resolve durable send intent; an earlier cancellation prevents new IO."""
+    call.dispatch_started.set()
+    try:
+        if call.cancelled.is_set() or not journal.prepare_dispatch(digest):
+            return {'error': 'MCP 调用已停止，本次操作未执行'}
+        if call.cancelled.is_set():
+            journal.resolve_dispatch(digest, False)
+            return {'error': 'MCP 调用已停止，本次操作未执行'}
+        try:
+            result = send(call.dispatched.set)
+        except Exception:
+            result = {'error': 'MCP 请求发送失败，执行结果未知', 'uncertain': True}
+        sent = call.dispatched.is_set() or result is None
+        journal.resolve_dispatch(digest, sent)
+        if not sent and result is not None and result.get('uncertain'):
+            result = {**result, 'uncertain': False, 'error': 'MCP 请求未发出，本次操作未执行'}
+        return result
+    finally:
+        call.dispatch_done.set()
 
 
 def invoke(key, container, payload, state, *, authorize=None, journal=None):
@@ -186,11 +288,14 @@ def invoke(key, container, payload, state, *, authorize=None, journal=None):
     call = Invocation(key, payload)
     identity = key, name
     with GUARD:
+        if (len(ACTIVE) + len(CLOSING) >= 64
+                or sum(active.key == key for active in ACTIVE) + sum(item[0] == key for item in CLOSING.values()) >= 8):
+            return {"error": "MCP 并发请求已达到上限，本次操作未执行", "code": "MCP_BUSY"}
         mutex = CALL_LOCKS.setdefault(identity, threading.Lock())
         ACTIVE.add(call)
     acquired, worker, digest = False, None, None
     try:
-        deadline = time.monotonic() + 20
+        deadline = min(time.monotonic() + 20, call.deadline)
         while not call.cancelled.is_set() and time.monotonic() < deadline:
             if mutex.acquire(timeout=0.1):
                 acquired = True
@@ -200,9 +305,15 @@ def invoke(key, container, payload, state, *, authorize=None, journal=None):
         if not acquired:
             return {"error": "此 MCP 正忙，本次操作未执行，请稍后再试"}
         if payload["operation"] == "mcp_call" and (
-            authorize is None or not authorize(payload["authorization"])
+            authorize is None or not authorize({"authorization": payload["authorization"], "action": "validate"})
         ):
             return {"error": "MCP 当前任务或执行已失效，本次操作未执行"}
+        if payload['operation'] == 'mcp_call':
+            if journal is None:
+                return {'error': 'MCP 执行记录不可用，本次操作未执行'}
+            previous = journal.lookup(key, payload)
+            if previous is not None:
+                return previous
         with GUARD:
             worker = WORKERS.get(identity)
         if worker and (
@@ -210,53 +321,101 @@ def invoke(key, container, payload, state, *, authorize=None, journal=None):
         ):
             with GUARD:
                 WORKERS.pop(identity, None)
-            worker.close()
+            retire(worker, key, name, call.binding)
             worker = None
         if worker is None:
             worker = Worker(container, name, state["version"], state["timeout"])
             with GUARD:
                 call.worker = worker
-            worker.ready = worker.response(call.cancelled, timeout=25)
+            worker.ready = worker.response(call.cancelled, timeout=max(0, min(25, call.deadline - time.monotonic())))
             if not worker.ready.get("ready"):
-                worker.close()
+                retire(worker, key, name, call.binding)
                 return worker.ready
             with GUARD:
                 if not call.cancelled.is_set():
                     WORKERS[identity] = worker
         with GUARD:
             call.worker = worker
-        if call.cancelled.is_set():
-            worker.close()
+        if call.cancelled.is_set() or time.monotonic() >= call.deadline:
+            retire(worker, key, name, call.binding)
             return {"error": "MCP 执行已失效，本次操作未执行"}
         if payload["operation"] == "mcp_call":
-            if (
-                authorize is None
-                or journal is None
-                or not authorize(payload["authorization"])
-            ):
-                return {"error": "MCP 当前任务或执行已失效，本次操作未执行"}
             digest, previous = journal.begin(key, payload)
             if previous is not None:
                 return previous
+            if (
+                authorize is None
+                or journal is None
+                or not authorize({"authorization": payload["authorization"], "action": "consume"})
+            ):
+                result = {"error": "MCP 当前任务或执行已失效，本次操作未执行"}
+                journal.finish(digest, result)
+                return result
         # This short critical section orders dispatch against stop/config changes.
         # External connection, authorization and response waits never hold it.
         with GUARD:
-            if call.cancelled.is_set():
+            if call.cancelled.is_set() or time.monotonic() >= call.deadline:
                 result = {"error": "MCP 执行已失效，本次操作未执行"}
             else:
-                result = worker.send(payload)
+                result = None
+        # Non-blocking pipe IO must never hold the cross-owner cancellation lock.
         if result is None:
-            result = worker.response(call.cancelled)
+            if digest is not None:
+                result = send_bound(call, journal, digest, lambda on_dispatch: worker.send(payload, call.cancelled, on_dispatch))
+            else:
+                result = worker.send(payload, call.cancelled)
+        if result is None:
+            result = worker.response(call.cancelled, timeout=max(0, min(state['timeout'] + 15, call.deadline - time.monotonic())))
         if digest is not None:
             journal.finish(digest, result)
         if result.get("uncertain") or result.get("conflict") or call.cancelled.is_set():
             with GUARD:
                 if WORKERS.get(identity) is worker:
                     WORKERS.pop(identity)
-            worker.close()
+            retire(worker, key, name, call.binding)
         return result
     finally:
         with GUARD:
             ACTIVE.discard(call)
+            LAST_USED[identity] = time.monotonic()
         if acquired:
             mutex.release()
+        with GUARD:
+            if not any((active.key, active.name) == identity for active in ACTIVE):
+                CALL_LOCKS.pop(identity, None)
+
+
+def statistics():
+    with GUARD:
+        return {"active_calls": len(ACTIVE), "workers": len(WORKERS), "closing_workers": len(CLOSING), "call_locks": len(CALL_LOCKS)}
+
+
+def reap_workers(idle_seconds=300, max_workers=64):
+    expired = []
+    with GUARD:
+        busy = {(call.key, call.name) for call in ACTIVE}
+        for identity in sorted(WORKERS, key=lambda item: LAST_USED.get(item, 0)):
+            if identity not in busy and (len(WORKERS) > max_workers or time.monotonic() - LAST_USED.get(identity, 0) > idle_seconds):
+                worker = WORKERS.pop(identity)
+                expired.append(worker)
+                CLOSING[worker] = (identity[0], identity[1], None)
+                LAST_USED.pop(identity, None)
+        for identity in list(LAST_USED):
+            if identity not in WORKERS and identity not in busy:
+                LAST_USED.pop(identity, None)
+        expired.extend(CLOSING)
+    close_workers(expired)
+
+
+def fence_workspace(key):
+    """Only after Docker confirms the entire owner sandbox has stopped."""
+    with GUARD:
+        for call in ACTIVE:
+            if call.key == key:
+                call.cancelled.set()
+        for worker, (workspace, _, _) in list(CLOSING.items()):
+            if workspace == key:
+                CLOSING.pop(worker, None)
+        for identity in list(WORKERS):
+            if identity[0] == key:
+                WORKERS.pop(identity, None)

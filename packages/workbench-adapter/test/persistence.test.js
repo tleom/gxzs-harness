@@ -61,12 +61,20 @@ describe('workbench durable projection', () => {
     const { chat, ownerId } = seed(first)
     const { run } = first.createRun({ ownerId, chatId: chat.id, sessionId: chat.sessionId, query: 'q', selection: {}, now: 2 })
     first.transitionRun(ownerId, run.id, 'running', undefined, 3)
+    first.requireRunFence(ownerId, run.id)
+    first.confirmRunFence(ownerId, run.id, { fenced: true, uncertain: true })
+    first.requireRunFence(ownerId, run.id)
     first.close()
 
     const reopened = new WorkbenchDatabase(filename)
     opened.push(reopened)
+    expect(reopened.pendingRunFences(ownerId).map(value => value.id)).toEqual([run.id])
+    expect(reopened.getRun(ownerId, run.id).stopConfirmation).toEqual({ fenced: true, uncertain: true })
     expect(reopened.recoverInterrupted(4)).toEqual([{ id: run.id, owner_id: ownerId }])
     expect(reopened.getRun(ownerId, run.id)).toMatchObject({ status: 'interrupted', error: '适配层进程重启，任务已中断' })
+    expect(reopened.pendingRunFences(ownerId).map(value => value.id)).toEqual([run.id])
+    reopened.confirmRunFence(ownerId, run.id)
+    expect(reopened.pendingRunFences(ownerId)).toEqual([])
   })
 
   it('does not rewrite followup terminal states during recovery', () => {

@@ -8,14 +8,14 @@ describe('conversation session history', () => {
     const source = { events, header: { cwd: '/workspace' }, projections: { values: { agentPreset: 'standard' } }, [Symbol.dispose]: dispose }
     const services = {
       sessionQuery: { observeSession: vi.fn(async () => source) },
-      agentPresets: { resolve: vi.fn(async () => ({ id: 'standard' })), mount: vi.fn() },
+      agentPresets: { resolve: vi.fn(async () => ({ id: 'standard' })), mount: vi.fn(async () => () => {}) },
       agentDefaultModel: { currentSelection: () => ({ provider: 'qwen', model: 'flash' }) },
       agents: { create: vi.fn(async () => ({})) },
     }
     const child = await copySessionDirectory(services, 'old', '/workspace/conversations/chat', 1)
     const request = services.agents.create.mock.calls[0][0]
     expect(request).toMatchObject({ sessionId: child.sessionId, seed: events.slice(0, 2), inheritedEventCount: 2, meta: { cwd: '/workspace/conversations/chat', parentSession: 'old', agentPreset: 'standard' } })
-    await request.setup('agent-context')
+    expect(await request.setup('agent-context')).toBeUndefined()
     expect(services.agentPresets.mount).toHaveBeenCalledWith('agent-context', 'standard')
     expect(source.events).toHaveLength(3)
     expect(dispose).toHaveBeenCalledOnce()
