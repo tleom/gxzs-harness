@@ -56,6 +56,22 @@ function activateNative(test, runId, queued = []) {
 }
 
 describe('followup and control service', () => {
+  it.each(['queued', 'completed'])('rejects a delayed stop for a %s run while a different run is active', async (status) => {
+    const test = setup()
+    const { database, owner, chat, service, sessionController, agent } = test
+    const { run: target } = database.createRun({ ownerId: owner.ownerId, chatId: chat.id, sessionId: chat.sessionId, query: 'target', selection: {} })
+    if (status === 'completed') database.transitionRun(owner.ownerId, target.id, 'completed')
+    const { run: active } = database.createRun({ ownerId: owner.ownerId, chatId: chat.id, sessionId: chat.sessionId, query: 'active', selection: {} })
+    activateNative(test, active.id, [{ id: 'queued-target', source: { kind: 'user', rpcId: target.id } }])
+    service.platformClient = { json: vi.fn() }
+    await expect(service.stopRun(owner, target.id)).rejects.toMatchObject({ status: 409, code: 'STALE_RUN' })
+    expect(sessionController.cancel).not.toHaveBeenCalled()
+    expect(service.platformClient.json).not.toHaveBeenCalled()
+    expect(agent.inbox.remove).not.toHaveBeenCalled()
+    expect(database.getRun(owner.ownerId, active.id).status).toBe('running')
+    expect(database.getRun(owner.ownerId, target.id).status).toBe(status)
+  })
+
   it('reads plan mode from the native projection rather than the Workbench cache', async () => {
     const { service, owner, chat, database } = setup()
     database.updateControlBySession(chat.sessionId, { plan: { active: false, pending: false, objective: 'obsolete' } })

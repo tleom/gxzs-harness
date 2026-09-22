@@ -314,11 +314,12 @@ class Hosts:
             # particular, plugin readiness may call back into this workspace.
             info = json.loads(self.docker('inspect', item['instance_id']).stdout)[0]
             healthy = info['State']['Running'] and item.get('endpoint') and self.healthy(item['endpoint'])
+            alive = healthy or (info['State']['Running'] and item.get('endpoint') and self.alive(item['endpoint']))
             with self.lock(record.parent.name):
                 item = json.loads(record.read_text())
                 if item != observed:
                     return
-                if item.get('state') == 'draining' and info['State']['Running'] and healthy:
+                if item.get('state') == 'draining' and info['State']['Running'] and alive:
                     self.failures.pop(item['instance_id'], None)
                     self.heartbeat(item, 'draining')
                     return
@@ -332,6 +333,11 @@ class Hosts:
                     item.update(state='ready', ready=True)
                     self._save(record, item)
                     self.heartbeat(item, 'ready')
+                elif info['State']['Running'] and alive:
+                    self.failures.pop(item['instance_id'], None)
+                    item.update(state='provisioning', ready=False)
+                    self._save(record, item)
+                    self.heartbeat(item, 'provisioning')
                 elif not info['State']['Running']:
                     # Fence tools before returning capacity to other users.
                     sandbox, _ = self.identity(item['workspace_id'])

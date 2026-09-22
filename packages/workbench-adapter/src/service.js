@@ -493,7 +493,8 @@ export class WorkbenchService {
     // Native cancel retains the inbox. Only native events change the turn cache;
     // an acknowledgement is not a terminal state and creates no `stopping` state.
     const active = currentExecutionRun(this.database, this.agents, run.sessionId)
-    const runIds = [...new Set([...(run.status !== 'queued' || active?.id === run.id ? [run.id] : []), ...(active ? [active.id] : [])])]
+    if (active && active.id !== run.id) throw httpError(409, '当前任务已改变，请刷新后重试', 'STALE_RUN')
+    const runIds = run.status !== 'queued' || active?.id === run.id ? [run.id] : []
     for (const id of runIds) this.database.requireRunFence(owner.ownerId, id)
     let nativeError
     try {

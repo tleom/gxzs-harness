@@ -110,6 +110,37 @@ def test_active_task_prevents_idle_shutdown(tmp_path, monkeypatch):
     assert host.heartbeat.call_args.args[1] == 'ready'
 
 
+@pytest.mark.parametrize('state', ['ready', 'provisioning', 'draining'])
+def test_live_unready_host_is_not_fenced_after_readiness_grace(tmp_path, monkeypatch, state):
+    host, docker, _, payload, _ = setup(tmp_path, monkeypatch)
+    host.ensure('workspace', payload)
+    record = host.root / 'workspace' / 'host.json'
+    item = json.loads(record.read_text())
+    item['state'] = state
+    record.write_text(json.dumps(item))
+    host.healthy.return_value = False
+    host.alive = Mock(return_value=True)
+    host.failures['host-1'] = 0
+    host.admission.active.return_value = 1
+    host.maintain()
+    assert not any(call.args[0] == 'stop' for call in docker.call_args_list)
+    host.admission.fence.assert_not_called()
+    assert 'host-1' not in host.failures
+    assert host.heartbeat.call_args.args[1] == ('draining' if state == 'draining' else 'provisioning')
+
+
+def test_dead_host_is_fenced_after_liveness_grace(tmp_path, monkeypatch):
+    host, docker, _, payload, _ = setup(tmp_path, monkeypatch)
+    host.ensure('workspace', payload)
+    host.healthy.return_value = False
+    host.alive = Mock(return_value=False)
+    host.failures['host-1'] = 0
+    host.admission.active.return_value = 1
+    host.maintain()
+    assert [call.args[-1] for call in docker.call_args_list if call.args[0] == 'stop'] == ['host-1', 'sandbox-workspace']
+    host.admission.fence.assert_called_once_with('t:1', 'host-1')
+
+
 def test_schedule_validates_owner_and_stopped_host(tmp_path, monkeypatch):
     host, _, _, payload, created = setup(tmp_path, monkeypatch)
     host.ensure('workspace', payload)
