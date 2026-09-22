@@ -9,7 +9,7 @@ describe('office preset policy', () => {
     expect(officePreset('- id: tool-web\r\n  name: web')).toBe('')
   })
   it('replaces all shipped persona variants while retaining model interpolation', () => {
-    expect(officePreset('You are a coding agent powered by the {{model}} model.')).toContain('办公 Agent，使用 {{model}} 模型')
+    expect(officePreset('You are a coding agent powered by the {{model}} model.')).toContain('公信智能办案助手，一个办公 Agent，使用 {{model}} 模型')
     expect(officePreset('You are a coding agent powered by the {{model}} model, running on the DeepSeek Harness.')).not.toContain('DeepSeek Harness')
     expect(officePreset('You are a helpful software engineer assistant.')).toContain(assistantIdentity)
   })

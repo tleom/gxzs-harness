@@ -2,6 +2,7 @@ import { Context } from '@deepseek-ai/cordis'
 import SkillRegistry from '@deepseek-ai/dsh-skill'
 import { describe, expect, it, vi } from 'vitest'
 import { SandboxSkillProvider } from '../src/index.js'
+import { readSkillDefinition } from '../src/definition.js'
 
 const skill = (overrides = {}) => ({
   id: 'demo', version: 'v1', enabled: true,
@@ -10,6 +11,13 @@ const skill = (overrides = {}) => ({
 const control = () => ({ signal: new AbortController().signal, invalidate: vi.fn() })
 
 describe('sandbox personal skill provider', () => {
+  it('uses native frontmatter, invocation flags and an optional metadata display name', async () => {
+    const definition = await readSkillDefinition('---\nname: report\ndescription: Reports\nmetadata:\n  displayName: 报告核验\ndisable-model-invocation: true\nuser-invocable: false\n---\nBody', { id: 'report' })
+    expect(definition).toMatchObject({ name: 'report', displayName: '报告核验', metadata: { displayName: '报告核验' }, content: 'Body' })
+    expect(definition.invocation).toMatchObject({ modelInvocable: false, userInvocable: false })
+    expect((await readSkillDefinition(skill().content)).displayName).toBe('demo')
+    await expect(readSkillDefinition(skill().content, { id: 'other' })).rejects.toThrow('目录名')
+  })
   it('advertises only valid enabled skills with remote resource paths', async () => {
     const manager = { personalResources: async () => ({ skills: [skill(), skill({ id: 'off', enabled: false }), skill({ id: 'bad' })] }) }
     const provider = new SandboxSkillProvider(manager, control())

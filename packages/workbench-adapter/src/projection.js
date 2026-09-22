@@ -16,6 +16,7 @@ export function createAssistantStreamProjector(database, expectedOwnerId) {
     const attempt = attempts.get(String(frame.attemptId))
     if (!attempt || attempt.sessionId !== sessionId) return undefined
     if (frame.type === 'end') {
+      database.flushStreamEvents()
       attempts.delete(String(frame.attemptId))
       if (frame.outcome?.kind !== 'abandoned') return undefined
       const run = database.runForTurn(sessionId, attempt.turn)
@@ -31,18 +32,27 @@ export function createAssistantStreamProjector(database, expectedOwnerId) {
     if (!chunk.text) return undefined
     const run = database.runForTurn(sessionId, attempt.turn)
     if (!run) return undefined
-    database.markStreamedStep(chat.ownerId, run.id, attempt.turn, attempt.step)
-    return database.appendEvent(chat.ownerId, run.id, {
+    return database.appendStreamEvent(chat.ownerId, run.id, {
       event: 'workbench_activity', backend_run_id: run.id,
       data: {
         kind: chunk.type === 'text-delta' ? 'text' : 'reasoning', workbench_run_id: run.id,
         segment_id: `t${attempt.turn}s${attempt.step}a${String(frame.attemptId)}:b${chunk.index ?? 0}`, text: chunk.text,
       },
-    })
+    }, attempt.turn, attempt.step)
   }
 }
 
 export function projectSessionEvent(database, sessionId, event, expectedOwnerId, context) {
+  database.flushStreamEvents()
+  if (database.hasProjectedEvent(sessionId, event.seq)) return undefined
+  return database.transaction(() => {
+    const result = projectEvent(database, sessionId, event, expectedOwnerId, context)
+    database.markProjectedEvent(sessionId, event.seq)
+    return result
+  })()
+}
+
+function projectEvent(database, sessionId, event, expectedOwnerId, context) {
   const chat = database.getChatBySession(sessionId)
   if (!chat || (expectedOwnerId && chat.ownerId !== expectedOwnerId)) return undefined
 
@@ -87,8 +97,19 @@ export function projectSessionEvent(database, sessionId, event, expectedOwnerId,
     })
   }
 
-  if (['todo/write', 'goal/change', 'plan/mode', 'compaction/start', 'compaction/summary', 'compaction/end'].includes(event.type))
-    return projectControlEvent(database, chat, sessionId, event)
+  if (['plan/mode', 'command/run', 'command/done'].includes(event.type)) {
+    if (!context?.plan) return undefined
+    // A display cache of DSH's PlanProjection; never fold another plan lifecycle.
+    const state = database.updateControlBySession(sessionId, { plan: context.plan })
+    const run = database.activeRun(chat.ownerId, chat.id)
+    if (run) database.appendEvent(chat.ownerId, run.id, { event: 'workbench_control', state })
+    return state
+  }
+  if (['todo/write', 'goal/change', 'compaction/start', 'compaction/summary', 'compaction/end'].includes(event.type)) {
+    const result = projectControlEvent(database, chat, sessionId, event)
+    if (event.type === 'goal/change' && context?.nativeIdle) settleNativeIdle(database, sessionId, event.data?.goal)
+    return result
+  }
 
   const turn = event.data?.turn
   if (!Number.isInteger(turn)) return undefined
@@ -112,15 +133,21 @@ export function projectSessionEvent(database, sessionId, event, expectedOwnerId,
         ? undefined
         : String(event.data?.reason?.error?.message ?? `任务结束：${kind}`)
       if (Number.isInteger(event.seq)) database.setRunSourceSeq(chat.ownerId, run.id, 'source_end_seq', event.seq)
+      const goal = context?.goal ?? database.getControl(chat.ownerId, chat.id).goal
+      if (kind === 'completed' && goal?.phase === 'active' && goal.activation !== 'disarmed'
+        && database.goalRun(sessionId)?.id === run.id) {
+        // DSH owns continuation; one business run spans its automatic rounds.
+        return append({ event: 'workbench_status', status: 'running', turn, goal_round_complete: true })
+      }
       database.transitionRun(chat.ownerId, run.id, status, error)
       return append({ event: 'workbench_end', status, error })
     }
     case 'deliverables/presented':
-      return append({ event: 'workbench_presented', files: event.data?.files ?? [] })
+      return append({ event: 'workbench_presented', native: event, files: event.data?.files ?? [] })
     case 'tool/call':
       database.startToolCall(chat.ownerId, run.id, String(event.data?.callId ?? ''), String(event.data?.name ?? ''))
       return append({
-        event: 'workbench_activity', backend_run_id: run.id,
+        event: 'workbench_activity', native: event, backend_run_id: run.id,
         data: {
           kind: 'tool', workbench_run_id: run.id, call_id: String(event.data?.callId ?? ''),
           tool_call_id: String(event.data?.callId ?? ''), tool_name: String(event.data?.name ?? ''),
@@ -133,7 +160,7 @@ export function projectSessionEvent(database, sessionId, event, expectedOwnerId,
       const callId = String(event.data?.message?.source?.callId ?? block?.toolCallId ?? '')
       const toolName = database.finishToolCall(chat.ownerId, run.id, callId) ?? ''
       return append({
-        event: 'workbench_activity', backend_run_id: run.id,
+        event: 'workbench_activity', native: event, backend_run_id: run.id,
         data: {
           kind: 'tool', workbench_run_id: run.id, call_id: callId, tool_call_id: callId,
           tool_name: toolName, activity_id: callId,
@@ -154,7 +181,7 @@ export function projectSessionEvent(database, sessionId, event, expectedOwnerId,
         for (const [index, block] of (event.data?.message?.content ?? []).entries()) {
           if ((block?.type === 'text' || block?.type === 'reasoning') && typeof block.text === 'string' && block.text)
             append({
-              event: 'workbench_activity', backend_run_id: run.id,
+              event: 'workbench_activity', native: event, backend_run_id: run.id,
               data: { kind: block.type, workbench_run_id: run.id, segment_id: `t${event.data.turn}s${event.data.step}b${index}`, text: block.text },
             })
         }
@@ -176,10 +203,16 @@ export function projectSessionEvent(database, sessionId, event, expectedOwnerId,
 
 export function projectInboxClaim(database, { agent, message, turn }, expectedOwnerId) {
   const sessionId = agent?.session?.id ?? agent?.id
-  if (!Number.isInteger(turn) || message?.source?.kind !== 'user' || typeof message.source.rpcId !== 'string' || typeof message?.id !== 'string') return undefined
+  if (!Number.isInteger(turn) || typeof message?.id !== 'string') return undefined
   const chat = database.getChatBySession(sessionId)
   if (!chat || (expectedOwnerId && chat.ownerId !== expectedOwnerId)) return undefined
-  const run = database.bindRunMessage(sessionId, message.source.rpcId, turn, message.id)
+  let run
+  if (message.source?.kind === 'user' && typeof message.source.rpcId === 'string')
+    run = database.bindRunMessage(sessionId, message.source.rpcId, turn, message.id)
+  else if (message.source?.kind === 'goal') {
+    const active = database.goalRun(sessionId) ?? database.activeRunBySession(sessionId)
+    if (active) run = database.bindNativeTurn(active, turn)
+  }
   if (run?.status === 'queued') {
     database.transitionRun(run.ownerId, run.id, 'running')
     database.appendEvent(run.ownerId, run.id, { event: 'workbench_status', status: 'running' })
@@ -197,19 +230,21 @@ function projectControlEvent(database, chat, sessionId, event) {
   if (event.type === 'todo/write') update = { todos: event.data?.todos ?? [] }
   else if (event.type === 'goal/change') {
     const goal = event.data?.goal
+    if (goal?.phase === 'active' && (!database.goalRun(sessionId) || ['completed', 'failed', 'interrupted', 'cancelled'].includes(database.goalRun(sessionId).status))) {
+      const active = database.activeRunBySession(sessionId)
+      if (active) database.setGoalRun(sessionId, active.id)
+    }
     update = { goal: event.data?.operation === 'clear' || !goal ? null : {
       id: goal.id,
       revision: goal.revision,
       objective: goal.objective,
       phase: goal.phase,
+      activation: goal.activation,
       reason: goal.blockedReason?.message ?? null,
       max_rounds: goal.maxGoalRounds ?? null,
       rounds_started: event.data?.roundsStarted ?? 0,
       last_run_id: null,
     } }
-  } else if (event.type === 'plan/mode') {
-    const current = database.getControl(chat.ownerId, chat.id)
-    update = { plan: { ...current.plan, active: Boolean(event.data?.active), pending: false } }
   } else if (event.type === 'compaction/summary') {
     update = { compaction: {
       id: event.data?.compactionId ?? '', phase: 'compacting', message: contentText(event.data?.summary),
@@ -228,6 +263,78 @@ function projectControlEvent(database, chat, sessionId, event) {
   const run = Number.isInteger(event.data?.turn) ? database.runForTurn(sessionId, event.data.turn) : undefined
   if (control && run) database.appendEvent(chat.ownerId, run.id, { event: 'workbench_control', state: control })
   return control
+}
+
+export function settleNativeIdle(database, sessionId, goal) {
+  const run = database.goalRun(sessionId)
+  if (!run || !['running', 'waiting_input', 'stopping'].includes(run.status)) return
+  if (goal?.phase === 'active' && goal.activation !== 'disarmed') return
+  const status = goal?.phase === 'active' ? 'interrupted' : 'completed'
+  database.transitionRun(run.ownerId, run.id, status)
+  database.appendEvent(run.ownerId, run.id, { event: 'workbench_end', status })
+}
+
+/** Replay native facts before declaring readiness; never wake a recovered agent. */
+export async function reconcileNativeSessions(database, sessionQuery, ownerId) {
+  const queued = []
+  for (const chat of database.listChats(ownerId)) {
+    let observed
+    try { observed = await sessionQuery.observeSession(chat.sessionId) }
+    catch (error) {
+      if (error?.code === 'SESSION_QUERY_SESSION_NOT_FOUND') continue
+      throw error
+    }
+    try {
+      const events = observed.events ?? []
+      const inbox = { 'next-turn': [], 'next-step': [] }
+      let turn
+      // Claims are transient notifications. Reconstruct the turn relation from
+      // the durable user/message records before replaying their projected output.
+      for (const event of events) {
+        if (event.type === 'agent/inbox/spliced') {
+          const data = event.data
+          inbox[data.target].splice(data.start, data.removedCount ?? 0, ...(data.inserted ?? []))
+        }
+        if (event.type === 'turn/start') turn = event.data.turn
+        if (event.type === 'user/message' && Number.isInteger(turn)) {
+          const message = event.data
+          if (message.source?.kind === 'user' && typeof message.source.rpcId === 'string')
+            database.bindRunMessage(chat.sessionId, message.source.rpcId, turn, message.id)
+          else if (message.source?.kind === 'goal') {
+            const run = database.goalRun(chat.sessionId)
+            if (run) database.bindNativeTurn(run, turn)
+          }
+        }
+      }
+      for (const event of events) {
+        if (event.type === 'assistant/message' && !database.hasProjectedEvent(chat.sessionId, event.seq)) {
+          const run = database.runForTurn(chat.sessionId, event.data.turn)
+          if (run && database.isStreamedStep(ownerId, run.id, event.data.turn, event.data.step)) {
+            // A crash may leave acknowledged early deltas plus a durable native
+            // final message whose last buffered deltas never had a cursor.
+            // Replace that step through the existing reset protocol before
+            // replaying the complete native answer; never append duplicate text.
+            database.transaction(() => {
+              database.clearStreamedStep(ownerId, run.id, event.data.turn, event.data.step)
+              database.appendEvent(ownerId, run.id, { event: 'workbench_stream_reset', segment_prefix: `t${event.data.turn}s${event.data.step}a` })
+              projectSessionEvent(database, chat.sessionId, event, ownerId)
+            })()
+            continue
+          }
+        }
+        projectSessionEvent(database, chat.sessionId, event, ownerId)
+      }
+      for (const message of [...inbox['next-turn'], ...inbox['next-step']]) {
+        const requestId = message.source?.kind === 'user' ? message.source.rpcId : undefined
+        const run = requestId ? database.getRun(ownerId, requestId) : undefined
+        if (run && run.sessionId === chat.sessionId) {
+          queued.push(run.id)
+          database.adoptInboxMessage(chat.sessionId, requestId, message.id)
+        }
+      }
+    } finally { observed[Symbol.dispose]?.() }
+  }
+  database.recoverInterrupted(Date.now(), queued)
 }
 
 function contentText(content) {

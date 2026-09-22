@@ -1,29 +1,32 @@
 import { randomUUID } from 'node:crypto'
 
 export class HumanInputBridge {
-  constructor({ database, timeoutSeconds = 60 }) {
+  constructor({ database, timeoutSeconds = 60, executionRun }) {
     this.database = database
     this.timeoutSeconds = timeoutSeconds
     this.pendings = new Map()
+    this.executionRun = executionRun
   }
 
   handleRequest = async (request, next) => {
     const sessionId = request?.agent?.session?.id ?? request?.agent?.session?.header?.id
-    const chat = this.database.getChatBySession(sessionId)
-    const run = chat ? this.database.activeRun(chat.ownerId, chat.id) : undefined
+    const run = this.executionRun ? this.executionRun(sessionId) : this.database.activeRunBySession(sessionId)
+    const chat = run ? this.database.getChat(run.ownerId, run.chatId) : undefined
     if (!chat || !run) return next()
     const id = randomUUID()
-    const deadlineAt = Date.now() + this.timeoutSeconds * 1000
+    const planReview = request.questions?.some((question) => question.intent?.kind === 'plan-review')
+    const deadlineAt = planReview ? null : Date.now() + this.timeoutSeconds * 1000
     const payload = pendingPayload(id, request.questions ?? [])
     const pending = { id, ownerId: chat.ownerId, runId: run.id, questions: request.questions ?? [], settled: false }
     const answer = new Promise((resolve, reject) => Object.assign(pending, { resolve, reject }))
     this.pendings.set(id, pending)
     this.database.createPendingInput(chat.ownerId, run.id, { requestId: id, payload, deadlineAt })
     this.database.appendEvent(chat.ownerId, run.id, { event: 'workbench_status', status: 'waiting_input' })
-    pending.timer = setTimeout(() => this.timeout(chat.ownerId, run.id, id), this.timeoutSeconds * 1000)
-    pending.timer.unref?.()
+    if (deadlineAt !== null) pending.timer = setTimeout(() => this.timeout(chat.ownerId, run.id, id), this.timeoutSeconds * 1000)
+    pending.timer?.unref?.()
     const abort = () => this.abort(pending)
     request.signal?.addEventListener('abort', abort, { once: true })
+    if (request.signal?.aborted) abort()
     try { return await answer }
     finally { request.signal?.removeEventListener('abort', abort) }
   }
@@ -43,14 +46,15 @@ export class HumanInputBridge {
     const resolved = this.resolve(ownerId, runId, requestId)
     if (resolved.stored.status !== 'pending') return resolved.stored
     const pending = resolved.pending
-    this.settle(pending, 'skipped')
+    this.settle(pending, reason)
     if (pending.questions.some((question) => question.intent?.kind === 'plan-review')) {
-      pending.reject(cancelledError())
+      pending.reject(cancelledError(reason))
     } else {
       pending.resolve({ answers: pending.questions.map((question) => ({
-        id: question.id,
-        selected: [],
-        custom: `【系统提示，非用户回答】${reason === 'timeout' ? '等待超时，用户未回答，本次补充提问已自动跳过。' : '用户跳过了本次补充提问，未提供回答。'}请根据已有信息自行判断，采用合理假设继续完成任务；必要时简要说明假设。不要因本次未回答而将任务标记为失败，也不要重复询问同一问题。未回答不代表同意任何选项或授予操作权限；确实缺少必要授权或无法推断的关键事实时，继续完成不依赖它的部分，并说明剩余限制。`,
+        id: question.id, selected: [],
+        custom: reason === 'timeout'
+          ? '[系统提示] 用户未在等待时间内回答。请根据已有信息自行判断并继续；这不代表用户授权任何需要确认的操作。'
+          : '[系统提示] 用户跳过了提问。请根据已有信息自行判断并继续；这不代表用户授权任何需要确认的操作。',
       })) })
     }
     return this.database.getPendingInput(ownerId, runId)
@@ -101,37 +105,36 @@ export class HumanInputBridge {
 }
 
 function pendingPayload(id, questions) {
-  const plan = questions.length === 1 && questions[0]?.intent?.kind === 'plan-review'
-  if (plan) return {
-    request_id: id, tool_call_id: id, tool_name: 'exit_plan_mode',
-    args: {
-      question: questions[0].question, title: questions[0].header, markdown: questions[0].detail,
-      actions: (questions[0].options ?? []).map((option) => ({ id: option.label, label: option.label })),
-    },
-  }
   return {
+    questions,
     request_id: id,
     tool_call_id: id,
-    tool_name: 'ask_user_question',
-    args: {
-      fields: questions.map((question) => ({
-        name: question.id, label: question.question,
-        type: question.options?.length ? 'select' : 'paragraph', required: !question.options?.length,
-        options: question.options?.map((option) => ({ label: option.label, value: option.label, description: option.description ?? null })),
-      })),
-    },
+    tool_name: questions.length === 1 && questions[0]?.intent?.kind === 'plan-review'
+      ? 'exit_plan_mode' : 'ask_user_question',
   }
 }
 
-function toAnswer(questions, body) {
-  const values = body.values ?? {}
-  return { answers: questions.map((question) => {
-    const value = typeof values[question.id] === 'string' ? values[question.id] : ''
-    const selected = (question.options ?? []).some((option) => option.label === value) ? [value] : []
-    return { id: question.id, selected, ...(value && selected.length === 0 ? { custom: value } : {}) }
-  }) }
+export function toAnswer(questions, body) {
+  const fail = () => { throw Object.assign(new Error('回答与原始问题不匹配'), { status: 400 }) }
+  const answers = body.answers
+  if (!Array.isArray(answers) || answers.length !== questions.length) fail()
+  const ids = new Set()
+  for (const answer of answers) {
+    const question = questions.find((item) => item.id === answer?.id)
+    if (!question || ids.has(answer.id) || !Array.isArray(answer.selected)) fail()
+    ids.add(answer.id)
+    if (new Set(answer.selected).size !== answer.selected.length ||
+        (!question.multiSelect && answer.selected.length > 1) ||
+        answer.selected.some((label) => !question.options?.some((option) => option.label === label)) ||
+        (answer.custom !== undefined && typeof answer.custom !== 'string')) fail()
+    if (question.intent?.kind === 'plan-review' && (answer.selected.length !== 1 || answer.custom)) fail()
+  }
+  return { answers: answers.map(({ id, selected, custom }) => ({ id, selected: [...selected], ...(custom === undefined ? {} : { custom }) })) }
 }
 
-function cancelledError() {
-  return Object.assign(new Error('the user cancelled ask_user_question'), { name: 'UserQuestionError', code: 'ASK_CANCELLED' })
+function cancelledError(reason = 'skipped') {
+  const message = reason === 'timeout'
+    ? 'Workbench question deadline expired without an answer. Continue with available information where possible; this grants no permission.'
+    : 'The user skipped this question without answering. Continue with available information where possible; this grants no permission.'
+  return Object.assign(new Error(message), { name: 'UserQuestionError', code: 'ASK_CANCELLED' })
 }

@@ -30,13 +30,11 @@ def package(text="---\nname: report\ndescription: Verify reports\n---\n# Report 
     return {"files": [{"path": "SKILL.md", "data": base64.b64encode(text.encode()).decode()}]}
 
 
-def test_memory_is_per_workspace_and_uses_version_conflicts(resources, tmp_path):
-    a, b = tmp_path / "a", tmp_path / "b"
-    a.mkdir(); b.mkdir()
-    first = resources.personal({"operation": "memory_update", "content": "用户甲偏好中文", "version": None}, str(a))
-    assert resources.personal({"operation": "list"}, str(b))["memory"]["content"] == ""
-    assert resources.personal({"operation": "memory_update", "content": "overwritten", "version": None}, str(a)) == {"conflict": True}
-    assert resources.personal({"operation": "list"}, str(a))["memory"] == first
+def test_removed_memory_operation_is_rejected(resources, tmp_path):
+    with pytest.raises(ValueError):
+        resources.personal({"operation": "memory_update", "content": "removed"}, str(tmp_path))
+    assert "memory" not in resources.personal({"operation": "list"}, str(tmp_path))
+    assert not (tmp_path / "memory.md").exists()
 
 
 def test_skill_inspect_validates_without_writing(resources, tmp_path):
@@ -63,18 +61,6 @@ def test_import_toggle_replace_and_recoverable_backup(resources, tmp_path):
     resources.personal({"operation": "skill_import", "name": "report", "version": first["version"], **package("updated")}, str(tmp_path))
     assert (tmp_path / "skills/report/SKILL.md").read_text() == "updated"
     assert next((tmp_path / ".skill-backups").iterdir()).joinpath("SKILL.md").read_text().startswith("---")
-
-
-@pytest.mark.parametrize("old", [b"a" * (64 * 1024 + 1), b"\xff\xfe"])
-def test_invalid_memory_can_be_replaced_without_blocking_skills(resources, tmp_path, old):
-    (tmp_path / "memory.md").write_bytes(old)
-    resources.personal({"operation": "skill_import", "name": "report", **package()}, str(tmp_path))
-    resources.personal({"operation": "skill_toggle", "name": "report", "enabled": False}, str(tmp_path))
-    listing = resources.personal({"operation": "list"}, str(tmp_path))
-    assert listing["warnings"] and not listing["skills"][0]["enabled"]
-    assert resources.personal({"operation": "memory_update", "content": "short", "version": None}, str(tmp_path)) == {"conflict": True}
-    resources.personal({"operation": "memory_update", "content": "新记忆", "version": listing["memory"]["version"]}, str(tmp_path))
-    assert (tmp_path / "memory.md").read_text(encoding="utf-8") == "新记忆"
 
 
 def test_unreadable_memory_does_not_block_independent_skill_operations(resources, tmp_path):
@@ -114,8 +100,8 @@ def test_zip_symlinks_and_live_symlinks_do_not_escape(resources, tmp_path):
         resources.members({"archive": base64.b64encode(stream.getvalue()).decode()})
     (tmp_path / "memory.md").symlink_to("/etc/passwd")
     listing = resources.personal({"operation": "list"}, str(tmp_path))
-    assert listing["memory"]["content"] == "" and listing["warnings"]
-    with pytest.raises(OSError):
+    assert "memory" not in listing
+    with pytest.raises(ValueError):
         resources.personal({"operation": "memory_update", "content": "bad"}, str(tmp_path))
 
 

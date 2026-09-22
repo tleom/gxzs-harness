@@ -6,12 +6,17 @@ export const Config = z.object({
   baseUrl: z.string().required(),
   workspaceId: z.string().required(),
   tokenEnv: z.string().default('GXZS_SANDBOX_MANAGER_TOKEN'),
+  ownerEnv: z.string().default('GXZS_HOST_OWNER_ID'),
+  generationEnv: z.string().default('GXZS_HOST_GENERATION'),
+  instanceEnv: z.string().default('GXZS_HOST_INSTANCE_ID'),
   timeoutMs: z.number().default(90_000),
+  // A manager directory download allows 50 MiB before base64 encoding.
+  maxResponseBytes: z.number().default(72 * 1024 * 1024),
 })
 
 const ACTIONS = {
   files: new Set(['list', 'stat', 'manifest', 'get', 'upload', 'delete', 'mkdir']),
-  'personal-resources': new Set(['list', 'memory_update', 'skill_inspect', 'skill_import', 'skill_update', 'skill_uninstall', 'skill_toggle', 'skill_pin']),
+  'personal-resources': new Set(['list', 'skill_inspect', 'skill_import', 'skill_update', 'skill_uninstall', 'skill_toggle', 'skill_pin']),
   'personal-mcp': new Set(['mcp_list', 'mcp_read', 'mcp_save', 'mcp_delete', 'mcp_toggle', 'mcp_pin', 'mcp_test']),
 }
 
@@ -21,7 +26,17 @@ export class FileManagerClient {
     this.workspaceId = validateWorkspaceId(config.workspaceId)
     this.token = process.env[config.tokenEnv]
     if (!this.token) throw new Error(`${config.tokenEnv} is required`)
-    this.timeoutMs = config.timeoutMs
+    this.owner = process.env[config.ownerEnv ?? 'GXZS_HOST_OWNER_ID']
+    this.generation = process.env[config.generationEnv ?? 'GXZS_HOST_GENERATION']
+    this.instance = process.env[config.instanceEnv ?? 'GXZS_HOST_INSTANCE_ID']
+    if (!this.owner || /[\r\n]/.test(this.owner) || !/^\d+$/.test(this.generation ?? '') || !this.instance || /[\r\n]/.test(this.instance))
+      throw new Error('sandbox manager owner, generation and instance identity are required')
+    const url = new URL(this.baseUrl)
+    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash)
+      throw new Error('sandbox manager baseUrl must be an HTTP(S) service base without credentials, query or fragment')
+    this.timeoutMs = config.timeoutMs ?? 90_000
+    this.maxResponseBytes = config.maxResponseBytes ?? 72 * 1024 * 1024
+    if (!Number.isSafeInteger(this.maxResponseBytes) || this.maxResponseBytes < 1) throw new Error('maxResponseBytes must be a positive integer')
     this.fetch = fetchImpl
   }
 
@@ -33,15 +48,56 @@ export class FileManagerClient {
     if (!ACTIONS[action]?.has(payload?.operation)) throw new TypeError(action === 'files' ? 'unsupported file operation' : `unsupported ${action} operation`)
     const response = await this.fetch(`${this.baseUrl}/sandboxes/${this.workspaceId}/${action}`, {
       method: 'POST',
-      headers: { authorization: `Bearer ${this.token}`, 'content-type': 'application/json' },
+      headers: { authorization: `Bearer ${this.token}`, 'content-type': 'application/json',
+        'x-gxzs-owner': this.owner, 'x-gxzs-host-generation': this.generation, 'x-gxzs-host-instance': this.instance },
       body: JSON.stringify(payload),
       signal: AbortSignal.timeout(this.timeoutMs),
+      redirect: 'error',
     })
-    const result = await response.json().catch(() => ({}))
-    if (response.status === 409 || result.conflict) throw Object.assign(new Error(result.message || '内容已改变，请刷新后重试'), { status: 409 })
-    if (!response.ok) throw Object.assign(new Error(result.error || '工作台资源操作失败'), { status: response.status === 400 ? 400 : 502 })
+    const result = await managerJson(response, this.maxResponseBytes)
+    if (response.status === 409 || result.conflict) throw Object.assign(new Error(result.message || '内容已改变，请刷新后重试'), { status: 409, code: 'RESOURCE_CONFLICT' })
+    if (!response.ok) throw Object.assign(new Error(result.error || '工作台资源操作失败'), { status: [400, 401, 403, 404, 413, 429].includes(response.status) ? response.status : 502 })
     return result
   }
+}
+
+async function managerJson(response, limit) {
+  const fail = () => Object.assign(new Error('工作台资源服务响应超过大小限制'), { status: 502, code: 'UPSTREAM_RESPONSE_TOO_LARGE' })
+  const declared = response.headers?.get('content-length')
+  if (declared && /^\d+$/.test(declared) && Number(declared) > limit) {
+    await Promise.resolve(response.body?.cancel()).catch(() => {})
+    throw fail()
+  }
+  let text
+  if (response.body?.getReader) {
+    const reader = response.body.getReader()
+    const chunks = []
+    let size = 0
+    try {
+      while (true) {
+        const { value, done } = await reader.read()
+        if (done) break
+        size += value.byteLength
+        if (size > limit) throw fail()
+        chunks.push(value)
+      }
+      text = Buffer.concat(chunks, size).toString('utf8')
+    } catch (error) {
+      await reader.cancel().catch(() => {})
+      throw error
+    } finally { reader.releaseLock() }
+  } else {
+    // Compatibility with injected transports; fetch Responses use the bounded
+    // streaming branch above, including responses without Content-Length.
+    text = response.text ? await response.text() : JSON.stringify(await response.json())
+    if (Buffer.byteLength(text, 'utf8') > limit) throw fail()
+  }
+  try {
+    const value = JSON.parse(text)
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('object required')
+    return value
+  }
+  catch { throw Object.assign(new Error('工作台资源服务返回了无效 JSON'), { status: 502, code: 'INVALID_UPSTREAM_RESPONSE' }) }
 }
 
 export class WorkbenchFileManager extends Service {

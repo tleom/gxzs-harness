@@ -201,7 +201,7 @@ describe('DSH session event projection', () => {
         goal: { id: 'g1', revision: 3, objective: '完成迁移', phase: 'active', maxGoalRounds: 6 },
       },
     })
-    projectSessionEvent(database, chat.sessionId, { type: 'plan/mode', data: { active: true } })
+    projectSessionEvent(database, chat.sessionId, { type: 'plan/mode', data: { active: true } }, undefined, { plan: { active: true, pending: false } })
     projectSessionEvent(database, chat.sessionId, { type: 'compaction/start', data: { compactionId: 'c1', turn: null } })
     projectSessionEvent(database, chat.sessionId, { type: 'compaction/summary', data: { compactionId: 'c1', summary: [{ type: 'text', text: 'summary' }], shadowedTokenCount: 200 } })
     projectSessionEvent(database, chat.sessionId, { type: 'compaction/end', data: { compactionId: 'c1', turn: null } })

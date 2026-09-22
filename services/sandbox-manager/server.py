@@ -10,10 +10,13 @@ import subprocess
 import threading
 import time
 import uuid
+from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor
 from urllib.request import ProxyHandler, Request, build_opener
 
 from mcp_journal import Journal
 from admission import Admission
+from owner_auth import authorize as authorize_request
 
 TOKEN = os.environ["WORKBENCH_SANDBOX_MANAGER_TOKEN"]
 IMAGE = os.environ.get("WORKBENCH_SANDBOX_IMAGE", "langgenius/dify-agent-local-sandbox:1.17.1")
@@ -23,6 +26,9 @@ STATE = Path(os.environ.get("WORKBENCH_MANAGER_STATE", "/state"))
 STATE.mkdir(parents=True, exist_ok=True)
 LOCKS = {}
 LOCKS_GUARD = threading.Lock()
+REQUEST_CONTEXT = threading.local()
+OPERATION_CAPACITY = threading.BoundedSemaphore(int(os.environ.get('WORKBENCH_MANAGER_MAX_OPERATIONS', '24')))
+CONTROL_ACTIONS = frozenset({'stop-binding', 'fence-binding', 'schedule', 'runtime-epoch', 'touch', 'diagnostics'})
 MAX_BODY = 30 * 1024 * 1024
 MCP_JOURNAL = Journal(STATE)
 ADMISSION = Admission(str(STATE / 'admission.sqlite3'))
@@ -40,9 +46,18 @@ def docker(*args, stdin=None, timeout=90, check=True):
     return result
 
 
+@contextmanager
 def lock(key):
     with LOCKS_GUARD:
-        return LOCKS.setdefault(key, threading.RLock())
+        mutex = LOCKS.setdefault(key, threading.RLock())
+    with mutex:
+        context = getattr(REQUEST_CONTEXT, "owner", None)
+        if context is not None:
+            headers, workspace, action = context
+            if workspace != key:
+                raise PermissionError("Manager workspace mismatch")
+            authorize_request(headers, TOKEN, HOSTS.root, workspace, action)
+        yield
 
 
 def identity(key):
@@ -95,6 +110,7 @@ def ensure(key):
                    "base=Path('/opt/office/python/lib/python3.12/site-packages'); "
                    "(site/'workbench_office.pth').write_text(str(base)+'\\n') if site.exists() and base.exists() else None")
             docker("create", "--name", name, "--label", "workbench=" + PREFIX, "--network", NETWORK,
+                   '--log-driver', 'json-file', '--log-opt', 'max-size=10m', '--log-opt', 'max-file=3',
                    "--cpus", os.environ.get("WORKBENCH_SANDBOX_CPUS", "2"),
                    "--memory", os.environ.get("WORKBENCH_SANDBOX_MEMORY", "4g"), "--pids-limit", "512",
                    "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true",
@@ -123,7 +139,7 @@ def stop_binding(key, binding):
 
     binding = str(uuid.UUID(binding))
     inspection_count = stop_inspections(key, binding, docker=docker, prefix=PREFIX,
-                                        admission=InspectionAdmission(STATE, lock))
+                                        admission=InspectionAdmission(STATE, lambda value: lock('planning:' + value)))
     name, _ = identity(key)
     info = docker("inspect", name, check=False)
     if info.returncode or not json.loads(info.stdout)[0]["State"]["Running"]:
@@ -138,6 +154,10 @@ def stop_binding(key, binding):
 
 def authorize_mcp(payload):
     """Only the configured API can confirm a currently owned execution."""
+    context = getattr(REQUEST_CONTEXT, "owner", None)
+    if context is not None:
+        with lock(context[1]):
+            pass
     request = Request(MCP_API_URL + "/internal/ai/mcp/authorize",
                       data=json.dumps(payload).encode(), method="POST",
                       headers={"Authorization": "Bearer " + TOKEN, "Content-Type": "application/json"})
@@ -150,8 +170,18 @@ def authorize_mcp(payload):
 
 def operation(key, action, payload):
     name, _ = identity(key)
+    if action == "global-memory":
+        from global_memory import operate
+        return operate(key, payload, docker=docker, ensure=ensure, identity=identity,
+                       lock=lock, authorize=authorize_mcp, journal=MCP_JOURNAL)
     if action == 'ensure-host':
         return HOSTS.ensure(key, payload)
+    if action == 'replace-host':
+        return HOSTS.replace(key, payload)
+    if action == 'diagnostics':
+        from mcp_runtime import statistics
+        from global_memory import statistics as memory_statistics
+        return {"mcp": statistics(), "memory": memory_statistics(), "journal": MCP_JOURNAL.statistics(), "workspace_locks": len(LOCKS)}
     if action == 'schedule':
         return HOSTS.schedule(key, payload)
     if action == "runtime-epoch":
@@ -167,11 +197,17 @@ def operation(key, action, payload):
             if current["running"] and current["epoch"] == previous:
                 return {"fenced": False}
         from mcp_runtime import invalidate
+        from global_memory import invalidate as cancel_memory
 
-        invalidate(key, binding=str(uuid.UUID(payload["binding_id"])))
-        with lock(key):
-            result = stop_binding(key, payload["binding_id"])
-            return {**result, "fenced": True}
+        binding = str(uuid.UUID(payload['binding_id']))
+        MCP_JOURNAL.cancel_binding(key, binding)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            mcp_cancel = pool.submit(invalidate, key, binding=binding)
+            memory_cancel = pool.submit(cancel_memory, key, binding=binding)
+            mcp_stopped, memory_stopped = mcp_cancel.result(), memory_cancel.result()
+        result = stop_binding(key, payload["binding_id"])
+        return {**result, "fenced": memory_stopped and mcp_stopped,
+                'uncertain': MCP_JOURNAL.binding_uncertain(key, binding)}
     if action == "ensure":
         return ensure(key)
     if action == "touch":
@@ -180,7 +216,7 @@ def operation(key, action, payload):
     if action in ("plan-admission", "plan-inspect"):
         from planning import InspectionAdmission, inspect_plan
 
-        admission = InspectionAdmission(STATE, lock)
+        admission = InspectionAdmission(STATE, lambda value: lock('planning:' + value))
         if action == "plan-admission":
             return {"ticket": admission.ticket(key, payload["binding_id"])}
         return inspect_plan(
@@ -334,25 +370,48 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         code = 200
+        admitted = False
         try:
-            if not hmac.compare_digest(self.headers.get("Authorization", ""), "Bearer " + TOKEN):
-                self.send_error(403)
-                return
             parts = self.path.strip("/").split("/")
             if len(parts) != 3 or parts[0] != "sandboxes":
                 raise ValueError("Unsupported route")
             key = str(uuid.UUID(parts[1]))
+            # Hold the workspace lock only for identity validation. Provisioning
+            # and replacement revoke old identities before any destructive step.
+            # Root cancellation must reach in-flight process supervisors even
+            # while another operation owns the workspace preparation lock.
+            if hmac.compare_digest(self.headers.get('Authorization', ''), 'Bearer ' + TOKEN):
+                role = 'root'
+            else:
+                with lock(key):
+                    role = authorize_request(self.headers, TOKEN, HOSTS.root, key, parts[2])
+            if role == 'owner':
+                REQUEST_CONTEXT.owner = (self.headers, key, parts[2])
             size = int(self.headers.get("Content-Length", "0"))
             if not 0 <= size <= MAX_BODY:
                 raise ValueError("Request too large")
             payload = json.loads(self.rfile.read(size) or "{}")
+            if not isinstance(payload, dict):
+                raise ValueError('Request must be an object')
+            if parts[2] not in CONTROL_ACTIONS:
+                admitted = OPERATION_CAPACITY.acquire(blocking=False)
+                if not admitted:
+                    raise CapacityError('Sandbox manager is busy; operation was not started')
             output = operation(key, parts[2], payload)
             if output.get("conflict"):
                 code = 409
+        except CapacityError as error:
+            code, output = 503, {'error': str(error), 'code': 'MANAGER_BUSY'}
+        except PermissionError as error:
+            code, output = 403, {"error": str(error), "code": "MANAGER_FORBIDDEN"}
         except (ValueError, OSError) as error:
             code, output = 400, {"error": str(error)}
         except Exception:
             code, output = 503, {"error": "Sandbox operation failed; current data and environment retained"}
+        finally:
+            REQUEST_CONTEXT.owner = None
+            if admitted:
+                OPERATION_CAPACITY.release()
         data = json.dumps(output).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
@@ -361,11 +420,46 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
 
+class CapacityError(RuntimeError):
+    pass
+
+
+class BoundedHTTPServer(ThreadingHTTPServer):
+    """Bound retained request bodies and long-running operation threads."""
+    daemon_threads = True
+
+    def __init__(self, *args, **kwargs):
+        self.capacity = threading.BoundedSemaphore(int(os.environ.get("WORKBENCH_MANAGER_MAX_REQUESTS", "32")))
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request, client_address):
+        if not self.capacity.acquire(blocking=False):
+            try:
+                request.sendall(b'HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nRetry-After: 1\r\nConnection: close\r\n\r\n')
+            finally:
+                self.shutdown_request(request)
+            return
+        request.settimeout(30)
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self.capacity.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.capacity.release()
+
+
 def reap():
     while True:
         time.sleep(30)
         try:
             MCP_JOURNAL.prune()
+            from mcp_runtime import reap_workers
+            reap_workers()
         except (ValueError, OSError, sqlite3.Error):
             pass
         for item in STATE.iterdir():
@@ -396,4 +490,4 @@ if __name__ == "__main__":
         raise ValueError("Manager token must contain at least 32 characters")
     threading.Thread(target=reap, daemon=True).start()
     threading.Thread(target=maintain_hosts, daemon=True).start()
-    ThreadingHTTPServer(("0.0.0.0", 5010), Handler).serve_forever()
+    BoundedHTTPServer(("0.0.0.0", 5010), Handler).serve_forever()

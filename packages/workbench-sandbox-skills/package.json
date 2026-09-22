@@ -3,11 +3,16 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "exports": { ".": "./src/index.js" },
-  "engines": { "node": "^22.19.0 || >=24.0.0" },
+  "exports": {
+    ".": "./src/index.js",
+    "./definition": "./src/definition.js"
+  },
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
   "dependencies": {
     "@deepseek-ai/cordis": "4.0.2",
-    "js-yaml": "4.1.1"
+    "@deepseek-ai/dsh-skill-filesystem": "0.1.6-alpha.2"
   },
   "devDependencies": {
     "@deepseek-ai/dsh-skill": "0.1.6-alpha.2"

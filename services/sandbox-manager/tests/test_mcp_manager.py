@@ -41,13 +41,16 @@ def manager(tmp_path, monkeypatch):
                 return {"error": "stopped", "uncertain": True}
             return {"result": {"value": "ok"}}
 
-        def send(self, payload):
+        def send(self, payload, cancelled=None, on_dispatch=None):
             self.pending = payload
+            if on_dispatch:
+                on_dispatch()
             calls.append(payload)
             entered.set()
 
         def close(self):
             self.closed.set()
+            return True
 
     def docker(*args, stdin=None, **kwargs):
         if args[0] == "ps":
@@ -83,8 +86,10 @@ def payload(key, binding, *, tool="slow", request="call-1"):
         "manifest_version": "m1",
         "tool": tool,
         "arguments": {},
-        "request_key": request,
-        "authorization": {"workspace_id": key, "binding_id": binding},
+        "request_key": binding + ':' + request,
+        "authorization": {"workspace_id": key, "binding_id": binding, "run_id": binding,
+                          "request_key": request, "resource_id": 'personal:mcp:demo:' + tool,
+                          "version": "v1", "manifest_version": "m1", "arguments": {}},
     }
 
 
@@ -95,7 +100,7 @@ def test_stop_and_catalog_do_not_wait_for_business_call_and_queued_calls_reautho
     key, first, second = [str(uuid4()) for _ in range(3)]
     allowed = {first: True, second: True}
     monkeypatch.setattr(
-        module, "authorize_mcp", lambda auth: allowed[auth["binding_id"]]
+        module, "authorize_mcp", lambda auth: allowed[auth['authorization']["binding_id"]]
     )
     with ThreadPoolExecutor(max_workers=3) as pool:
         active = pool.submit(module.operation, key, "personal-mcp", payload(key, first))
@@ -129,6 +134,7 @@ def test_stop_cancels_only_its_binding_and_other_server_can_complete(manager):
         active = pool.submit(module.operation, key, "personal-mcp", payload(key, first))
         assert entered.wait(2)
         other = {**payload(key, second, tool="fast", request="call-2"), "name": "other"}
+        other['authorization']['resource_id'] = 'personal:mcp:other:fast'
         assert module.operation(key, "personal-mcp", other)["result"]["value"] == "ok"
         module.operation(key, "stop-binding", {"binding_id": second})
         assert not active.done()
@@ -196,10 +202,12 @@ def test_retention_limits_keep_tombstones_and_request_identity(manager):
         in restarted.begin("b", {"request_key": "3", "tool": "changed"})[1]["error"]
     )
     assert journal.begin("c", {"request_key": "4"})[1] is None
-    assert "容量" in journal.begin("c", {"request_key": "5"})[1]["error"]
+    assert journal.begin("c", {"request_key": "5"})[1] is None
+    assert journal.statistics()['archived_records'] >= 1
+    assert journal.begin(*stored[0][:2])[1]['uncertain']
 
 
-def test_legacy_result_is_compacted_without_replay(manager):
+def test_obsolete_reservation_is_rejected_without_reading_or_replaying(manager):
     module, _, _, _ = manager
     from mcp_journal import Journal
 
@@ -211,5 +219,210 @@ def test_legacy_result_is_compacted_without_replay(manager):
         json.dumps({"fingerprint": fingerprint, "result": {"content": "x" * 10000}})
     )
     journal.prune()
-    assert path.stat().st_size < 100
+    assert path.stat().st_size > 10000
     assert journal.begin("owner", body)[1]["uncertain"]
+
+
+def test_validate_then_consume_once_and_retry_never_replays(manager, monkeypatch):
+    module, _, calls, _ = manager
+    key, binding = str(uuid4()), str(uuid4())
+    request = payload(key, binding, tool='fast')
+    request['authorization']['jti'] = 'nonce-one'
+    consumed, actions = set(), []
+    def authorize(callback):
+        actions.append(callback['action'])
+        nonce = callback['authorization']['jti']
+        if callback['action'] == 'validate':
+            return True
+        if nonce in consumed:
+            return False
+        consumed.add(nonce)
+        return True
+    monkeypatch.setattr(module, 'authorize_mcp', authorize)
+    first = module.operation(key, 'personal-mcp', request)
+    request['authorization']['jti'] = 'nonce-two'
+    assert module.operation(key, 'personal-mcp', request) == first
+    assert len(calls) == 1
+    assert actions == ['validate', 'consume', 'validate']
+    assert consumed == {'nonce-one'}
+
+
+@pytest.mark.parametrize('field,value', [('tool', 'other'), ('arguments', {'x': 1}), ('manifest_version', 'm2'), ('request_key', 'other'), ('deadline_ms', 1)])
+def test_payload_cannot_change_signed_operation(manager, field, value):
+    module, _, calls, _ = manager
+    key, binding = str(uuid4()), str(uuid4())
+    request = payload(key, binding, tool='fast')
+    request[field] = value
+    with pytest.raises(ValueError):
+        module.operation(key, 'personal-mcp', request)
+    assert not calls
+
+
+def test_java_grant_fixture_reaches_worker_and_has_exact_callbacks(manager, monkeypatch):
+    module, _, calls, _ = manager
+    fixture = json.loads((Path(__file__).parent / 'fixtures' / 'mcp-grant-v2.json').read_text(encoding='utf-8'))
+    monkeypatch.setattr(time, 'time', lambda: fixture['issued_at_ms'] / 1000)
+    callbacks = []
+    monkeypatch.setattr(module, 'authorize_mcp', lambda request: (callbacks.append(request), True)[1])
+    result = module.operation(fixture['authorization']['workspace_id'], 'personal-mcp', fixture['manager_payload'])
+    assert result['result']['value'] == 'ok'
+    assert callbacks == [fixture['validate_callback'], fixture['consume_callback']]
+    assert len(calls) == 1
+
+
+def test_grant_does_not_equate_boolean_and_number(manager):
+    module, _, calls, _ = manager
+    key, binding = str(uuid4()), str(uuid4())
+    request = payload(key, binding, tool='fast')
+    request['arguments'] = {'confirm': 1}
+    request['authorization']['arguments'] = {'confirm': True}
+    with pytest.raises(ValueError):
+        module.operation(key, 'personal-mcp', request)
+    assert not calls
+
+
+def test_expired_deadline_never_creates_worker_or_dispatches(manager):
+    module, _, calls, _ = manager
+    key, binding = str(uuid4()), str(uuid4())
+    request = payload(key, binding, tool='fast')
+    request['deadline_ms'] = request['authorization']['deadline_ms'] = int(time.time() * 1000) - 1
+    assert '未执行' in module.operation(key, 'personal-mcp', request)['error']
+    assert not calls
+
+
+def test_archive_remains_queryable_after_restart(manager):
+    module, _, _, _ = manager
+    from mcp_journal import Journal
+    journal = Journal(module.STATE, max_records=2)
+    for number in range(10):
+        request = {'request_key': str(number), 'tool': 'write', 'arguments': {'number': number}}
+        digest, previous = journal.begin('owner', request)
+        assert previous is None
+        journal.finish(digest, {'result': number})
+    restarted = Journal(module.STATE, max_records=2)
+    stats = restarted.statistics()
+    assert stats['active_records'] == 2
+    assert stats['archived_records'] == 8
+    assert restarted.lookup('owner', {'request_key': '0', 'tool': 'write', 'arguments': {'number': 0}})['uncertain']
+    assert '不同参数' in restarted.lookup('owner', {'request_key': '0', 'tool': 'write', 'arguments': {'number': 999}})['error']
+
+
+def test_worker_wire_payload_keeps_utf8_arguments_within_frame_limit():
+    from io import BytesIO
+    from mcp_runtime import Worker
+    worker = object.__new__(Worker)
+    worker.close_guard = threading.Lock()
+    worker.process = SimpleNamespace(stdin=BytesIO())
+    arguments = {'query': '中' * 340000}
+    request = {'operation': 'mcp_call', 'tool': 'search', 'arguments': arguments,
+               'manifest_version': 'm1', 'authorization': {'arguments': arguments, 'signature': 'secret'}}
+    assert Worker.send(worker, request) is None
+    encoded = worker.process.stdin.getvalue()
+    assert len(encoded) < 2 * 1024 * 1024
+    decoded = json.loads(encoded)
+    assert decoded['arguments'] == arguments
+    assert 'authorization' not in decoded
+
+
+def test_stop_does_not_confirm_unfinished_personal_worker(manager):
+    module, runtime, _, _ = manager
+    key, binding = str(uuid4()), str(uuid4())
+    class PendingWorker:
+        stopped = False
+        def close(self):
+            return self.stopped
+    worker = PendingWorker()
+    runtime.CLOSING[worker] = (key, 'demo', binding)
+    assert module.operation(key, 'stop-binding', {'binding_id': binding})['fenced'] is False
+    assert module.operation(key, 'stop-binding', {'binding_id': binding})['fenced'] is False
+    worker.stopped = True
+    assert module.operation(key, 'stop-binding', {'binding_id': binding})['fenced'] is True
+    assert worker not in runtime.CLOSING
+
+
+def test_real_worker_close_keeps_unconfirmed_client_for_later_check():
+    import subprocess
+    from io import BytesIO
+    from unittest.mock import Mock
+    from mcp_runtime import Worker
+    worker = object.__new__(Worker)
+    worker.close_guard, worker.closed = threading.Lock(), False
+    worker.process = SimpleNamespace(stdin=BytesIO(), returncode=None,
+        wait=Mock(side_effect=subprocess.TimeoutExpired('docker', 5)), terminate=Mock())
+    assert worker.close() is False
+    worker.process.terminate.assert_not_called()
+
+
+def test_saturated_business_capacity_keeps_root_cancel_available(manager, monkeypatch):
+    from io import BytesIO
+    from unittest.mock import Mock
+    module, _, _, _ = manager
+    capacity = threading.BoundedSemaphore(1)
+    capacity.acquire()
+    monkeypatch.setattr(module, 'OPERATION_CAPACITY', capacity)
+    operation = Mock(return_value={'fenced': True})
+    monkeypatch.setattr(module, 'operation', operation)
+    def request(action, token=module.TOKEN):
+        handler = object.__new__(module.Handler)
+        body = json.dumps({'binding_id': str(uuid4())}).encode()
+        handler.path = '/sandboxes/' + str(uuid4()) + '/' + action
+        handler.headers = {'Authorization': 'Bearer ' + token, 'Content-Length': str(len(body))}
+        handler.rfile, handler.wfile = BytesIO(body), BytesIO()
+        handler.send_response, handler.send_header, handler.end_headers = Mock(), Mock(), Mock()
+        handler.do_POST()
+        return handler.send_response.call_args.args[0]
+    assert request('personal-mcp') == 503
+    assert request('stop-binding') == 200
+    assert request('stop-binding', 'invalid') == 403
+    assert operation.call_count == 1
+    capacity.release()
+
+
+def test_stop_plain_text_or_known_complete_tool_is_not_uncertain(manager):
+    module, _, _, _ = manager
+    key, text_binding, known_binding = [str(uuid4()) for _ in range(3)]
+    assert module.operation(key, 'stop-binding', {'binding_id': text_binding}) == {'stopped': 0, 'fenced': True, 'uncertain': False}
+    module.operation(key, 'personal-mcp', payload(key, known_binding, tool='fast'))
+    result = module.operation(key, 'stop-binding', {'binding_id': known_binding})
+    assert result['fenced'] is True and result['uncertain'] is False
+    module.MCP_JOURNAL.ttl = -1
+    module.MCP_JOURNAL.prune()
+    assert module.operation(key, 'stop-binding', {'binding_id': known_binding})['uncertain'] is False
+
+
+def test_cancelled_inflight_unknown_remains_sticky_after_restart_and_archive(manager):
+    module, _, _, entered = manager
+    key, binding = str(uuid4()), str(uuid4())
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(module.operation, key, 'personal-mcp', payload(key, binding))
+        assert entered.wait(2)
+        result = module.operation(key, 'stop-binding', {'binding_id': binding})
+        assert result['fenced'] is True and result['uncertain'] is True
+        assert pending.result()['uncertain']
+    from mcp_journal import Journal
+    module.MCP_JOURNAL = Journal(module.STATE, max_records=0)
+    module.MCP_JOURNAL.prune()
+    assert module.MCP_JOURNAL.statistics()['archived_records'] == 1
+    assert module.operation(key, 'stop-binding', {'binding_id': binding})['uncertain'] is True
+
+
+def test_cancel_before_dispatch_seals_new_requests_without_side_effect_warning(manager):
+    module, _, calls, _ = manager
+    key, binding = str(uuid4()), str(uuid4())
+    assert module.operation(key, 'stop-binding', {'binding_id': binding})['uncertain'] is False
+    result = module.operation(key, 'personal-mcp', payload(key, binding, tool='fast'))
+    assert '未执行' in result['error']
+    assert not calls
+    assert module.operation(key, 'stop-binding', {'binding_id': binding})['uncertain'] is False
+
+
+def test_reserved_or_aborted_send_does_not_count_as_dispatched(manager):
+    module, _, _, _ = manager
+    key, binding = str(uuid4()), str(uuid4())
+    digest, _ = module.MCP_JOURNAL.begin(key, payload(key, binding, tool='fast'))
+    assert module.MCP_JOURNAL.binding_uncertain(key, binding) is False
+    assert module.MCP_JOURNAL.prepare_dispatch(digest)
+    assert module.MCP_JOURNAL.binding_uncertain(key, binding) is True
+    module.MCP_JOURNAL.resolve_dispatch(digest, False)
+    module.MCP_JOURNAL.finish(digest, {'error': 'not sent'})
+    assert module.MCP_JOURNAL.binding_uncertain(key, binding) is False

@@ -23,6 +23,8 @@ class Admission:
             # Serialize read/decide/write across SQLite connections as well.
             self.db.execute('BEGIN IMMEDIATE')
             row = self.db.execute('SELECT * FROM task_admission WHERE owner=? AND run=?', (owner, run)).fetchone()
+            if row and row['state'] == 'done' and generation > row['generation']:
+                return {'state': 'fenced', 'code': 'ADMISSION_TICKET_FENCED'}
             if row and (row['generation'] != generation or row['instance'] != instance or row['chat'] != chat):
                 raise ValueError('Task belongs to another host generation or conversation')
             now = time.time()
@@ -63,7 +65,7 @@ class Admission:
     def fence(self, owner, instance):
         """Call only AFTER that host and its sandbox have been stopped."""
         with self.guard, self.db:
-            self.db.execute("UPDATE task_admission SET state='done' WHERE owner=? AND instance=? AND state='running'", (owner, instance))
+            self.db.execute("UPDATE task_admission SET state='done' WHERE owner=? AND instance=? AND state IN ('running','waiting','retry')", (owner, instance))
 
     def active(self, owner):
         with self.guard:

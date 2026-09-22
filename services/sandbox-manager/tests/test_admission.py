@@ -5,6 +5,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from admission import Admission
 
 
+def test_fenced_old_generation_ticket_can_request_new_identity(tmp_path):
+    queue = Admission(str(tmp_path / 'queue.db'))
+    assert queue.request('a', 1, 'host-1', 'ticket', 'chat', 'acquire')['state'] == 'running'
+    queue.fence('a', 'host-1')
+    assert queue.request('a', 2, 'host-2', 'ticket', 'chat', 'acquire') == {'state': 'fenced', 'code': 'ADMISSION_TICKET_FENCED'}
+    assert queue.request('a', 2, 'host-2', 'new-ticket', 'chat', 'acquire')['state'] == 'running'
+    queue.close()
+
+
 def test_limits_and_fifo(tmp_path):
     queue = Admission(str(tmp_path / 'queue.db'))
     def call(owner, run, action='acquire'):

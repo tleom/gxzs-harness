@@ -9,6 +9,73 @@ function create(fetchImpl) {
 }
 
 describe('restricted platform client', () => {
+  it('honors the remaining absolute deadline and sends it to the platform', async () => {
+    const fetchImpl = vi.fn(async (_url, { signal }) => {
+      signal.throwIfAborted()
+      return new Promise((_resolve, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }))
+    })
+    const client = create(fetchImpl)
+    const deadlineMs = Date.now() + 25
+    await expect(client.request({ owner: { ownerId: 't:1' }, method: 'POST', route: 'mcp/call', timeoutMs: 350_000, deadlineMs }))
+      .rejects.toMatchObject({ name: 'TimeoutError' })
+    expect(fetchImpl.mock.calls[0][1].headers['x-gxzs-deadline-ms']).toBe(String(deadlineMs))
+    await expect(client.request({ owner: { ownerId: 't:1' }, method: 'POST', route: 'mcp/call', deadlineMs: Date.now() - 1 }))
+      .rejects.toMatchObject({ status: 504, code: 'DEADLINE_EXCEEDED' })
+    expect(fetchImpl).toHaveBeenCalledTimes(1)
+  })
+
+  it('cancels response consumption as soon as the streaming size limit is exceeded', async () => {
+    const cancel = vi.fn()
+    const stream = new ReadableStream({ pull(controller) { controller.enqueue(new Uint8Array(10)) }, cancel })
+    const client = create(async () => new Response(stream))
+    client.maxResponseBytes = 12
+    await expect(client.request({ owner: { ownerId: 't:1' }, method: 'GET', route: 'mcp/catalog' }))
+      .rejects.toMatchObject({ code: 'UPSTREAM_RESPONSE_TOO_LARGE' })
+    expect(cancel).toHaveBeenCalledOnce()
+  })
+
+  it('rejects an excessive declared response length without reading its body', async () => {
+    const cancel = vi.fn()
+    const arrayBuffer = vi.fn()
+    const client = create(async () => ({ ok: true, status: 200, headers: new Headers({ 'content-length': '100' }), body: { cancel }, arrayBuffer }))
+    client.maxResponseBytes = 12
+    await expect(client.request({ owner: { ownerId: 't:1' }, method: 'GET', route: 'mcp/catalog' }))
+      .rejects.toMatchObject({ code: 'UPSTREAM_RESPONSE_TOO_LARGE' })
+    expect(arrayBuffer).not.toHaveBeenCalled()
+    expect(cancel).toHaveBeenCalledOnce()
+  })
+
+  it('revalidates configuration by owner and never returns a cached value on access denial', async () => {
+    const fetchImpl = vi.fn()
+      .mockResolvedValueOnce(new Response('{"data":{"version":1}}', { headers: { etag: '"v1"' } }))
+      .mockResolvedValueOnce(new Response(null, { status: 304 }))
+      .mockResolvedValueOnce(new Response('{"message":"denied","code":"HOST_REVOKED"}', { status: 403 }))
+      .mockResolvedValueOnce(new Response('{"data":{"version":2}}', { headers: { etag: '"v2"' } }))
+    const client = create(fetchImpl)
+    const request = { owner: { ownerId: 't:1' }, method: 'GET', route: 'workbench/config' }
+    const first = await client.request(request)
+    const second = await client.request(request)
+    expect(Buffer.from(second.bytes).toString()).toBe(Buffer.from(first.bytes).toString())
+    expect(fetchImpl.mock.calls[1][1].headers['if-none-match']).toBe('"v1"')
+    await expect(client.request(request)).rejects.toMatchObject({ status: 403, code: 'HOST_REVOKED' })
+    await client.request({ ...request, owner: { ownerId: 't:2' } })
+    expect(fetchImpl.mock.calls[3][1].headers['if-none-match']).toBeUndefined()
+    expect(client.configCache.has('t:1')).toBe(false)
+  })
+  it('propagates prompt cancellation and a per-request timeout to fetch', async () => {
+    const fetchImpl = vi.fn(async (_url, { signal }) => {
+      signal.throwIfAborted()
+      return new Promise((_resolve, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }))
+    })
+    const client = create(fetchImpl)
+    const controller = new AbortController()
+    const request = client.request({ owner: { ownerId: 't:1' }, method: 'GET', route: 'workbench/config', signal: controller.signal })
+    controller.abort(new Error('turn cancelled'))
+    await expect(request).rejects.toThrow('turn cancelled')
+    await expect(client.request({ owner: { ownerId: 't:1' }, method: 'GET', route: 'workbench/config', timeoutMs: 10 }))
+      .rejects.toMatchObject({ name: 'TimeoutError' })
+  })
+
   it('keeps unconfigured platform features unavailable without blocking the core host', async () => {
     const fetchImpl = vi.fn()
     const client = new PlatformClient({ baseUrl: '', tokenEnv: 'MISSING_TOKEN', timeoutMs: 1000 }, { fetchImpl })
@@ -32,8 +99,10 @@ describe('restricted platform client', () => {
     const client = create(fetchImpl)
     await client.request({ owner: { ownerId: 't:1' }, method: 'GET', route: 'mcp/catalog' })
     await client.request({ owner: { ownerId: 't:1' }, method: 'POST', route: 'mcp/call', contentType: 'application/json', body: Buffer.from('{}') })
+    await client.request({ owner: { ownerId: 't:1' }, method: 'POST', route: 'mcp/cancel', contentType: 'application/json', body: Buffer.from('{"run_id":"run-1"}') })
     expect(fetchImpl.mock.calls.map(([url]) => url)).toEqual([
       'http://platform/internal/workbench/mcp/catalog', 'http://platform/internal/workbench/mcp/call',
+      'http://platform/internal/workbench/mcp/cancel',
     ])
   })
 

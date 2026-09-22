@@ -9,6 +9,7 @@ import asyncio
 import json
 import os
 import sys
+import time
 from contextlib import AsyncExitStack
 
 import httpx2
@@ -203,16 +204,21 @@ async def serve(name, expected_version, root="/workspace"):
                     emit({"error": "MCP 工具参数不符合声明"})
                     continue
                 try:
+                    remaining = (request.get('deadline_ms', int(time.time() * 1000) + 350_000) - time.time() * 1000) / 1000
+                    if remaining <= 0:
+                        emit({'error': 'MCP 调用已过期，本次操作未执行', 'code': 'MCP_DEADLINE_EXCEEDED'})
+                        continue
+                    call_timeout = min(timeout, remaining)
                     # Use the session's one-request API. High-level input-required
                     # loops can repeat a call and are inappropriate for writes.
                     result = await connected(
                         client.session.call_tool(
                             tool["name"],
                             arguments,
-                            read_timeout_seconds=timeout,
+                            read_timeout_seconds=call_timeout,
                         ),
                         disconnected,
-                        timeout,
+                        call_timeout,
                     )
                     emit(
                         {

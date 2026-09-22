@@ -1,4 +1,4 @@
-"""Personal memory and skill packages, executed inside the owning sandbox.
+"""Personal skill packages, executed inside the owning sandbox.
 
 No package script is executed during import. All archive members are validated
 before writes; user files use no-follow directory descriptors and atomic swaps.
@@ -128,35 +128,14 @@ def write_package(fd, files, *, readonly=False):
 
 def personal(payload, root="/workspace"):
     operation = payload["operation"]
+    if operation not in {"list", "skill_inspect", "skill_import", "skill_update", "skill_uninstall", "skill_toggle", "skill_pin"}:
+        raise ValueError("未知个人资源操作")
     rootfd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
         warnings = []
-        memory = None
         if operation == "skill_inspect":
             files = members(payload)
             return {"content": files["SKILL.md"].decode("utf-8-sig")}
-        if operation in {"list", "memory_update"}:
-            try:
-                memory = read_file(rootfd, "memory.md")
-            except (ValueError, OSError) as error:
-                if operation != "list":
-                    raise
-                warnings.append("memory.md 无法读取：" + str(error))
-        if memory is not None and len(memory) > MAX_SKILL_TEXT:
-            warnings.append("memory.md 超过 64 KiB，未载入模型")
-        try:
-            memory_text = (memory or b"").decode("utf-8-sig") if len(memory or b"") <= MAX_SKILL_TEXT else ""
-        except UnicodeDecodeError:
-            memory_text = ""
-            warnings.append("memory.md 不是有效 UTF-8，未载入模型")
-        if operation == "memory_update":
-            text = payload["content"].encode("utf-8")
-            if len(text) > MAX_SKILL_TEXT:
-                raise ValueError("memory.md 不能超过 64 KiB")
-            if payload.get("version") != version(memory):
-                return {"conflict": True}
-            atomic_write(rootfd, "memory.md", text)
-            return {"content": payload["content"], "version": version(text)}
         if operation in {"list", "skill_toggle"}:
             try:
                 raw_settings = read_file(rootfd, SETTINGS)
@@ -188,7 +167,7 @@ def personal(payload, root="/workspace"):
         except OSError as error:
             if operation != "list":
                 raise
-            return {"memory": {"content": memory_text, "version": version(memory)}, "skills": [], "warnings": [*warnings, "skills 目录无法读取：" + str(error)]}
+            return {"skills": [], "warnings": [*warnings, "skills 目录无法读取：" + str(error)]}
         try:
             if operation == "list":
                 skills = []
@@ -211,7 +190,7 @@ def personal(payload, root="/workspace"):
                         warnings.append("技能 " + name + " 未载入：" + str(error))
                     finally:
                         os.close(fd)
-                return {"memory": {"content": memory_text, "version": version(memory)}, "skills": skills, "warnings": warnings}
+                return {"skills": skills, "warnings": warnings}
             name = safe_name(payload["name"])
             if operation == "skill_pin":
                 fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=skillsfd)

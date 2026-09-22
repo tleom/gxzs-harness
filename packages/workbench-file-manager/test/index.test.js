@@ -5,18 +5,37 @@ const workspaceId = '00000000-0000-4000-8000-000000000001'
 
 function create(fetchImpl) {
   vi.stubEnv('TEST_MANAGER_TOKEN', 'secret')
+  vi.stubEnv('GXZS_HOST_OWNER_ID', 't:1')
+  vi.stubEnv('GXZS_HOST_GENERATION', '7')
+  vi.stubEnv('GXZS_HOST_INSTANCE_ID', 'host-7')
   return new FileManagerClient({
     baseUrl: 'http://manager.internal:5010/', workspaceId, tokenEnv: 'TEST_MANAGER_TOKEN', timeoutMs: 1000,
   }, { fetchImpl })
 }
 
 describe('restricted sandbox-manager file client', () => {
+  it('fails closed when host identity is missing and refuses redirect credentials', () => {
+    const manager = create(vi.fn())
+    vi.stubEnv('GXZS_HOST_OWNER_ID', '')
+    expect(() => new FileManagerClient({ baseUrl: manager.baseUrl, workspaceId, tokenEnv: 'TEST_MANAGER_TOKEN' })).toThrow('identity')
+  })
+
+  it('bounds a streamed manager response and rejects malformed JSON', async () => {
+    const cancel = vi.fn()
+    const manager = create(async () => new Response(new ReadableStream({ pull(controller) { controller.enqueue(new Uint8Array(10)) }, cancel })))
+    manager.maxResponseBytes = 12
+    await expect(manager.operate({ operation: 'list' })).rejects.toMatchObject({ status: 502, code: 'UPSTREAM_RESPONSE_TOO_LARGE' })
+    expect(cancel).toHaveBeenCalledOnce()
+    await expect(create(async () => new Response('invalid')).operate({ operation: 'list' }))
+      .rejects.toMatchObject({ status: 502, code: 'INVALID_UPSTREAM_RESPONSE' })
+  })
   it('binds every mutation to the configured workspace and bearer token', async () => {
     const fetchImpl = vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ path: 'a.bin', version: 'v1' }) }))
     const manager = create(fetchImpl)
     await expect(manager.operate({ operation: 'upload', path: 'a.bin', version: null, data: 'AA==' })).resolves.toMatchObject({ version: 'v1' })
     expect(fetchImpl).toHaveBeenCalledWith(`http://manager.internal:5010/sandboxes/${workspaceId}/files`, expect.objectContaining({
-      method: 'POST', headers: expect.objectContaining({ authorization: 'Bearer secret' }),
+      method: 'POST', redirect: 'error', headers: expect.objectContaining({ authorization: 'Bearer secret',
+        'x-gxzs-owner': 't:1', 'x-gxzs-host-generation': '7', 'x-gxzs-host-instance': 'host-7' }),
     }))
   })
 

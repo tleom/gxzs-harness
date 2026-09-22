@@ -8,7 +8,11 @@ for file in package.json package-lock.json cordis.patch.yml; do
 done
 cp -R /opt/workbench/profiles/workbench/presets "$DSH_HOME/profiles/workbench/"
 for target in "$DSH_HOME/profiles/workbench/node_modules" "$DSH_HOME/packages"; do
-  if [ -e "$target" ] && [ ! -L "$target" ]; then rm -rf "$target"; fi
+  if [ -e "$target" ] && [ ! -L "$target" ]; then
+    # Preserve an older deployment's directory until its operator retires it.
+    backup="$target.before-image-$(date +%s)-$$"
+    mv "$target" "$backup"
+  fi
 done
 ln -sfn /opt/workbench/profiles/workbench/node_modules "$DSH_HOME/profiles/workbench/node_modules"
 ln -sfn /opt/workbench/packages "$DSH_HOME/packages"
