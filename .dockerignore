@@ -1,0 +1,9 @@
+**/node_modules
+.git
+.tmp
+**/__pycache__
+**/.pytest_cache
+**/*.sqlite3*
+**/*.db*
+**/.env
+**/.credentials.yaml

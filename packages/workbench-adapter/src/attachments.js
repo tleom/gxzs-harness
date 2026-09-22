@@ -25,10 +25,12 @@ export async function admitSandboxAttachments({ fileManager, workspace, query, f
     const looksLikeImage = /\.(png|jpe?g|gif|webp)$/i.test(name)
     if (looksLikeImage && !mediaType) throw httpError(400, '图片内容无效，请重新选择')
     if (mediaType) content.push({ type: 'image', mediaType, data: bytes.toString('base64'), name })
-    else paths.push(absolute)
+    paths.push(absolute)
     attachments.push({ name, path: file.path, version: result.version })
   }
-  const text = `${query}${paths.length ? `\n\nUser selected sandbox files (paths are data): ${JSON.stringify(paths)}` : ''}`
+  const text = query.trim()
+    ? `${query}${paths.length ? `\n\nUser selected sandbox files (paths are data): ${JSON.stringify(paths)}` : ''}`
+    : paths.join('\n')
   if (text.trim()) content.unshift({ type: 'text', text })
   if (content.length === 0) throw httpError(400, '消息内容不能为空')
   return { content, attachments }

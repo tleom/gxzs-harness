@@ -86,6 +86,8 @@ GXZS_SANDBOX_WORKSPACE_ID=<平台分配的固定UUID>
 GXZS_SANDBOX_WORKSPACE=/workspace
 GXZS_SANDBOX_SSH_HOST=<OpenSSH config中的sandbox别名>
 GXZS_SANDBOX_NODE=/usr/local/bin/node
+GXZS_SANDBOX_RG=/usr/bin/rg
+GXZS_SANDBOX_PTC_BOOTSTRAP=/opt/dsh/node_modules/@deepseek-ai/dsh-ptc-runtime-node/lib/process.js
 GXZS_SANDBOX_HELPER=/opt/dsh/node_modules/@deepseek-ai/dsh-ssh/lib/helper.js
 GXZS_SANDBOX_HELPER_HASH=<部署镜像中helper.js的64位小写SHA-256>
 
@@ -103,6 +105,10 @@ node scripts/derive-host-token.mjs '<tenantId:userId>' '<generation>' '<instance
 把输出写入该host的`GXZS_PLATFORM_INTERNAL_TOKEN`。不要把`GXZS_PLATFORM_INTERNAL_KEY`放进host。
 
 模型provider所需API key继续按DSH对应provider的环境变量注入，不放进`settings.yaml`、workspace或sandbox。
+
+`GXZS_SANDBOX_RG`、`GXZS_SANDBOX_NODE` 和 `GXZS_SANDBOX_PTC_BOOTSTRAP` 必须是用户沙盒内的路径。搜索适配器只将上游搜索工具解析出的宿主 rg 路径映射到沙盒 rg，其他命令保持原样并继续经 SSH 执行。沙盒镜像须包含可执行的 rg、Node 和对应版本的 PTC `process.js`；不能仅在 DSH host 内安装依赖。
+
+可供模型再次读取的大输出保存到用户沙盒 `/workspace/.agent-output/<session-hash>/<random-id>.txt`，使用远端文件系统原子创建和 0600 文件权限；读取和搜索复用同一个 SSH 文件系统。此目录随用户 workspace 卷保留。当前不自动清理历史输出，清理由 workspace 生命周期策略管理。DSH host 的会话数据库、模型凭据和附件缓存属于控制服务内部数据，不作为模型文件操作的工作目录。
 
 ## 4. 必须保持一致的值
 

@@ -39,7 +39,7 @@ describe('legacy workbench migration', () => {
     try {
       const result = await state.importer.import(bundle())
       expect(result).toMatchObject({ source_id: 'batch-1', workspace: { id: workspaceId, tree_version: 'tree-v1' } })
-      expect(state.sessions.create).toHaveBeenCalledWith({ sessionId: `session-${chatId}`, cwd: '/workspace' })
+      expect(state.sessions.create).toHaveBeenCalledWith({ sessionId: `session-${chatId}`, cwd: `/workspace/conversations/${chatId}` })
       expect(state.append.mock.calls.map(([type]) => type)).toEqual(['turn/start', 'user/message', 'step/start', 'assistant/message', 'step/end', 'turn/end'])
       expect(state.database.getChat('tenant:1', chatId)).toMatchObject({ title: '旧对话', pinned: true })
       expect(state.database.getRun('tenant:1', runId)).toMatchObject({ query: '旧问题', status: 'completed' })

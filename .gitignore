@@ -1,4 +1,5 @@
 node_modules/
+profiles/workbench/presets/
 coverage/
 dist/
 *.log

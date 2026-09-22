@@ -16,6 +16,7 @@ const ROUTES = new Set([
   'POST audio',
   'GET mcp/catalog', 'POST mcp/call',
   'GET workbench/config',
+  'POST scheduling',
 ])
 
 export class PlatformClient {

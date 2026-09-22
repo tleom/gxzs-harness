@@ -117,6 +117,17 @@ describe('DSH session event projection', () => {
     expect(tools[1].data).toMatchObject({ tool_name: 'bash', stage: 'returned', output: '/workspace' })
   })
 
+  it('preserves DSH result metadata for typed frontend cards', () => {
+    const { database, chat, run } = setup()
+    bind(database, chat, run)
+    const meta = { path: '/workspace/a.txt', lines: [{ number: 1, text: 'hello' }], totalLines: 1 }
+    projectSessionEvent(database, chat.sessionId, { type: 'tool/call', data: { turn: 1, callId: 'read-1', name: 'read', arguments: { file_path: meta.path } } })
+    projectSessionEvent(database, chat.sessionId, { type: 'tool/result', data: {
+      turn: 1, meta, message: { source: { callId: 'read-1' }, content: [{ toolCallId: 'read-1', content: [{ type: 'text', text: '1: hello' }] }] },
+    } })
+    expect(database.eventsAfter(chat.ownerId, run.id, 0).at(-1).data).toMatchObject({ tool_name: 'read', output: '1: hello', result_meta: meta })
+  })
+
   it('records surface replacement metadata without deleting transcript events', () => {
     const { database, chat, run } = setup()
     bind(database, chat, run)
@@ -133,7 +144,7 @@ describe('DSH session event projection', () => {
   it('projects DSH titles into chat history and the active run stream', () => {
     const { database, chat, run } = setup()
     const event = projectSessionEvent(database, chat.sessionId, {
-      type: 'session/title', data: { title: '合同证据整理', messageSeqs: [0], source: { kind: 'fallback' } },
+      type: 'session/title', data: { title: '合同证据整理', messageSeqs: [0], source: { kind: 'provider' } },
     })
     expect(database.getChat(chat.ownerId, chat.id).title).toBe('合同证据整理')
     expect(event).toMatchObject({
@@ -142,6 +153,20 @@ describe('DSH session event projection', () => {
     expect(database.eventsAfter(chat.ownerId, run.id, 0)).toContainEqual(expect.objectContaining({
       event: 'workbench_chat_title', title: '合同证据整理',
     }))
+  })
+
+  it('keeps the submitted fallback and persists a generated title after completion', () => {
+    const { database, chat, run } = setup()
+    database.updateChat(chat.ownerId, chat.id, { title: '检索资料，核对结论' })
+    projectSessionEvent(database, chat.sessionId, {
+      type: 'session/title', data: { title: '检索资料，核对结论 User selected', source: { kind: 'fallback' } },
+    })
+    expect(database.getChat(chat.ownerId, chat.id).title).toBe('检索资料，核对结论')
+    database.transitionRun(chat.ownerId, run.id, 'completed')
+    projectSessionEvent(database, chat.sessionId, {
+      type: 'session/title', data: { title: '资料核对', source: { kind: 'provider' } },
+    })
+    expect(database.getChat(chat.ownerId, chat.id).title).toBe('资料核对')
   })
 
   it('projects complete token-meter readings for the context gauge', () => {
@@ -186,11 +211,18 @@ describe('DSH session event projection', () => {
       goal: {
         id: 'g1', revision: 3, objective: '完成迁移', phase: 'active',
         max_rounds: 6, rounds_started: 2, reason: null,
-        started_at: 10, active_since: 12, last_run_id: null,
+        last_run_id: null,
       },
       plan: { active: true, pending: false },
       compaction: { id: 'c1', phase: 'compacted', message: 'summary', before_tokens: 200, after_tokens: null },
     })
+  })
+
+  it('persists explicit DSH deliveries for replay', () => {
+    const { database, chat, run } = setup()
+    bind(database, chat, run)
+    projectSessionEvent(database, chat.sessionId, { type: 'deliverables/presented', data: {turn: 1, callId: 'present', files: [{path: '/workspace/report.docx', description: '报告'}]} })
+    expect(database.allEvents(chat.ownerId, run.id)).toContainEqual(expect.objectContaining({ event: 'workbench_presented', files: [{path:'/workspace/report.docx',description:'报告'}] }))
   })
 
   it('ignores unbound turn events and unknown sessions', () => {

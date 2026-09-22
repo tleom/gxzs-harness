@@ -1,9 +1,14 @@
 import yaml from 'js-yaml'
+import { randomUUID } from 'node:crypto'
 import { admitSandboxAttachments } from './attachments.js'
+import { normalizeResourceMentions, appendResourceInstructions } from './resource-mentions.js'
 import { httpError } from './http.js'
+import { resolveWorkspacePath } from './paths.js'
+import { copySessionDirectory } from './session-directory.js'
+import { forkChat } from './fork-chat.js'
 
 export class WorkbenchService {
-  constructor({ database, sessionController, agents, commands, skills, fileManager, platformClient, workspace }) {
+  constructor({ database, sessionController, agents, commands, skills, fileManager, platformClient, workspace, sessionQuery, agentPresets, agentDefaultModel, scheduler }) {
     this.database = database
     this.sessions = sessionController
     this.agents = agents
@@ -12,14 +17,47 @@ export class WorkbenchService {
     this.fileManager = fileManager
     this.platformClient = platformClient
     this.workspace = workspace
+    this.sessionQuery = sessionQuery
+    this.agentPresets = agentPresets
+    this.agentDefaultModel = agentDefaultModel
     this.inflightCommands = new Map()
     this.chatMutations = new Map()
+    this.scheduler = scheduler
   }
 
   async createChat(owner, workspace, selection) {
-    const created = await this.sessions.create({ cwd: workspace })
-    const chat = this.database.createChat({ ownerId: owner.ownerId, sessionId: created.sessionId, selection })
+    const id = randomUUID()
+    await this.fileManager.operate({ operation: 'mkdir', path: `conversations/${id}` })
+    const created = await this.sessions.create({ cwd: this.chatDirectory(id) })
+    const chat = this.database.createChat({ id, ownerId: owner.ownerId, sessionId: created.sessionId, selection })
+    return chat
+  }
+
+  chatDirectory(chatId) { return resolveWorkspacePath(this.workspace, `conversations/${chatId}`) }
+
+  async ensureChatSession(owner, chat, { allowActive = false } = {}) {
     await this.ensureChatDirectory(owner, chat.id)
+    const cwd = this.chatDirectory(chat.id)
+    const live = this.agents.get(chat.sessionId)
+    let header = live?.session?.header
+    if (!header && this.sessionQuery) {
+      try {
+        const observed = await this.sessionQuery.observeSession(chat.sessionId)
+        try { header = observed.header } finally { observed[Symbol.dispose]?.() }
+      } catch (error) {
+        if (error?.code !== 'SESSION_QUERY_SESSION_NOT_FOUND') throw error
+      }
+    }
+    if (header && header.cwd !== cwd) {
+      if (this.database.activeRun(owner.ownerId, chat.id)) {
+        if (allowActive) return chat
+        throw httpError(409, '当前任务结束后才能更新对话工作目录')
+      }
+      const child = await copySessionDirectory(this, chat.sessionId, cwd)
+      this.database.switchChatSession(owner.ownerId, chat.id, chat.sessionId, child.sessionId)
+      return this.requireChat(owner, chat.id)
+    }
+    if (!live) await this.sessions.create({ sessionId: chat.sessionId, cwd })
     return chat
   }
 
@@ -69,51 +107,7 @@ export class WorkbenchService {
     })
   }
 
-  async regenerate(owner, sourceRunId, body) {
-    const source = this.database.getRun(owner.ownerId, sourceRunId)
-    if (!source) throw httpError(404, '任务不存在')
-    if (!Number.isInteger(source.turnNumber)) throw httpError(409, '原任务尚未形成可重新生成的轮次')
-    return this.withChatMutation(source.chatId, async () => {
-      const chat = this.requireChat(owner, source.chatId)
-      const requestKey = typeof body.request_key === 'string' ? body.request_key : undefined
-      const existing = this.database.findRunByRequestKey(owner.ownerId, chat.id, requestKey)
-      if (existing && existing.status !== 'failed') return runDto(existing, this.database.allEvents(owner.ownerId, existing.id))
-      if (existing) {
-        if (existing.parentRunId !== source.id) throw httpError(409, 'request_key 已用于其他重新生成任务')
-        const admitted = await admitSandboxAttachments({ fileManager: this.fileManager, workspace: this.workspace, query: existing.query, files: existing.attachments })
-        this.database.transitionRun(owner.ownerId, existing.id, 'queued')
-        this.database.appendEvent(owner.ownerId, existing.id, { event: 'workbench_status', status: 'queued' })
-        try {
-          if (existing.selection.model) await this.sessions.selectModel({ sessionId: existing.sessionId, ...splitModel(existing.selection.model), ...(existing.selection.model_parameters?.reasoning_effort ? { reasoningEffort: existing.selection.model_parameters.reasoning_effort } : {}) })
-          await this.sessions.prompt({ requestId: existing.id, sessionId: existing.sessionId, mode: 'queue', content: admitted.content }, new AbortController().signal)
-        } catch (error) {
-          this.database.transitionRun(owner.ownerId, existing.id, 'failed', `重新生成提交失败：${error?.message ?? error}`)
-        }
-        return runDto(this.database.getRun(owner.ownerId, existing.id))
-      }
-      if (chat.sessionId !== source.sessionId) throw httpError(409, '只能从当前会话分支重新生成')
-      if (this.database.activeRun(owner.ownerId, chat.id)) throw httpError(409, '任务运行时不能重新生成')
-      const previous = this.database.previousRun(source.sessionId, source.turnNumber)
-      const child = previous
-        ? await this.sessions.fork({ sessionId: source.sessionId, atSeq: previous.sourceEndSeq })
-        : await this.sessions.create({ cwd: this.workspace })
-      const query = typeof body.query === 'string' && body.query.trim() ? body.query : source.query
-      const admitted = await admitSandboxAttachments({ fileManager: this.fileManager, workspace: this.workspace, query, files: source.attachments })
-      const { run } = this.database.createRun({
-        ownerId: owner.ownerId, chatId: chat.id, sessionId: child.sessionId, query,
-        attachments: admitted.attachments, mcpTools: await this.freezeMcpTools(owner, source.selection.tools), selection: source.selection, requestKey, parentRunId: source.id,
-      })
-      this.database.switchChatSession(owner.ownerId, chat.id, source.sessionId, child.sessionId)
-      this.database.appendEvent(owner.ownerId, run.id, { event: 'workbench_status', status: 'queued' })
-      try {
-        if (source.selection.model) await this.sessions.selectModel({ sessionId: child.sessionId, ...splitModel(source.selection.model), ...(source.selection.model_parameters?.reasoning_effort ? { reasoningEffort: source.selection.model_parameters.reasoning_effort } : {}) })
-        await this.sessions.prompt({ requestId: run.id, sessionId: child.sessionId, mode: 'queue', content: admitted.content }, new AbortController().signal)
-      } catch (error) {
-        this.database.transitionRun(owner.ownerId, run.id, 'failed', `重新生成提交失败：${error?.message ?? error}`)
-      }
-      return runDto(this.database.getRun(owner.ownerId, run.id))
-    })
-  }
+  fork(owner, sourceRunId, body) { return forkChat(this, owner, sourceRunId, body) }
 
   feedback(owner, runId, rating) {
     if (rating !== null && rating !== 'like' && rating !== 'dislike') throw httpError(400, '反馈类型无效')
@@ -168,7 +162,7 @@ export class WorkbenchService {
     return {
       id: chat.id, title: chat.title, version: chat.version, pinned: chat.pinned, favorited: chat.favorited,
       created_at: Math.floor(chat.createdAt / 1000), updated_at: Math.floor(chat.updatedAt / 1000),
-      has_active_run: Boolean(active), is_running: Boolean(active), needs_input: active?.status === 'waiting_input',
+      has_active_run: Boolean(active), is_running: ['running', 'stopping'].includes(active?.status), needs_input: active?.status === 'waiting_input',
     }
   }
 
@@ -177,34 +171,70 @@ export class WorkbenchService {
   }
 
   async admitRun(owner, chatId, body) {
-    const chat = this.requireChat(owner, chatId)
+    let chat = this.requireChat(owner, chatId)
     if (body.version !== undefined && body.version !== chat.version)
       throw httpError(409, '配置版本已改变，请刷新后重试')
     const query = String(body.query ?? '')
+    const mentions = normalizeResourceMentions(body.resource_mentions)
     const files = Array.isArray(body.files) ? body.files : []
     if (!query.trim() && !files.length) throw httpError(400, '消息内容不能为空')
     const requestKey = typeof body.request_key === 'string' ? body.request_key : undefined
+    if (requestKey !== undefined && (requestKey.length === 0 || requestKey.length > 128 || requestKey.includes('\0')))
+      throw httpError(400, 'request_key 格式无效')
+    const cancelled = () => requestKey && this.database.getCommandReceipt(owner.ownerId, chatId, `run-stop:${requestKey}`)
+    const checkCancelled = () => { if (cancelled()) throw httpError(409, '消息已取消') }
+    checkCancelled()
     const existing = this.database.findRunByRequestKey(owner.ownerId, chatId, requestKey)
     if (existing && existing.status !== 'failed') return runDto(existing, this.database.allEvents(owner.ownerId, existing.id))
     const fileKeys = files.map((file) => ({ path: file?.path, version: file?.version }))
     const existingKeys = existing?.attachments?.map((file) => ({ path: file.path, version: file.version }))
-    if (existing && (existing.query !== query || JSON.stringify(existingKeys) !== JSON.stringify(fileKeys)))
+    if (existing && (existing.query !== query || JSON.stringify(normalizeResourceMentions(existing.selection.resource_mentions)) !== JSON.stringify(mentions) || JSON.stringify(existingKeys) !== JSON.stringify(fileKeys)))
       throw httpError(409, 'request_key 已用于不同的任务内容')
-    const parentRunId = body.continue_run_id ?? body.parent_run_id
+    let parentRunId = body.continue_run_id ?? body.parent_run_id ?? this.database.listRuns(owner.ownerId, chatId)
+      .filter((run) => !['discarded', 'steered'].includes(run.status)).at(-1)?.id
     if (parentRunId != null) {
       const parent = this.database.getRun(owner.ownerId, parentRunId)
       if (!parent || parent.chatId !== chatId) throw httpError(409, '上级任务不属于当前会话')
     }
+    // Admission is serialized per chat: a normal follow-up belongs after the
+    // actual queue tail, even if the client's active-run snapshot is stale.
+    if (!body.continue_run_id) {
+      const tail = this.database.listRuns(owner.ownerId, chatId)
+        .filter((run) => ['queued', 'running', 'waiting_input', 'stopping'].includes(run.status)).at(-1)
+      if (tail) parentRunId = tail.id
+    }
     const mcpTools = existing?.mcpTools ?? await this.freezeMcpTools(owner, chat.selection.tools)
+    checkCancelled()
     const admitted = await admitSandboxAttachments({ fileManager: this.fileManager, workspace: this.workspace, query, files })
+    admitted.content = await this.resourceContent(admitted.content, mentions, mcpTools)
+    checkCancelled()
+    chat = await this.ensureChatSession(owner, chat)
+    checkCancelled()
+    if (existing && existing.sessionId !== chat.sessionId) this.database.rebindFailedRunSession(owner.ownerId, existing.id, chat.sessionId)
     const { run, created } = this.database.createRun({
       ownerId: owner.ownerId, chatId, sessionId: chat.sessionId, query, attachments: admitted.attachments, mcpTools,
-      selection: chat.selection, requestKey,
+      selection: { ...chat.selection, resource_mentions: mentions }, requestKey,
       parentRunId,
     })
     if (!created && run.status !== 'failed') return runDto(run, this.database.allEvents(owner.ownerId, run.id))
     if (!created) this.database.transitionRun(owner.ownerId, run.id, 'queued')
+    // Use the submitted human text, never the attachment instructions sent to DSH.
+    if (created && chat.title === '新会话' && this.database.listRuns(owner.ownerId, chatId).length === 1) {
+      const title = (query.trim() || admitted.attachments.map((file) => resolveWorkspacePath(this.workspace, file.path)).join('\n') || '新会话').slice(0, 200)
+      this.database.updateChat(owner.ownerId, chatId, { title })
+      this.database.appendEvent(owner.ownerId, run.id, { event: 'workbench_chat_title', chat_id: chatId, title, title_source: 'fallback' })
+    }
     this.database.appendEvent(owner.ownerId, run.id, { event: 'workbench_status', status: 'queued' })
+    if (this.scheduler) {
+      checkCancelled()
+      try { await this.scheduler.enqueue(run, admitted.content, !created) }
+      catch (error) {
+        this.database.transitionRun(owner.ownerId, run.id, 'failed', `任务提交失败：${error?.message ?? error}`)
+        this.database.appendEvent(owner.ownerId, run.id, { event: 'workbench_end', status: 'failed', error: `任务提交失败：${error?.message ?? error}` })
+        throw error
+      }
+      return runDto(this.database.getRun(owner.ownerId, run.id))
+    }
     try {
       if (run.selection.model) {
         const active = this.database.activeRun(owner.ownerId, chatId)
@@ -212,14 +242,24 @@ export class WorkbenchService {
           await this.sessions.selectModel({ sessionId: chat.sessionId, ...splitModel(run.selection.model), ...(run.selection.model_parameters?.reasoning_effort ? { reasoningEffort: run.selection.model_parameters.reasoning_effort } : {}) })
         else if (active?.selection?.model !== run.selection.model) throw httpError(409, '排队任务不能切换当前运行模型')
       }
+      checkCancelled()
       await this.sessions.prompt({
         requestId: run.id, sessionId: chat.sessionId, mode: 'queue',
         content: admitted.content,
       }, new AbortController().signal)
     } catch (error) {
-      this.database.transitionRun(owner.ownerId, run.id, 'failed', `任务提交失败：${error?.message ?? error}`)
+      this.database.transitionRun(owner.ownerId, run.id, cancelled() ? 'cancelled' : 'failed',
+        cancelled() ? undefined : `任务提交失败：${error?.message ?? error}`)
     }
+    if (cancelled() && !['cancelled', 'failed'].includes(this.database.getRun(owner.ownerId, run.id).status))
+      return await this.stopRun(owner, run.id)
     return runDto(this.database.getRun(owner.ownerId, run.id))
+  }
+
+  async resourceContent(content, value, tools = []) {
+    const mentions = normalizeResourceMentions(value)
+    const skills = mentions.skills.length ? await this.listSkills() : []
+    return appendResourceInstructions(content, mentions, tools, skills)
   }
 
   async mcpCatalog(owner, { required = false } = {}) {
@@ -311,9 +351,10 @@ export class WorkbenchService {
   }
 
   async issueCommand(owner, chatId, body, { allowTodoClear = false } = {}) {
-    const chat = this.requireChat(owner, chatId)
+    let chat = this.requireChat(owner, chatId)
     const requestKey = typeof body.request_key === 'string' && body.request_key ? body.request_key : undefined
     if (!requestKey) throw httpError(400, '缺少 request_key')
+    if (requestKey.startsWith('run-stop:')) throw httpError(400, 'request_key 格式无效')
     const receipt = this.database.getCommandReceipt(owner.ownerId, chatId, requestKey)
     if (receipt) return receipt
     const key = `${owner.ownerId}:${chatId}:${requestKey}`
@@ -324,13 +365,10 @@ export class WorkbenchService {
     const line = String(body.command ?? '').trim()
     if (!/^\/(?:goal|plan|compact)(?:\s|$)/.test(line) && !(allowTodoClear && line === '/todos-clear'))
       throw httpError(400, '不支持的工作台命令')
-    let agent = this.agents.get(chat.sessionId)
-    if (!agent) {
-      await this.sessions.create({ sessionId: chat.sessionId, cwd: this.workspace })
-      agent = this.agents.get(chat.sessionId)
-    }
-    if (!agent) throw httpError(409, '会话暂时无法恢复，请稍后重试')
     const operation = (async () => {
+      chat = await this.withChatMutation(chatId, () => this.ensureChatSession(owner, this.requireChat(owner, chatId), { allowActive: true }))
+      const agent = this.agents.get(chat.sessionId)
+      if (!agent) throw httpError(409, '会话暂时无法恢复，请稍后重试')
       const execution = await this.commands.execute(agent, line, [], new AbortController().signal)
       if (!execution) throw httpError(400, '命令不存在或参数无效')
       if (execution.result?.kind === 'error') throw httpError(409, execution.result.text)
@@ -366,10 +404,31 @@ export class WorkbenchService {
     return { runs: this.database.followups(owner.ownerId, chatId, tracked).map((run) => this.inputRunDto(owner, run)) }
   }
 
+  async stopSubmission(owner, chatId, requestKey) {
+    this.requireChat(owner, chatId)
+    if (typeof requestKey !== 'string' || requestKey.length === 0 || requestKey.length > 128 || requestKey.includes('\0'))
+      throw httpError(400, 'request_key 格式无效')
+    // Persist independently of admission's chat lock: cancellation must win
+    // even while attachments, model setup or sandbox discovery are stalled.
+    this.database.saveCommandReceipt(owner.ownerId, chatId, `run-stop:${requestKey}`, { cancelled: true })
+    const run = this.database.findRunByRequestKey(owner.ownerId, chatId, requestKey)
+    if (run) {
+      try { return { accepted: true, run: await this.stopRun(owner, run.id) } }
+      catch (error) {
+        if (error.status !== 409 || run.messageId) throw error
+        // Admission sees the durable cancellation before/after prompt delivery.
+      }
+    }
+    return { accepted: true, run: null }
+  }
+
   stopRun(owner, runId) {
     const run = this.database.getRun(owner.ownerId, runId)
     if (!run) throw httpError(404, '任务不存在')
     if (['completed', 'failed', 'cancelled', 'interrupted', 'discarded', 'steered'].includes(run.status)) return runDto(run)
+    if (this.scheduler && !this.database.submission(owner.ownerId, run.id)?.dispatched && run.status === 'queued') {
+      return runDto(this.database.transitionRun(owner.ownerId, run.id, 'cancelled'))
+    }
     const active = this.database.activeRun(owner.ownerId, run.chatId)
     if (active?.id !== run.id) {
       if (!run.messageId) throw httpError(409, '排队消息尚未持久化，请稍后重试')
@@ -378,7 +437,10 @@ export class WorkbenchService {
     }
     this.database.transitionRun(owner.ownerId, run.id, 'stopping')
     try { this.sessions.cancel({ sessionId: run.sessionId }) }
-    catch { return runDto(this.database.transitionRun(owner.ownerId, run.id, 'cancelled')) }
+    catch (error) {
+      this.database.transitionRun(owner.ownerId, run.id, run.status)
+      throw httpError(502, `暂停请求未确认，请重试：${error?.message ?? error}`)
+    }
     return runDto(this.database.getRun(owner.ownerId, run.id))
   }
 
@@ -394,20 +456,35 @@ export class WorkbenchService {
       : Object.values(body.values ?? {}).filter((value) => typeof value === 'string' && value).join('\n')
     if (!answer) throw httpError(400, '补充回答不能为空')
     const chat = this.requireChat(owner, source.chatId)
+    const requestKey = `input-supplement:${input.requestId}`
+    const existing = this.database.findRunByRequestKey(owner.ownerId, chat.id, requestKey)
+    if (existing && existing.query !== answer) throw httpError(409, '该补答请求已使用不同的回答')
     const { run, created } = this.database.createRun({
       ownerId: owner.ownerId, chatId: chat.id, sessionId: chat.sessionId,
-      query: answer, mcpTools: await this.freezeMcpTools(owner, source.selection.tools), selection: source.selection, requestKey: `input-supplement:${input.requestId}`,
+      query: answer, mcpTools: existing?.mcpTools ?? await this.freezeMcpTools(owner, source.selection.tools), selection: source.selection, requestKey,
       parentRunId: source.id,
     })
     if (created || (run.status === 'queued' && !run.messageId)) {
       if (created) this.database.appendEvent(owner.ownerId, run.id, { event: 'workbench_status', status: 'queued' })
-      await this.sessions.prompt({ requestId: run.id, sessionId: run.sessionId, mode: 'queue', content: [{ type: 'text', text: answer }] }, new AbortController().signal)
+      const fields = input.payload.args?.fields ?? []
+      const context = fields.map((field) => ({ question: field.label, answer: body.values?.[field.name] ?? null }))
+      const content = [{ type: 'text', text: `用户补答了之前跳过的提问，请结合这些新信息继续处理当前任务，必要时修正之前的假设。\n${JSON.stringify(context)}\n补充回答：${answer}` }]
+      const active = this.database.activeRun(owner.ownerId, chat.id)
+      if (active && active.id !== run.id && ['running', 'waiting_input'].includes(active.status)) {
+        await this.sessions.prompt({ requestId: run.id, sessionId: active.sessionId, mode: 'steer', content }, new AbortController().signal)
+        this.database.transitionRun(owner.ownerId, run.id, 'steered')
+        this.database.appendEvent(owner.ownerId, run.id, { event: 'workbench_steered', steer_target_run_id: active.id })
+        this.database.appendEvent(owner.ownerId, active.id, {
+          event: 'workbench_steering', steering_id: run.id, query: answer, attachments: [],
+        })
+      } else if (this.scheduler) await this.scheduler.enqueue(run, content)
+      else await this.sessions.prompt({ requestId: run.id, sessionId: run.sessionId, mode: 'queue', content }, new AbortController().signal)
     }
     this.database.recordInputSupplement(owner.ownerId, sourceRunId, input.requestId, {
       values: body.values ?? {}, action: body.action ?? null,
       custom_fields: body.custom_fields ?? [], skipped_fields: body.skipped_fields ?? [], supplement_run_id: run.id,
     })
-    return runDto(this.database.getRun(owner.ownerId, run.id))
+    return this.getRun(owner, run.id)
   }
 
   async removeQueued(owner, runId) {
@@ -415,6 +492,8 @@ export class WorkbenchService {
     if (!run) throw httpError(404, '任务不存在')
     if (run.status === 'discarded') return runDto(run)
     if (run.status !== 'queued') throw httpError(409, '只有排队中的消息可以删除')
+    if (this.scheduler && !this.database.submission(owner.ownerId, run.id)?.dispatched)
+      return runDto(this.database.transitionRun(owner.ownerId, run.id, 'discarded'))
     if (!run.messageId) throw httpError(409, '排队消息尚未持久化，请稍后重试')
     await this.sessions.updateQueue({ sessionId: run.sessionId, itemId: run.messageId, action: { kind: 'remove' } })
     return runDto(this.database.transitionRun(owner.ownerId, run.id, 'discarded'))
@@ -423,11 +502,27 @@ export class WorkbenchService {
   async steer(owner, runId, targetRunId) {
     const run = this.database.getRun(owner.ownerId, runId)
     if (!run) throw httpError(404, '任务不存在')
+    if (run.status === 'steered') {
+      const accepted = this.getRun(owner, runId)
+      if (accepted.steer_target_run_id === targetRunId) return accepted
+      throw httpError(409, '消息已直接发送到其他任务')
+    }
     const active = this.database.activeRun(owner.ownerId, run.chatId)
-    if (!active || active.id !== targetRunId) throw httpError(409, '目标任务已不再运行')
-    if (run.status !== 'queued' || !run.messageId) throw httpError(409, '排队消息尚不能插话')
-    await this.sessions.updateQueue({ sessionId: run.sessionId, itemId: run.messageId, action: { kind: 'steer' } })
-    return runDto(this.database.transitionRun(owner.ownerId, run.id, 'steered'))
+    if (!active || active.id !== targetRunId || !['running', 'waiting_input'].includes(active.status)) throw httpError(409, '目标任务已不再运行')
+    if (run.status !== 'queued') throw httpError(409, '排队消息尚不能插话')
+    const pending = this.scheduler && this.database.submission(owner.ownerId, run.id)
+    if (pending && !pending.dispatched) {
+      await this.sessions.prompt({ requestId: run.id, sessionId: active.sessionId, mode: 'steer', content: pending.content }, new AbortController().signal)
+    } else {
+      if (!run.messageId) throw httpError(409, '排队消息尚不能插话')
+      await this.sessions.updateQueue({ sessionId: run.sessionId, itemId: run.messageId, action: { kind: 'steer' } })
+    }
+    this.database.transitionRun(owner.ownerId, run.id, 'steered')
+    this.database.appendEvent(owner.ownerId, run.id, { event: 'workbench_steered', steer_target_run_id: targetRunId })
+    this.database.appendEvent(owner.ownerId, targetRunId, {
+      event: 'workbench_steering', steering_id: run.id, query: run.query, attachments: run.attachments ?? [],
+    })
+    return this.getRun(owner, run.id)
   }
 
   getRun(owner, runId) {
@@ -438,8 +533,14 @@ export class WorkbenchService {
 
   inputRunDto(owner, run, events = []) {
     const inputs = this.database.listPendingInputs(owner.ownerId, run.id)
+    const steering = this.database.steeringEvents(owner.ownerId, run.id)
     return {
       ...runDto(run, events, inputs.at(-1)),
+      ...this.database.runTiming(owner.ownerId, run.id),
+      steer_target_run_id: steering.find((event) => event.event === 'workbench_steered')?.steer_target_run_id,
+      steering_messages: steering.filter((event) => event.event === 'workbench_steering').map((event) => ({
+        id: event.steering_id, query: event.query, attachments: event.attachments ?? [],
+      })),
       human_input_history: inputs.filter((input) => ['skipped', 'submitted'].includes(input.status)).map((input) => {
         const answers = input.answer?.answers ?? []
         const values = input.answer?.values ?? Object.fromEntries(answers.map((answer) => [answer.id, answer.custom ?? answer.selected?.[0] ?? '']))
@@ -521,6 +622,9 @@ export function runDto(run, events = [], pending = null) {
   const waiting = pending?.status === 'pending' ? pending : null
   return {
     id: run.id, chat_id: run.chatId, revision_id: run.id, version: 1, query: run.query,
+    created_at: run.createdAt / 1000,
+    can_fork: ['completed', 'failed', 'cancelled', 'interrupted'].includes(run.status) && Number.isInteger(run.selection?.fork_source?.endSeq ?? run.sourceEndSeq),
+    resource_mentions: normalizeResourceMentions(run.selection?.resource_mentions),
     status: run.status, error: run.error, feedback: run.feedback ?? null, events, events_cursor: `${run.seq}-0`,
     queue_order: run.queueOrder, parent_run_id: run.parentRunId ?? null,
     activity_protocol: 1, followup_protocol: 1, message_id: run.messageId ?? null, attachments: run.attachments ?? [],

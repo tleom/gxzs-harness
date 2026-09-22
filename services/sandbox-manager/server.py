@@ -13,6 +13,7 @@ import uuid
 from urllib.request import ProxyHandler, Request, build_opener
 
 from mcp_journal import Journal
+from admission import Admission
 
 TOKEN = os.environ["WORKBENCH_SANDBOX_MANAGER_TOKEN"]
 IMAGE = os.environ.get("WORKBENCH_SANDBOX_IMAGE", "langgenius/dify-agent-local-sandbox:1.17.1")
@@ -24,6 +25,7 @@ LOCKS = {}
 LOCKS_GUARD = threading.Lock()
 MAX_BODY = 30 * 1024 * 1024
 MCP_JOURNAL = Journal(STATE)
+ADMISSION = Admission(str(STATE / 'admission.sqlite3'))
 MCP_API_URL = os.environ.get("WORKBENCH_MCP_API_URL", "http://wb-api:5001").rstrip("/")
 # Manager-owned scripts never inherit a user's interpreter, import path or
 # site initialization. User tasks keep their personal-environment-first PATH.
@@ -148,6 +150,10 @@ def authorize_mcp(payload):
 
 def operation(key, action, payload):
     name, _ = identity(key)
+    if action == 'ensure-host':
+        return HOSTS.ensure(key, payload)
+    if action == 'schedule':
+        return HOSTS.schedule(key, payload)
     if action == "runtime-epoch":
         return runtime_epoch()
     if action in ("stop-binding", "fence-binding"):
@@ -318,6 +324,10 @@ def operation(key, action, payload):
     raise ValueError("Unsupported operation")
 
 
+from hosts import Hosts
+HOSTS = Hosts(STATE, docker, ensure, identity, lock, ADMISSION)
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
@@ -362,6 +372,9 @@ def reap():
             try:
                 key = str(uuid.UUID(item.name))
                 with lock(key):
+                    # Managed hosts and their sandboxes share one lifecycle.
+                    if (HOSTS.root / key / 'host.json').exists():
+                        continue
                     if time.time() - item.stat().st_mtime > 1800:
                         from mcp_runtime import invalidate
 
@@ -372,8 +385,15 @@ def reap():
                 continue
 
 
+def maintain_hosts():
+    while True:
+        HOSTS.maintain()
+        time.sleep(10)
+
+
 if __name__ == "__main__":
     if len(TOKEN) < 32:
         raise ValueError("Manager token must contain at least 32 characters")
     threading.Thread(target=reap, daemon=True).start()
+    threading.Thread(target=maintain_hosts, daemon=True).start()
     ThreadingHTTPServer(("0.0.0.0", 5010), Handler).serve_forever()

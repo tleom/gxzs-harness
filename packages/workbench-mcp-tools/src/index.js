@@ -1,5 +1,6 @@
 import { createMcpToolDefinition } from '@deepseek-ai/dsh-mcp-client'
 import { assertObjectJsonSchema } from '@deepseek-ai/dsh-tools'
+import { adaptInputSchema } from './schema.js'
 
 export const name = 'workbench-mcp-tools'
 export const inject = ['tools', 'workbenchPlatformClient', 'workbenchRuntime']
@@ -50,6 +51,7 @@ async function callProxy(ctx, tool, args, exec) {
   const sessionId = exec.agent?.session?.id ?? exec.agent?.id
   const authorization = ctx.workbenchRuntime.authorizeMcp(sessionId, tool.id, tool.version)
   if (!authorization) throw new Error('MCP tool is not authorized for the active run')
+  tool.validateArguments(args)
   const payload = await ctx.workbenchPlatformClient.json({
     owner: { ownerId: authorization.ownerId }, method: 'POST', route: 'mcp/call',
     contentType: 'application/json',
@@ -72,8 +74,9 @@ function normalizeCatalog(value) {
     if (!/^[A-Za-z][A-Za-z0-9_-]{0,127}$/.test(tool.runtime_name) || names.has(tool.runtime_name)) throw new Error('MCP runtime names must be valid and unique')
     if (!['global', 'personal'].includes(tool.scope) || typeof tool.version !== 'string' || !tool.version) throw new Error('invalid MCP scope or version')
     if (!tool.inputSchema || typeof tool.inputSchema !== 'object' || Array.isArray(tool.inputSchema)) throw new Error('invalid MCP input schema')
-    assertObjectJsonSchema(tool.inputSchema)
+    const adapted = adaptInputSchema(tool.inputSchema)
+    assertObjectJsonSchema(adapted.schema)
     names.add(tool.runtime_name)
-    return { ...tool, manifest_version: tool.manifest_version ?? '' }
+    return { ...tool, inputSchema: adapted.schema, validateArguments: adapted.validate, manifest_version: tool.manifest_version ?? '' }
   })
 }
