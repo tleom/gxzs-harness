@@ -492,14 +492,16 @@ export class WorkbenchService {
     }
     // Native cancel retains the inbox. Only native events change the turn cache;
     // an acknowledgement is not a terminal state and creates no `stopping` state.
+    const agent = this.agents.get(run.sessionId)
+    const goal = agent && this.goals?.get(agent)
     const active = currentExecutionRun(this.database, this.agents, run.sessionId)
-    if (active && active.id !== run.id) throw httpError(409, '当前任务已改变，请刷新后重试', 'STALE_RUN')
+      ?? (goal?.phase === 'active' ? this.database.goalRun(run.sessionId) : undefined)
+    if ((active && active.id !== run.id) || (!active && (goal?.phase === 'active' || agent?.status === 'running')))
+      throw httpError(409, '当前任务已改变，请刷新后重试', 'STALE_RUN')
     const runIds = run.status !== 'queued' || active?.id === run.id ? [run.id] : []
     for (const id of runIds) this.database.requireRunFence(owner.ownerId, id)
     let nativeError
     try {
-      const agent = this.agents.get(run.sessionId)
-      const goal = agent && this.goals?.get(agent)
       if (goal?.phase === 'active') this.goals.pause(agent, { id: goal.id, revision: goal.revision })
       this.sessions.cancel({ sessionId: run.sessionId })
     }
@@ -562,6 +564,8 @@ export class WorkbenchService {
   async removeQueued(owner, runId) {
     const run = this.database.getRun(owner.ownerId, runId)
     if (!run) throw httpError(404, '任务不存在')
+    if (run.status === 'discarded') return runDto(run)
+    if (run.status !== 'queued') throw httpError(409, '消息已离开队列，请刷新后重试', 'STALE_RUN')
     if (this.scheduler && this.database.submission(owner.ownerId, run.id)?.dispatched === false)
       return runDto(this.database.transitionRun(owner.ownerId, run.id, 'discarded'))
     if (!run.messageId) throw httpError(409, '排队消息尚未持久化，请稍后重试')

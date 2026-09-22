@@ -56,6 +56,24 @@ function activateNative(test, runId, queued = []) {
 }
 
 describe('followup and control service', () => {
+  it('only stops the owning Goal between native rounds', async () => {
+    const test = setup()
+    const { database, owner, chat, service, sessionController, agent } = test
+    const { run: goalRun } = database.createRun({ ownerId: owner.ownerId, chatId: chat.id, sessionId: chat.sessionId, query: 'goal', selection: {} })
+    database.setGoalRun(chat.sessionId, goalRun.id)
+    activateNative(test, goalRun.id)
+    agent.status = 'idle'
+    agent.session.snapshotEvents = () => [{ type: 'turn/start', data: { turn: 1 } }, { type: 'turn/end', data: { turn: 1 } }]
+    service.goals = { get: () => ({ id: 'goal', revision: 1, phase: 'active', activation: 'armed' }), pause: vi.fn() }
+    const { run: stale } = database.createRun({ ownerId: owner.ownerId, chatId: chat.id, sessionId: chat.sessionId, query: 'stale', selection: {} })
+    await expect(service.stopRun(owner, stale.id)).rejects.toMatchObject({ status: 409, code: 'STALE_RUN' })
+    expect(service.goals.pause).not.toHaveBeenCalled()
+    expect(sessionController.cancel).not.toHaveBeenCalled()
+    await service.stopRun(owner, goalRun.id)
+    expect(service.goals.pause).toHaveBeenCalledOnce()
+    expect(sessionController.cancel).toHaveBeenCalledOnce()
+  })
+
   it.each(['queued', 'completed'])('rejects a delayed stop for a %s run while a different run is active', async (status) => {
     const test = setup()
     const { database, owner, chat, service, sessionController, agent } = test
@@ -555,6 +573,17 @@ describe('followup and control service', () => {
     const result = await service.removeQueued(owner, run.id)
     expect(sessionController.updateQueue).toHaveBeenCalledWith({ sessionId: chat.sessionId, itemId: 'message-2', action: { kind: 'remove' } })
     expect(result.status).toBe('discarded')
+    sessionController.updateQueue.mockRejectedValue(new Error('already removed'))
+    await expect(service.removeQueued(owner, run.id)).resolves.toMatchObject({ status: 'discarded' })
+    expect(sessionController.updateQueue).toHaveBeenCalledOnce()
+  })
+
+  it.each(['running', 'completed'])('rejects queue deletion for a %s run without touching native state', async (status) => {
+    const { database, owner, chat, service, sessionController } = setup()
+    const { run } = database.createRun({ ownerId: owner.ownerId, chatId: chat.id, sessionId: chat.sessionId, query: 'q', selection: {} })
+    database.transitionRun(owner.ownerId, run.id, status)
+    await expect(service.removeQueued(owner, run.id)).rejects.toMatchObject({ status: 409, code: 'STALE_RUN' })
+    expect(sessionController.updateQueue).not.toHaveBeenCalled()
   })
 
   it('steers a queued message through the synchronous native inbox facade', async () => {
