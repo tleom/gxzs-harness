@@ -382,6 +382,7 @@ class Hosts:
 
     def _maintain_one(self, record):
         heartbeats = []
+        cleanup_item = None
         try:
             with self.lock(record.parent.name):
                 item = json.loads(record.read_text())
@@ -440,13 +441,6 @@ class Hosts:
                     self.recoveries.pop(item['instance_id'], None)
                     return
                 if healthy:
-                    if time.monotonic() >= self.cleanup_at.get(item['instance_id'], 0):
-                        try:
-                            self._cleanup_superseded(item)
-                        except Exception:
-                            logging.getLogger(__name__).warning(
-                                'Superseded Host cleanup deferred workspace=%s', item['workspace_id'])
-                        self.cleanup_at[item['instance_id']] = time.monotonic() + 300
                     self.failures.pop(item['instance_id'], None)
                     self.recoveries.pop(item['instance_id'], None)
                     if item.get('state') == 'draining':
@@ -455,6 +449,8 @@ class Hosts:
                     item.update(state='ready', ready=True)
                     self._save(record, item)
                     heartbeats.append((dict(item), 'ready'))
+                    if time.monotonic() >= self.cleanup_at.get(item['instance_id'], 0):
+                        cleanup_item = dict(item)
                     return
 
                 # An unavailable external MCP catalog is an application-level
@@ -535,3 +531,20 @@ class Hosts:
                     logging.getLogger(__name__).exception(
                         'Host heartbeat failed workspace=%s instance=%s state=%s',
                         item['workspace_id'], item['instance_id'], state)
+            if cleanup_item is not None:
+                try:
+                    # Snapshot identity under the lock, then release it before
+                    # potentially slow Docker list/inspect/remove operations.
+                    with self.lock(record.parent.name):
+                        current = json.loads(record.read_text())
+                        eligible = (current.get('ready') is True and current.get('state') == 'ready'
+                                    and all(current.get(field) == cleanup_item[field] for field in
+                                            ('owner_id', 'workspace_id', 'generation', 'instance_id')))
+                    if eligible:
+                        try:
+                            self._cleanup_superseded(cleanup_item)
+                        finally:
+                            self.cleanup_at[cleanup_item['instance_id']] = time.monotonic() + 300
+                except Exception:
+                    logging.getLogger(__name__).warning(
+                        'Superseded Host cleanup deferred workspace=%s', cleanup_item['workspace_id'])

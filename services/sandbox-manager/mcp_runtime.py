@@ -1,7 +1,9 @@
 """Manager-side lifecycle of sandbox-local MCP workers; no MCP code runs here."""
 
 import json
+import logging
 import queue
+import sqlite3
 import subprocess
 import threading
 import time
@@ -363,7 +365,10 @@ def invoke(key, container, payload, state, *, authorize=None):
     finally:
         try:
             if tracked and not outcome_uncertain:
-                complete_call(key, call.binding, call.call_id)
+                try:
+                    complete_call(key, call.binding, call.call_id)
+                except (sqlite3.Error, OSError):
+                    logging.getLogger(__name__).exception('Unable to clear confirmed MCP outcome')
         finally:
             with GUARD:
                 ACTIVE.discard(call)

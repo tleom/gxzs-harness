@@ -110,6 +110,14 @@ class RoutingTests(unittest.TestCase):
         self.assertEqual(self.worker.send.call_count, 2)
         self.assertTrue(has_unconfirmed('owner-a', self.payload['authorization']['binding_id']))
 
+    def test_confirmed_memory_result_survives_outcome_cleanup_error(self):
+        import sqlite3
+        from mcp_outcomes import has_unconfirmed
+        with patch('mcp_outcomes.complete_call', side_effect=sqlite3.OperationalError('locked')):
+            result = self.run_call()
+        self.assertFalse(result['isError'])
+        self.assertTrue(has_unconfirmed('owner-a', self.payload['authorization']['binding_id']))
+
     def test_bad_operation_rejected_before_worker(self):
         self.payload['arguments'] = {'op': 'identity', 'action': 'add', 'subject_id': 'user:example'}
         result = self.run_call()

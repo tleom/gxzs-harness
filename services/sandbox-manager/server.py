@@ -249,7 +249,12 @@ def operation(key, action, payload):
         from mcp_outcomes import has_unconfirmed
 
         binding = str(uuid.UUID(payload['binding_id']))
-        uncertain = has_unconfirmed(key, binding) or mcp_inflight(key, binding) or memory_inflight(key, binding)
+        try:
+            uncertain = has_unconfirmed(key, binding)
+        except (sqlite3.Error, OSError):
+            LOGGER.exception('Unable to read MCP outcome state during stop')
+            uncertain = True
+        uncertain = uncertain or mcp_inflight(key, binding) or memory_inflight(key, binding)
         with ThreadPoolExecutor(max_workers=2) as pool:
             mcp_cancel = pool.submit(invalidate, key, binding=binding)
             memory_cancel = pool.submit(cancel_memory, key, binding=binding)

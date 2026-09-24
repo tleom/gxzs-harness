@@ -1,6 +1,8 @@
 """Platform memory backed by dsh-memory, always executed in the owner's sandbox."""
 import json
+import logging
 import os
+import sqlite3
 import sys
 import time
 import threading
@@ -350,7 +352,10 @@ def operate(key, payload, *, docker, ensure, identity, lock, authorize, worker_f
         finally:
             try:
                 if tracked and not outcome_uncertain:
-                    complete_call(key, binding, call.call_id)
+                    try:
+                        complete_call(key, binding, call.call_id)
+                    except (sqlite3.Error, OSError):
+                        logging.getLogger(__name__).exception('Unable to clear confirmed memory outcome')
             finally:
                 with GUARD:
                     if confirmed:
