@@ -118,6 +118,20 @@ class RoutingTests(unittest.TestCase):
         self.assertFalse(result['isError'])
         self.assertTrue(has_unconfirmed('owner-a', self.payload['authorization']['binding_id']))
 
+    def test_late_stop_after_definitive_memory_response_clears_marker(self):
+        from mcp_outcomes import has_unconfirmed
+        self.worker.send.side_effect = lambda _tool, _arguments, _remaining, _cancelled, on_dispatch: on_dispatch()
+        responses = iter([{'ready': True}, {'content': [], 'isError': False}])
+        def response(cancelled, timeout=None):
+            value = next(responses)
+            if 'content' in value:
+                cancelled.set()
+            return value
+        self.worker.response.side_effect = response
+        result = self.run_call()
+        self.assertFalse(result['isError'])
+        self.assertFalse(has_unconfirmed('owner-a', self.payload['authorization']['binding_id']))
+
     def test_bad_operation_rejected_before_worker(self):
         self.payload['arguments'] = {'op': 'identity', 'action': 'add', 'subject_id': 'user:example'}
         result = self.run_call()

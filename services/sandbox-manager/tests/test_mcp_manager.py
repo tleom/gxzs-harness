@@ -346,6 +346,22 @@ def test_confirmed_tool_result_survives_outcome_cleanup_error(manager, monkeypat
     assert module.operation(key, 'stop-binding', {'binding_id': binding})['uncertain'] is True
 
 
+def test_late_stop_after_definitive_tool_response_clears_marker(manager, monkeypatch):
+    module, runtime, _, _ = manager
+    original_worker = runtime.Worker
+    class LateStopWorker(original_worker):
+        def response(self, cancelled=None, timeout=None):
+            result = super().response(cancelled, timeout)
+            if 'result' in result:
+                cancelled.set()
+            return result
+    monkeypatch.setattr(runtime, 'Worker', LateStopWorker)
+    key, binding = str(uuid4()), str(uuid4())
+    result = module.operation(key, 'personal-mcp', payload(key, binding, tool='fast'))
+    assert result['result']['value'] == 'ok'
+    assert module.operation(key, 'stop-binding', {'binding_id': binding})['uncertain'] is False
+
+
 def test_stop_reports_inflight_uncertainty_without_blocking_later_calls(manager):
     module, _, _, entered = manager
     key, binding = str(uuid4()), str(uuid4())

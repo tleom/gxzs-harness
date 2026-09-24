@@ -360,7 +360,8 @@ def invoke(key, container, payload, state, *, authorize=None):
                 if WORKERS.get(identity) is worker:
                     WORKERS.pop(identity)
             retire(worker, key, name, call.binding)
-        outcome_uncertain = bool(result.get("uncertain") or (call.cancelled.is_set() and call.dispatched.is_set()))
+        # A late stop cannot turn a definitive response back into uncertainty.
+        outcome_uncertain = bool(result.get("uncertain"))
         return result
     finally:
         try:

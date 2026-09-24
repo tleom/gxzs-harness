@@ -343,7 +343,8 @@ def operate(key, payload, *, docker, ensure, identity, lock, authorize, worker_f
                 output = call.worker.response(call.cancelled, timeout=max(0, remaining))
         except Exception:
             output = {"error": "记忆调用结果未知，可检索核实后重试", "uncertain": True}
-        outcome_uncertain = bool(output.get('uncertain') or (call.cancelled.is_set() and call.dispatched.is_set()))
+        # A late stop cannot turn a definitive response back into uncertainty.
+        outcome_uncertain = bool(output.get('uncertain'))
         return output
     finally:
         confirmed = False
