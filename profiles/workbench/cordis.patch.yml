@@ -48,7 +48,7 @@
 
 - insert:
     - id: gxzs-ssh
-      name: '@deepseek-ai/dsh-ssh'
+      name: '@gxzs/dsh-workbench-sandbox-runtime/ssh'
       config:
         host: !!js process.env.GXZS_SANDBOX_SSH_HOST
         node: !!js process.env.GXZS_SANDBOX_NODE ?? '/usr/local/bin/node'

@@ -53,7 +53,7 @@ describe('durable human input bridge', () => {
     bridge.touch(chat.ownerId, run.id, pending.requestId)
     expect(bridge.timeout(chat.ownerId, run.id, pending.requestId)).toMatchObject({ status: 'pending', interacted: true, deadlineAt: null })
     bridge.skip(chat.ownerId, run.id, pending.requestId)
-    await expect(waiting).resolves.toMatchObject({ answers: expect.arrayContaining([expect.objectContaining({ selected: [], custom: expect.stringContaining('自行判断') })]) })
+    await expect(waiting).resolves.toEqual({ answers: [{ id: 'environment', selected: [] }] })
   })
 
   it('expires an untouched question and ignores repeated expiry', async () => {
@@ -64,7 +64,7 @@ describe('durable human input bridge', () => {
     try {
       expect(bridge.timeout(chat.ownerId, run.id, pending.requestId).status).toBe('timeout')
       expect(bridge.timeout(chat.ownerId, run.id, pending.requestId).status).toBe('timeout')
-      await expect(waiting).resolves.toMatchObject({ answers: expect.arrayContaining([expect.objectContaining({ selected: [], custom: expect.stringContaining('自行判断') })]) })
+      await expect(waiting).resolves.toEqual({ answers: [{ id: 'environment', selected: [] }] })
       expect(database.getRun(chat.ownerId, run.id).status).toBe('running')
       expect(database.getPendingInput(chat.ownerId, run.id).answer).toBeNull()
     } finally { clock.mockRestore() }
@@ -75,7 +75,9 @@ describe('durable human input bridge', () => {
       const { database, chat, run, bridge, request } = setup()
       request.questions.push({ id: 'format', question: '什么格式？' })
       const waiting = bridge.handleRequest(request, vi.fn())
-      const cancelled = expect(waiting).resolves.toMatchObject({ answers: expect.arrayContaining([expect.objectContaining({ selected: [], custom: expect.stringContaining('自行判断') })]) })
+      const cancelled = expect(waiting).resolves.toEqual({ answers: [
+        { id: 'environment', selected: [] }, { id: 'format', selected: [] },
+      ] })
       await vi.advanceTimersByTimeAsync(59_999)
       expect(database.getPendingInput(chat.ownerId, run.id).status).toBe('pending')
       await vi.advanceTimersByTimeAsync(1)
@@ -125,7 +127,7 @@ describe('durable human input bridge', () => {
     await vi.waitFor(() => expect(next.database.getPendingInput(next.chat.ownerId, next.run.id)).not.toBeNull())
     const skipped = next.database.getPendingInput(next.chat.ownerId, next.run.id)
     next.bridge.skip(next.chat.ownerId, next.run.id, skipped.requestId)
-    await expect(skippedWaiting).resolves.toMatchObject({ answers: expect.arrayContaining([expect.objectContaining({ selected: [], custom: expect.stringContaining('自行判断') })]) })
+    await expect(skippedWaiting).resolves.toEqual({ answers: [{ id: 'environment', selected: [] }] })
     expect(() => next.bridge.resume(next.chat.ownerId, next.run.id, { request_id: skipped.requestId, answers: [{ id: 'environment', selected: ['prod'] }] }))
       .toThrow('该问题已关闭')
   })
@@ -138,7 +140,7 @@ describe('durable human input bridge', () => {
     bridge.touch(chat.ownerId, run.id, pending.requestId)
     expect(database.getPendingInput(chat.ownerId, run.id)).toMatchObject({ interacted: true, deadlineAt: null })
     bridge.skip(chat.ownerId, run.id, pending.requestId)
-    await expect(waiting).resolves.toMatchObject({ answers: expect.arrayContaining([expect.objectContaining({ selected: [], custom: expect.stringContaining('自行判断') })]) })
+    await expect(waiting).resolves.toEqual({ answers: [{ id: 'environment', selected: [] }] })
   })
 })
 
@@ -178,7 +180,7 @@ it('binds the native call identity and resolves skip without recording an answer
   bridge.skip(chat.ownerId, run.id, pending.requestId)
   const result = await waiting
   expect(result.answers[0]).toMatchObject({ id: 'environment', selected: [] })
-  expect(result.answers[0].custom).toContain('用户跳过')
+  expect(result.answers[0]).not.toHaveProperty('custom')
   expect(database.getPendingInput(chat.ownerId, run.id)).toMatchObject({ status: 'skipped', answer: null })
   expect(database.getRun(chat.ownerId, run.id).status).toBe('running')
 })

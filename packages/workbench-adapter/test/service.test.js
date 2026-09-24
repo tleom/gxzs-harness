@@ -1,4 +1,4 @@
-import { platformToolName } from '../../workbench-mcp-tools/src/names.js'
+import { platformToolName, platformToolNames } from '../../workbench-mcp-tools/src/names.js'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { WorkbenchDatabase } from '../src/persistence.js'
 import { WorkbenchService } from '../src/service.js'
@@ -205,6 +205,7 @@ describe('followup and control service', () => {
     const { run } = database.createRun({ ownerId: owner.ownerId, chatId: chat.id, sessionId: chat.sessionId, query: 'q', selection: { model: 'p/m', tools: [] } })
     database.createPendingInput(owner.ownerId, run.id, { requestId: 'question', payload: { request_id: 'question', tool_name: 'ask_user_question', questions: [{ id: 'q', question: 'Question' }] }, deadlineAt: null })
     database.settlePendingInput(owner.ownerId, run.id, 'question', 'skipped')
+    database.transitionRun(owner.ownerId, run.id, 'completed')
     const body = { request_id: 'question', answers: [{ id: 'q', selected: [], custom: 'answer' }] }
     sessionController.prompt.mockRejectedValueOnce(new Error('temporary dispatch failure'))
     await expect(service.supplement(owner, run.id, body)).rejects.toThrow('temporary dispatch failure')
@@ -218,21 +219,27 @@ describe('followup and control service', () => {
     ])
     await expect(service.supplement(owner, run.id, { ...body, request_id: 'missing' })).rejects.toMatchObject({ status: 404 })
   })
-  it.each(['running', 'completed'])('sends a historical answer as an interruption or followup when the task is %s', async (status) => {
-    const { database, owner, chat, service, sessionController } = setup()
+  it.each(['running', 'completed'])('sends a historical answer immediately or as a followup when the task is %s', async (status) => {
+    const test = setup()
+    const { database, owner, chat, service, sessionController, agent } = test
     const { run } = database.createRun({ ownerId: owner.ownerId, chatId: chat.id, sessionId: chat.sessionId, query: '任务', selection: {} })
     database.createPendingInput(owner.ownerId, run.id, { requestId: 'late-answer', payload: { tool_name: 'ask_user_question', questions: [{ id: 'format', question: '交付格式？' }] }, deadlineAt: null })
     database.settlePendingInput(owner.ownerId, run.id, 'late-answer', 'skipped')
-    database.transitionRun(owner.ownerId, run.id, status)
+    if (status === 'running') activateNative(test, run.id)
+    else database.transitionRun(owner.ownerId, run.id, status)
     const body = { request_id: 'late-answer', answers: [{ id: 'format', selected: [], custom: 'Word' }] }
     const result = await service.supplement(owner, run.id, body)
-    expect(sessionController.prompt.mock.calls[0][0]).toMatchObject({ mode: 'queue' })
-    const text = sessionController.prompt.mock.calls[0][0].content[0].text
+    const text = status === 'running'
+      ? agent.steer.mock.calls[0][0].content[0].text
+      : sessionController.prompt.mock.calls[0][0].content[0].text
     expect(text).toContain('交付格式？')
     expect(text).toContain('Word')
-    expect(result.status).toBe('queued')
+    expect(result.status).toBe(status === 'running' ? 'steered' : 'queued')
     await service.supplement(owner, run.id, body)
-    expect(sessionController.prompt).toHaveBeenCalledTimes(1)
+    if (status === 'running') {
+      expect(agent.steer).toHaveBeenCalledTimes(1)
+      expect(sessionController.prompt).not.toHaveBeenCalled()
+    } else expect(sessionController.prompt).toHaveBeenCalledTimes(1)
   })
 
   it.each(['ask_user_question', 'exit_plan_mode'])('keeps %s visible across followup refreshes and preserves settled history', (toolName) => {
@@ -303,12 +310,41 @@ describe('followup and control service', () => {
     expect(fileManager.personalResources).toHaveBeenLastCalledWith({ ...payload, name: 'demo' })
   })
 
-  it.each([502, 503])('handles temporary platform MCP status %s by request criticality', async (status) => {
+  it('accepts a skill rename only when SKILL.md matches the requested call name', async () => {
+    const { service, fileManager } = setup()
+    const content = '---\nname: evidence-review\ndescription: Review evidence\nmetadata:\n  display-name: 证据审查\n---\n# Work'
+    const payload = { operation: 'skill_update', name: 'case-evidence', new_name: 'evidence-review', version: 'v1', content }
+    fileManager.personalResources.mockResolvedValueOnce({ id: 'evidence-review', version: 'v2' })
+    await expect(service.mutateResource(payload)).resolves.toMatchObject({ id: 'evidence-review', version: 'v2' })
+    expect(fileManager.personalResources).toHaveBeenCalledWith(payload)
+    await expect(service.mutateResource({ ...payload, new_name: 'different' })).rejects.toMatchObject({ status: 400 })
+  })
+
+  it.each([502, 503, 504])('does not report an empty successful catalog on platform MCP status %s', async (status) => {
     const { service, platformClient } = setup()
     const error = Object.assign(new Error('unavailable'), { status })
     platformClient.json.mockRejectedValue(error)
-    await expect(service.mcpCatalog({ ownerId: 'tenant:user' })).resolves.toEqual([])
-    await expect(service.mcpCatalog({ ownerId: 'tenant:user' }, { required: true })).rejects.toBe(error)
+    await expect(service.mcpCatalog({ ownerId: 'tenant:user' })).rejects.toMatchObject({ status: 503, code: 'MCP_CATALOG_UNAVAILABLE' })
+    await expect(service.mcpCatalog({ ownerId: 'tenant:user' }, { required: true })).rejects.toMatchObject({ status: 503, code: 'MCP_CATALOG_UNAVAILABLE' })
+  })
+
+  it('recovers a transient platform catalog failure without discarding the selected MCP tools', async () => {
+    const { service, platformClient, owner } = setup()
+    const tool = { id: 'personal:mcp:gaode:maps_geo', runtime_name: 'maps_geo', version: 'v1',
+      scope: 'personal', server_id: 'gaode', tool_name: 'maps_geo', description: 'Geocode',
+      inputSchema: { type: 'object' } }
+    platformClient.json.mockRejectedValueOnce(Object.assign(new Error('temporary'), { status: 502 }))
+      .mockResolvedValueOnce({ data: { tools: [tool] } })
+    await expect(service.freezeMcpTools(owner, [tool.id])).resolves.toMatchObject([{ id: tool.id }])
+    expect(platformClient.json).toHaveBeenCalledTimes(2)
+  })
+
+  it.each(['TimeoutError', 'TypeError'])('makes catalog %s explicit without leaking upstream error details', async (name) => {
+    const { service, platformClient } = setup()
+    platformClient.json.mockRejectedValue(Object.assign(new Error('secret upstream address'), { name }))
+    await expect(service.mcpCatalog({ ownerId: 'tenant:user' })).rejects.toMatchObject({
+      status: 503, code: 'MCP_CATALOG_UNAVAILABLE', message: 'MCP 工具目录暂不可用，请稍后重试',
+    })
   })
 
   it('freezes selected global and personal MCP tool revisions on each run', async () => {
@@ -325,6 +361,18 @@ describe('followup and control service', () => {
     expect(database.getRun(owner.ownerId, run.id).mcpTools.map((tool) => tool.version)).toEqual(['g1', 'p1'])
   })
 
+  it('exposes all enabled global and personal MCP tools without a manual selection', async () => {
+    const { database, owner, chat, service, platformClient } = setup()
+    const tools = [
+      { id: 'global:mcp:legal:search', runtime_name: 'global_legal_search', version: 'g1', scope: 'global', server_id: 'legal', tool_name: 'search', description: 'Search', inputSchema: { type: 'object' } },
+      { id: 'personal:mcp:gaode:maps_geo', runtime_name: 'personal_gaode_maps_geo', version: 'p1', scope: 'personal', server_id: 'gaode', tool_name: 'maps_geo', description: 'Geocode', inputSchema: { type: 'object' } },
+    ]
+    platformClient.json.mockResolvedValue({ tools })
+    const run = await service.submitRun(owner, chat.id, { query: '驾车从徐州到襄城' })
+    expect(database.getRun(owner.ownerId, run.id).mcpTools.map(tool => tool.id)).toEqual(tools.map(tool => tool.id))
+    expect(database.getChat(owner.ownerId, chat.id).selection.tools ?? []).toEqual([])
+  })
+
   it('preserves MCP provider identity for plugin grouping', async () => {
     const { service, platformClient, owner } = setup()
     platformClient.json.mockResolvedValue({ tools: [{
@@ -337,11 +385,29 @@ describe('followup and control service', () => {
     }])
   })
 
-  it('rejects unavailable MCP selections before committing chat configuration', async () => {
+  it('keeps original display names and matches the registered aliases for duplicate providers', async () => {
+    const { service, platformClient, owner } = setup()
+    const tools = ['global', 'personal'].map(scope => ({
+      id: `${scope}:mcp:court:search`, runtime_name: `${scope}_court_search`, version: '1', manifest_version: 'm1',
+      scope, server_id: 'court', tool_name: 'search', description: 'Search', inputSchema: { type: 'object' },
+    }))
+    platformClient.json.mockResolvedValue({ tools })
+    const catalog = await service.mcpCatalog(owner)
+    const names = platformToolNames(tools)
+    expect(catalog.map(tool => tool.name)).toEqual(['search', 'search'])
+    expect(catalog.map(tool => tool.display_name)).toEqual(['search', 'search'])
+    expect(catalog.map(tool => tool.runtime_name)).toEqual(tools.map(tool => names.get(tool.id)))
+    expect(new Set(catalog.map(tool => tool.runtime_name)).size).toBe(2)
+    expect((await service.freezeMcpTools(owner, [tools[1].id])).find(tool => tool.id === tools[1].id)).toMatchObject({ id: tools[1].id, version: '1', manifest_version: 'm1', runtime_name: names.get(tools[1].id) })
+  })
+
+  it('does not let stale legacy chat selections block a model update or a new run', async () => {
     const { database, owner, chat, service, platformClient } = setup()
     platformClient.json.mockResolvedValue({ tools: [] })
-    await expect(service.updateConfig(owner, chat.id, { version: 1, selection: { model: 'p/m', tools: ['personal:missing:x'] } })).rejects.toMatchObject({ status: 409 })
-    expect(database.getChat(owner.ownerId, chat.id).version).toBe(1)
+    await service.updateConfig(owner, chat.id, { version: 1, selection: { model: 'p/m', tools: ['personal:missing:x'] } })
+    const run = await service.submitRun(owner, chat.id, { query: '正常继续', version: 2 })
+    expect(database.getRun(owner.ownerId, run.id).mcpTools).toEqual([])
+    expect(database.getChat(owner.ownerId, chat.id).version).toBe(2)
   })
 
   it('keeps pin and favorite independent and synchronizes accepted titles', async () => {
@@ -654,18 +720,54 @@ describe('followup and control service', () => {
 
 
 describe('explicit resource mentions', () => {
-  it('uses native user invocation even for model-disabled skills and rejects user-disabled skills', async () => {
+  it('passes an explicitly mentioned plugin name as a preference without changing availability', async () => {
+    const { service, owner, chat, platformClient, sessionController, database } = setup()
+    const tool = { id: 'personal:mcp:gaode:maps_direction_bicycling', runtime_name: 'personal_gaode_maps_direction_bicycling',
+      version: 'v1', scope: 'personal', provider: 'personal:mcp:gaode', provider_name: '高德地图', server_id: 'gaode', tool_name: 'maps_direction_bicycling',
+      description: 'Route by bicycle', inputSchema: { type: 'object', properties: {} } }
+    platformClient.json.mockResolvedValue({ tools: [tool] })
+    const run = await service.submitRun(owner, chat.id, {
+      query: '规划骑行路线', resource_mentions: { tools: [tool.id] },
+    })
+    const frozen = database.getRun(owner.ownerId, run.id).mcpTools
+    expect(frozen).toHaveLength(1)
+    expect(frozen[0].id).toBe(tool.id)
+    expect(sessionController.prompt.mock.calls[0][0].content[1].text).toContain('高德地图')
+    expect(sessionController.prompt.mock.calls[0][0].content[1].text).not.toContain('maps_direction_bicycling')
+    expect(database.getChat(owner.ownerId, chat.id).selection.tools ?? []).toEqual([])
+  })
+
+  it('mentions a plugin with multiple child tools only once by its top-level name', async () => {
+    const { service, owner, chat, platformClient, sessionController, database } = setup()
+    const tools = ['maps_geo', 'maps_direction_driving'].map(toolName => ({
+      id: `personal:mcp:gaode:${toolName}`, runtime_name: `personal_gaode_${toolName}`,
+      version: 'v1', scope: 'personal', provider: 'personal:mcp:gaode', provider_name: '高德地图',
+      server_id: 'gaode', tool_name: toolName, description: toolName, inputSchema: { type: 'object' },
+    }))
+    platformClient.json.mockResolvedValue({ tools })
+    const run = await service.submitRun(owner, chat.id, {
+      query: '开车怎么走', resource_mentions: { tools: tools.map(tool => tool.id) },
+    })
+    expect(database.getRun(owner.ownerId, run.id).mcpTools).toHaveLength(2)
+    const hint = sessionController.prompt.mock.calls[0][0].content[1].text
+    expect(hint.match(/高德地图/g)).toHaveLength(1)
+    expect(hint).not.toContain('maps_geo')
+    expect(hint).not.toContain('maps_direction_driving')
+  })
+
+  it('sends a skill preference only when the skill is model-invocable', async () => {
     const { service, owner, chat, sessionController, skills } = setup()
-    skills.list.mockResolvedValue([{ name: 'manual', invocation: { modelInvocable: false, userInvocable: true } }])
-    await service.submitRun(owner, chat.id, { query: 'run', resource_mentions: { skills: ['manual'] } })
-    expect(sessionController.prompt.mock.calls[0][0].content.at(-1)).toEqual({ type: 'text', text: '/manual' })
     skills.list.mockResolvedValue([{ name: 'manual', invocation: { modelInvocable: true, userInvocable: false } }])
+    await service.submitRun(owner, chat.id, { query: 'run', resource_mentions: { skills: ['manual'] } })
+    expect(sessionController.prompt.mock.calls[0][0].content.at(-1).text).toContain('manual')
+    expect(sessionController.prompt.mock.calls[0][0].content.at(-1).text).not.toContain('/manual')
+    skills.list.mockResolvedValue([{ name: 'manual', invocation: { modelInvocable: false, userInvocable: true } }])
     await expect(service.submitRun(owner, chat.id, { query: 'run again', resource_mentions: { skills: ['manual'] } })).rejects.toMatchObject({ status: 409 })
   })
 
   it('delivers selected plugin and skill instructions without changing user text or title, and retains them on fork', async () => {
     const { service, owner, chat, database, sessionController, skills } = setup()
-    const tool = { id: 'law', runtime_name: 'global_law_search', provider_name: '法律检索', name: '检索' }
+    const tool = { id: 'law', runtime_name: 'global_law_search', provider: 'global:mcp:law', provider_name: '法律检索', name: '检索' }
     vi.spyOn(service, 'freezeMcpTools').mockResolvedValue([tool])
     skills.list.mockResolvedValue([{ name: 'legal-review', description: '审查' }])
     const mentions = { tools: ['law'], skills: ['legal-review'], knowledge: [] }
@@ -675,9 +777,10 @@ describe('explicit resource mentions', () => {
     expect(database.getChat(owner.ownerId, chat.id).title).toBe('融资租赁')
     const content = sessionController.prompt.mock.calls[0][0].content
     expect(content[0].text).toBe('融资租赁')
-    expect(content[1].text).toContain('global_law_search')
-    expect(content[2]).toEqual({ type: 'text', text: '/legal-review' })
-    expect(content[1].text).toBe('用户选择的 MCP 工具：\n["global_law_search"]')
+    expect(content[1].text).toContain('法律检索')
+    expect(content[1].text).toContain('legal-review')
+    expect(content[1].text).not.toContain('global_law_search')
+    expect(content).toHaveLength(2)
     database.bindRunMessage(chat.sessionId, run.id, 1, 'm1')
     database.transitionRun(owner.ownerId, run.id, 'completed')
     database.setRunSourceSeq(owner.ownerId, run.id, 'source_end_seq', 9)

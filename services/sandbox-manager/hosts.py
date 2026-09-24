@@ -15,13 +15,14 @@ from owner_auth import owner_token, assertion_key
 
 
 class Hosts:
-    def __init__(self, state, docker, ensure_sandbox, identity, lock, admission):
+    def __init__(self, state, docker, ensure_sandbox, identity, lock, admission, ensure_network):
         self.root = Path(state) / 'hosts'
         self.root.mkdir(exist_ok=True)
         self.docker, self.ensure_sandbox, self.identity = docker, ensure_sandbox, identity
-        self.lock, self.admission = lock, admission
+        self.lock, self.admission, self.ensure_network = lock, admission, ensure_network
         self.opener = build_opener(ProxyHandler({}))
         self.failures = {}
+        self.recoveries = {}
 
     def ensure(self, workspace, payload):
         owner = payload['owner_id']
@@ -40,23 +41,17 @@ class Hosts:
                     raise ValueError('Host identity changed; fence the previous generation before replacement')
                 if current.get('state') in {'draining', 'fencing'}:
                     return {**current, 'ready': False}
+                # A ready generation can temporarily be unavailable while the
+                # manager restarts its host/sandbox pair. Never regress the
+                # platform's monotonic ready state back to provisioning.
+                if current.get('state') == 'ready' and current.get('ready') is False:
+                    return current
             image = os.environ['GXZS_HOST_IMAGE']
             image_info = json.loads(self.docker('image', 'inspect', image).stdout)[0]
             desired_digest = image_info['Id']
             if payload.get('image_digest') and payload['image_digest'] != desired_digest:
                 raise ValueError('Desired host image does not match the installed digest')
-            network = os.environ['GXZS_HOST_NETWORK']
-            advertise = os.environ.get('GXZS_HOST_ADVERTISE_IP')
-            publish = []
-            if advertise:
-                ipaddress.IPv4Address(advertise)
-                bind = os.environ['GXZS_HOST_BIND_IP']
-                if not ipaddress.IPv4Address(bind).is_private or bind == '0.0.0.0':
-                    raise ValueError('Host listener must bind a private interface')
-                publish = ['-p', bind + '::3081']
-            host_state = PurePosixPath(os.environ['WORKBENCH_MANAGER_HOST_STATE'])
-            if not host_state.is_absolute():
-                raise ValueError('Manager host state mount must be absolute')
+            network, advertise, publish, host_state = self._runtime_config(workspace)
             sandbox, _ = self.identity(workspace)
             info = self.docker('inspect', instance, check=False)
             if not info.returncode:
@@ -70,6 +65,9 @@ class Hosts:
                     raise ValueError('Host image rollout requires draining before replacement')
                 if existing['Image'] != desired_digest:
                     raise ValueError('Host image digest changed; drain before replacement')
+                attached = set((existing.get('NetworkSettings', {}).get('Networks') or {}).keys())
+                if attached != {network}:
+                    raise ValueError('Host network rollout requires draining before replacement')
                 if not existing['State']['Running']:
                     # Restart only after fencing any surviving tool processes.
                     self.docker('stop', '--time', '10', sandbox)
@@ -113,22 +111,9 @@ class Hosts:
                 env_file.write_text(''.join(f'{key}={value}\n' for key, value in env.items()))
                 os.chmod(env_file, 0o600)
                 self.docker('volume', 'create', '--label', 'gxzs.owner=' + owner, home_volume)
-                self.docker('create', '--name', instance, '--label', 'gxzs.owner=' + owner,
-                            '--label', 'gxzs.workspace=' + workspace, '--label', 'gxzs.generation=' + str(generation),
-                            '--label', 'gxzs.credentials=owner-v1',
-                            '--log-driver', 'json-file', '--log-opt', 'max-size=10m', '--log-opt', 'max-file=3',
-                            '--network', network, '--restart', 'no', '--cpus', '2', '--memory', '2g', '--pids-limit', '256',
-                            *publish,
-                            '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges:true', '--env-file', str(env_file),
-                            '-v', home_volume + ':/srv/dsh',
-                            '-v', str(host_state / 'hosts' / workspace) + ':/run/gxzs:ro',
-                            '-v', str(host_state / 'hosts' / workspace / 'ssh') + ':/home/node/.ssh:ro', image)
+                self._create_container(current, folder, image, network, publish, host_state)
             self.docker('start', instance)
-            endpoint = 'http://' + instance + ':3081'
-            if advertise:
-                ports = json.loads(self.docker('inspect', instance).stdout)[0]['NetworkSettings']['Ports']['3081/tcp']
-                endpoint = 'http://' + advertise + ':' + str(ports[0]['HostPort'])
-            current.update(endpoint=endpoint, image_digest=json.loads(self.docker('inspect', instance).stdout)[0]['Image'])
+            current.update(**self._container_identity(current, advertise))
             temporary.write_text(json.dumps(current))
             temporary.replace(record)
             # Java has registered the provisioning generation before ensure;
@@ -144,6 +129,44 @@ class Hosts:
         temporary = record.with_suffix('.tmp')
         temporary.write_text(json.dumps(item), encoding='utf-8')
         temporary.replace(record)
+
+    def _runtime_config(self, workspace):
+        advertise = os.environ.get('GXZS_HOST_ADVERTISE_IP')
+        bind = os.environ.get('GXZS_HOST_BIND_IP')
+        if not advertise or not bind:
+            raise ValueError('Host advertised and bind IPs are required for manager access')
+        ipaddress.IPv4Address(advertise)
+        if not ipaddress.IPv4Address(bind).is_private or bind == '0.0.0.0':
+            raise ValueError('Host listener must bind a private interface')
+        publish = ['-p', bind + '::3081']
+        host_state = PurePosixPath(os.environ['WORKBENCH_MANAGER_HOST_STATE'])
+        if not host_state.is_absolute():
+            raise ValueError('Manager host state mount must be absolute')
+        network = self.ensure_network(workspace)
+        return network, advertise, publish, host_state
+
+    def _create_container(self, item, folder, image, network, publish, host_state):
+        env_file = folder / 'host.env'
+        if not env_file.exists():
+            raise ValueError('Host runtime configuration is missing; replacement is required')
+        memory = os.environ.get('GXZS_HOST_MEMORY', '1g')
+        self.docker('create', '--name', item['instance_id'], '--label', 'gxzs.owner=' + item['owner_id'],
+                    '--label', 'gxzs.workspace=' + item['workspace_id'],
+                    '--label', 'gxzs.generation=' + str(item['generation']), '--label', 'gxzs.credentials=owner-v1',
+                    '--log-driver', 'json-file', '--log-opt', 'max-size=10m', '--log-opt', 'max-file=3',
+                    '--network', network, '--restart', 'no',
+                    '--cpus', os.environ.get('GXZS_HOST_CPUS', '0.5'),
+                    '--memory', memory, '--memory-swap', memory, '--pids-limit', '256', *publish,
+                    '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges:true', '--env-file', str(env_file),
+                    '-v', item['home_volume'] + ':/srv/dsh',
+                    '-v', str(host_state / 'hosts' / item['workspace_id']) + ':/run/gxzs:ro',
+                    '-v', str(host_state / 'hosts' / item['workspace_id'] / 'ssh') + ':/home/node/.ssh:ro', image)
+
+    def _container_identity(self, item, advertise):
+        info = json.loads(self.docker('inspect', item['instance_id']).stdout)[0]
+        ports = info['NetworkSettings']['Ports']['3081/tcp']
+        endpoint = 'http://' + advertise + ':' + str(ports[0]['HostPort'])
+        return {'endpoint': endpoint, 'image_digest': info['Image']}
 
     def replace(self, workspace, payload):
         """Root-only, resumable drain/fence/replace; never stop an active run."""
@@ -177,7 +200,7 @@ class Hosts:
                               generation=desired[0], instance_id=desired[1])
             current.update(state='draining', ready=False, replacement=transition)
             self._save(record, current)
-            if self.admission.active(current['owner_id']):
+            if self.admission.busy(current['owner_id']):
                 return current
             current['state'] = 'fencing'
             self._save(record, current)
@@ -251,6 +274,28 @@ class Hosts:
         except Exception:
             return False
 
+    def dependency_degraded(self, endpoint):
+        """Return true only for a live host blocked by an external catalog.
+
+        The Workbench health endpoint deliberately reports 503 while its MCP
+        catalog is unavailable. Restarting the owner Host/Sandbox pair cannot
+        repair that upstream dependency and instead creates a recovery storm.
+        """
+        try:
+            with self.opener.open(endpoint + '/ai/workbench/health', timeout=2) as response:
+                payload = json.loads(response.read(4096))
+        except HTTPError as error:
+            if error.code != 503:
+                return False
+            try:
+                payload = json.loads(error.read(4096))
+            except (ValueError, OSError):
+                return False
+        except Exception:
+            return False
+        return (payload.get('live') is True and payload.get('recovery') == 'ready'
+                and payload.get('resources') == 'unavailable')
+
     def maintain(self):
         # A slow or broken host must not expire every other owner's heartbeat.
         with ThreadPoolExecutor(max_workers=16) as pool:
@@ -267,7 +312,8 @@ class Hosts:
         with self.lock(workspace):
             record = self.root / workspace / 'host.json'
             info = None
-            if record.exists():
+            managed = record.exists()
+            if managed:
                 item = json.loads(record.read_text())
             else:
                 # Migrated hosts were registered by the platform before Hosts
@@ -299,11 +345,14 @@ class Hosts:
                     info = json.loads(self.docker('inspect', item['instance_id']).stdout)[0]
                 if not info['State']['Running']:
                     raise ValueError('Scheduling host is stopped')
+            if managed and payload['action'] == 'acquire' and item.get('ready') is not True:
+                raise ValueError('Host is not ready; new task admission is paused')
             (self.root.parent / workspace).touch()
             return self.admission.request(payload['owner_id'], int(payload['generation']), payload['instance_id'],
                                           payload.get('ticket_id') or payload['run_id'], payload['chat_id'], payload['action'], bool(payload.get('retry')))
 
     def _maintain_one(self, record):
+        heartbeats = []
         try:
             with self.lock(record.parent.name):
                 item = json.loads(record.read_text())
@@ -312,50 +361,141 @@ class Hosts:
                 observed = dict(item)
             # Both Docker inspection and health checks can be slow. In
             # particular, plugin readiness may call back into this workspace.
-            info = json.loads(self.docker('inspect', item['instance_id']).stdout)[0]
-            healthy = info['State']['Running'] and item.get('endpoint') and self.healthy(item['endpoint'])
-            alive = healthy or (info['State']['Running'] and item.get('endpoint') and self.alive(item['endpoint']))
+            host_result = self.docker('inspect', item['instance_id'], check=False)
+            info = json.loads(host_result.stdout)[0] if not host_result.returncode else None
+            sandbox, _ = self.identity(item['workspace_id'])
+            sandbox_result = self.docker('inspect', sandbox, check=False)
+            sandbox_info = json.loads(sandbox_result.stdout)[0] if not sandbox_result.returncode else None
+            sandbox_running = bool(sandbox_info and sandbox_info['State']['Running'])
+            sandbox_health = ((sandbox_info or {}).get('State', {}).get('Health') or {}).get('Status')
+            sandbox_healthy = sandbox_running and sandbox_health in (None, 'healthy')
+            host_running = bool(info and info['State']['Running'])
+            if item.get('state') == 'stopped':
+                # Older managers could restart an intentionally stopped pair
+                # without changing its durable state. Reconcile that drift,
+                # but never stop a pair while any admission is still busy.
+                with self.lock(record.parent.name):
+                    current = json.loads(record.read_text())
+                    if current != observed or self.admission.busy(current['owner_id']):
+                        return
+                    if host_running:
+                        self.docker('stop', '--time', '10', current['instance_id'])
+                    if sandbox_running:
+                        self.docker('stop', '--time', '10', sandbox)
+                    if host_running or sandbox_running:
+                        self._fence(current['workspace_id'], current['owner_id'], current['instance_id'])
+                        heartbeats.append((dict(current), 'stopped'))
+                    self.failures.pop(current['instance_id'], None)
+                    self.recoveries.pop(current['instance_id'], None)
+                return
+            healthy = bool(host_running and sandbox_healthy and item.get('endpoint') and self.healthy(item['endpoint']))
+            alive = bool(healthy or (host_running and item.get('endpoint') and self.alive(item['endpoint'])))
+            dependency_degraded = bool(not healthy and alive and sandbox_healthy
+                                       and self.dependency_degraded(item['endpoint']))
             with self.lock(record.parent.name):
                 item = json.loads(record.read_text())
                 if item != observed:
                     return
-                if item.get('state') == 'draining' and info['State']['Running'] and alive:
-                    self.failures.pop(item['instance_id'], None)
-                    self.heartbeat(item, 'draining')
-                    return
                 activity = self.root.parent / item['workspace_id']
-                idle = item.get('state') != 'draining' and activity.exists() and time.time() - activity.stat().st_mtime > 1800 and not self.admission.active(item['owner_id'])
-                if info['State']['Running'] and idle:
+                idle = (item.get('state') != 'draining' and activity.exists()
+                        and time.time() - activity.stat().st_mtime > 1800
+                        and not self.admission.busy(item['owner_id']))
+                if host_running and idle:
                     self.docker('stop', '--time', '10', item['instance_id'])
-                    info['State']['Running'] = False
-                if info['State']['Running'] and healthy:
-                    self.failures.pop(item['instance_id'], None)
-                    item.update(state='ready', ready=True)
-                    self._save(record, item)
-                    self.heartbeat(item, 'ready')
-                elif info['State']['Running'] and alive:
-                    self.failures.pop(item['instance_id'], None)
-                    item.update(state='provisioning', ready=False)
-                    self._save(record, item)
-                    self.heartbeat(item, 'provisioning')
-                elif not info['State']['Running']:
-                    # Fence tools before returning capacity to other users.
-                    sandbox, _ = self.identity(item['workspace_id'])
-                    self.docker('stop', '--time', '10', sandbox)
+                    self.docker('stop', '--time', '10', sandbox, check=False)
                     self._fence(item['workspace_id'], item['owner_id'], item['instance_id'])
                     item.update(state='stopped', ready=False)
                     self._save(record, item)
-                    self.heartbeat(item, 'stopped')
-                else:
-                    since = self.failures.setdefault(item['instance_id'], time.time())
-                    if time.time() - since > 60:
-                        self.docker('stop', '--time', '10', item['instance_id'])
-                        sandbox, _ = self.identity(item['workspace_id'])
-                        self.docker('stop', '--time', '10', sandbox)
-                        self._fence(item['workspace_id'], item['owner_id'], item['instance_id'])
-                        item.update(state='stopped', ready=False)
+                    heartbeats.append((dict(item), 'stopped'))
+                    self.failures.pop(item['instance_id'], None)
+                    self.recoveries.pop(item['instance_id'], None)
+                    return
+                if healthy:
+                    self.failures.pop(item['instance_id'], None)
+                    self.recoveries.pop(item['instance_id'], None)
+                    if item.get('state') == 'draining':
+                        heartbeats.append((dict(item), 'draining'))
+                        return
+                    item.update(state='ready', ready=True)
+                    self._save(record, item)
+                    heartbeats.append((dict(item), 'ready'))
+                    return
+
+                # An unavailable external MCP catalog is an application-level
+                # degraded state, not evidence that either local container is
+                # damaged. Pause new admission, retain the current generation,
+                # and let the Host's catalog poller recover in place.
+                if dependency_degraded:
+                    self.failures.pop(item['instance_id'], None)
+                    self.recoveries.pop(item['instance_id'], None)
+                    if item.get('ready') is not False:
+                        item['ready'] = False
                         self._save(record, item)
-                        self.heartbeat(item, 'stopped')
+                    return
+
+                # Pause new work as soon as either half of the pair is
+                # unhealthy. Provisioning/draining heartbeats remain monotonic;
+                # a previously ready generation is never reported backwards.
+                if item.get('ready') is not False:
+                    item['ready'] = False
+                    self._save(record, item)
+                if alive and item.get('state') in {'provisioning', 'draining'}:
+                    heartbeats.append((dict(item), item['state']))
+                now = time.time()
+                since = self.failures.setdefault(item['instance_id'], now)
+                # A missing Docker object is definitive, unlike a transient
+                # readiness probe. Recover it quickly while retaining a short
+                # debounce for daemon/eventual-consistency races.
+                grace = (5 if info is None or sandbox_info is None else
+                         (180 if item.get('state') == 'provisioning' else 60))
+                recovery = self.recoveries.get(item['instance_id'], {})
+                if now - since <= grace or now < recovery.get('next_retry_at', 0):
+                    return
+                attempts = int(recovery.get('attempts', 0)) + 1
+                reason = ('host_missing' if info is None else
+                          ('sandbox_' + str(sandbox_health or ('stopped' if not sandbox_running else 'unknown'))
+                           if not sandbox_healthy else ('host_unready' if alive else 'host_unreachable')))
+                logging.getLogger(__name__).warning(
+                    'Recovering host pair workspace=%s instance=%s attempt=%d reason=%s',
+                    item['workspace_id'], item['instance_id'], attempts, reason)
+                self.recoveries[item['instance_id']] = {
+                    'attempts': attempts,
+                    'next_retry_at': now + min(300, 30 * (2 ** min(attempts - 1, 4))),
+                }
+                # Preserve all named volumes. Fencing invalidates in-flight
+                # tools, then the same containers restart with the same owner
+                # and generation. Readiness is published by a later probe.
+                self.docker('stop', '--time', '10', item['instance_id'], check=False)
+                self.docker('stop', '--time', '10', sandbox, check=False)
+                self._fence(item['workspace_id'], item['owner_id'], item['instance_id'])
+                self.ensure_sandbox(item['workspace_id'])
+                self._ssh(record.parent, sandbox)
+                image = os.environ['GXZS_HOST_IMAGE']
+                desired = json.loads(self.docker('image', 'inspect', image).stdout)[0]['Id']
+                if desired != item.get('desired_image_digest'):
+                    raise ValueError('Host image changed; replacement is required before recovery')
+                # Recreate instead of restarting so a damaged writable layer,
+                # stale shared network or obsolete cgroup limit cannot survive
+                # recovery. Durable owner state remains in the named volume.
+                if info is not None:
+                    self.docker('rename', item['instance_id'],
+                                item['instance_id'] + '-previous-' + info['Id'][:12])
+                network, advertise, publish, host_state = self._runtime_config(item['workspace_id'])
+                self._create_container(item, record.parent, image, network, publish, host_state)
+                self.docker('start', item['instance_id'])
+                item.update(**self._container_identity(item, advertise))
+                self._save(record, item)
+                self.failures[item['instance_id']] = time.time()
         except Exception:
             # Keep capacity reserved on uncertain fencing; never log secrets.
-            logging.getLogger(__name__).warning('Host maintenance failed for workspace %s', record.parent.name)
+            logging.getLogger(__name__).exception('Host maintenance failed for workspace %s', record.parent.name)
+        finally:
+            # Platform DNS/TLS can stall for five seconds. Never make schedule
+            # wait behind that network call while holding the owner lock.
+            for item, state in heartbeats:
+                try:
+                    self.heartbeat(item, state)
+                except Exception:
+                    logging.getLogger(__name__).exception(
+                        'Host heartbeat failed workspace=%s instance=%s state=%s',
+                        item['workspace_id'], item['instance_id'], state)

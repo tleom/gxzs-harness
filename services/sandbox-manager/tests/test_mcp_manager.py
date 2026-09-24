@@ -1,4 +1,4 @@
-"""Manager scheduling, authorization and durable retention with bounded fake IO."""
+"""Manager scheduling, authorization and repeated calls with bounded fake IO."""
 
 import importlib.util
 import json
@@ -176,54 +176,7 @@ def test_stop_during_final_authorization_prevents_dispatch(manager, monkeypatch)
     assert not calls
 
 
-def test_retention_limits_keep_tombstones_and_request_identity(manager):
-    module, _, _, _ = manager
-    from mcp_journal import Journal
-
-    journal = Journal(module.STATE, owner_bytes=150, total_bytes=200, max_records=4)
-    stored = []
-    for owner, request in (("a", "1"), ("a", "2"), ("b", "3")):
-        body = {"request_key": request, "tool": "query"}
-        digest, previous = journal.begin(owner, body)
-        assert previous is None
-        journal.finish(digest, {"result": "x" * 100})
-        stored.append((owner, body, digest))
-    with journal.connection() as db:
-        assert db.execute("SELECT sum(length(result)) FROM calls").fetchone()[0] <= 200
-    assert journal.begin(*stored[0][:2])[1]["uncertain"]
-    assert journal.begin(*stored[1][:2])[1]["uncertain"]
-    assert journal.begin(*stored[2][:2])[1]["result"] == "x" * 100
-    journal.ttl = -1
-    journal.prune()
-    restarted = Journal(module.STATE)
-    assert restarted.begin(*stored[2][:2])[1]["uncertain"]
-    assert (
-        "不同参数"
-        in restarted.begin("b", {"request_key": "3", "tool": "changed"})[1]["error"]
-    )
-    assert journal.begin("c", {"request_key": "4"})[1] is None
-    assert journal.begin("c", {"request_key": "5"})[1] is None
-    assert journal.statistics()['archived_records'] >= 1
-    assert journal.begin(*stored[0][:2])[1]['uncertain']
-
-
-def test_obsolete_reservation_is_rejected_without_reading_or_replaying(manager):
-    module, _, _, _ = manager
-    from mcp_journal import Journal
-
-    journal = Journal(module.STATE)
-    body = {"request_key": "old-call"}
-    digest, fingerprint = journal.identity("owner", body)
-    path = module.STATE / ("mcp-" + digest)
-    path.write_text(
-        json.dumps({"fingerprint": fingerprint, "result": {"content": "x" * 10000}})
-    )
-    journal.prune()
-    assert path.stat().st_size > 10000
-    assert journal.begin("owner", body)[1]["uncertain"]
-
-
-def test_validate_then_consume_once_and_retry_never_replays(manager, monkeypatch):
+def test_new_grant_can_repeat_same_tool_call_without_replay_suppression(manager, monkeypatch):
     module, _, calls, _ = manager
     key, binding = str(uuid4()), str(uuid4())
     request = payload(key, binding, tool='fast')
@@ -242,9 +195,9 @@ def test_validate_then_consume_once_and_retry_never_replays(manager, monkeypatch
     first = module.operation(key, 'personal-mcp', request)
     request['authorization']['jti'] = 'nonce-two'
     assert module.operation(key, 'personal-mcp', request) == first
-    assert len(calls) == 1
-    assert actions == ['validate', 'consume', 'validate']
-    assert consumed == {'nonce-one'}
+    assert len(calls) == 2
+    assert actions == ['validate', 'consume', 'validate', 'consume']
+    assert consumed == {'nonce-one', 'nonce-two'}
 
 
 @pytest.mark.parametrize('field,value', [('tool', 'other'), ('arguments', {'x': 1}), ('manifest_version', 'm2'), ('request_key', 'other'), ('deadline_ms', 1)])
@@ -288,23 +241,6 @@ def test_expired_deadline_never_creates_worker_or_dispatches(manager):
     request['deadline_ms'] = request['authorization']['deadline_ms'] = int(time.time() * 1000) - 1
     assert '未执行' in module.operation(key, 'personal-mcp', request)['error']
     assert not calls
-
-
-def test_archive_remains_queryable_after_restart(manager):
-    module, _, _, _ = manager
-    from mcp_journal import Journal
-    journal = Journal(module.STATE, max_records=2)
-    for number in range(10):
-        request = {'request_key': str(number), 'tool': 'write', 'arguments': {'number': number}}
-        digest, previous = journal.begin('owner', request)
-        assert previous is None
-        journal.finish(digest, {'result': number})
-    restarted = Journal(module.STATE, max_records=2)
-    stats = restarted.statistics()
-    assert stats['active_records'] == 2
-    assert stats['archived_records'] == 8
-    assert restarted.lookup('owner', {'request_key': '0', 'tool': 'write', 'arguments': {'number': 0}})['uncertain']
-    assert '不同参数' in restarted.lookup('owner', {'request_key': '0', 'tool': 'write', 'arguments': {'number': 999}})['error']
 
 
 def test_worker_wire_payload_keeps_utf8_arguments_within_frame_limit():
@@ -385,12 +321,10 @@ def test_stop_plain_text_or_known_complete_tool_is_not_uncertain(manager):
     module.operation(key, 'personal-mcp', payload(key, known_binding, tool='fast'))
     result = module.operation(key, 'stop-binding', {'binding_id': known_binding})
     assert result['fenced'] is True and result['uncertain'] is False
-    module.MCP_JOURNAL.ttl = -1
-    module.MCP_JOURNAL.prune()
     assert module.operation(key, 'stop-binding', {'binding_id': known_binding})['uncertain'] is False
 
 
-def test_cancelled_inflight_unknown_remains_sticky_after_restart_and_archive(manager):
+def test_stop_reports_inflight_uncertainty_without_blocking_later_calls(manager):
     module, _, _, entered = manager
     key, binding = str(uuid4()), str(uuid4())
     with ThreadPoolExecutor(max_workers=1) as pool:
@@ -399,30 +333,26 @@ def test_cancelled_inflight_unknown_remains_sticky_after_restart_and_archive(man
         result = module.operation(key, 'stop-binding', {'binding_id': binding})
         assert result['fenced'] is True and result['uncertain'] is True
         assert pending.result()['uncertain']
-    from mcp_journal import Journal
-    module.MCP_JOURNAL = Journal(module.STATE, max_records=0)
-    module.MCP_JOURNAL.prune()
-    assert module.MCP_JOURNAL.statistics()['archived_records'] == 1
-    assert module.operation(key, 'stop-binding', {'binding_id': binding})['uncertain'] is True
+    assert module.operation(key, 'stop-binding', {'binding_id': binding})['uncertain'] is False
+    assert module.operation(key, 'personal-mcp', payload(key, binding, tool='fast'))['result']['value'] == 'ok'
 
 
-def test_cancel_before_dispatch_seals_new_requests_without_side_effect_warning(manager):
+def test_cancelled_run_is_rejected_by_current_authorization(manager, monkeypatch):
     module, _, calls, _ = manager
     key, binding = str(uuid4()), str(uuid4())
     assert module.operation(key, 'stop-binding', {'binding_id': binding})['uncertain'] is False
+    monkeypatch.setattr(module, 'authorize_mcp', lambda _: False)
     result = module.operation(key, 'personal-mcp', payload(key, binding, tool='fast'))
     assert '未执行' in result['error']
     assert not calls
     assert module.operation(key, 'stop-binding', {'binding_id': binding})['uncertain'] is False
 
 
-def test_reserved_or_aborted_send_does_not_count_as_dispatched(manager):
-    module, _, _, _ = manager
-    key, binding = str(uuid4()), str(uuid4())
-    digest, _ = module.MCP_JOURNAL.begin(key, payload(key, binding, tool='fast'))
-    assert module.MCP_JOURNAL.binding_uncertain(key, binding) is False
-    assert module.MCP_JOURNAL.prepare_dispatch(digest)
-    assert module.MCP_JOURNAL.binding_uncertain(key, binding) is True
-    module.MCP_JOURNAL.resolve_dispatch(digest, False)
-    module.MCP_JOURNAL.finish(digest, {'error': 'not sent'})
-    assert module.MCP_JOURNAL.binding_uncertain(key, binding) is False
+def test_cancel_before_send_does_not_dispatch(manager):
+    _, runtime, _, _ = manager
+    call = SimpleNamespace(cancelled=threading.Event(), dispatched=threading.Event(),
+                           dispatch_started=threading.Event(), dispatch_done=threading.Event())
+    call.cancelled.set()
+    assert '未执行' in runtime.send_checked(call, lambda _: pytest.fail('must not send'))['error']
+    assert call.dispatch_done.is_set()
+    assert not call.dispatched.is_set()

@@ -1,4 +1,4 @@
-import { platformToolName } from '@gxzs/dsh-workbench-mcp-tools/names'
+import { platformToolNames } from '@gxzs/dsh-workbench-mcp-tools/names'
 import { readSkillDefinition, skillDisplayName } from '@gxzs/dsh-workbench-sandbox-skills/definition'
 import { randomUUID } from 'node:crypto'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
@@ -96,7 +96,7 @@ export class WorkbenchService {
       if (JSON.stringify(selection) === JSON.stringify(chat.selection)) return this.getChat(owner, chatId)
       if (body.version !== chat.version) throw httpError(409, '配置版本已改变，请刷新后重试')
       if (this.database.activeRun(owner.ownerId, chatId)) throw httpError(409, '任务运行时不能修改模型配置')
-      await this.freezeMcpTools(owner, selection.tools)
+      // Legacy chat selections are display preferences, not MCP authority.
       const route = splitModel(selection.model)
       await requireDatabaseModel(this.platformClient, this.sessions, owner, selection.model, this.modelSettings)
       await this.sessions.selectModel({ sessionId: chat.sessionId, ...route, ...(selection.model_parameters.reasoning_effort ? { reasoningEffort: selection.model_parameters.reasoning_effort } : {}) })
@@ -230,7 +230,10 @@ export class WorkbenchService {
         .filter((run) => ['queued', 'running', 'waiting_input', 'stopping'].includes(run.status)).at(-1)
       if (tail) parentRunId = tail.id
     }
-    const mcpTools = await this.freezeMcpTools(owner, chat.selection.tools)
+    // Every currently enabled owner-scoped tool is available to the model.
+    // Selection and mentions only express the user's preference; neither is
+    // an extra authorization boundary or a native DSH invocation gesture.
+    const mcpTools = await this.freezeMcpTools(owner, mentions.tools)
     checkCancelled()
     const admitted = await admitSandboxAttachments({ fileManager: this.fileManager, workspace: this.workspace, query, files })
     admitted.content = await this.resourceContent(admitted.content, mentions, mcpTools)
@@ -288,26 +291,30 @@ export class WorkbenchService {
   }
 
   async mcpCatalog(owner, { required = false } = {}) {
-    try {
-      const payload = await this.platformClient.json({ owner, method: 'GET', route: 'mcp/catalog' })
-      const tools = payload.data?.tools ?? payload.tools ?? []
-      if (!Array.isArray(tools)) throw httpError(502, '平台 MCP 目录格式无效')
-      return tools.map(normalizeMcpResource)
-    } catch (error) {
-      if (!required && [502, 503].includes(error?.status)) return []
-      throw error
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const payload = await this.platformClient.json({ owner, method: 'GET', route: 'mcp/catalog' })
+        const tools = payload.data?.tools ?? payload.tools ?? []
+        if (!Array.isArray(tools)) throw httpError(502, '平台 MCP 目录格式无效')
+        const normalized = tools.map(normalizeMcpResource)
+        const names = platformToolNames(normalized)
+        return normalized.map(tool => ({ ...tool, runtime_name: names.get(tool.id) }))
+      } catch (error) {
+        const transient = [502, 503, 504].includes(error?.status) || ['TimeoutError', 'TypeError'].includes(error?.name)
+        if (transient && attempt === 0) continue
+        if (transient)
+          throw Object.assign(httpError(503, 'MCP 工具目录暂不可用，请稍后重试'), { code: 'MCP_CATALOG_UNAVAILABLE' })
+        throw error
+      }
     }
   }
 
   async freezeMcpTools(owner, selectedIds) {
-    if (!selectedIds?.length) return []
     const catalog = await this.mcpCatalog(owner, { required: true })
     const byId = new Map(catalog.map((tool) => [tool.id, tool]))
-    return selectedIds.map((id) => {
-      const tool = byId.get(id)
-      if (!tool) throw httpError(409, `MCP 工具已不可用：${id}`)
-      return tool
-    })
+    for (const id of selectedIds ?? [])
+      if (!byId.has(id)) throw httpError(409, `MCP 工具已不可用：${id}`)
+    return catalog
   }
 
   async resources() {
@@ -349,7 +356,7 @@ export class WorkbenchService {
     }
     if (operation === 'skill_update') {
       const metadata = await readImportedSkill(body.content)
-      if (metadata.name !== body.name) throw httpError(400, '编辑时不能修改技能 name')
+      if (metadata.name !== (body.new_name ?? body.name)) throw httpError(400, '技能调用名与 SKILL.md 中的 name 不一致')
     }
     if (operation.startsWith('mcp_')) return this.fileManager.personalMcp(body)
     if (!['skill_import', 'skill_update', 'skill_uninstall', 'skill_toggle', 'skill_pin'].includes(operation))
@@ -408,7 +415,7 @@ export class WorkbenchService {
         }
         goalRun = this.database.activeRunBySession(chat.sessionId)
         if (!goalRun || goalRun.status !== 'running') {
-          const mcpTools = await this.freezeMcpTools(owner, chat.selection.tools ?? [])
+          const mcpTools = await this.freezeMcpTools(owner, [])
           goalRun = this.database.createRun({ ownerId: owner.ownerId, chatId, sessionId: chat.sessionId,
             query: line, selection: chat.selection, mcpTools, requestKey: `goal:${requestKey}` }).run
           createdGoalRun = true
@@ -515,6 +522,12 @@ export class WorkbenchService {
   async supplement(owner, sourceRunId, body) {
     const source = this.database.getRun(owner.ownerId, sourceRunId)
     if (!source) throw httpError(404, '任务不存在')
+    return this.withChatMutation(source.chatId, () => this.supplementAccepted(owner, sourceRunId, body))
+  }
+
+  async supplementAccepted(owner, sourceRunId, body) {
+    const source = this.database.getRun(owner.ownerId, sourceRunId)
+    if (!source) throw httpError(404, '任务不存在')
     const input = this.database.listPendingInputs(owner.ownerId, sourceRunId).find((value) => value.requestId === body.request_id)
     if (!input) throw httpError(404, '问题不存在')
     if (input.answer?.supplement_run_id) return this.getRun(owner, input.answer.supplement_run_id)
@@ -526,16 +539,26 @@ export class WorkbenchService {
     const requestKey = `input-supplement:${input.requestId}`
     const existing = this.database.findRunByRequestKey(owner.ownerId, chat.id, requestKey)
     if (existing && existing.query !== answer) throw httpError(409, '该补答请求已使用不同的回答')
+    const active = currentExecutionRun(this.database, this.agents, chat.sessionId)
+    const agent = this.agents.get(chat.sessionId)
+    if (active && (!['running', 'waiting_input'].includes(active.status) || agent?.status !== 'running'
+      || !this.scheduler?.hasAdmission(chat.sessionId)))
+      throw Object.assign(httpError(409, '当前任务正在切换，请稍后重试补答'), { code: 'STALE_RUN' })
     const { run, created } = this.database.createRun({
       ownerId: owner.ownerId, chatId: chat.id, sessionId: chat.sessionId,
-      query: answer, mcpTools: existing?.mcpTools ?? await this.freezeMcpTools(owner, source.selection.tools), selection: source.selection, requestKey,
+      query: answer, mcpTools: existing?.mcpTools ?? (active ? source.mcpTools : await this.freezeMcpTools(owner, [])), selection: source.selection, requestKey,
       parentRunId: source.id,
     })
     if (created || (run.status === 'queued' && !run.messageId)) {
       if (created) this.database.appendEvent(owner.ownerId, run.id, { event: 'workbench_status', status: 'queued' })
       const context = (input.payload.questions ?? []).map((question) => ({ question: question.question, answer: nativeAnswer.answers.find((item) => item.id === question.id) }))
-      const content = [{ type: 'text', text: `用户补答了之前跳过的提问，请结合这些新信息继续处理当前任务，必要时修正之前的假设。\n${JSON.stringify(context)}\n补充回答：${answer}` }]
-      if (this.scheduler) await this.scheduler.enqueue(run, content)
+      const content = [{ type: 'text', text: `用户重新回答了之前跳过的提问。请立即按这些新信息调整当前任务；如先前的假设与补答冲突，以补答为准。\n${JSON.stringify(context)}\n补充回答：${answer}` }]
+      if (active) {
+        agent.steer(createUserMessage({ content, source: { kind: 'user', rpcId: run.id } }))
+        this.database.transitionRun(owner.ownerId, run.id, 'steered')
+        this.database.appendEvent(owner.ownerId, run.id, { event: 'workbench_steered', steer_target_run_id: active.id })
+        this.database.appendEvent(owner.ownerId, active.id, { event: 'workbench_steering', steering_id: run.id, query: run.query, attachments: [] })
+      } else if (this.scheduler) await this.scheduler.enqueue(run, content)
       else await this.sessions.prompt({ requestId: run.id, sessionId: run.sessionId, mode: 'queue', content }, new AbortController().signal)
     }
     this.database.recordInputSupplement(owner.ownerId, sourceRunId, input.requestId, {
@@ -670,9 +693,9 @@ function normalizeMcpResource(value) {
   if (typeof value.server_id !== 'string' || typeof value.tool_name !== 'string' || typeof value.description !== 'string') throw httpError(502, '平台 MCP 工具元数据无效')
   if (!value.inputSchema || typeof value.inputSchema !== 'object' || Array.isArray(value.inputSchema)) throw httpError(502, '平台 MCP 参数 schema 无效')
   return {
-    id: value.id, runtime_name: platformToolName(value), version: value.version, manifest_version: value.manifest_version ?? '',
+    id: value.id, runtime_name: value.runtime_name, version: value.version, manifest_version: value.manifest_version ?? '',
     scope: value.scope, server_id: value.server_id, tool_name: value.tool_name,
-    name: platformToolName(value), display_name: platformToolName(value),
+    name: value.tool_name, display_name: value.tool_name,
     description: value.description, inputSchema: value.inputSchema,
     group: value.group ?? 'mcp', provider: value.provider ?? 'mcp',
     provider_name: value.provider_name ?? value.server_id,

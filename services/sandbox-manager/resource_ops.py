@@ -212,6 +212,7 @@ def personal(payload, root="/workspace"):
                         text = payload["content"].encode("utf-8")
                         if len(text) > MAX_SKILL_TEXT:
                             raise ValueError("SKILL.md 不能超过 64 KiB")
+                        target_name = safe_name(payload.get("new_name", name))
                     backups = directory(rootfd, ".skill-backups")
                     backup_name = name + "-" + uuid.uuid4().hex
                     try:
@@ -228,8 +229,47 @@ def personal(payload, root="/workspace"):
                                 atomic_write(backup, "SKILL.md", previous)
                         finally:
                             os.close(backup)
-                        atomic_write(fd, "SKILL.md", text)
-                        return {"id": name, "version": tree_version(fd)}
+                        renamed = target_name != name
+                        if renamed:
+                            try:
+                                os.mkdir(target_name, 0o700, dir_fd=skillsfd)
+                            except FileExistsError:
+                                return {"conflict": True}
+                            try:
+                                os.rename(name, target_name, src_dir_fd=skillsfd, dst_dir_fd=skillsfd)
+                            except BaseException:
+                                os.rmdir(target_name, dir_fd=skillsfd)
+                                raise
+                        changed_settings = []
+                        try:
+                            atomic_write(fd, "SKILL.md", text)
+                            if renamed:
+                                for filename in (SETTINGS, PINS):
+                                    raw = read_file(rootfd, filename)
+                                    if raw is None:
+                                        continue
+                                    values = json.loads(raw)
+                                    if not isinstance(values, dict):
+                                        raise ValueError("技能设置文件格式无效")
+                                    if name in values:
+                                        values[target_name] = values.pop(name)
+                                        changed_settings.append((filename, raw))
+                                        atomic_write(rootfd, filename, json.dumps(values).encode())
+                                os.fsync(skillsfd)
+                        except BaseException:
+                            if renamed:
+                                os.rename(target_name, name, src_dir_fd=skillsfd, dst_dir_fd=skillsfd)
+                            if previous is not None:
+                                atomic_write(fd, "SKILL.md", previous)
+                            else:
+                                try:
+                                    os.unlink("SKILL.md", dir_fd=fd)
+                                except FileNotFoundError:
+                                    pass
+                            for filename, raw in changed_settings:
+                                atomic_write(rootfd, filename, raw)
+                            raise
+                        return {"id": target_name, "version": tree_version(fd)}
                     finally:
                         os.close(backups)
                 finally:

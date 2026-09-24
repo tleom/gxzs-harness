@@ -50,12 +50,9 @@ export class HumanInputBridge {
     if (pending.questions.some((question) => question.intent?.kind === 'plan-review')) {
       pending.reject(cancelledError(reason))
     } else {
-      pending.resolve({ answers: pending.questions.map((question) => ({
-        id: question.id, selected: [],
-        custom: reason === 'timeout'
-          ? '[系统提示] 用户未在等待时间内回答。请根据已有信息自行判断并继续；这不代表用户授权任何需要确认的操作。'
-          : '[系统提示] 用户跳过了提问。请根据已有信息自行判断并继续；这不代表用户授权任何需要确认的操作。',
-      })) })
+      // Match DSH's native per-question skip shape for the entire batch.
+      // Do not disguise a system hint as the user's custom answer.
+      pending.resolve({ answers: pending.questions.map((question) => ({ id: question.id, selected: [] })) })
     }
     return this.database.getPendingInput(ownerId, runId)
   }

@@ -7,6 +7,7 @@ import { TaskScheduler } from '../src/scheduler.js'
 import { WorkbenchService } from '../src/service.js'
 import { WorkbenchRuntime } from '../src/runtime.js'
 import { createAssistantStreamProjector, projectInboxClaim, projectSessionEvent, reconcileNativeSessions, settleNativeIdle } from '../src/projection.js'
+import { apply as applyMcpTools } from '../../workbench-mcp-tools/src/index.js'
 
 // Exercise the exact published DSH version installed by the production profile.
 // CI must install profiles/workbench before running this contract suite.
@@ -95,6 +96,43 @@ async function fixture(script) {
   return { ctx, db, agent, owner, chat, model, scheduler, runtime, sessions, requests, create,
     permit: value => { permitted = value } }
 }
+
+it('advertises only selected MCP tools on the actual first native request and binds selected raw-name calls', async () => {
+  const test = await fixture(['without weather', 'hang'])
+  const weather = { id: 'personal:mcp:gaode:maps_weather', runtime_name: 'personal_gaode_weather', version: 'v1', manifest_version: 'm1',
+    scope: 'personal', server_id: 'gaode', tool_name: 'maps_weather', description: 'Weather',
+    inputSchema: { type: 'object', properties: { city: { type: 'string' } }, required: ['city'] } }
+  const calls = []
+  test.ctx.provide('workbenchPlatformClient', { json: async request => {
+    if (request.route === 'mcp/catalog') return { tools: [weather] }
+    calls.push(JSON.parse(request.body))
+    return { result: { content: [{ type: 'text', text: 'fixture weather' }] } }
+  } })
+  await applyMcpTools(test.ctx)
+  const create = tools => test.db.createRun({ ownerId: test.owner.ownerId, chatId: test.chat.id, sessionId: test.agent.id,
+    query: 'fixture', selection: { tools: tools.map(tool => tool.id) }, mcpTools: tools }).run
+  const first = create([])
+  await test.scheduler.enqueue(first, [{ type: 'text', text: 'fixture' }])
+  await test.scheduler.tick()
+  await test.agent.whenIdle()
+  expect(test.model.requests).toHaveLength(1)
+  expect(test.model.requests[0].tools?.map(tool => tool.name) ?? []).not.toContain('maps_weather')
+  const denied = await test.ctx.tools.execute({ callId: 'not-selected', name: 'maps_weather', arguments: { city: 'fixture' }, agent: test.agent, signal: new AbortController().signal })
+  expect(denied.isError).toBe(true)
+  expect(calls).toHaveLength(0)
+  await test.scheduler.tick()
+  const second = create([weather])
+  await test.scheduler.enqueue(second, [{ type: 'text', text: 'fixture' }])
+  await test.scheduler.tick()
+  await vi.waitFor(() => expect(test.model.requests).toHaveLength(2))
+  expect(test.model.requests[1].tools.map(tool => tool.name)).toContain('maps_weather')
+  expect(test.model.requests[1].tools.some(tool => tool.name.startsWith('mcp__'))).toBe(false)
+  const result = await test.ctx.tools.execute({ callId: 'selected-weather', name: 'maps_weather', arguments: { city: 'fixture' }, agent: test.agent, signal: new AbortController().signal })
+  expect(result.isError).not.toBe(true)
+  expect(calls).toEqual([expect.objectContaining({ run_id: second.id, resource_id: weather.id, server_id: 'gaode', tool_name: 'maps_weather', version: 'v1', manifest_version: 'm1' })])
+  test.agent.cancel({ kind: 'user' }, { keepInbox: true })
+  await test.agent.whenIdle()
+})
 
 it('runs a fresh request after a failed native turn while duplicate delivery remains exactly once', async () => {
   const test = await fixture([new Error('provider failure'), 'second answer'])

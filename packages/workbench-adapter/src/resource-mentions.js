@@ -14,26 +14,24 @@ export function normalizeResourceMentions(value) {
 }
 
 export function appendResourceInstructions(content, mentions, tools, skills) {
-  const resources = []
-  const gestures = []
+  const providers = new Map()
+  const preferredSkills = []
   for (const id of mentions.tools) {
     const tool = tools.find((item) => item.id === id)
     if (!tool) throw httpError(409, `引用的插件工具未启用或已不可用：${id}`)
-    // DSH has no MCP slash gesture. Keep this boundary as a user reference
-    // to registered public tool names; descriptions belong to tool definitions.
-    resources.push(tool.runtime_name)
+    const provider = tool.provider && tool.provider !== 'mcp' ? tool.provider
+      : tool.server_id ? `${tool.scope ?? 'global'}:${tool.server_id}` : tool.runtime_name
+    providers.set(provider, tool.provider_name ?? tool.server_id ?? provider)
   }
   for (const id of mentions.skills) {
     const skill = skills.find((item) => item.enabled !== false && (item.id === id || item.name === id || `personal:${item.name}` === id))
     if (!skill) throw httpError(409, `引用的技能已不可用：${id}`)
-    if (skill.invocation?.userInvocable === false) throw httpError(409, `技能不允许用户调用：${skill.name}`)
-    // DSH's tool-skill pre-step owns loading, instructions and invocation policy.
-    gestures.push(`/${skill.name}`)
+    if (skill.invocation?.modelInvocable === false) throw httpError(409, `技能不允许 AI 调用：${skill.name}`)
+    preferredSkills.push(skill.name)
   }
-  const invocation = gestures.length ? [{ type: 'text', text: gestures.join(' ') }] : []
-  if (!resources.length) return [...content, ...invocation]
-  return [...content, { type: 'text', text: [
-    '用户选择的 MCP 工具：',
-    JSON.stringify(resources),
-  ].join('\n') }, ...invocation]
+  if (!providers.size && !preferredSkills.length) return content
+  const hints = []
+  if (providers.size) hints.push(`用户指定插件：${JSON.stringify([...providers.values()])}。请先从当前实际可用的工具目录中选择该插件下合适的子工具调用；若不适用，再说明原因。不要猜测工具名称。`)
+  if (preferredSkills.length) hints.push(`用户指定技能：${JSON.stringify(preferredSkills)}。请先按当前实际可用的技能目录中的准确名称调用；若不适用，再说明原因。不要猜测技能名称。`)
+  return [...content, { type: 'text', text: hints.join('\n') }]
 }

@@ -255,29 +255,27 @@ def wait_dispatch(calls):
             call.dispatch_done.wait(max(0, deadline - time.monotonic()))
 
 
-def send_bound(call, journal, digest, send):
-    """Resolve durable send intent; an earlier cancellation prevents new IO."""
+def binding_inflight(key, binding):
+    with GUARD:
+        return any(call.key == key and call.binding == binding for call in ACTIVE)
+
+
+def send_checked(call, send):
+    """Order cancellation against a single send without suppressing later calls."""
     call.dispatch_started.set()
     try:
-        if call.cancelled.is_set() or not journal.prepare_dispatch(digest):
-            return {'error': 'MCP 调用已停止，本次操作未执行'}
         if call.cancelled.is_set():
-            journal.resolve_dispatch(digest, False)
             return {'error': 'MCP 调用已停止，本次操作未执行'}
         try:
-            result = send(call.dispatched.set)
+            return send(call.dispatched.set)
         except Exception:
-            result = {'error': 'MCP 请求发送失败，执行结果未知', 'uncertain': True}
-        sent = call.dispatched.is_set() or result is None
-        journal.resolve_dispatch(digest, sent)
-        if not sent and result is not None and result.get('uncertain'):
-            result = {**result, 'uncertain': False, 'error': 'MCP 请求未发出，本次操作未执行'}
-        return result
+            return {'error': 'MCP 请求发送失败，执行结果未知' if call.dispatched.is_set() else 'MCP 请求未发出，本次操作未执行',
+                    'uncertain': call.dispatched.is_set()}
     finally:
         call.dispatch_done.set()
 
 
-def invoke(key, container, payload, state, *, authorize=None, journal=None):
+def invoke(key, container, payload, state, *, authorize=None):
     name = payload["name"]
     if payload.get("version") != state["version"]:
         return {"conflict": True}
@@ -293,7 +291,7 @@ def invoke(key, container, payload, state, *, authorize=None, journal=None):
             return {"error": "MCP 并发请求已达到上限，本次操作未执行", "code": "MCP_BUSY"}
         mutex = CALL_LOCKS.setdefault(identity, threading.Lock())
         ACTIVE.add(call)
-    acquired, worker, digest = False, None, None
+    acquired, worker = False, None
     try:
         deadline = min(time.monotonic() + 20, call.deadline)
         while not call.cancelled.is_set() and time.monotonic() < deadline:
@@ -308,12 +306,6 @@ def invoke(key, container, payload, state, *, authorize=None, journal=None):
             authorize is None or not authorize({"authorization": payload["authorization"], "action": "validate"})
         ):
             return {"error": "MCP 当前任务或执行已失效，本次操作未执行"}
-        if payload['operation'] == 'mcp_call':
-            if journal is None:
-                return {'error': 'MCP 执行记录不可用，本次操作未执行'}
-            previous = journal.lookup(key, payload)
-            if previous is not None:
-                return previous
         with GUARD:
             worker = WORKERS.get(identity)
         if worker and (
@@ -340,17 +332,8 @@ def invoke(key, container, payload, state, *, authorize=None, journal=None):
             retire(worker, key, name, call.binding)
             return {"error": "MCP 执行已失效，本次操作未执行"}
         if payload["operation"] == "mcp_call":
-            digest, previous = journal.begin(key, payload)
-            if previous is not None:
-                return previous
-            if (
-                authorize is None
-                or journal is None
-                or not authorize({"authorization": payload["authorization"], "action": "consume"})
-            ):
-                result = {"error": "MCP 当前任务或执行已失效，本次操作未执行"}
-                journal.finish(digest, result)
-                return result
+            if authorize is None or not authorize({"authorization": payload["authorization"], "action": "consume"}):
+                return {"error": "MCP 当前任务或执行已失效，本次操作未执行"}
         # This short critical section orders dispatch against stop/config changes.
         # External connection, authorization and response waits never hold it.
         with GUARD:
@@ -360,14 +343,9 @@ def invoke(key, container, payload, state, *, authorize=None, journal=None):
                 result = None
         # Non-blocking pipe IO must never hold the cross-owner cancellation lock.
         if result is None:
-            if digest is not None:
-                result = send_bound(call, journal, digest, lambda on_dispatch: worker.send(payload, call.cancelled, on_dispatch))
-            else:
-                result = worker.send(payload, call.cancelled)
+            result = send_checked(call, lambda on_dispatch: worker.send(payload, call.cancelled, on_dispatch))
         if result is None:
             result = worker.response(call.cancelled, timeout=max(0, min(state['timeout'] + 15, call.deadline - time.monotonic())))
-        if digest is not None:
-            journal.finish(digest, result)
         if result.get("uncertain") or result.get("conflict") or call.cancelled.is_set():
             with GUARD:
                 if WORKERS.get(identity) is worker:

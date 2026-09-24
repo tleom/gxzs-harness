@@ -10,17 +10,27 @@ export function adaptInputSchema(source) {
   } catch (error) {
     if (error?.code !== 'UNSUPPORTED_SCHEMA') throw error
   }
-  const project = (schema) => {
+  const project = (schema, requiredProperty) => {
     if (!schema || typeof schema !== 'object' || Array.isArray(schema)) return schema
     const result = { ...schema }
-    const limits = ['minimum', 'maximum', 'minItems', 'maxItems', 'format']
+    // md_cg's _p/_s generator retains this boolean after building the parent's
+    // standard required list. Remove only a matching, redundant annotation;
+    // never discard an unknown keyword or an unrepresented requirement.
+    if ('_req' in result) {
+      if (typeof result._req !== 'boolean' || result._req !== requiredProperty)
+        throw Object.assign(new Error('MCP _req annotation must match the parent required list'), { code: 'UNSUPPORTED_SCHEMA' })
+      delete result._req
+    }
+    const bounds = ['minimum', 'maximum', 'minItems', 'maxItems', 'minProperties', 'maxProperties', 'format']
+    const limits = bounds
       .filter((key) => key in result).map((key) => `${key}: ${JSON.stringify(result[key])}`)
-    for (const key of ['minimum', 'maximum', 'minItems', 'maxItems', 'format']) delete result[key]
+    for (const key of bounds) delete result[key]
     if (limits.length) result.description = [result.description, limits.join('; ')].filter(Boolean).join('\n')
-    if (result.properties) result.properties = Object.fromEntries(Object.entries(result.properties).map(([key, value]) => [key, project(value)]))
+    if (result.properties) result.properties = Object.fromEntries(Object.entries(result.properties)
+      .map(([key, value]) => [key, project(value, Array.isArray(result.required) && result.required.includes(key))]))
     if (result.items) result.items = project(result.items)
     if (typeof result.additionalProperties === 'object') result.additionalProperties = project(result.additionalProperties)
-    for (const key of ['anyOf', 'allOf', 'oneOf']) if (Array.isArray(result[key])) result[key] = result[key].map(project)
+    for (const key of ['anyOf', 'allOf', 'oneOf']) if (Array.isArray(result[key])) result[key] = result[key].map(value => project(value))
     if (result.not) result.not = project(result.not)
     return result
   }

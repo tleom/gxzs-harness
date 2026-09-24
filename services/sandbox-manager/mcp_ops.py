@@ -41,10 +41,10 @@ def configuration(raw):
     value = json.loads(raw.decode("utf-8-sig"))
     if not isinstance(value, dict):
         raise ValueError("MCP 配置必须是 JSON 对象")
-    allowed = {"name", "description", "transport", "url", "headers", "command", "args", "env", "cwd", "timeout"}
+    allowed = {"name", "display_name", "description", "transport", "url", "headers", "command", "args", "env", "cwd", "timeout"}
     if set(value) - allowed:
         raise ValueError("MCP 配置包含不支持的字段")
-    for key, maximum in (("name", 120), ("description", 2000)):
+    for key, maximum in (("name", 120), ("display_name", 120), ("description", 2000)):
         if key in value and (not isinstance(value[key], str) or len(value[key]) > maximum):
             raise ValueError("MCP 名称或说明格式无效")
     transport = value.get("transport") or ("stdio" if value.get("command") else "streamable-http")
@@ -91,6 +91,12 @@ def configuration(raw):
         if any("\r" in k + v or "\n" in k + v for k, v in value["headers"].items()):
             raise ValueError("MCP headers 不能包含换行")
     return value
+
+
+def connection_configuration(config):
+    """Presentation metadata does not change the tools exposed by a connection."""
+    return {key: value for key, value in config.items()
+            if key not in {"name", "display_name", "description"}}
 
 
 def tool_manifest(tools):
@@ -189,7 +195,8 @@ def snapshot(rootfd, selected=None):
                 item["version"] = revision
                 config = configuration(raw)
                 item.update(
-                    name=config.get("name") or name,
+                    name=config.get("display_name") or config.get("name") or name,
+                    call_name=name,
                     description=config.get("description", ""),
                     transport=config["transport"],
                     version=revision,
@@ -255,7 +262,24 @@ def personal_mcp(payload, root="/workspace"):
                     if not isinstance(content, str):
                         raise ValueError("缺少 MCP 配置")
                     data = content.encode("utf-8")
-                    configuration(data)
+                    config = configuration(data)
+                    if raw is None and config.get("name", name) != name:
+                        raise ValueError("新插件 JSON 中的 name 必须与调用名称一致")
+                    cached = None
+                    if raw is not None:
+                        try:
+                            if connection_configuration(configuration(raw)) == connection_configuration(config):
+                                cachefd = directory(rootfd, ".mcp-cache")
+                                try:
+                                    cached = json.loads(read_file(cachefd, name + ".json") or b"{}")
+                                    if not isinstance(cached, dict) or cached.get("version") != revision:
+                                        cached = None
+                                    else:
+                                        tool_manifest(cached.get("tools", []))
+                                finally:
+                                    os.close(cachefd)
+                        except (ValueError, OSError, RecursionError):
+                            cached = None
                     if raw is not None:
                         backups = directory(rootfd, ".mcp-backups")
                         try:
@@ -263,6 +287,14 @@ def personal_mcp(payload, root="/workspace"):
                         finally:
                             os.close(backups)
                     atomic_write(fd, "mcp.json", data)
+                    if cached is not None:
+                        cachefd = directory(rootfd, ".mcp-cache")
+                        try:
+                            atomic_write(cachefd, name + ".json", json.dumps({
+                                **cached, "version": version(data)
+                            }).encode())
+                        finally:
+                            os.close(cachefd)
                     return {"id": name, "version": version(data)}
                 if operation == "mcp_delete":
                     backups = directory(rootfd, ".mcp-backups")

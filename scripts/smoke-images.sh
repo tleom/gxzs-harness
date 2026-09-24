@@ -13,7 +13,10 @@ docker run --rm --network none --cap-drop ALL --security-opt no-new-privileges:t
   /opt/workbench/check-runtime-imports.mjs
 docker run --rm --network none --cap-drop ALL --security-opt no-new-privileges:true \
   --memory 1g --cpus 1 --pids-limit 128 --entrypoint node \
-  -v "$script_dir/smoke-host-bootstrap.mjs:/smoke-host-bootstrap.mjs:ro" "$host_image" /smoke-host-bootstrap.mjs
+  -v "$script_dir/smoke-host-bootstrap.mjs:/smoke-host-bootstrap.mjs:ro" "$host_image" /smoke-host-bootstrap.mjs --session-create
+docker run --rm --network none --cap-drop ALL --security-opt no-new-privileges:true \
+  --memory 256m --cpus 1 --pids-limit 64 --entrypoint node \
+  -v "$script_dir/smoke-host-relay.mjs:/smoke-host-relay.mjs:ro" "$host_image" /smoke-host-relay.mjs
 docker run --rm --network none --entrypoint python "$manager_image" \
   -I -c "import sys;sys.path.insert(0,'/app');import hosts,mcp_runtime,mcp_authorization,owner_auth;from global_memory import catalog;assert catalog()['tools']"
 docker run --rm --network none --cap-drop ALL --security-opt no-new-privileges:true \
@@ -27,7 +30,7 @@ for attempt in {1..15}; do
   if [[ $attempt == 15 ]]; then docker logs "$container_id"; exit 1; fi
   sleep 1
 done
-python3 "$script_dir/smoke-sandbox-ssh.py" "$container_id"
+python3 "$script_dir/smoke-sandbox-ssh.py" "$container_id" "$host_image"
 docker exec "$container_id" /opt/office/python/bin/python -c \
   "from docx import Document;d=Document();d.add_paragraph('中文预览验证');d.save('/tmp/check.docx')"
 docker exec "$container_id" /usr/bin/python3 -I /opt/office/uno_worker.py /tmp/check.docx /tmp/check.pdf convert

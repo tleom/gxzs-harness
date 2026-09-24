@@ -159,6 +159,28 @@ def test_edit_preserves_assets_and_keeps_source_backup_with_version_checks(resou
     assert (tmp_path / "skills/report/SKILL.md").read_text() == "updated"
 
 
+def test_skill_rename_preserves_assets_toggle_pin_and_rejects_existing_target(resources, tmp_path):
+    payload = package()
+    payload["files"].append({"path": "scripts/helper.py", "data": base64.b64encode(b"asset").decode()})
+    first = resources.personal({"operation": "skill_import", "name": "report", **payload}, str(tmp_path))
+    resources.personal({"operation": "skill_toggle", "name": "report", "enabled": False}, str(tmp_path))
+    resources.personal({"operation": "skill_pin", "name": "report", "pinned": True}, str(tmp_path))
+    updated = "---\nname: evidence-review\ndescription: Review evidence\n---\n# Evidence"
+    renamed = resources.personal({"operation": "skill_update", "name": "report", "new_name": "evidence-review",
+                                  "version": first["version"], "content": updated}, str(tmp_path))
+    assert renamed["id"] == "evidence-review"
+    assert not (tmp_path / "skills/report").exists()
+    assert (tmp_path / "skills/evidence-review/SKILL.md").read_text() == updated
+    assert (tmp_path / "skills/evidence-review/scripts/helper.py").read_text() == "asset"
+    listed = resources.personal({"operation": "list"}, str(tmp_path))["skills"]
+    assert listed[0]["id"] == "evidence-review"
+    assert listed[0]["enabled"] is False and listed[0]["pinned"] is True
+    resources.personal({"operation": "skill_import", "name": "report", **package()}, str(tmp_path))
+    assert resources.personal({"operation": "skill_update", "name": "evidence-review", "new_name": "report",
+                               "version": renamed["version"], "content": updated}, str(tmp_path)) == {"conflict": True}
+    assert (tmp_path / "skills/report/SKILL.md").exists()
+
+
 def test_uninstall_requires_version_and_moves_the_whole_package_to_backup(resources, tmp_path):
     first = resources.personal({"operation": "skill_import", "name": "report", **package()}, str(tmp_path))
     assert resources.personal({"operation": "skill_uninstall", "name": "report", "version": "stale"}, str(tmp_path)) == {"conflict": True}
