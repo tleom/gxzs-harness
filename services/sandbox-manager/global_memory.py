@@ -7,8 +7,10 @@ import threading
 import subprocess
 import queue
 import copy
+from uuid import uuid4
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from mcp_outcomes import record_pending, complete_call
 
 REVISION = "bf846ebffca0d33c6d3b1468e12e16c7358fd715"
 VERSION = "2-" + REVISION[:12]
@@ -136,6 +138,7 @@ class MemoryWorker:
 class MemoryCall:
     def __init__(self, key, binding):
         self.key, self.binding = key, binding
+        self.call_id = uuid4().hex
         self.cancelled, self.worker = threading.Event(), None
         self.dispatch_started, self.dispatch_done, self.dispatched = threading.Event(), threading.Event(), threading.Event()
 
@@ -295,6 +298,7 @@ def operate(key, payload, *, docker, ensure, identity, lock, authorize, worker_f
         if len(ACTIVE) >= 32 or sum(item.key == key for item in ACTIVE) >= 8:
             return {'error': '记忆调用达到并发上限，本次操作未执行', 'code': 'MCP_BUSY'}
         ACTIVE.add(call)
+    tracked, outcome_uncertain = False, True
     try:
         if not authorize({"authorization": grant, "action": "validate"}):
             return {"error": "记忆调用授权已失效，本次操作未执行"}
@@ -321,6 +325,8 @@ def operate(key, payload, *, docker, ensure, identity, lock, authorize, worker_f
             return ready
         if not authorize({"authorization": grant, "action": "consume"}):
             return {"error": "记忆调用授权已失效，本次操作未执行"}
+        record_pending(key, binding, call.call_id)
+        tracked = True
         try:
             with GUARD:
                 remaining = min(60, (deadline - time.time() * 1000) / 1000)
@@ -335,12 +341,20 @@ def operate(key, payload, *, docker, ensure, identity, lock, authorize, worker_f
                 output = call.worker.response(call.cancelled, timeout=max(0, remaining))
         except Exception:
             output = {"error": "记忆调用结果未知，可检索核实后重试", "uncertain": True}
+        outcome_uncertain = bool(output.get('uncertain') or (call.cancelled.is_set() and call.dispatched.is_set()))
         return output
     finally:
-        confirmed = call.worker is None or call.worker.close()
-        with GUARD:
-            if confirmed:
-                ACTIVE.discard(call)
+        confirmed = False
+        try:
+            confirmed = call.worker is None or call.worker.close()
+        finally:
+            try:
+                if tracked and not outcome_uncertain:
+                    complete_call(key, binding, call.call_id)
+            finally:
+                with GUARD:
+                    if confirmed:
+                        ACTIVE.discard(call)
 
 
 def install():

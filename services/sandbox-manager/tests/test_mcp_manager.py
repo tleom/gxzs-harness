@@ -333,7 +333,7 @@ def test_stop_reports_inflight_uncertainty_without_blocking_later_calls(manager)
         result = module.operation(key, 'stop-binding', {'binding_id': binding})
         assert result['fenced'] is True and result['uncertain'] is True
         assert pending.result()['uncertain']
-    assert module.operation(key, 'stop-binding', {'binding_id': binding})['uncertain'] is False
+    assert module.operation(key, 'stop-binding', {'binding_id': binding})['uncertain'] is True
     assert module.operation(key, 'personal-mcp', payload(key, binding, tool='fast'))['result']['value'] == 'ok'
 
 

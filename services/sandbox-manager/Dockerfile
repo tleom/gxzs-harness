@@ -8,7 +8,7 @@ LABEL org.opencontainers.image.source="https://github.com/tleom/gxzs-harness" \
 RUN apt-get update && apt-get install -y --no-install-recommends openssh-client && rm -rf /var/lib/apt/lists/*
 COPY --from=docker-cli /usr/local/bin/docker /usr/local/bin/docker
 WORKDIR /app
-COPY global_memory.py ./
+COPY mcp_outcomes.py global_memory.py ./
 RUN python global_memory.py --install
 COPY server.py file_ops.py resource_ops.py environment.py stop_jobs.py office_preview.py planning.py planning_exec.py ./
 COPY mcp_ops.py mcp_worker.py mcp_runtime.py ./

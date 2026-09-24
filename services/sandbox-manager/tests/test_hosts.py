@@ -254,6 +254,35 @@ def test_dead_host_pair_is_fenced_and_restarted_after_liveness_grace(tmp_path, m
     host.heartbeat.assert_not_called()
 
 
+def test_healthy_recovery_removes_only_verified_stopped_predecessor(tmp_path, monkeypatch):
+    host, docker, _, payload, _ = setup(tmp_path, monkeypatch)
+    host.ensure('workspace', payload)
+    record = host.root / 'workspace' / 'host.json'
+    item = json.loads(record.read_text())
+    item.update(state='ready', ready=True)
+    record.write_text(json.dumps(item))
+    host.healthy.return_value = False
+    host.alive = Mock(return_value=False)
+    host.failures['host-1'] = 0
+    host.maintain()
+
+    original = docker.side_effect
+    old_name = 'host-1-previous-' + 'c' * 12
+    def with_predecessors(*args, **kwargs):
+        if args[0] == 'ps':
+            return SimpleNamespace(returncode=0, stdout=old_name + '\n' + 'host-1-previous-' + 'a' * 12 + '\n')
+        if args[:2] == ('inspect', old_name):
+            return SimpleNamespace(returncode=0, stdout=json.dumps([{
+                'Id': 'c' * 64, 'State': {'Running': False},
+                'Config': {'Labels': {'gxzs.owner': 't:1', 'gxzs.workspace': 'workspace', 'gxzs.generation': '1'}},
+            }]))
+        return original(*args, **kwargs)
+    docker.side_effect = with_predecessors
+    host.healthy.return_value = True
+    host.maintain()
+    assert [call.args for call in docker.call_args_list if call.args[0] == 'rm'] == [('rm', old_name)]
+
+
 def test_missing_host_container_is_recreated_from_durable_owner_state(tmp_path, monkeypatch):
     host, docker, sandbox, payload, created = setup(tmp_path, monkeypatch)
     host.ensure('workspace', payload)

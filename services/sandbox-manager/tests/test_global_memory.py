@@ -20,6 +20,9 @@ class RoutingTests(unittest.TestCase):
         self.addCleanup(mock_catalog.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
+        state = patch.dict(os.environ, {"WORKBENCH_MANAGER_STATE": self.temp.name})
+        state.start()
+        self.addCleanup(state.stop)
         self.docker = Mock(return_value=Mock(returncode=0, stdout=json.dumps({"content": [], "isError": False})))
         self.authorize = Mock(return_value=True)
         self.ensure = Mock()
@@ -87,11 +90,14 @@ class RoutingTests(unittest.TestCase):
         self.assertEqual(self.worker.send.call_count, 2)
 
     def test_engine_unknown_result_does_not_suppress_a_later_call(self):
+        from mcp_outcomes import has_unconfirmed
         self.worker.response.side_effect = [{'ready': True}, memory.error_result('unknown', uncertain=True)]
         self.assertTrue(self.run_call()['uncertain'])
+        self.assertTrue(has_unconfirmed('owner-a', self.payload['authorization']['binding_id']))
         self.worker.response.side_effect = [{'ready': True}, {'content': [], 'isError': False}]
         self.assertFalse(self.run_call().get('uncertain', False))
         self.assertEqual(self.worker.send.call_count, 2)
+        self.assertTrue(has_unconfirmed('owner-a', self.payload['authorization']['binding_id']))
 
     def test_bad_operation_rejected_before_worker(self):
         self.payload['arguments'] = {'op': 'identity', 'action': 'add', 'subject_id': 'user:example'}

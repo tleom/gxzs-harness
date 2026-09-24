@@ -23,6 +23,35 @@ class Hosts:
         self.opener = build_opener(ProxyHandler({}))
         self.failures = {}
         self.recoveries = {}
+        self.cleanup_at = {}
+
+    def _cleanup_superseded(self, item):
+        """Remove only stopped, identity-verified predecessors after the new Host is healthy."""
+        listed = self.docker('ps', '-a', '--filter', 'label=gxzs.owner=' + item['owner_id'],
+                             '--filter', 'label=gxzs.workspace=' + item['workspace_id'],
+                             '--format', '{{.Names}}', timeout=5, check=False)
+        if listed.returncode:
+            raise RuntimeError('Unable to list superseded hosts')
+        prefix = item['instance_id'] + '-previous-'
+        for name in listed.stdout.splitlines()[:8]:
+            if not re.fullmatch(re.escape(prefix) + r'[0-9a-f]{12}', name):
+                continue
+            observed = self.docker('inspect', name, timeout=5, check=False)
+            if observed.returncode:
+                continue
+            previous = json.loads(observed.stdout)[0]
+            labels = previous.get('Config', {}).get('Labels') or {}
+            if (previous.get('Id', '')[:12] != name[len(prefix):]
+                    or previous.get('State', {}).get('Running') is not False
+                    or any(labels.get(label) != expected for label, expected in {
+                        'gxzs.owner': item['owner_id'],
+                        'gxzs.workspace': item['workspace_id'],
+                        'gxzs.generation': str(item['generation']),
+                    }.items())):
+                continue
+            removed = self.docker('rm', name, timeout=5, check=False)
+            if removed.returncode:
+                logging.getLogger(__name__).warning('Superseded Host cleanup deferred workspace=%s', item['workspace_id'])
 
     def ensure(self, workspace, payload):
         owner = payload['owner_id']
@@ -411,6 +440,13 @@ class Hosts:
                     self.recoveries.pop(item['instance_id'], None)
                     return
                 if healthy:
+                    if time.monotonic() >= self.cleanup_at.get(item['instance_id'], 0):
+                        try:
+                            self._cleanup_superseded(item)
+                        except Exception:
+                            logging.getLogger(__name__).warning(
+                                'Superseded Host cleanup deferred workspace=%s', item['workspace_id'])
+                        self.cleanup_at[item['instance_id']] = time.monotonic() + 300
                     self.failures.pop(item['instance_id'], None)
                     self.recoveries.pop(item['instance_id'], None)
                     if item.get('state') == 'draining':

@@ -36,7 +36,7 @@ Java ensure/replace 提交的是 root assertion key，manager 只向 host 下发
 - `binding_id` 为纯 run UUID。授权 callback 外层是 `{authorization: grant, action: 'validate' | 'consume'}`；validate 可重复且实时核对权限，consume 在派发前只消费一次 nonce。
 - grant 签名覆盖 owner/workspace/run/request/resource、version/manifest_version/runtime_version、arguments、deadline_ms 等业务内容。manager 对参数进行类型敏感比较，不能将 `true` 与 `1` 混为相同参数。
 - 个人工具的 runtime_version 等于 version；全局记忆的 runtime_version 对应镜像内固定记忆引擎，平台资源 version 独立用于授权。
-- 防重账本的身份排除临时授权 nonce/签名/期限，保留真实工具、版本、参数和稳定 request_key。旧调用结果可重放；结果未知不能自动重做。归档保留永久查重墓碑。
+- `request_key` 用于关联执行与授权，不作为去重或调用次数限制。AI 可以自行再次调用同一工具；新的授权 nonce 仍须单独验证和消费。平台只持久保存尚未确认的外部调用状态，用于停止时提示可能的副作用，不缓存结果、不自动重放，也不因未知结果自动替 AI 重试。
 - `deadline_ms` 是最多 350 秒的绝对 Unix 毫秒截止时间，各层仅消耗剩余预算。manifest 或 schema/description 变化会刷新工具。完整 catalog 不可用时返回失败，不能把局部成功当作完整目录。
 - 用户停止由平台 `POST /internal/workbench/mcp/cancel {run_id}` 集中处理（`mcp/stop-run` 为同义兼容入口）：Java 写取消标记、取消全局 HTTP，并调用 root manager `stop-binding {binding_id}` 等待执行终止确认。客户端断线本身不停止任务。外部已产生的副作用不可回滚，结果保留 uncertain。
 - `stop_confirmation: {fenced, uncertain}` 经 SQLite、GET DTO 和 `workbench_stop_confirmation` 事件保持一致。`fenced` 表示已确认执行隔离；`uncertain` 合并全局 HTTP、个人 MCP、global-memory 账本及仍未结算的原生工具调用。纯文本、未派发和结果已知的调用不误报；未知结果在重复停止、重启及归档后继续保留，不能据此自动重试。

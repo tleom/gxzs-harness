@@ -10,8 +10,9 @@ import selectors
 import io
 from contextlib import nullcontext
 from pathlib import Path
-from uuid import UUID
+from uuid import UUID, uuid4
 from mcp_authorization import validate_grant
+from mcp_outcomes import record_pending, complete_call
 
 MAX_LINE = 8 * 1024 * 1024 + 1
 WORKERS = {}
@@ -172,6 +173,7 @@ class Worker:
 class Invocation:
     def __init__(self, key, payload):
         self.key, self.name = key, payload["name"]
+        self.call_id = uuid4().hex
         self.cancelled, self.worker = threading.Event(), None
         self.dispatch_started, self.dispatch_done, self.dispatched = threading.Event(), threading.Event(), threading.Event()
         supplied_deadline = payload.get('deadline_ms', int(time.time() * 1000) + 350_000)
@@ -292,6 +294,7 @@ def invoke(key, container, payload, state, *, authorize=None):
         mutex = CALL_LOCKS.setdefault(identity, threading.Lock())
         ACTIVE.add(call)
     acquired, worker = False, None
+    tracked, outcome_uncertain = False, True
     try:
         deadline = min(time.monotonic() + 20, call.deadline)
         while not call.cancelled.is_set() and time.monotonic() < deadline:
@@ -334,6 +337,10 @@ def invoke(key, container, payload, state, *, authorize=None):
         if payload["operation"] == "mcp_call":
             if authorize is None or not authorize({"authorization": payload["authorization"], "action": "consume"}):
                 return {"error": "MCP 当前任务或执行已失效，本次操作未执行"}
+            # Commit before any pipe write: a manager crash after dispatch must
+            # remain visible to a later stop, without restricting another call.
+            record_pending(key, call.binding, call.call_id)
+            tracked = True
         # This short critical section orders dispatch against stop/config changes.
         # External connection, authorization and response waits never hold it.
         with GUARD:
@@ -351,16 +358,21 @@ def invoke(key, container, payload, state, *, authorize=None):
                 if WORKERS.get(identity) is worker:
                     WORKERS.pop(identity)
             retire(worker, key, name, call.binding)
+        outcome_uncertain = bool(result.get("uncertain") or (call.cancelled.is_set() and call.dispatched.is_set()))
         return result
     finally:
-        with GUARD:
-            ACTIVE.discard(call)
-            LAST_USED[identity] = time.monotonic()
-        if acquired:
-            mutex.release()
-        with GUARD:
-            if not any((active.key, active.name) == identity for active in ACTIVE):
-                CALL_LOCKS.pop(identity, None)
+        try:
+            if tracked and not outcome_uncertain:
+                complete_call(key, call.binding, call.call_id)
+        finally:
+            with GUARD:
+                ACTIVE.discard(call)
+                LAST_USED[identity] = time.monotonic()
+            if acquired:
+                mutex.release()
+            with GUARD:
+                if not any((active.key, active.name) == identity for active in ACTIVE):
+                    CALL_LOCKS.pop(identity, None)
 
 
 def statistics():
