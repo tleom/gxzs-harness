@@ -23,6 +23,35 @@ class Hosts:
         self.opener = build_opener(ProxyHandler({}))
         self.failures = {}
         self.recoveries = {}
+        self.cleanup_at = {}
+
+    def _cleanup_superseded(self, item):
+        """Remove only stopped, identity-verified predecessors after the new Host is healthy."""
+        listed = self.docker('ps', '-a', '--filter', 'label=gxzs.owner=' + item['owner_id'],
+                             '--filter', 'label=gxzs.workspace=' + item['workspace_id'],
+                             '--format', '{{.Names}}', timeout=5, check=False)
+        if listed.returncode:
+            raise RuntimeError('Unable to list superseded hosts')
+        prefix = item['instance_id'] + '-previous-'
+        for name in listed.stdout.splitlines()[:8]:
+            if not re.fullmatch(re.escape(prefix) + r'[0-9a-f]{12}', name):
+                continue
+            observed = self.docker('inspect', name, timeout=5, check=False)
+            if observed.returncode:
+                continue
+            previous = json.loads(observed.stdout)[0]
+            labels = previous.get('Config', {}).get('Labels') or {}
+            if (previous.get('Id', '')[:12] != name[len(prefix):]
+                    or previous.get('State', {}).get('Running') is not False
+                    or any(labels.get(label) != expected for label, expected in {
+                        'gxzs.owner': item['owner_id'],
+                        'gxzs.workspace': item['workspace_id'],
+                        'gxzs.generation': str(item['generation']),
+                    }.items())):
+                continue
+            removed = self.docker('rm', name, timeout=5, check=False)
+            if removed.returncode:
+                logging.getLogger(__name__).warning('Superseded Host cleanup deferred workspace=%s', item['workspace_id'])
 
     def ensure(self, workspace, payload):
         owner = payload['owner_id']
@@ -353,6 +382,7 @@ class Hosts:
 
     def _maintain_one(self, record):
         heartbeats = []
+        cleanup_item = None
         try:
             with self.lock(record.parent.name):
                 item = json.loads(record.read_text())
@@ -419,6 +449,8 @@ class Hosts:
                     item.update(state='ready', ready=True)
                     self._save(record, item)
                     heartbeats.append((dict(item), 'ready'))
+                    if time.monotonic() >= self.cleanup_at.get(item['instance_id'], 0):
+                        cleanup_item = dict(item)
                     return
 
                 # An unavailable external MCP catalog is an application-level
@@ -499,3 +531,20 @@ class Hosts:
                     logging.getLogger(__name__).exception(
                         'Host heartbeat failed workspace=%s instance=%s state=%s',
                         item['workspace_id'], item['instance_id'], state)
+            if cleanup_item is not None:
+                try:
+                    # Snapshot identity under the lock, then release it before
+                    # potentially slow Docker list/inspect/remove operations.
+                    with self.lock(record.parent.name):
+                        current = json.loads(record.read_text())
+                        eligible = (current.get('ready') is True and current.get('state') == 'ready'
+                                    and all(current.get(field) == cleanup_item[field] for field in
+                                            ('owner_id', 'workspace_id', 'generation', 'instance_id')))
+                    if eligible:
+                        try:
+                            self._cleanup_superseded(cleanup_item)
+                        finally:
+                            self.cleanup_at[cleanup_item['instance_id']] = time.monotonic() + 300
+                except Exception:
+                    logging.getLogger(__name__).warning(
+                        'Superseded Host cleanup deferred workspace=%s', cleanup_item['workspace_id'])

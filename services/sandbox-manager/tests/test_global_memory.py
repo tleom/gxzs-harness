@@ -14,12 +14,26 @@ from global_memory import operate
 
 
 class RoutingTests(unittest.TestCase):
+    def test_sandbox_embedded_source_does_not_import_manager_state(self):
+        code = (
+            "import pathlib,sys; source=pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'); "
+            "scope={'__name__':'sandbox_memory','__file__':'<embedded>'}; "
+            "exec(compile(source.split('if __name__ == \"__main__\":')[0], '<embedded>', 'exec'),scope); "
+            "assert callable(scope['run_request'])"
+        )
+        result = subprocess.run([sys.executable, '-I', '-S', '-c', code, memory.__file__],
+                                text=True, capture_output=True)
+        self.assertEqual(0, result.returncode, result.stderr)
+
     def setUp(self):
         mock_catalog = patch.object(memory, "catalog", return_value={"version": memory.VERSION, "manifest_version": "manifest"})
         mock_catalog.start()
         self.addCleanup(mock_catalog.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
+        state = patch.dict(os.environ, {"WORKBENCH_MANAGER_STATE": self.temp.name})
+        state.start()
+        self.addCleanup(state.stop)
         self.docker = Mock(return_value=Mock(returncode=0, stdout=json.dumps({"content": [], "isError": False})))
         self.authorize = Mock(return_value=True)
         self.ensure = Mock()
@@ -87,11 +101,36 @@ class RoutingTests(unittest.TestCase):
         self.assertEqual(self.worker.send.call_count, 2)
 
     def test_engine_unknown_result_does_not_suppress_a_later_call(self):
+        from mcp_outcomes import has_unconfirmed
         self.worker.response.side_effect = [{'ready': True}, memory.error_result('unknown', uncertain=True)]
         self.assertTrue(self.run_call()['uncertain'])
+        self.assertTrue(has_unconfirmed('owner-a', self.payload['authorization']['binding_id']))
         self.worker.response.side_effect = [{'ready': True}, {'content': [], 'isError': False}]
         self.assertFalse(self.run_call().get('uncertain', False))
         self.assertEqual(self.worker.send.call_count, 2)
+        self.assertTrue(has_unconfirmed('owner-a', self.payload['authorization']['binding_id']))
+
+    def test_confirmed_memory_result_survives_outcome_cleanup_error(self):
+        import sqlite3
+        from mcp_outcomes import has_unconfirmed
+        with patch('mcp_outcomes.complete_call', side_effect=sqlite3.OperationalError('locked')):
+            result = self.run_call()
+        self.assertFalse(result['isError'])
+        self.assertTrue(has_unconfirmed('owner-a', self.payload['authorization']['binding_id']))
+
+    def test_late_stop_after_definitive_memory_response_clears_marker(self):
+        from mcp_outcomes import has_unconfirmed
+        self.worker.send.side_effect = lambda _tool, _arguments, _remaining, _cancelled, on_dispatch: on_dispatch()
+        responses = iter([{'ready': True}, {'content': [], 'isError': False}])
+        def response(cancelled, timeout=None):
+            value = next(responses)
+            if 'content' in value:
+                cancelled.set()
+            return value
+        self.worker.response.side_effect = response
+        result = self.run_call()
+        self.assertFalse(result['isError'])
+        self.assertFalse(has_unconfirmed('owner-a', self.payload['authorization']['binding_id']))
 
     def test_bad_operation_rejected_before_worker(self):
         self.payload['arguments'] = {'op': 'identity', 'action': 'add', 'subject_id': 'user:example'}
