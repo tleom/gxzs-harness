@@ -16,6 +16,7 @@ def setup(tmp_path, monkeypatch):
         'WORKBENCH_MANAGER_HOST_STATE': '/srv/manager', 'GXZS_HOST_PLATFORM_URL': 'http://backend/internal/workbench',
         'GXZS_HOST_MANAGER_URL': 'http://manager:5010', 'WORKBENCH_SANDBOX_MANAGER_TOKEN': 'secret',
         'GXZS_SANDBOX_HELPER_HASH': 'a' * 64,
+        'GXZS_HOST_ADVERTISE_IP': '10.16.9.237', 'GXZS_HOST_BIND_IP': '10.16.9.237',
     }.items(): monkeypatch.setenv(key, value)
     created = {}
     def docker(*args, **kwargs):
@@ -78,6 +79,14 @@ def test_cross_machine_gateway_receives_private_published_address(tmp_path, monk
     monkeypatch.setenv('GXZS_HOST_BIND_IP', '10.16.9.237')
     assert host.ensure('workspace', payload)['endpoint'] == 'http://10.16.9.237:32001'
     assert any('10.16.9.237::3081' in call.args for call in docker.call_args_list)
+
+
+def test_missing_host_advertise_ip_fails_before_creating_network(tmp_path, monkeypatch):
+    host, docker, sandbox, payload, _ = setup(tmp_path, monkeypatch)
+    monkeypatch.delenv('GXZS_HOST_ADVERTISE_IP')
+    with pytest.raises(ValueError, match='advertised and bind IPs are required'):
+        host.ensure('workspace', payload)
+    assert not any(call.args[0] == 'create' for call in docker.call_args_list)
 
 
 def test_failed_start_is_tracked_and_retains_owner(tmp_path, monkeypatch):
@@ -265,7 +274,7 @@ def test_missing_host_container_is_recreated_from_durable_owner_state(tmp_path, 
     assert len(creates) == 2
     assert sandbox.call_args.args == ('workspace',)
     host._ssh.assert_called_once()
-    assert json.loads(record.read_text())['endpoint'] == 'http://host-1:3081'
+    assert json.loads(record.read_text())['endpoint'] == 'http://10.16.9.237:32001'
     assert any(call.args == ('start', 'host-1') for call in docker.call_args_list)
 
 
@@ -407,7 +416,7 @@ def test_creation_does_not_wait_for_readiness_under_workspace_lock(tmp_path, mon
     host.healthy.side_effect = AssertionError('ensure must not wait for dependent plugin bootstrap')
     result = host.ensure('workspace', payload)
     assert result['state'] == 'provisioning'
-    assert result['endpoint'] == 'http://host-1:3081'
+    assert result['endpoint'] == 'http://10.16.9.237:32001'
     host.heartbeat.assert_called_once()
 
 

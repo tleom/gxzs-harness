@@ -21,7 +21,7 @@
 ```dotenv
 GXZS_HOST_IMAGE=gxzs/dsh-host:<已验证版本>
 GXZS_HOST_NETWORK=gxzs-ai-sandboxes
-# Java 与 Docker 不同机器时必填：绑定 237 的内网接口，并返回其动态映射端口。
+# 必填：manager 不加入每个 owner 的隔离网络，必须通过内网映射端口访问 Host。
 GXZS_HOST_BIND_IP=10.16.9.237
 GXZS_HOST_ADVERTISE_IP=10.16.9.237
 # /state 绑定目录在 Docker 宿主机上的真实绝对路径
@@ -34,7 +34,7 @@ GXZS_HOST_SETTINGS_FILE=/config/host-settings.yaml
 GXZS_HOST_CREDENTIALS_FILE=/config/host-credentials.yaml
 ```
 
-settings / credentials 是专门准备的统一模型模板，仅配置已批准的 Qwen 模型；路径挂入 manager，只复制模板文件。签名密钥与按 owner 派生的平台代理 token 通过私有 ensure 请求提供，平台主密钥不会进入宿主。manager 的 `/state` 必须持久化；host 与 manager 必须能通过内部网络解析彼此及沙盒名称。宿主仅在 3081 暴露签名适配 API，原生 DSH API 保持 loopback。跨机器网关使用 Docker 分配并保持的内网映射端口，不把容器 DNS 名称返回给 235；同一 Docker 网络部署可以省略两个 IP 配置。
+settings / credentials 是专门准备的统一模型模板，仅配置已批准的 Qwen 模型；路径挂入 manager，只复制模板文件。签名密钥与按 owner 派生的平台代理 token 通过私有 ensure 请求提供，平台主密钥不会进入宿主。manager 的 `/state` 必须持久化；manager 必须能访问 `GXZS_HOST_ADVERTISE_IP` 上 Docker 动态映射的 Host 端口。缺少 `GXZS_HOST_BIND_IP` 或 `GXZS_HOST_ADVERTISE_IP` 时，manager 拒绝创建 Host。宿主仅在 3081 暴露签名适配 API，原生 DSH API 保持 loopback。跨机器网关使用 Docker 分配并保持的内网映射端口，不把容器 DNS 名称返回给 235。
 
 构建入口：
 

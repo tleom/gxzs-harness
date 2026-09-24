@@ -131,18 +131,18 @@ class Hosts:
         temporary.replace(record)
 
     def _runtime_config(self, workspace):
-        network = self.ensure_network(workspace)
         advertise = os.environ.get('GXZS_HOST_ADVERTISE_IP')
-        publish = []
-        if advertise:
-            ipaddress.IPv4Address(advertise)
-            bind = os.environ['GXZS_HOST_BIND_IP']
-            if not ipaddress.IPv4Address(bind).is_private or bind == '0.0.0.0':
-                raise ValueError('Host listener must bind a private interface')
-            publish = ['-p', bind + '::3081']
+        bind = os.environ.get('GXZS_HOST_BIND_IP')
+        if not advertise or not bind:
+            raise ValueError('Host advertised and bind IPs are required for manager access')
+        ipaddress.IPv4Address(advertise)
+        if not ipaddress.IPv4Address(bind).is_private or bind == '0.0.0.0':
+            raise ValueError('Host listener must bind a private interface')
+        publish = ['-p', bind + '::3081']
         host_state = PurePosixPath(os.environ['WORKBENCH_MANAGER_HOST_STATE'])
         if not host_state.is_absolute():
             raise ValueError('Manager host state mount must be absolute')
+        network = self.ensure_network(workspace)
         return network, advertise, publish, host_state
 
     def _create_container(self, item, folder, image, network, publish, host_state):
@@ -164,10 +164,8 @@ class Hosts:
 
     def _container_identity(self, item, advertise):
         info = json.loads(self.docker('inspect', item['instance_id']).stdout)[0]
-        endpoint = 'http://' + item['instance_id'] + ':3081'
-        if advertise:
-            ports = info['NetworkSettings']['Ports']['3081/tcp']
-            endpoint = 'http://' + advertise + ':' + str(ports[0]['HostPort'])
+        ports = info['NetworkSettings']['Ports']['3081/tcp']
+        endpoint = 'http://' + advertise + ':' + str(ports[0]['HostPort'])
         return {'endpoint': endpoint, 'image_digest': info['Image']}
 
     def replace(self, workspace, payload):
