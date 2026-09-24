@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Verify current manager SSH setup against an existing isolated sandbox."""
 import ast
+import io
 import json
 import os
 from pathlib import Path
@@ -8,12 +9,20 @@ import re
 import subprocess
 import sys
 import tempfile
+import tarfile
 from types import SimpleNamespace
 
 
 def docker(*args, stdin=None):
     return subprocess.run(['docker', *args], input=stdin, text=True,
                           capture_output=True, check=True, timeout=30)
+
+
+def bridge_processes(container):
+    """Count only disposable per-stream bridges, not the long-lived helper."""
+    output = docker('top', container, '-eo', 'pid,args').stdout
+    return sum("const net=require('node:net')" in line and '/tmp/dsh-ssh-' in line
+               for line in output.splitlines())
 
 
 AUTH_CHECK = r'''
@@ -49,7 +58,7 @@ with tempfile.TemporaryDirectory(prefix='gxzs-ssh-smoke-') as directory:
 '''
 
 
-def verify(container):
+def verify(container, host_image=None):
     if not re.fullmatch(r'[0-9a-f]{64}', container):
         raise ValueError('Expected the full ID of the disposable smoke container')
     source = Path(__file__).resolve().parents[1] / 'services/sandbox-manager/hosts.py'
@@ -90,14 +99,68 @@ def verify(container):
         docker('exec', '-i', container, '/usr/local/bin/python', '-I', '-S', '-c', AUTH_CHECK,
                stdin=json.dumps({'private': key.read_text(), 'public': key.with_suffix('.pub').read_text(),
                                  'known_hosts': known}))
+        if host_image:
+            # Share only this disposable sandbox's network namespace. The host
+            # receives fresh fixture SSH keys, never sandbox/user data mounts.
+            ssh_folder = folder / 'ssh'
+            (ssh_folder / 'known_hosts').write_text(known)
+            (ssh_folder / 'config').write_text('Host fixture-sandbox\n  HostName 127.0.0.1\n'
+                '  User dify\n  Port 2222\n  IdentityFile /home/node/.ssh/id_ed25519\n'
+                '  IdentitiesOnly yes\n  StrictHostKeyChecking yes\n'
+                '  UserKnownHostsFile /home/node/.ssh/known_hosts\n')
+            helper_hash = docker('exec', container, 'sha256sum',
+                '/opt/dsh/node_modules/@deepseek-ai/dsh-ssh/lib/helper.js').stdout.split()[0]
+            scripts = Path(__file__).resolve().parent
+            host = docker('create', '--network', 'container:' + container,
+                    '--user', '1000:1000', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges:true',
+                    '--memory', '1g', '--cpus', '2', '--pids-limit', '256',
+                    '-v', str(scripts) + ':/smoke:ro', '-e', 'GXZS_SANDBOX_SSH_HOST=fixture-sandbox',
+                    '-e', 'GXZS_SANDBOX_HELPER_HASH=' + helper_hash,
+                    '--entrypoint', 'sleep', host_image, '120').stdout.strip()
+            try:
+                # Preserve UID 1000 through the Docker archive API even when
+                # the CI runner has another uid; never grant CHOWN to runtime.
+                archive = io.BytesIO()
+                with tarfile.open(fileobj=archive, mode='w') as tar:
+                    entry = tarfile.TarInfo('.ssh')
+                    entry.type, entry.mode, entry.uid, entry.gid = tarfile.DIRTYPE, 0o700, 1000, 1000
+                    tar.addfile(entry)
+                    for name in ('id_ed25519', 'config', 'known_hosts'):
+                        data = (ssh_folder / name).read_bytes()
+                        entry = tarfile.TarInfo('.ssh/' + name)
+                        entry.size, entry.mode, entry.uid, entry.gid = len(data), 0o600, 1000, 1000
+                        tar.addfile(entry, io.BytesIO(data))
+                subprocess.run(['docker', 'cp', '-a', '-', host + ':/home/node'],
+                               input=archive.getvalue(), capture_output=True, check=True, timeout=20)
+                docker('start', host)
+                for script in ('smoke-native-ssh.mjs', 'smoke-native-sandbox-tools.mjs'):
+                    before = bridge_processes(container)
+                    result = subprocess.run(['docker', 'exec', host, 'node', '/smoke/' + script],
+                                            text=True, capture_output=True, timeout=65)
+                    print(result.stdout, end='')
+                    if result.returncode:
+                        print(result.stderr[-4000:], file=sys.stderr, end='')
+                        raise ValueError('Native SSH smoke failed: ' + script)
+                    # Local bridge bookkeeping can be empty while an SSH remote
+                    # command is still stuck. Assert against the sandbox PID
+                    # namespace so the production leak is covered directly.
+                    for _ in range(50):
+                        after = bridge_processes(container)
+                        if after == before:
+                            break
+                        import time
+                        time.sleep(0.1)
+                    assert after == before, f'Remote SSH bridges leaked: before={before}, after={after}'
+            finally:
+                docker('rm', '-f', host)
     print('PASS sandbox SSH: actual manager key setup; owner accepted; wrong key rejected; UID=1000 CapEff=0')
 
 
 if __name__ == '__main__':
     try:
-        if len(sys.argv) != 2:
-            raise ValueError('Usage: smoke-sandbox-ssh.py CONTAINER_ID')
-        verify(sys.argv[1])
+        if len(sys.argv) not in (2, 3):
+            raise ValueError('Usage: smoke-sandbox-ssh.py CONTAINER_ID [HOST_IMAGE]')
+        verify(sys.argv[1], sys.argv[2] if len(sys.argv) == 3 else None)
     except subprocess.CalledProcessError as error:
         # Inputs contain fresh fixture keys; never print command arguments or input.
         print(f'FAIL sandbox SSH (exit={error.returncode}):\n{error.stdout or ""}{error.stderr or ""}', file=sys.stderr)

@@ -74,6 +74,9 @@ importers:
 
   packages/workbench-sandbox-runtime:
     dependencies:
+      '@deepseek-ai/dsh-ssh':
+        specifier: 0.1.6-alpha.2
+        version: 0.1.6-alpha.2(8604669ed7c92dd9f11ce2b5d0ec40de)
       '@deepseek-ai/cordis':
         specifier: 4.0.2
         version: 4.0.2

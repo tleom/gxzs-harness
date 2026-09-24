@@ -19,5 +19,6 @@ chmod 600 "$host_key" "$ssh_dir/authorized_keys"
   -o "PidFile=$ssh_dir/sshd.pid" -o "AuthorizedKeysFile=$ssh_dir/authorized_keys" \
   -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no -o UsePAM=no \
   -o PermitRootLogin=no -o StrictModes=yes -o PrintMotd=no \
-  -o AllowTcpForwarding=no -o AllowAgentForwarding=no -o X11Forwarding=no
+  -o AllowTcpForwarding=no -o AllowStreamLocalForwarding=no -o AllowAgentForwarding=no \
+  -o X11Forwarding=no -o MaxSessions=256 -o MaxStartups=256
 exec "$@"

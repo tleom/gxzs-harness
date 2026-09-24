@@ -18,7 +18,19 @@ export default class WorkbenchSubprocess extends SshSubprocessRuntime {
   }
 
   spawn(spec) {
-    return super.spawn(this.mapExecutable(spec))
+    const handle = super.spawn(this.mapExecutable(spec))
+    // The SSH provider otherwise waits for every stream to close naturally
+    // before releasing its handle. An unconsumed pipe/control channel can keep
+    // the per-stream SSH bridge alive after process.done has completed.
+    // done already drains ordinary output up to the configured grace period;
+    // release the transport after that boundary on both success and failure.
+    if (handle.done && typeof handle.closeStreams === 'function') {
+      void handle.done.then(
+        () => handle.closeStreams(),
+        () => handle.closeStreams(),
+      ).catch(() => {})
+    }
+    return handle
   }
 
   spawnTerminal(spec) {

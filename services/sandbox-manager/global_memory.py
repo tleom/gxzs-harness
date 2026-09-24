@@ -6,16 +6,77 @@ import time
 import threading
 import subprocess
 import queue
+import copy
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 REVISION = "bf846ebffca0d33c6d3b1468e12e16c7358fd715"
-VERSION = "1-" + REVISION[:12]
+VERSION = "2-" + REVISION[:12]
 SERVER_ID = "global-memory"
 SOURCE = "/opt/gxzs-global-memory/" + REVISION
 ROOT = "/home/dify/.gxzs-global-memory"
 ACTIVE = set()
 GUARD = threading.RLock()
+CG_OPS = ("info", "route", "read", "write", "forget", "recent", "goal", "identity", "verify")
+STG_OPS = ("relation", "timeline", "anchors", "consistency")
+LAYERS = ("knowledge", "contextual", "structural", "self", "goals", "unresolved", "rejected")
+IDENTITY_ACTIONS = ("observe", "trait", "profile", "positions", "catalog", "history")
+ACTION_HELP = ("identity: observe 记录主体事实(content+subject_id)，trait 记录特征(trait+subject_id)，"
+               "profile/positions/catalog/history 查询；没有 add 或 anchor。"
+               "goal: add/list/status/set_status；recent: add/append/remember/list/clear；"
+               "forget: forget/restore。普通事实请用 op=write，不需要 action。")
+
+
+class MemoryInputError(ValueError):
+    """A platform precondition rejected before invoking the memory engine."""
+
+
+def error_result(message, *, uncertain=False):
+    return {"isError": True, "uncertain": uncertain,
+            "code": "MEMORY_RESULT_UNKNOWN" if uncertain else "MEMORY_INVALID_ARGUMENTS",
+            "content": [{"type": "text", "text": message}]}
+
+
+def tool_result(name, arguments, value):
+    failed = isinstance(value, dict) and (bool(value.get("error")) or value.get("ok") is False)
+    # cg.info returns bucket_health at its root. Its ok flag describes index
+    # health, not whether the diagnostic operation ran. Recognize that specific
+    # report shape; malformed reports and actual engine errors remain failures.
+    health_warning = (
+        name == "cg" and arguments.get("op") == "info" and isinstance(value, dict)
+        and value.get("ok") is False and "error" not in value
+        and all(type(value.get(key)) is int and value[key] >= 0 for key in ("buckets", "nodes", "total_nodes"))
+        and isinstance(value.get("os"), dict)
+        and isinstance(value.get("problems"), list) and bool(value["problems"])
+        and all(isinstance(problem, str) for problem in value["problems"])
+    )
+    return {"content": [{"type": "text", "text": json.dumps(value, ensure_ascii=False)}],
+            "isError": failed and not health_warning}
+
+
+def platform_tools(upstream):
+    """Publish the capabilities of our restricted owner principal, not upstream admin tools."""
+    tools = copy.deepcopy(upstream)
+    for tool in tools:
+        properties = tool["inputSchema"]["properties"]
+        ops = CG_OPS if tool["name"] == "cg" else STG_OPS
+        properties["op"] = {"type": "string", "enum": list(ops), "description": "必填；明确选择操作，不会按其他参数猜测。"}
+        properties["layer"] = {"type": "string", "enum": list(LAYERS), "description": "默认 knowledge；用户事实和偏好使用 knowledge。平台不开放 anchor 写入。"}
+        if tool["name"] == "cg":
+            tool["description"] = (
+                "当前用户跨会话记忆，必须显式传 op。常用："
+                "写入 {\"op\":\"write\",\"content\":\"用户希望使用中文\",\"content_kind\":\"text\",\"layer\":\"knowledge\"}；"
+                "检索 {\"op\":\"read\",\"query\":\"语言偏好\"}；"
+                "更正已有事实：read 得到节点 id 后，以相同 node_id 调用 write 并提供完整新 content，勿重复创建。"
+                "只开放 info/route/read/write/forget/recent/goal/identity/verify。" + ACTION_HELP +
+                "写入结果 committed=true 才表示正式记忆已提交；committed=false 或审核拒绝/待审核不得声称已记住。"
+                "结果未知时先按 node_id 或内容检索核实，勿重放写入。")
+            properties["action"] = {"type": "string", "description": ACTION_HELP}
+            properties["content"] = {**properties["content"], "description": "op=write 必填，完整记忆正文；修改时同时提供已有 node_id。普通文字同时传 content_kind=text。"}
+            properties["node_id"] = {**properties["node_id"], "description": "已有节点 id；read 读取，write 更新同一节点，forget 遗忘。"}
+        else:
+            tool["description"] = "查询当前用户记忆的时间与空间关系；必须显式传 op：relation(节点 a+b)、timeline、anchors 或 consistency。"
+    return tools
 
 
 class MemoryWorker:
@@ -97,6 +158,11 @@ def invalidate(key, binding=None):
     return confirmed
 
 
+def binding_inflight(key, binding):
+    with GUARD:
+        return any(call.key == key and call.binding == binding for call in ACTIVE)
+
+
 def fence_workspace(key):
     """Only after Docker confirms the entire owner sandbox has stopped."""
     with GUARD:
@@ -115,18 +181,30 @@ def catalog(source=SOURCE):
     import hashlib
     sys.path.insert(0, source)
     from md_cg.mcp_server import KERNEL_TOOLS
-    tools = KERNEL_TOOLS
+    tools = platform_tools(KERNEL_TOOLS)
     manifest = hashlib.sha256(json.dumps(tools, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     return {"id": SERVER_ID, "name": "全局记忆", "version": VERSION, "manifest_version": manifest, "tools": tools}
 
 
 def validate(name, arguments):
     if name not in {"cg", "stg"} or not isinstance(arguments, dict):
-        raise ValueError("记忆工具或参数无效")
+        raise MemoryInputError("记忆工具或参数无效")
     if len(json.dumps(arguments).encode()) > 1024 * 1024:
-        raise ValueError("记忆参数超过 1 MiB")
+        raise MemoryInputError("记忆参数超过 1 MiB")
     if any(key in arguments for key in ("root", "source", "owner_id", "workspace_id")):
-        raise ValueError("工具参数不能指定记忆存储或用户身份")
+        raise MemoryInputError("工具参数不能指定记忆存储或用户身份")
+    ops = CG_OPS if name == "cg" else STG_OPS
+    if arguments.get("op") not in ops:
+        raise MemoryInputError("op 为必填参数，允许：" + ", ".join(ops) + "。本次操作未执行。")
+    if "layer" in arguments and arguments["layer"] not in LAYERS:
+        raise MemoryInputError("平台不开放该记忆层；普通事实或偏好请使用 layer=knowledge。本次操作未执行。")
+    if name == "cg" and arguments["op"] == "identity":
+        action = arguments.get("action", "profile")
+        if action not in IDENTITY_ACTIONS:
+            raise MemoryInputError("identity 的 action 允许：" + ", ".join(IDENTITY_ACTIONS) + "；记录普通事实也可用 op=write。本次操作未执行。")
+    if name == "cg" and arguments["op"] == "write":
+        if not isinstance(arguments.get("content"), str) or not arguments["content"].strip():
+            raise MemoryInputError("op=write 需要非空 content；普通文字同时传 content_kind=text。本次操作未执行。")
 
 
 def execute(name, arguments, *, root=ROOT, source=SOURCE):
@@ -157,22 +235,40 @@ def execute(name, arguments, *, root=ROOT, source=SOURCE):
         if not secret_path.exists():
             issued = tokens.issue("designer", actor="global-memory", tenant="sandbox-owner",
                                   clearance="internal", delegable=False,
-                                  layers_allow=["knowledge", "contextual", "structural", "self", "goals", "unresolved", "rejected"],
-                                  ops_allow=["info", "route", "read", "write", "forget", "recent", "goal", "identity", "verify"], path=str(token_path))
+                                  layers_allow=list(LAYERS), ops_allow=list(CG_OPS), path=str(token_path))
             fd = os.open(secret_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
             with os.fdopen(fd, "w") as stream:
                 stream.write(issued["token"])
         principal = tokens.verify_token(secret_path.read_text(), path=str(token_path))
         graph = MdCGSecure(str(directory / "data"), principal=principal, autoflush=1)
+        value = None
         try:
             value = call_tool(graph, name, arguments)
-            return {"content": [{"type": "text", "text": json.dumps(value, ensure_ascii=False)}],
-                    "isError": isinstance(value, dict) and (bool(value.get("error")) or value.get("ok") is False)}
         finally:
-            graph.close()
+            try:
+                graph.close()
+            except Exception:
+                # A known committed write must not become an apparent failed
+                # write merely because later index flush/cleanup raised.
+                if isinstance(value, dict) and value.get("committed") is True:
+                    value["warning"] = "记忆已提交，但后续同步未确认；可按节点 id 核实当前状态。"
+                else:
+                    raise
+        return tool_result(name, arguments, value)
 
 
-def operate(key, payload, *, docker, ensure, identity, lock, authorize, journal, worker_factory=None):
+def run_request(request, *, root=ROOT, source=SOURCE):
+    try:
+        return execute(request["tool"], request["arguments"], root=root, source=source)
+    except MemoryInputError as error:
+        return error_result(str(error))
+    except Exception:
+        # The engine can raise after writing the node or its audit ledger.
+        # Neither a ValueError nor an AccessDenied proves rollback here.
+        return error_result("记忆调用结果未知，可按节点 id 或内容检索核实后再决定是否重试。", uncertain=True)
+
+
+def operate(key, payload, *, docker, ensure, identity, lock, authorize, worker_factory=None):
     from mcp_authorization import validate_grant
     descriptor = catalog()
     if payload.get("operation") == "catalog":
@@ -188,7 +284,10 @@ def operate(key, payload, *, docker, ensure, identity, lock, authorize, journal,
     if payload.get("version") != descriptor["version"] or payload.get("manifest_version") != descriptor["manifest_version"]:
         return {"conflict": True}
     tool, arguments = payload.get("tool"), payload.get("arguments")
-    validate(tool, arguments)
+    try:
+        validate(tool, arguments)
+    except MemoryInputError as error:
+        return error_result(str(error))
     grant = payload.get("authorization") or {}
     binding = validate_grant(key, payload, 'global:mcp:' + SERVER_ID + ':' + tool)
     call = MemoryCall(key, binding)
@@ -196,16 +295,11 @@ def operate(key, payload, *, docker, ensure, identity, lock, authorize, journal,
         if len(ACTIVE) >= 32 or sum(item.key == key for item in ACTIVE) >= 8:
             return {'error': '记忆调用达到并发上限，本次操作未执行', 'code': 'MCP_BUSY'}
         ACTIVE.add(call)
-    digest = None
     try:
         if not authorize({"authorization": grant, "action": "validate"}):
             return {"error": "记忆调用授权已失效，本次操作未执行"}
         if deadline <= time.time() * 1000:
             return {"error": "记忆调用已过期，本次操作未执行", "code": "MCP_DEADLINE_EXCEEDED"}
-        reservation = {field: payload[field] for field in ("tool", "arguments", "version", "manifest_version", "request_key")}
-        previous = journal.lookup(key, reservation)
-        if previous is not None:
-            return previous
         with lock(key):
             if call.cancelled.is_set():
                 return {'error': '记忆调用已停止，本次操作未执行'}
@@ -225,13 +319,8 @@ def operate(key, payload, *, docker, ensure, identity, lock, authorize, journal,
         ready = call.worker.response(call.cancelled, timeout=min(10, max(0, (deadline - time.time() * 1000) / 1000)))
         if not ready.get('ready'):
             return ready
-        digest, previous = journal.begin(key, reservation)
-        if previous is not None:
-            return previous
         if not authorize({"authorization": grant, "action": "consume"}):
-            result = {"error": "记忆调用授权已失效，本次操作未执行"}
-            journal.finish(digest, result)
-            return result
+            return {"error": "记忆调用授权已失效，本次操作未执行"}
         try:
             with GUARD:
                 remaining = min(60, (deadline - time.time() * 1000) / 1000)
@@ -240,13 +329,12 @@ def operate(key, payload, *, docker, ensure, identity, lock, authorize, journal,
                 else:
                     output = None
             if output is None:
-                from mcp_runtime import send_bound
-                output = send_bound(call, journal, digest, lambda on_dispatch: call.worker.send(tool, arguments, remaining, call.cancelled, on_dispatch))
+                from mcp_runtime import send_checked
+                output = send_checked(call, lambda on_dispatch: call.worker.send(tool, arguments, remaining, call.cancelled, on_dispatch))
             if output is None:
                 output = call.worker.response(call.cancelled, timeout=max(0, remaining))
         except Exception:
-            output = {"error": "记忆调用结果未知，请先检索核实，勿重复写入", "uncertain": True}
-        journal.finish(digest, output)
+            output = {"error": "记忆调用结果未知，可检索核实后重试", "uncertain": True}
         return output
     finally:
         confirmed = call.worker is None or call.worker.close()
@@ -287,8 +375,5 @@ if __name__ == "__main__":
         install()
     else:
         request = json.load(sys.stdin)
-        try:
-            result = execute(request["tool"], request["arguments"])
-        except Exception:
-            result = {"isError": True, "content": [{"type": "text", "text": "记忆操作失败，未确认完成，请稍后核实。"}]}
+        result = run_request(request)
         print(json.dumps(result, ensure_ascii=False))

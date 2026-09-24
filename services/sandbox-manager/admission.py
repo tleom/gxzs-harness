@@ -1,4 +1,5 @@
 """Durable global task admission. A stale heartbeat never frees a live task slot."""
+import os
 import sqlite3
 import threading
 import time
@@ -15,6 +16,7 @@ class Admission:
             generation INTEGER NOT NULL, instance TEXT NOT NULL, chat TEXT NOT NULL,
             state TEXT NOT NULL, heartbeat REAL NOT NULL, UNIQUE(owner,run))''')
         self.db.commit()
+        os.chmod(path, 0o600)
 
     def request(self, owner, generation, instance, run, chat, action, retry=False):
         if action not in ('acquire', 'renew', 'release') or not all((owner, instance, run, chat)) or generation < 1:
@@ -70,6 +72,25 @@ class Admission:
     def active(self, owner):
         with self.guard:
             return self.db.execute("SELECT COUNT(*) FROM task_admission WHERE owner=? AND state='running'", (owner,)).fetchone()[0]
+
+    def busy(self, owner):
+        """Include queued and retrying work when deciding host lifecycle."""
+        with self.guard:
+            return self.db.execute(
+                "SELECT COUNT(*) FROM task_admission WHERE owner=? AND state IN ('running','waiting','retry')",
+                (owner,),
+            ).fetchone()[0]
+
+    def ping(self):
+        with self.guard:
+            return self.db.execute('SELECT 1').fetchone()[0] == 1
+
+    def prune(self, before):
+        """Bound terminal scheduling history without touching active tickets."""
+        with self.guard, self.db:
+            return self.db.execute(
+                "DELETE FROM task_admission WHERE state='done' AND heartbeat<?", (before,)
+            ).rowcount
 
     def close(self):
         self.db.close()

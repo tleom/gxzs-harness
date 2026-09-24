@@ -4,7 +4,7 @@ WORKDIR /app
 COPY global_memory.py ./
 RUN python3 global_memory.py --install
 COPY server.py file_ops.py resource_ops.py environment.py stop_jobs.py office_preview.py planning.py planning_exec.py ./
-COPY mcp_ops.py mcp_worker.py mcp_runtime.py mcp_journal.py ./
+COPY mcp_ops.py mcp_worker.py mcp_runtime.py ./
 COPY hosts.py admission.py owner_auth.py mcp_authorization.py ./
 COPY memory_exec.py ./
 # Test deployment mounts the host's Docker CLI read-only at /usr/local/bin/docker.

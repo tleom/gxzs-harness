@@ -15,6 +15,8 @@ describe('sandbox personal skill provider', () => {
     const definition = await readSkillDefinition('---\nname: report\ndescription: Reports\nmetadata:\n  displayName: 报告核验\ndisable-model-invocation: true\nuser-invocable: false\n---\nBody', { id: 'report' })
     expect(definition).toMatchObject({ name: 'report', displayName: '报告核验', metadata: { displayName: '报告核验' }, content: 'Body' })
     expect(definition.invocation).toMatchObject({ modelInvocable: false, userInvocable: false })
+    const hyphenated = await readSkillDefinition('---\nname: report\ndescription: Reports\nmetadata:\n  display-name: 办案材料整理\n---\nBody', { id: 'report' })
+    expect(hyphenated.displayName).toBe('办案材料整理')
     expect((await readSkillDefinition(skill().content)).displayName).toBe('demo')
     await expect(readSkillDefinition(skill().content, { id: 'other' })).rejects.toThrow('目录名')
   })

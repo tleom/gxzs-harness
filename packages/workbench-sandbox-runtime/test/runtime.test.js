@@ -8,6 +8,36 @@ import SandboxSpillStore from '../src/spill.js'
 afterEach(() => vi.restoreAllMocks())
 
 describe('sandbox search executable', () => {
+  it('releases SSH streams after a command completes even when a reader leaves a pipe open', async () => {
+    const ctx = new Context()
+    ctx.provide('ssh', { request: vi.fn() })
+    const runtime = new WorkbenchSubprocess(ctx, { ripgrepExecutable: 'rg' })
+    const complete = Promise.withResolvers()
+    const handle = { done: complete.promise, closeStreams: vi.fn() }
+    vi.spyOn(SshSubprocessRuntime.prototype, 'spawn').mockReturnValue(handle)
+    expect(runtime.spawn({ argv: ['/bin/true'] })).toBe(handle)
+    expect(handle.closeStreams).not.toHaveBeenCalled()
+    complete.resolve({ exitCode: 0, signal: null })
+    await complete.promise
+    await Promise.resolve()
+    expect(handle.closeStreams).toHaveBeenCalledOnce()
+    await ctx.fiber.dispose()
+  })
+
+  it('releases SSH streams when a command fails', async () => {
+    const ctx = new Context()
+    ctx.provide('ssh', { request: vi.fn() })
+    const runtime = new WorkbenchSubprocess(ctx, { ripgrepExecutable: 'rg' })
+    const complete = Promise.withResolvers()
+    const handle = { done: complete.promise, closeStreams: vi.fn() }
+    vi.spyOn(SshSubprocessRuntime.prototype, 'spawn').mockReturnValue(handle)
+    runtime.spawn({ argv: ['/bin/false'] })
+    complete.reject(new Error('remote process failed'))
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(handle.closeStreams).toHaveBeenCalledOnce()
+    await ctx.fiber.dispose()
+  })
   it('resolves rg remotely and preserves arguments, cwd, streams and cancellation', async () => {
     const ctx = new Context()
     const request = vi.fn().mockResolvedValue('/usr/bin/rg')

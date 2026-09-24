@@ -1,14 +1,28 @@
 import { requireDatabaseModel } from './database-models.js'
 import { setTimeout as delay } from 'node:timers/promises'
+import { createHash } from 'node:crypto'
 
 const TERMINAL = new Set(['completed', 'cancelled', 'failed', 'interrupted', 'discarded', 'steered'])
+const DIAGNOSTIC_CODES = new Set(['ADMISSION_TICKET_FENCED', 'DEADLINE_EXCEEDED', 'UPSTREAM_RESPONSE_TOO_LARGE',
+  'CANCEL_UNCONFIRMED', 'HOST_NOT_REGISTERED', 'UNAUTHORIZED', 'FORBIDDEN', 'INVALID_REQUEST',
+  'UPSTREAM_ERROR', 'UNAVAILABLE', 'RATE_LIMITED', 'INTERNAL_ERROR'])
+const DIAGNOSTIC_STATES = new Set(['running', 'waiting', 'done', 'retry', 'fenced', 'missing'])
+const DIAGNOSTIC_REASONS = new Set(['request_failed', 'unfenced', 'renew_state', 'dispatch_error'])
+const DIAGNOSTIC_ACTIONS = new Set(['acquire', 'renew', 'release', 'cancel', 'dispatch'])
+const RETRYABLE_ADMISSION_STATUSES = new Set([408, 429, 500, 502, 503, 504])
 
-export async function fenceMcpExecutions(platformClient, owner, runIds) {
+function retryableAdmissionError(error) {
+  if (error?.name === 'AbortError' || error?.code === 'UPSTREAM_RESPONSE_TOO_LARGE') return false
+  if (error?.status != null) return RETRYABLE_ADMISSION_STATUSES.has(error.status)
+  return error?.name === 'TypeError' || error?.name === 'TimeoutError'
+}
+
+export async function fenceMcpExecutions(platformClient, owner, runIds, signal) {
   let uncertain = false
   try {
     for (const runId of new Set(runIds)) {
       const response = await platformClient.json({ owner, method: 'POST', route: 'mcp/cancel',
-        contentType: 'application/json', body: Buffer.from(JSON.stringify({ run_id: runId })), timeoutMs: 15000 })
+        contentType: 'application/json', body: Buffer.from(JSON.stringify({ run_id: runId })), timeoutMs: 15000, signal })
       const confirmation = response.data ?? response
       if (confirmation.fenced !== true) throw new Error('MCP execution has not been fenced')
       uncertain ||= confirmation.uncertain === true
@@ -43,6 +57,28 @@ export class TaskScheduler {
     this.leases = new Map()
     this.nativeAdmissions = new Map()
     this.unfencedSessions = new Set()
+    this.pendingFenceTick = null
+    this.fenceLifetime = new AbortController()
+  }
+
+  diagnostic(run, operation, reason, { action, state, error, code } = {}) {
+    // Never serialize upstream errors: even their message/code may contain secrets.
+    // Diagnostics are best effort and must not change admission or cancellation.
+    try {
+      const rawCode = code ?? error?.code
+      const generation = String(this.generation)
+      console.warn(JSON.stringify({ event: 'workbench_scheduler',
+        operation: ['request_failed', 'renew_rejected', 'dispatch_failed', 'cancel_execution'].includes(operation) ? operation : 'unknown',
+        reason: DIAGNOSTIC_REASONS.has(reason) ? reason : 'unknown',
+        action: DIAGNOSTIC_ACTIONS.has(action) ? action : 'unknown',
+        status: Number.isInteger(error?.status) && error.status >= 400 && error.status <= 599 ? error.status : null,
+        code: DIAGNOSTIC_CODES.has(rawCode) ? rawCode : error?.name === 'TimeoutError' ? 'TIMEOUT'
+          : error?.name === 'AbortError' ? 'ABORTED' : null,
+        state: DIAGNOSTIC_STATES.has(state) ? state : null,
+        generation: generation === 'local' ? 'local' : /^[1-9]\d{0,8}$/.test(generation) ? Number(generation) : null,
+        run_hash: typeof run?.id === 'string' ? createHash('sha256').update(run.id).digest('hex').slice(0, 12) : null,
+      }))
+    } catch { /* A failed log sink must not change task behavior. */ }
   }
 
   async enqueue(run, content, retry = false) {
@@ -56,12 +92,20 @@ export class TaskScheduler {
   async request(run, action, retry = false, signal, rotated = false) {
     this.database.ensureTicketGeneration(this.ownerId, run.id, this.generation)
     const ticketId = this.database.submission(this.ownerId, run.id)?.ticketId
-    const value = await this.platformClient.json({
-      owner: { ownerId: this.ownerId }, method: 'POST', route: 'scheduling',
-      body: Buffer.from(JSON.stringify({ action, run_id: run.id, ticket_id: ticketId, chat_id: run.chatId, retry })), contentType: 'application/json',
-      timeoutMs: 5000, signal,
-    })
+    let value
+    try {
+      value = await this.platformClient.json({
+        owner: { ownerId: this.ownerId }, method: 'POST', route: 'scheduling',
+        body: Buffer.from(JSON.stringify({ action, run_id: run.id, ticket_id: ticketId, chat_id: run.chatId, retry })), contentType: 'application/json',
+        timeoutMs: 5000, signal,
+      })
+    } catch (error) {
+      this.diagnostic(run, 'request_failed', 'request_failed', { action, error })
+      throw error
+    }
     const result = value.data ?? value
+    if (action === 'renew' && result.state !== 'running')
+      this.diagnostic(run, 'renew_rejected', 'renew_state', { action, state: result.state, code: result.code })
     if (result.state === 'fenced' && result.code === 'ADMISSION_TICKET_FENCED' && !rotated && action !== 'release') {
       this.database.rotateSubmissionTicket(this.ownerId, run.id, this.generation)
       if (action === 'acquire') return this.request(run, action, retry, signal, true)
@@ -73,10 +117,14 @@ export class TaskScheduler {
 
   hasAdmission(sessionId) {
     const lease = this.leases.get(sessionId)
-    return Boolean(lease && !this.unfencedSessions.has(sessionId) && Date.now() - lease.checkedAt < 10000)
+    return Boolean(lease && !this.unfencedSessions.has(sessionId) && !this.hasPendingFence(sessionId)
+      && Date.now() - lease.checkedAt < 10000)
   }
 
-  async cancelExecution(run) {
+  hasPendingFence(sessionId) { return this.database.pendingRunFences(this.ownerId).some(run => run.sessionId === sessionId) }
+
+  async cancelExecution(run, reason = 'unfenced', detail = { action: 'cancel' }) {
+    this.diagnostic(run, 'cancel_execution', reason, detail)
     this.unfencedSessions.add(run.sessionId)
     this.leases.delete(run.sessionId)
     const active = currentExecutionRun(this.database, this.agents, run.sessionId)
@@ -86,21 +134,38 @@ export class TaskScheduler {
     const goal = agent && this.goals?.get(agent)
     if (goal?.phase === 'active') this.goals.pause(agent, { id: goal.id, revision: goal.revision })
     this.sessions.cancel({ sessionId: run.sessionId })
-    const result = await fenceMcpExecutions(this.platformClient, { ownerId: this.ownerId }, runIds)
-    for (const runId of runIds) this.database.confirmRunFence(this.ownerId, runId, result)
-    this.unfencedSessions.delete(run.sessionId)
-    return result
+    // The durable fence blocks this Session immediately. Remote confirmation
+    // must not hold unrelated Sessions' short admission renewals behind it.
+    if (!runIds.length) this.unfencedSessions.delete(run.sessionId)
+    this.retryFences()
   }
 
-  async flushFences() {
+  retryFences() {
+    if (this.closed || this.pendingFenceTick) return
     const pending = this.database.pendingRunFences(this.ownerId)
+    if (!pending.length) return
+    this.pendingFenceTick = this.flushFences(pending).catch(() => {
+      // Leave the durable outbox pending for the next tick.
+    }).finally(() => { this.pendingFenceTick = null })
+  }
+
+  async flushFences(pending = this.database.pendingRunFences(this.ownerId)) {
+    let failure
     await Promise.all(Array.from({ length: Math.min(4, pending.length) }, async () => {
       while (pending.length && !this.closed) {
         const run = pending.shift()
-        const result = await fenceMcpExecutions(this.platformClient, { ownerId: this.ownerId }, [run.id])
-        this.database.confirmRunFence(this.ownerId, run.id, result)
+        try {
+          const result = await fenceMcpExecutions(this.platformClient, { ownerId: this.ownerId }, [run.id], this.fenceLifetime.signal)
+          if (this.closed) return
+          this.database.confirmRunFence(this.ownerId, run.id, result)
+          if (!this.hasPendingFence(run.sessionId))
+            this.unfencedSessions.delete(run.sessionId)
+        } catch (error) { failure ??= error }
       }
     }))
+    // Cold recovery awaits this method directly and must remain not-ready on
+    // failure. Background retries catch it only after every worker settles.
+    if (failure) throw failure
   }
 
   /** Native lifecycle fence, also reached by Goal and restored inbox turns. */
@@ -116,7 +181,13 @@ export class TaskScheduler {
     if (!run || TERMINAL.has(run.status)) return { kind: 'reject' }
     while (!this.hasAdmission(sessionId)) {
       signal.throwIfAborted()
-      if (this.closed || TERMINAL.has(this.database.getRun(this.ownerId, run.id)?.status)) return { kind: 'reject' }
+      if (this.closed || this.unfencedSessions.has(sessionId)
+        || TERMINAL.has(this.database.getRun(this.ownerId, run.id)?.status)) return { kind: 'reject' }
+      if (this.hasPendingFence(sessionId)) {
+        this.retryFences()
+        await delay(250, undefined, { signal })
+        continue
+      }
       // Do not redeliver a native message merely to obtain its execution lease.
       let holder = this.database.submissions(this.ownerId).find(item =>
         item.dispatched && this.database.getRun(this.ownerId, item.runId)?.sessionId === sessionId)
@@ -131,7 +202,15 @@ export class TaskScheduler {
         pending = this.request(holderRun, 'acquire', false, signal).finally(() => this.nativeAdmissions.delete(sessionId))
         this.nativeAdmissions.set(sessionId, pending)
       }
-      const ticket = await pending
+      let ticket
+      try { ticket = await pending }
+      catch (error) {
+        if (!retryableAdmissionError(error)) throw error
+        // A lost response does not revoke the durable ticket. Keep native
+        // execution behind the admission gate until the manager answers.
+        await delay(250, undefined, { signal })
+        continue
+      }
       signal.throwIfAborted()
       if (ticket.state !== 'running') {
         this.database.transitionRun(this.ownerId, run.id, 'queued')
@@ -153,7 +232,7 @@ export class TaskScheduler {
   }
 
   async dispatch() {
-    try { await this.flushFences() } catch { /* Persistent outbox retries on the next tick. */ }
+    this.retryFences()
     const groups = new Map()
     for (const item of this.database.submissions(this.ownerId)) {
       const sessionId = this.database.getRun(this.ownerId, item.runId)?.sessionId
@@ -176,17 +255,26 @@ export class TaskScheduler {
       let run = this.database.getRun(this.ownerId, item.runId)
       if (run && this.deletingChats.has(run.chatId)) continue
       let admitted = false
+      let cancelAttempted = false
+      const cancel = (...args) => { cancelAttempted = true; return this.cancelExecution(...args) }
       try {
-        if (this.unfencedSessions.has(run.sessionId)) { await this.cancelExecution(run); continue }
-        if (this.database.pendingRunFences(this.ownerId).some(value => value.sessionId === run.sessionId)) continue
+        if (this.hasPendingFence(run.sessionId)) continue
+        if (this.unfencedSessions.has(run.sessionId)) { await cancel(run, 'unfenced'); continue }
         if (item.dispatched) {
           const agent = this.agents?.get(run.sessionId)
           const goal = agent && this.goals?.get(agent)
           if (agent?.status === 'running' || (goal?.phase === 'active' && goal.activation === 'armed')) {
             if (this.nativeAdmissions.has(run.sessionId) || !this.leases.has(run.sessionId)) continue
-            const lease = await this.request(run, 'renew')
+            let lease
+            try { lease = await this.request(run, 'renew') }
+            catch (error) {
+              if (!retryableAdmissionError(error)) throw error
+              // Retain the durable ticket and retry on the next tick. A new
+              // native step still needs a fresh admission after the cache ages.
+              continue
+            }
             if (this.closed) return
-            if (lease.state !== 'running') await this.cancelExecution(run)
+            if (lease.state !== 'running') await cancel(run, 'renew_state', { action: 'renew', state: lease.state, code: lease.code })
           } else {
             // Cancel keeps DSH's inbox, but an idle Session holds no execution
             // slot. The next explicit prompt must pass admission again.
@@ -211,8 +299,14 @@ export class TaskScheduler {
           this.database.getRun(this.ownerId, candidate.runId)?.sessionId === run.sessionId)
         if (leaseOwner && agent?.status === 'running') {
           const holder = this.database.getRun(this.ownerId, leaseOwner.runId)
-          const lease = await this.request(holder, 'renew')
-          if (lease.state !== 'running') { await this.cancelExecution(holder); continue }
+          let lease
+          try { lease = await this.request(holder, 'renew') }
+          catch (error) {
+            if (!retryableAdmissionError(error)) throw error
+            // Do not deliver a follow-up while renewal is uncertain.
+            continue
+          }
+          if (lease.state !== 'running') { await cancel(holder, 'renew_state', { action: 'renew', state: lease.state, code: lease.code }); continue }
           if (this.closed || this.database.getRun(this.ownerId, run.id)?.status !== 'queued') continue
           await this.sessions.prompt({ requestId: run.id, sessionId: run.sessionId, mode: 'queue', content: item.content }, new AbortController().signal)
           // Admission ended at the native prompt receipt. Session persistence now
@@ -244,6 +338,7 @@ export class TaskScheduler {
         await this.sessions.prompt({ requestId: run.id, sessionId: run.sessionId, mode: 'queue', content: item.content }, new AbortController().signal)
       } catch (error) {
         if (this.closed) return
+        this.diagnostic(run, 'dispatch_failed', 'dispatch_error', { action: 'dispatch', error })
         // Admission outages leave queued work queued. Once dispatched, retain
         // its slot and stop execution; recovery must confirm the terminal state.
         const current = this.database.getRun(this.ownerId, item.runId)
@@ -264,7 +359,9 @@ export class TaskScheduler {
           continue
         }
         if (this.database.submission(this.ownerId, item.runId)?.dispatched) {
-          try { await this.cancelExecution(current) } catch {}
+          if (!cancelAttempted) {
+            try { await cancel(current, 'dispatch_error', { action: 'dispatch', error }) } catch {}
+          }
           // A direct prompt rejection without an observed receipt is an admission
           // failure. Native idle alone never means a failed turn.
           if (admitted && !current.messageId) {
@@ -282,5 +379,5 @@ export class TaskScheduler {
     void this.tick()
   }
 
-  close() { this.closed = true; this.leases.clear(); clearInterval(this.timer) }
+  close() { this.closed = true; this.fenceLifetime.abort(); this.leases.clear(); clearInterval(this.timer) }
 }

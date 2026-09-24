@@ -12,7 +12,9 @@ RUN cd profiles/workbench && npm ci --no-audit --no-fund \
     && node /opt/workbench/check-runtime-imports.mjs
 COPY services/dsh-host/start.sh /usr/local/bin/start-workbench
 COPY services/dsh-host/relay.mjs /opt/workbench/relay.mjs
-RUN chmod 755 /usr/local/bin/start-workbench && mkdir -p /srv/dsh && chown node:node /srv/dsh
+# Native session creation ensures its cwd locally before mounting SSH tools.
+# This empty directory holds only cwd placeholders; user files stay in the sandbox.
+RUN chmod 755 /usr/local/bin/start-workbench && mkdir -p /srv/dsh /workspace && chown node:node /srv/dsh /workspace
 USER node
 ENV DSH_HOME=/srv/dsh
 EXPOSE 3081

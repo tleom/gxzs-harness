@@ -3,6 +3,7 @@ import hashlib
 import hmac
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import logging
 import os
 import sqlite3
 from pathlib import Path
@@ -14,9 +15,11 @@ from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from urllib.request import ProxyHandler, Request, build_opener
 
-from mcp_journal import Journal
 from admission import Admission
 from owner_auth import authorize as authorize_request
+
+
+LOGGER = logging.getLogger(__name__)
 
 TOKEN = os.environ["WORKBENCH_SANDBOX_MANAGER_TOKEN"]
 IMAGE = os.environ.get("WORKBENCH_SANDBOX_IMAGE", "langgenius/dify-agent-local-sandbox:1.17.1")
@@ -24,15 +27,19 @@ NETWORK = os.environ.get("WORKBENCH_SANDBOX_NETWORK", "dify-workbench-sandboxes"
 PREFIX = os.environ.get("WORKBENCH_SANDBOX_PREFIX", "dify-wb-dev")
 STATE = Path(os.environ.get("WORKBENCH_MANAGER_STATE", "/state"))
 STATE.mkdir(parents=True, exist_ok=True)
+os.chmod(STATE, 0o700)
 LOCKS = {}
 LOCKS_GUARD = threading.Lock()
 REQUEST_CONTEXT = threading.local()
 OPERATION_CAPACITY = threading.BoundedSemaphore(int(os.environ.get('WORKBENCH_MANAGER_MAX_OPERATIONS', '24')))
 CONTROL_ACTIONS = frozenset({'stop-binding', 'fence-binding', 'schedule', 'runtime-epoch', 'touch', 'diagnostics'})
 MAX_BODY = 30 * 1024 * 1024
-MCP_JOURNAL = Journal(STATE)
 ADMISSION = Admission(str(STATE / 'admission.sqlite3'))
 MCP_API_URL = os.environ.get("WORKBENCH_MCP_API_URL", "http://wb-api:5001").rstrip("/")
+HEALTH = {'reaper': 0.0, 'hosts': 0.0}
+HEALTH_GUARD = threading.Lock()
+INSTALL_TIMEOUT = int(os.environ.get('WORKBENCH_ENVIRONMENT_TIMEOUT_SECONDS', '900'))
+OPERATION_RETENTION = int(os.environ.get('WORKBENCH_OPERATION_RETENTION_SECONDS', str(7 * 86400)))
 # Manager-owned scripts never inherit a user's interpreter, import path or
 # site initialization. User tasks keep their personal-environment-first PATH.
 MANAGER_PYTHON = ("/usr/local/bin/python", "-I", "-S")
@@ -46,18 +53,55 @@ def docker(*args, stdin=None, timeout=90, check=True):
     return result
 
 
+class SandboxUpdatePending(RuntimeError):
+    pass
+
+
+def tick(worker):
+    with HEALTH_GUARD:
+        HEALTH[worker] = time.monotonic()
+
+
+def network_name(key):
+    return NETWORK + '-' + hashlib.sha256(key.encode()).hexdigest()[:16]
+
+
+def ensure_network(key):
+    """Create one owner bridge; never attach the manager or another owner."""
+    key = str(uuid.UUID(key))
+    name = network_name(key)
+    result = docker('network', 'inspect', name, check=False)
+    if result.returncode:
+        docker('network', 'create', '--driver', 'bridge', '--label', 'workbench=' + PREFIX,
+               '--label', 'gxzs.workspace=' + key, name)
+        result = docker('network', 'inspect', name)
+    info = json.loads(result.stdout)[0]
+    labels = info.get('Labels') or {}
+    if labels.get('workbench') != PREFIX or labels.get('gxzs.workspace') != key:
+        raise ValueError('Owner network identity mismatch')
+    return name
+
+
 @contextmanager
 def lock(key):
     with LOCKS_GUARD:
-        mutex = LOCKS.setdefault(key, threading.RLock())
-    with mutex:
-        context = getattr(REQUEST_CONTEXT, "owner", None)
-        if context is not None:
-            headers, workspace, action = context
-            if workspace != key:
-                raise PermissionError("Manager workspace mismatch")
-            authorize_request(headers, TOKEN, HOSTS.root, workspace, action)
-        yield
+        entry = LOCKS.setdefault(key, [threading.RLock(), 0])
+        entry[1] += 1
+        mutex = entry[0]
+    try:
+        with mutex:
+            context = getattr(REQUEST_CONTEXT, "owner", None)
+            if context is not None:
+                headers, workspace, action = context
+                if workspace != key:
+                    raise PermissionError("Manager workspace mismatch")
+                authorize_request(headers, TOKEN, HOSTS.root, workspace, action)
+            yield
+    finally:
+        with LOCKS_GUARD:
+            entry[1] -= 1
+            if entry[1] == 0 and LOCKS.get(key) is entry:
+                LOCKS.pop(key, None)
 
 
 def identity(key):
@@ -85,14 +129,16 @@ def save_operation(path, value):
 def ensure(key):
     name, token = identity(key)
     with lock(key):
+        network = ensure_network(key)
         info = docker("inspect", name, check=False)
         if not info.returncode:
             existing = json.loads(info.stdout)[0]
-            if existing["Config"]["Image"] != IMAGE:
+            attached = set((existing.get('NetworkSettings', {}).get('Networks') or {}).keys())
+            if existing["Config"]["Image"] != IMAGE or attached != {network}:
                 if existing["State"]["Running"]:
                     # Do not execute privileged helpers in a previous image.
                     # Deployment drains its runs before stopping/recreating it.
-                    raise RuntimeError("个人沙箱需要更新，请等待当前任务结束后由管理员重建运行容器")
+                    raise SandboxUpdatePending("个人沙箱正在更新，请稍后重试；数据和环境已保留")
                 # Keep the stopped container as a rollback reference and reuse all owner volumes.
                 docker("rename", name, name + "-previous-" + existing["Id"][:12])
                 info = docker("inspect", name, check=False)
@@ -109,10 +155,12 @@ def ensure(key):
                    "from pathlib import Path; site=Path('/opt/user-env/current/python/lib/python3.12/site-packages'); "
                    "base=Path('/opt/office/python/lib/python3.12/site-packages'); "
                    "(site/'workbench_office.pth').write_text(str(base)+'\\n') if site.exists() and base.exists() else None")
-            docker("create", "--name", name, "--label", "workbench=" + PREFIX, "--network", NETWORK,
+            docker("create", "--name", name, "--label", "workbench=" + PREFIX,
+                   '--label', 'gxzs.workspace=' + key, "--network", network,
                    '--log-driver', 'json-file', '--log-opt', 'max-size=10m', '--log-opt', 'max-file=3',
-                   "--cpus", os.environ.get("WORKBENCH_SANDBOX_CPUS", "2"),
-                   "--memory", os.environ.get("WORKBENCH_SANDBOX_MEMORY", "4g"), "--pids-limit", "512",
+                   "--cpus", os.environ.get("WORKBENCH_SANDBOX_CPUS", "1"),
+                   "--memory", os.environ.get("WORKBENCH_SANDBOX_MEMORY", "3g"),
+                   "--memory-swap", os.environ.get("WORKBENCH_SANDBOX_MEMORY", "3g"), "--pids-limit", "256",
                    "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true",
                    "-v", name + "-home:/home/dify", "-v", name + "-files:/workspace",
                    "-v", name + "-env:/opt/user-env:ro",
@@ -173,7 +221,7 @@ def operation(key, action, payload):
     if action == "global-memory":
         from global_memory import operate
         return operate(key, payload, docker=docker, ensure=ensure, identity=identity,
-                       lock=lock, authorize=authorize_mcp, journal=MCP_JOURNAL)
+                       lock=lock, authorize=authorize_mcp)
     if action == 'ensure-host':
         return HOSTS.ensure(key, payload)
     if action == 'replace-host':
@@ -181,7 +229,7 @@ def operation(key, action, payload):
     if action == 'diagnostics':
         from mcp_runtime import statistics
         from global_memory import statistics as memory_statistics
-        return {"mcp": statistics(), "memory": memory_statistics(), "journal": MCP_JOURNAL.statistics(), "workspace_locks": len(LOCKS)}
+        return {"mcp": statistics(), "memory": memory_statistics(), "workspace_locks": len(LOCKS)}
     if action == 'schedule':
         return HOSTS.schedule(key, payload)
     if action == "runtime-epoch":
@@ -196,18 +244,18 @@ def operation(key, action, payload):
             current = runtime_epoch()
             if current["running"] and current["epoch"] == previous:
                 return {"fenced": False}
-        from mcp_runtime import invalidate
-        from global_memory import invalidate as cancel_memory
+        from mcp_runtime import invalidate, binding_inflight as mcp_inflight
+        from global_memory import invalidate as cancel_memory, binding_inflight as memory_inflight
 
         binding = str(uuid.UUID(payload['binding_id']))
-        MCP_JOURNAL.cancel_binding(key, binding)
+        uncertain = mcp_inflight(key, binding) or memory_inflight(key, binding)
         with ThreadPoolExecutor(max_workers=2) as pool:
             mcp_cancel = pool.submit(invalidate, key, binding=binding)
             memory_cancel = pool.submit(cancel_memory, key, binding=binding)
             mcp_stopped, memory_stopped = mcp_cancel.result(), memory_cancel.result()
         result = stop_binding(key, payload["binding_id"])
         return {**result, "fenced": memory_stopped and mcp_stopped,
-                'uncertain': MCP_JOURNAL.binding_uncertain(key, binding)}
+                'uncertain': uncertain}
     if action == "ensure":
         return ensure(key)
     if action == "touch":
@@ -246,7 +294,7 @@ def operation(key, action, payload):
         if payload["operation"] in {"mcp_save", "mcp_delete", "mcp_toggle"} and not output.get("conflict"):
             invalidate(key, payload["name"])
         if payload["operation"] in {"mcp_test", "mcp_call"}:
-            output = invoke(key, name, payload, output, authorize=authorize_mcp, journal=MCP_JOURNAL)
+            output = invoke(key, name, payload, output, authorize=authorize_mcp)
         touch(key)
         return output
     if action == "office-preview":
@@ -307,18 +355,19 @@ def operation(key, action, payload):
             record, installer = operation_file(key, request_id)
             if record.exists():
                 return operation(key, "environment-status", {"request_id": request_id})
-            save_operation(record, {"status": "installing"})
+            installing = {"status": "installing", "deadline": time.time() + INSTALL_TIMEOUT + 30}
+            save_operation(record, installing)
             script = Path(__file__).with_name("environment.py").read_text()
             # No Home, files, Docker socket or credentials are mounted into the installer.
             try:
                 result = docker("run", "--rm", "--name", installer, "--user", "1000", "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true",
-                    "--memory", "2g", "--cpus", "2", "--pids-limit", "256", "--entrypoint", MANAGER_PYTHON[0],
+                    "--memory", "1g", "--cpus", "1", "--pids-limit", "256", "--entrypoint", MANAGER_PYTHON[0],
                     "-v", name + "-env:/opt/user-env", "-i", IMAGE, *MANAGER_PYTHON[1:], "-c", script,
-                    stdin=json.dumps(payload), timeout=900)
+                    stdin=json.dumps(payload), timeout=INSTALL_TIMEOUT)
                 output = json.loads(result.stdout)
             except subprocess.TimeoutExpired:
                 # The installer may still be running. Keep the gate closed until its outcome is known.
-                return {"status": "installing"}
+                return installing
             except Exception as error:
                 # Installer stderr contains package diagnostics, never sandbox credentials.
                 record.with_suffix(".error.log").write_text(str(error)[-12000:])
@@ -334,6 +383,10 @@ def operation(key, action, payload):
             return value
         result = docker("inspect", "--format", "{{.State.Running}}", installer, check=False)
         if result.returncode == 0 and result.stdout.strip() == "true":
+            if time.time() > float(value.get('deadline', 0)):
+                docker('rm', '-f', installer, check=False)
+                value = {"status": "failed", "message": "安装超时，原环境已保留。"}
+                save_operation(record, value)
             return value
         # Recover a switch that completed just before a manager restart.
         current = docker("exec", "--user", "1000", name, *MANAGER_PYTHON, "-c",
@@ -361,21 +414,51 @@ def operation(key, action, payload):
 
 
 from hosts import Hosts
-HOSTS = Hosts(STATE, docker, ensure, identity, lock, ADMISSION)
+HOSTS = Hosts(STATE, docker, ensure, identity, lock, ADMISSION, ensure_network)
 
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
 
+    def do_GET(self):
+        if self.path != '/healthz':
+            self.send_error(404)
+            return
+        errors = []
+        now = time.monotonic()
+        with HEALTH_GUARD:
+            workers = dict(HEALTH)
+        for worker, seen in workers.items():
+            if seen <= 0 or now - seen > 120:
+                errors.append(worker + '_stale')
+        try:
+            if not ADMISSION.ping():
+                errors.append('admission_unavailable')
+        except Exception:
+            errors.append('admission_unavailable')
+        try:
+            docker('version', '--format', '{{.Server.Version}}', timeout=5)
+        except Exception:
+            errors.append('docker_unavailable')
+        data = json.dumps({'ok': not errors, 'errors': errors}).encode()
+        self.send_response(200 if not errors else 503)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
     def do_POST(self):
         code = 200
         admitted = False
+        request_id = uuid.uuid4().hex[:12]
+        key = action = role = 'unresolved'
         try:
             parts = self.path.strip("/").split("/")
             if len(parts) != 3 or parts[0] != "sandboxes":
                 raise ValueError("Unsupported route")
             key = str(uuid.UUID(parts[1]))
+            action = parts[2]
             # Hold the workspace lock only for identity validation. Provisioning
             # and replacement revoke old identities before any destructive step.
             # Root cancellation must reach in-flight process supervisors even
@@ -402,12 +485,19 @@ class Handler(BaseHTTPRequestHandler):
                 code = 409
         except CapacityError as error:
             code, output = 503, {'error': str(error), 'code': 'MANAGER_BUSY'}
+        except SandboxUpdatePending as error:
+            code, output = 503, {'error': str(error), 'code': 'SANDBOX_UPDATING', 'retry_after': 5}
         except PermissionError as error:
             code, output = 403, {"error": str(error), "code": "MANAGER_FORBIDDEN"}
         except (ValueError, OSError) as error:
             code, output = 400, {"error": str(error)}
         except Exception:
-            code, output = 503, {"error": "Sandbox operation failed; current data and environment retained"}
+            # Keep the full traceback server-side with a correlation id, but
+            # never log request bodies, authorization headers or user files.
+            LOGGER.exception('Sandbox request failed request_id=%s workspace=%s action=%s role=%s',
+                             request_id, key, action, role)
+            code, output = 503, {"error": "Sandbox operation failed; current data and environment retained",
+                                 "request_id": request_id}
         finally:
             REQUEST_CONTEXT.owner = None
             if admitted:
@@ -453,39 +543,70 @@ class BoundedHTTPServer(ThreadingHTTPServer):
             self.capacity.release()
 
 
+def reap_operations(now=None):
+    now = now or time.time()
+    for record in STATE.glob('op-*'):
+        if not record.is_file() or len(record.name) != 67 or record.name[3:].strip('0123456789abcdef'):
+            continue
+        try:
+            value = json.loads(record.read_text())
+            if value.get('status') == 'installing' and now > float(value.get('deadline', 0)):
+                installer = PREFIX + '-install-' + record.name[3:27]
+                docker('rm', '-f', installer, check=False)
+                save_operation(record, {'status': 'failed', 'message': '安装超时，原环境已保留。'})
+                value = {'status': 'failed'}
+            if value.get('status') != 'installing' and now - record.stat().st_mtime > OPERATION_RETENTION:
+                record.unlink(missing_ok=True)
+                record.with_suffix('.error.log').unlink(missing_ok=True)
+        except (ValueError, OSError, sqlite3.Error):
+            LOGGER.warning('Failed to reap operation record %s', record.name, exc_info=True)
+
+
 def reap():
     while True:
-        time.sleep(30)
+        tick('reaper')
         try:
-            MCP_JOURNAL.prune()
+            ADMISSION.prune(time.time() - OPERATION_RETENTION)
+            reap_operations()
             from mcp_runtime import reap_workers
             reap_workers()
-        except (ValueError, OSError, sqlite3.Error):
-            pass
-        for item in STATE.iterdir():
-            try:
-                key = str(uuid.UUID(item.name))
-                with lock(key):
-                    # Managed hosts and their sandboxes share one lifecycle.
-                    if (HOSTS.root / key / 'host.json').exists():
-                        continue
-                    if time.time() - item.stat().st_mtime > 1800:
-                        from mcp_runtime import invalidate
+            for item in STATE.iterdir():
+                try:
+                    key = str(uuid.UUID(item.name))
+                    with lock(key):
+                        # Managed hosts and their sandboxes share one lifecycle.
+                        if (HOSTS.root / key / 'host.json').exists():
+                            continue
+                        if time.time() - item.stat().st_mtime > 1800:
+                            from mcp_runtime import invalidate
 
-                        invalidate(key)
-                        name, _ = identity(key)
-                        docker("stop", "--time", "10", name, check=False)
-            except (ValueError, OSError):
-                continue
+                            invalidate(key)
+                            name, _ = identity(key)
+                            docker("stop", "--time", "10", name, check=False)
+                except (ValueError, OSError):
+                    continue
+        except Exception:
+            # A malformed record or transient Docker failure must not kill GC.
+            LOGGER.exception('Sandbox reaper cycle failed')
+        tick('reaper')
+        time.sleep(30)
 
 
 def maintain_hosts():
     while True:
-        HOSTS.maintain()
+        tick('hosts')
+        try:
+            HOSTS.maintain()
+        except Exception:
+            # One unexpected cycle must not permanently kill self-healing.
+            LOGGER.exception('Host maintenance cycle failed')
+        tick('hosts')
         time.sleep(10)
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=os.environ.get('WORKBENCH_MANAGER_LOG_LEVEL', 'INFO'),
+                        format='%(asctime)s %(levelname)s %(name)s %(message)s')
     if len(TOKEN) < 32:
         raise ValueError("Manager token must contain at least 32 characters")
     threading.Thread(target=reap, daemon=True).start()

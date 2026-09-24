@@ -60,6 +60,23 @@ def test_retry_requeues_released_run(tmp_path):
     queue.close()
 
 
+def test_busy_includes_waiting_and_retry_but_prune_only_removes_done(tmp_path):
+    queue = Admission(str(tmp_path / 'queue.db'))
+    queue.request('a', 1, 'host', 'running', 'chat-a', 'acquire')
+    queue.request('a', 1, 'host', 'waiting', 'chat-b', 'acquire')
+    queue.request('a', 1, 'host', 'retry', 'chat-c', 'acquire')
+    queue.request('a', 1, 'host', 'retry', 'chat-c', 'release', retry=True)
+    queue.request('a', 1, 'host', 'done', 'chat-d', 'release')
+    assert queue.active('a') == 2
+    assert queue.busy('a') == 3
+    queue.db.execute("UPDATE task_admission SET heartbeat=0")
+    queue.db.commit()
+    assert queue.prune(1) == 1
+    assert queue.busy('a') == 3
+    assert queue.ping()
+    queue.close()
+
+
 def test_concurrent_owners_never_exceed_capacity(tmp_path):
     queue = Admission(str(tmp_path / 'queue.db'))
     def acquire(i):
