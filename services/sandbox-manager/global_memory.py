@@ -10,7 +10,6 @@ import copy
 from uuid import uuid4
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from mcp_outcomes import record_pending, complete_call
 
 REVISION = "bf846ebffca0d33c6d3b1468e12e16c7358fd715"
 VERSION = "2-" + REVISION[:12]
@@ -273,6 +272,7 @@ def run_request(request, *, root=ROOT, source=SOURCE):
 
 def operate(key, payload, *, docker, ensure, identity, lock, authorize, worker_factory=None):
     from mcp_authorization import validate_grant
+    from mcp_outcomes import record_pending, complete_call
     descriptor = catalog()
     if payload.get("operation") == "catalog":
         # Advertise only when the pinned runtime has been included in this image.

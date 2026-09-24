@@ -14,6 +14,17 @@ from global_memory import operate
 
 
 class RoutingTests(unittest.TestCase):
+    def test_sandbox_embedded_source_does_not_import_manager_state(self):
+        code = (
+            "import pathlib,sys; source=pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'); "
+            "scope={'__name__':'sandbox_memory','__file__':'<embedded>'}; "
+            "exec(compile(source.split('if __name__ == \"__main__\":')[0], '<embedded>', 'exec'),scope); "
+            "assert callable(scope['run_request'])"
+        )
+        result = subprocess.run([sys.executable, '-I', '-S', '-c', code, memory.__file__],
+                                text=True, capture_output=True)
+        self.assertEqual(0, result.returncode, result.stderr)
+
     def setUp(self):
         mock_catalog = patch.object(memory, "catalog", return_value={"version": memory.VERSION, "manifest_version": "manifest"})
         mock_catalog.start()
