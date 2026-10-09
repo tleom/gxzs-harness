@@ -200,7 +200,7 @@ class Hosts:
                     '--memory', memory, '--memory-swap', memory, '--pids-limit', '256', *publish,
                     '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges:true', '--env-file', str(env_file),
                     *font_mount, '-v', item['home_volume'] + ':/srv/dsh',
-                    '-v', sandbox + '-workspace:/workspace:ro',
+                    '-v', sandbox + '-files:/workspace:ro',
                     '-v', str(host_state / 'hosts' / item['workspace_id']) + ':/run/gxzs:ro',
                     '-v', str(host_state / 'hosts' / item['workspace_id'] / 'ssh') + ':/home/node/.ssh:ro', image)
 

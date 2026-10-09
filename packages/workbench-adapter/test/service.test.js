@@ -25,6 +25,7 @@ function setup() {
   const fileManager = {
     operate: vi.fn(async ({ operation }) => {
       if (operation === 'stat') return { kind: 'directory', version: 'tree-v1' }
+      if (operation === 'list') return { entries: [] }
       if (operation === 'delete' || operation === 'mkdir') return { deleted: true }
       throw new Error('unexpected file operation')
     }),
@@ -228,6 +229,17 @@ describe('followup and control service', () => {
     await expect(service.createChat(owner, '/workspace', {}, 'missing')).rejects.toMatchObject({ status: 404 })
     expect(sessionController.create).not.toHaveBeenCalled()
     expect(fileManager.operate).not.toHaveBeenCalled()
+  })
+  it.each(['.', 'cases'])('validates an existing workspace directory without mutating it (%s)', async path => {
+    const { service, owner, fileManager } = setup()
+    service.workspaces = { requireWorkspace: vi.fn(async () => ({ workspaceId: 'ws', path })) }
+    const chat = await service.createChat(owner, '/workspace', {}, 'ws')
+    fileManager.operate.mockImplementation(async ({ operation }) => {
+      if (operation !== 'list') throw new Error('The workspace root can only be listed')
+      return { entries: [] }
+    })
+    await service.ensureChatSession(owner, chat)
+    expect(fileManager.operate).toHaveBeenCalledExactlyOnceWith({ operation: 'list', path: path === '.' ? 'conversations' : 'conversations/cases' })
   })
   it('sends resume from the backend and persists the hidden continuation marker', async () => {
     const { database, owner, chat, service, sessionController } = setup()

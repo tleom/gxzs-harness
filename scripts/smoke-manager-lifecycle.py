@@ -4,15 +4,19 @@ import json
 import secrets
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
+from pathlib import Path
 
-if len(sys.argv) != 3:
-    raise SystemExit('Usage: smoke-manager-lifecycle.py MANAGER_IMAGE SANDBOX_IMAGE')
-manager_image, sandbox_image = sys.argv[1:]
+if len(sys.argv) != 4:
+    raise SystemExit('Usage: smoke-manager-lifecycle.py MANAGER_IMAGE SANDBOX_IMAGE HOST_IMAGE')
+manager_image, sandbox_image, host_image = sys.argv[1:]
 
 prefix = 'gxzs-verify-' + uuid.uuid4().hex[:10]
 manager = prefix + '-manager'
+host_probe = prefix + '-host'
+host_home = prefix + '-host-home'
 token = secrets.token_hex(32)
 workspaces = [str(uuid.uuid4()), str(uuid.uuid4())]
 
@@ -88,6 +92,32 @@ try:
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
         results = list(pool.map(populate, range(2)))
     print('PASS real manager: parallel owner provisioning, binary roundtrip, stale-version conflict', flush=True)
+    with tempfile.TemporaryDirectory(prefix=prefix) as host_state:
+        (Path(host_state) / 'hosts' / workspaces[0] / 'ssh').mkdir(parents=True)
+        create_host = '''
+import json, sys
+from pathlib import Path, PurePosixPath
+sys.path.insert(0, '/app')
+from server import HOSTS
+value = json.load(sys.stdin)
+folder = Path('/tmp/host-workspace-probe')
+folder.mkdir(exist_ok=True)
+(folder / 'host.env').write_text('')
+HOSTS._create_container(value['item'], folder, value['image'], 'none', [], PurePosixPath(value['state']))
+'''
+        docker('exec', '-i', manager, 'python', '-c', create_host, stdin=json.dumps({
+            'item': {'instance_id': host_probe, 'owner_id': 'probe:1', 'workspace_id': workspaces[0],
+                     'generation': 1, 'home_volume': host_home}, 'image': host_image, 'state': host_state}))
+        sandbox_mounts = json.loads(docker('inspect', prefix + '-' + workspaces[0]).stdout)[0]['Mounts']
+        host_mounts = json.loads(docker('inspect', host_probe).stdout)[0]['Mounts']
+        sandbox_files = next(item for item in sandbox_mounts if item['Destination'] == '/workspace')
+        host_files = next(item for item in host_mounts if item['Destination'] == '/workspace')
+        assert sandbox_files['Source'] == host_files['Source'] and host_files['RW'] is False
+        docker('run', '--rm', '--network', 'none', '--volumes-from', host_probe + ':ro', '--entrypoint', 'node', host_image,
+               '-e', "const fs=require('node:fs');if(fs.readFileSync('/workspace/probe/data.bin').toString('base64')!=='AP8BAg==')process.exit(1)")
+        docker('rm', '-f', host_probe)
+        docker('volume', 'rm', host_home)
+    print('PASS managed Host creation: actual sandbox file volume mounted read-only and owner bytes readable', flush=True)
     networks = []
     for workspace in workspaces:
         info = json.loads(docker('inspect', prefix + '-' + workspace).stdout)[0]
@@ -128,6 +158,8 @@ try:
         files(workspace, 'delete', path='probe', version=folder['version'])
     print('PASS versioned deletion and missing-file state', flush=True)
 finally:
+    docker('rm', '-f', host_probe, check=False)
+    docker('volume', 'rm', host_home, check=False)
     docker('rm', '-f', manager, check=False)
     # Only resources created with this random probe's exact label are eligible.
     for kind in ['container', 'network', 'volume']:

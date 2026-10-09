@@ -57,7 +57,7 @@ def test_first_use_creates_once_and_reuses_workspace(tmp_path, monkeypatch):
     assert create[create.index('--memory') + 1] == '1g'
     assert create[create.index('--memory-swap') + 1] == '1g'
     assert create[create.index('--network') + 1] == 'owner-network'
-    assert 'sandbox-workspace-workspace:/workspace:ro' in create
+    assert 'sandbox-workspace-files:/workspace:ro' in create
     assert not any(value.endswith(':/workspace') for value in create)
 
 

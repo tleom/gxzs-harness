@@ -94,7 +94,7 @@ export class WorkbenchService {
 
   async ensureChatDirectory(owner, chatId) {
     const chat = this.requireChat(owner, chatId)
-    await this.fileManager.operate({ operation: 'mkdir', path: chat.directory ?? `conversations/${chatId}` })
+    await this.fileManager.operate({ operation: chat.directory ? 'list' : 'mkdir', path: chat.directory ?? `conversations/${chatId}` })
   }
 
   async updateChat(owner, chatId, body) {

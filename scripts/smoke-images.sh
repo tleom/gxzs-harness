@@ -37,5 +37,5 @@ docker exec "$container_id" /opt/office/python/bin/python -c \
   "import pymupdf;d=pymupdf.open('/tmp/check.pdf');assert '中文预览验证' in ''.join(p.get_text() for p in d)"
 docker exec "$container_id" /usr/local/bin/python -I -S -c \
   "import os;assert os.getuid()==1000;assert not os.access('/usr/local/bin/python',os.W_OK);assert not os.access('/opt/dsh/node_modules',os.W_OK);assert not os.path.exists('/var/run/docker.sock')"
-python3 "$script_dir/smoke-manager-lifecycle.py" "$manager_image" "$sandbox_image"
+python3 "$script_dir/smoke-manager-lifecycle.py" "$manager_image" "$sandbox_image" "$host_image"
 printf '%s\n' 'All image smoke checks passed'

@@ -84,10 +84,6 @@ export class WorkbenchWorkspaces {
   async mutate(owner, request) {
     const { operation } = request
     if (operation === 'browse' || operation === 'mkdir') {
-      if ((request.path ?? '.') === '.') {
-        // First-use users need the picker root before their first conversation.
-        await this.fileManager.operate({ operation: 'mkdir', path: 'conversations' })
-      }
       const canonical = await this.resolveDirectory(request.path ?? '.')
       let relative = path.posix.join('conversations', path.posix.relative(this.root, canonical))
       if (operation === 'mkdir') {

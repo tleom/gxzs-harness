@@ -67,9 +67,10 @@ def schedule_mcp_refresh(key, items):
             MCP_REFRESH_ATTEMPTS[identity] = time.monotonic()
             MCP_REFRESHING.add(identity)
 
-        def refresh(target=identity):
+        def refresh(target=identity, version=item["version"]):
             try:
                 operation(target[0], "personal-mcp", {"operation": "mcp_test", "name": target[1],
+                                                      "version": version,
                                                       "deadline_ms": int(time.time() * 1000) + 30_000})
             except Exception:
                 LOGGER.warning("Personal MCP catalog refresh failed for %s", target[1])

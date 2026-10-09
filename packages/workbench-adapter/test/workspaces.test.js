@@ -12,7 +12,10 @@ function fixture() {
   const controller = Object.fromEntries(['create', 'rename', 'delete', 'insertBefore', 'insertSessionBefore', 'archiveSession', 'unarchiveSession', 'pinSession', 'unpinSession'].map(name => [name, vi.fn()]))
   controller.follow = vi.fn(async function* (signal) { try { yield { type: 'baseline', value: baseline } } finally { closed(signal.aborted) } })
   const database = { listChats: vi.fn(() => chats), getChat: vi.fn((owner, id) => owner === 'owner-a' ? chats.find(chat => chat.id === id) : undefined) }
-  const fileManager = { operate: vi.fn(async () => ({ entries: [{ name: 'case-a', kind: 'directory' }, { name: 'file.txt', kind: 'file' }] })) }
+  const fileManager = { operate: vi.fn(async ({ operation, path }) => {
+    if (path === 'conversations' && operation !== 'list') throw new Error('The workspace root can only be listed')
+    return { entries: [{ name: 'case-a', kind: 'directory' }, { name: 'file.txt', kind: 'file' }] }
+  }) }
   const bridge = new WorkbenchWorkspaces({ controller, database, root: '/workspace/conversations', fileManager })
   return { bridge, controller, closed, fileManager, owner: { ownerId: 'owner-a' } }
 }
@@ -42,6 +45,8 @@ describe('native workspace boundary', () => {
     const { bridge, owner, fileManager } = fixture()
     expect(await bridge.mutate(owner, { operation: 'browse', path: '.' })).toEqual({ path: '.', entries: [{ name: 'case-a', path: 'case-a' }] })
     expect(fileManager.operate).toHaveBeenCalledWith({ operation: 'list', path: 'conversations' })
+    await bridge.mutate(owner, { operation: 'mkdir', path: '.', name: 'first-folder' })
+    expect(fileManager.operate).toHaveBeenCalledWith({ operation: 'mkdir', path: 'conversations/first-folder' })
     await bridge.mutate(owner, { operation: 'mkdir', path: 'case-a', name: '证据' })
     expect(fileManager.operate).toHaveBeenCalledWith({ operation: 'mkdir', path: 'conversations/case-a/证据' })
     await expect(bridge.mutate(owner, { operation: 'mkdir', path: 'case-a', name: '../outside' })).rejects.toMatchObject({ status: 400 })
