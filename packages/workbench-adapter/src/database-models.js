@@ -1,3 +1,4 @@
+import { symbols } from '@deepseek-ai/cordis'
 import { httpError } from './http.js'
 
 /** The published database catalog owns visibility, names and defaults.
@@ -5,26 +6,29 @@ import { httpError } from './http.js'
 const applied = new WeakMap()
 const writes = new WeakMap()
 const nativeCatalogs = new WeakMap()
+const identity = service => service[symbols.original] ?? service
 const revision = (settings, name) => settings.describe().find(item => item.ns === name)?.revision
 
 function nativeCatalog(sessions, settings, models) {
-  const stamp = JSON.stringify([models, settings?.describe()])
-  const cached = nativeCatalogs.get(sessions)
+  const key = identity(sessions)
+  const stamp = JSON.stringify([models, settings?.describe().map(({ ns, revision }) => [ns, revision])])
+  const cached = nativeCatalogs.get(key)
   if (cached?.stamp === stamp && cached.expires > Date.now()) return cached.promise
   const entry = { stamp, expires: Date.now() + 30_000 }
   entry.promise = Promise.resolve().then(() => sessions.modelCatalog()).catch(error => {
-    if (nativeCatalogs.get(sessions) === entry) nativeCatalogs.delete(sessions)
+    if (nativeCatalogs.get(key) === entry) nativeCatalogs.delete(key)
     throw error
   })
-  nativeCatalogs.set(sessions, entry)
+  nativeCatalogs.set(key, entry)
   return entry.promise
 }
 
 async function synchronize(settings, models) {
   if (!settings) return
-  const task = (writes.get(settings) ?? Promise.resolve()).catch(() => {}).then(async () => {
+  const key = identity(settings)
+  const task = (writes.get(key) ?? Promise.resolve()).catch(() => {}).then(async () => {
     const stamp = JSON.stringify(models)
-    const previous = applied.get(settings)
+    const previous = applied.get(key)
     if (previous?.stamp === stamp && previous.source === revision(settings, 'llm-pi-ai')
       && previous.defaultSource === revision(settings, 'agent-default-model')) return
     const providers = Object.fromEntries(Object.entries(models.providers).filter(([, p]) => p.enabled !== false).map(([id, p]) => {
@@ -36,9 +40,9 @@ async function synchronize(settings, models) {
     const provider = models.default.slice(0, slash)
     const reasoningEffort = models.providers[provider]?.reasoning
     await settings.replace('agent-default-model', { provider, model: models.default.slice(slash + 1), ...(reasoningEffort ? { reasoningEffort } : {}) })
-    applied.set(settings, { stamp, source: revision(settings, 'llm-pi-ai'), defaultSource: revision(settings, 'agent-default-model') })
+    applied.set(key, { stamp, source: revision(settings, 'llm-pi-ai'), defaultSource: revision(settings, 'agent-default-model') })
   })
-  writes.set(settings, task)
+  writes.set(key, task)
   return task
 }
 

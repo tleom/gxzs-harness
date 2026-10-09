@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
+import { symbols } from '@deepseek-ai/cordis'
 import { databaseModelCatalog, requireDatabaseModel } from '../src/database-models.js'
 
 function setup() {
@@ -18,6 +19,15 @@ function setup() {
 }
 
 describe('database model publication', () => {
+  it('shares synchronization and capabilities across fresh Cordis service proxies', async () => {
+    const { client, sessions, settings } = setup()
+    const proxy = target => new Proxy(target, { get: (value, property) => property === symbols.original ? value : value[property] })
+    await Promise.all([1, 2].map(() => databaseModelCatalog(client, proxy(sessions), {}, proxy(settings))))
+    await databaseModelCatalog(client, proxy(sessions), {}, proxy(settings))
+    expect(settings.replace).toHaveBeenCalledTimes(2)
+    expect(sessions.modelCatalog).toHaveBeenCalledTimes(1)
+    expect(client.json).toHaveBeenCalledTimes(3)
+  })
   it('publishes only database models and synchronizes all execution parameters', async () => {
     const { client, sessions, settings, model } = setup()
     const owner = { ownerId: 'tenant:user' }
