@@ -17,10 +17,9 @@ import { registerRunResourceContext } from './resource-mentions.js'
 import { prepareNativeFiles } from './attachments.js'
 import { WorkbenchWorkspaces } from './workspaces.js'
 import { streamWorkspaceEvents } from './workspace-events.js'
-import { nativeOfficePreview } from './office-preview.js'
 
 export const name = 'workbench-adapter'
-export const inject = ['webServer', 'sessionController', 'workspaceController', 'sessionReferenceResolver', 'fileReferences', 'officeToPdf', 'workspaceChanges', 'agents', 'commands', 'skills', 'systemPrompt', 'tokenMeter', 'workbenchFileManager', 'workbenchPlatformClient', 'sessionQuery', 'sessionProjections', 'agentPresets', 'agentDefaultModel', 'settings', 'attachments', 'fileUploads', 'goals']
+export const inject = ['webServer', 'sessionController', 'workspaceController', 'sessionReferenceResolver', 'fileReferences', 'workspaceChanges', 'agents', 'commands', 'skills', 'systemPrompt', 'tokenMeter', 'workbenchFileManager', 'workbenchPlatformClient', 'sessionQuery', 'sessionProjections', 'agentPresets', 'agentDefaultModel', 'settings', 'attachments', 'fileUploads', 'goals']
 
 export const Config = z.object({
   basePath: z.string().default('/ai/workbench'),
@@ -294,20 +293,8 @@ export function apply(ctx, config) {
       humanInput.touch(owner.ownerId, match[1], json.request_id)
       sendJson(res, 200, { data: service.getRun(owner, match[1]) })
     }],
-    ['GET', /^\/files\/preview$/, async (context, res) => {
-      const abort = new AbortController()
-      const disconnected = () => abort.abort()
-      res.once('close', disconnected)
-      try {
-        const pdf = await nativeOfficePreview({ owner: context.owner, path: context.url.searchParams.get('path'),
-          fileManager: ctx.workbenchFileManager, converter: ctx.officeToPdf, signal: abort.signal })
-        if (abort.signal.aborted) return
-        if (pdf === undefined) return await proxyPlatform(context, res, 'files/preview')
-        res.writeHead(200, { 'content-type': 'application/pdf', 'cache-control': 'no-store',
-          'content-length': pdf.length, 'x-content-type-options': 'nosniff' })
-        res.end(Buffer.from(pdf))
-      } finally { res.off('close', disconnected) }
-    }],
+    // The platform renders Word in an offline, resource-limited container.
+    ['GET', /^\/files\/preview$/, async (context, res) => proxyPlatform(context, res, 'files/preview')],
     ['POST', /^\/files\/preview$/, async (context, res) => proxyPlatform(context, res, 'files/preview')],
     ['GET', /^\/files\/shares$/, async (context, res) => proxyPlatform(context, res, 'files/shares')],
     ['POST', /^\/files\/shares$/, async (context, res) => proxyPlatform(context, res, 'files/shares')],

@@ -169,24 +169,18 @@ describe('authenticated workbench HTTP handler', () => {
     expect(context.workbenchPlatformClient.request).toHaveBeenLastCalledWith(expect.objectContaining({ method: 'POST', route: 'files/shares' }))
   })
 
-  it('converts sandbox Office files through native OfficeToPdf after owner authentication', async () => {
+  it('isolates Word conversion behind the authenticated platform route', async () => {
     const { handler, key, context } = setup()
-    const pdf = Buffer.from('%PDF-1.7 native preview')
-    context.officeToPdf = { convert: vi.fn(async (request, signal) => {
-      expect(request).toMatchObject({ extension: 'docx', priority: 'foreground',
-        source: { key: JSON.stringify(['t:42', 'case/a.docx']), version: 'sha256-v1', bytes: 2 } })
-      await expect(request.source.read(signal, 1024)).resolves.toEqual({ bytes: Buffer.from([0, 255]), version: 'sha256-v1' })
-      return { pdf }
-    }) }
+    context.officeToPdf = { convert: vi.fn(() => { throw new Error('Host converter must not run') }) }
     const route = '/files/preview?path=case%2Fa.docx'
     await expect(call(handler, key, 'GET', route, undefined, false)).resolves.toMatchObject({ status: 401 })
     await expect(call(handler, key, 'GET', route, undefined, true, '99')).resolves.toMatchObject({ status: 403 })
-    expect(context.officeToPdf.convert).not.toHaveBeenCalled()
-    await expect(call(handler, key, 'GET', route)).resolves.toMatchObject({
-      status: 200, body: pdf, headers: { 'content-type': 'application/pdf', 'cache-control': 'no-store' },
-    })
-    expect(context.officeToPdf.convert).toHaveBeenCalledTimes(1)
     expect(context.workbenchPlatformClient.request).not.toHaveBeenCalled()
+    await expect(call(handler, key, 'GET', route)).resolves.toMatchObject({ status: 200 })
+    expect(context.workbenchPlatformClient.request).toHaveBeenCalledWith(expect.objectContaining({
+      owner: expect.objectContaining({ ownerId: 't:42' }), method: 'GET', route: 'files/preview', query: '?path=case%2Fa.docx',
+    }))
+    expect(context.officeToPdf.convert).not.toHaveBeenCalled()
   })
 
   it('opens an owner-authorized native chat event stream through the public HTTP route', async () => {

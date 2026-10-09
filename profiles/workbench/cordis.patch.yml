@@ -1,3 +1,6 @@
+- id: office-to-pdf
+  disabled: true
+
 - id: session-telemetry-otel
   disabled: true
 

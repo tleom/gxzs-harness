@@ -1,4 +1,4 @@
-"""Convert one supplied Word document in a disposable, offline container."""
+"""Convert one supplied Office document in a disposable, offline container."""
 import base64
 import json
 import io
@@ -11,7 +11,7 @@ from xml.parsers.expat import ExpatError
 import zipfile
 
 MAX_BYTES = 20 * 1024 * 1024
-SUFFIXES = {".doc", ".docx", ".docm", ".dotx", ".dotm", ".odt", ".rtf"}
+SUFFIXES = {".doc", ".docx", ".docm", ".dotx", ".dotm", ".odt", ".rtf", ".xls", ".xlsx", ".xlsm", ".xlsb", ".xltx", ".xltm", ".ppt", ".pptx", ".pptm", ".ppsx", ".ppsm", ".potx", ".potm"}
 
 
 def preserve_exact_spacing(data, suffix):
