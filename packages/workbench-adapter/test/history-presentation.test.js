@@ -8,6 +8,31 @@ const run={id:'run',selection:{},mcpTools:[{runtime_name:'mcp__search',server_id
 const snapshot=(records=[],assistantStream={revision:0})=>({type:'snapshot',records,assistantStream})
 const durable=(seq,type,data)=>({type:'event',event:{seq,type,data,surfaceOp:'append'}})
 const frame=value=>({type:'assistant-stream',frame:value})
+it('maps inherited native message identities to forked runs without duplicating the original prompt', () => {
+  const fork = { ...run, id: 'fork-run', messageId: 'original-message' }
+  const view = new HistoryPresentation('fork-session', () => fork, undefined,
+    id => id === 'supplement-message' ? { id: 'fork-supplement', query: 'extra' } : undefined)
+  const result = view.accept(snapshot([
+    durable(1, 'turn/start', { turn: 1 }),
+    durable(2, 'user/message', { id: 'original-message', source: { rpcId: 'original-run' }, content: [{ type: 'text', text: 'original' }] }),
+    durable(3, 'user/message', { id: 'supplement-message', source: { rpcId: 'original-supplement' }, content: [{ type: 'text', text: 'extra' }] }),
+  ]))
+  expect(result.events).toHaveLength(1)
+  expect(result.events[0].event).toMatchObject({ steering_id: 'fork-supplement', query: 'extra' })
+})
+it('uses the same consumed user-message position in a snapshot and live follow even without a turn on the message', () => {
+  const records = [durable(1, 'turn/start', { turn: 1 }),
+    durable(2, 'assistant/message', { turn: 1, step: 1, message: { content: [{ type: 'text', text: 'before' }] } }),
+    durable(3, 'user/message', { source: { kind: 'user', rpcId: 'supplement' }, content: [{ type: 'text', text: 'extra' }] }),
+    durable(4, 'assistant/message', { turn: 1, step: 2, message: { content: [{ type: 'text', text: 'after' }] } })]
+  const resolve = turn => turn === 1 ? run : undefined
+  const baseline = new HistoryPresentation('session', resolve).accept(snapshot(records)).events
+  const live = new HistoryPresentation('session', resolve)
+  live.accept(snapshot())
+  expect(records.flatMap(record => live.accept(record).events)).toEqual(baseline)
+  expect(baseline.findIndex(item => item.event.event === 'workbench_steering')).toBe(2)
+  expect(baseline[2].event).toMatchObject({ steering_id: 'supplement', query: 'extra' })
+})
 it('keeps the vendored publication fold identical to the pinned native package except its source-map reference',async()=>{
   const require=createRequire(new URL('../../../profiles/workbench/package.json',import.meta.url))
   const original=join(dirname(require.resolve('@deepseek-ai/dsh-api-session-controller')),'types/client/sessions/assistant-stream.js')

@@ -3,10 +3,11 @@ import { nativePresentation } from './projection.js'
 
 /** Map native publication decisions to existing Workbench display records. */
 export class HistoryPresentation {
-  constructor(sessionId, resolveRun, resolveToolName = () => undefined) {
+  constructor(sessionId, resolveRun, resolveToolName = () => undefined, resolveMessage = () => undefined) {
     this.sessionId = sessionId
     this.resolveRun = resolveRun
     this.resolveToolName = resolveToolName
+    this.resolveMessage = resolveMessage
     this.stream = new ClientAssistantStream()
     this.attempts = new Map()
     this.tools = new Map()
@@ -16,7 +17,9 @@ export class HistoryPresentation {
   accept(frame) {
     const display = { replace: frame.type === 'snapshot', events: [], retire_attempts: [] }
     const project = entry => {
-      const event = entry.event, run = this.resolveRun(event.data?.turn)
+      const event = entry.event
+      if (Number.isInteger(event.data?.turn)) this.turn = event.data.turn
+      const run = this.resolveRun(event.data?.turn ?? this.turn)
       if (!run) return
       if (event.type === 'assistant/live-chunk') {
         const { chunk, attemptId, turn, step } = event.data
@@ -35,10 +38,12 @@ export class HistoryPresentation {
       }
       if (event.type === 'tool/call') this.tools.set(`${run.id}:${event.data.callId}`, event.data.name)
       const callId = event.data?.message?.source?.callId ?? event.data?.message?.content?.[0]?.toolCallId
-      for (const [index, value] of nativePresentation(run, event, { toolName: this.tools.get(`${run.id}:${callId}`) ?? this.resolveToolName(run, callId) ?? '' }).entries())
+      for (const [index, value] of nativePresentation(run, event, { toolName: this.tools.get(`${run.id}:${callId}`) ?? this.resolveToolName(run, callId) ?? '',
+        messageRun: event.type === 'user/message' ? this.resolveMessage(event.data?.id) : undefined }).entries())
         display.events.push({ run_id: run.id, event: { ...value, _id: `history:${this.sessionId}:${event.seq}:${index}` } })
     }
     if (frame.type === 'snapshot') {
+      this.turn = undefined
       this.attempts.clear(); this.tools.clear()
       this.revision = frame.assistantStream?.revision ?? 0
       const opening = frame.assistantStream?.activeAttempt

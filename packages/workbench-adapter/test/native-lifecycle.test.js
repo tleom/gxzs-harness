@@ -68,7 +68,7 @@ async function fixture(script) {
   const chat = db.createChat({ id: 'native-chat', ownerId: owner.ownerId, sessionId: agent.id, selection: {} })
   const controllerCtx = Object.create(ctx)
   controllerCtx.attachments = { admitPromptContent: async content => content }
-  controllerCtx.fileUploads = { bindPrompt: () => ({ commit() {}, [Symbol.dispose]() {} }) }
+  controllerCtx.fileUploads = { retirePrompt() {}, bindPrompt: () => ({ commit() {}, [Symbol.dispose]() {} }) }
   const controller = new SessionCommandController(controllerCtx, {
     resolveAgent: async () => ({ agent }), selectionFor: () => ({ current: { provider: 'mock', model: 'mock' } }),
   }, '/workspace')
@@ -100,6 +100,52 @@ async function fixture(script) {
   return { ctx, db, agent, owner, chat, model, scheduler, runtime, sessions, controllerCtx, requests, create,
     permit: value => { permitted = value } }
 }
+
+it.each(['local', 'native'])('edits and directly sends the selected %s queue item without waiting on unrelated scheduling', async placement => {
+  let release
+  const test = await fixture([new Promise(resolve => { release = resolve }), 'steered answer', 'queued answer'])
+  const first = test.create('original'), second = test.create('keep queued'), third = test.create('before edit')
+  await test.scheduler.enqueue(first, [{ type: 'text', text: first.query }])
+  await test.scheduler.tick()
+  await vi.waitFor(() => expect(test.model.requests).toHaveLength(1))
+  for (const run of [second, third]) test.db.saveSubmission(test.owner.ownerId, run.id, [{ type: 'text', text: run.query }])
+  if (placement === 'native') await test.scheduler.tick()
+  const service = new WorkbenchService({ database: test.db, sessionController: test.sessions, agents: test.ctx.agents, scheduler: test.scheduler })
+  await service.editQueued(test.owner, third.id, { content: [{ type: 'text', text: 'edited supplement' }] })
+  test.scheduler.pendingTick = new Promise(() => {})
+  try {
+    await service.steer(test.owner, third.id, first.id)
+    expect(test.agent.inbox.nextStep.map(item => item.content[0].text)).toEqual(['edited supplement'])
+    expect(test.db.getRun(test.owner.ownerId, second.id).status).toBe('queued')
+  } finally { test.scheduler.pendingTick = null }
+  await test.scheduler.tick()
+  release('first answer')
+  await test.agent.whenIdle()
+  expect(test.model.requests).toHaveLength(3)
+  expect(JSON.stringify(test.model.requests[1].messages)).toContain('edited supplement')
+  expect(JSON.stringify(test.model.requests[1].messages)).not.toContain('keep queued')
+  const messages = test.agent.session.snapshotEvents().filter(event => event.type === 'user/message')
+  expect(messages.map(event => event.data.source.rpcId)).toEqual([first.id, third.id, second.id])
+  expect(test.db.getRun(test.owner.ownerId, third.id).status).toBe('steered')
+})
+
+it.each(['local', 'native'])('removes only the selected %s queue item and consumes the remainder in order', async placement => {
+  let release
+  const test = await fixture([new Promise(resolve => { release = resolve }), 'answer A', 'answer C'])
+  const first = test.create('first'), a = test.create('A'), b = test.create('B'), c = test.create('C')
+  await test.scheduler.enqueue(first, [{ type: 'text', text: first.query }])
+  await test.scheduler.tick()
+  await vi.waitFor(() => expect(test.model.requests).toHaveLength(1))
+  for (const run of [a, b, c]) test.db.saveSubmission(test.owner.ownerId, run.id, [{ type: 'text', text: run.query }])
+  if (placement === 'native') await test.scheduler.tick()
+  const service = new WorkbenchService({ database: test.db, sessionController: test.sessions, agents: test.ctx.agents, scheduler: test.scheduler })
+  await service.removeQueued(test.owner, b.id)
+  await test.scheduler.tick()
+  release('first answer')
+  await test.agent.whenIdle()
+  expect(test.agent.session.snapshotEvents().filter(event => event.type === 'user/message').map(event => event.data.source.rpcId)).toEqual([first.id, a.id, c.id])
+  expect(test.db.getRun(test.owner.ownerId, b.id).status).toBe('discarded')
+})
 
 it('resolves a canonical conversation mention through native pre-step into model context', async () => {
   const test = await fixture(['reference received'])

@@ -388,6 +388,12 @@ export class WorkbenchDatabase {
     return row ? decodeRun(row) : undefined
   }
 
+  runForMessage(sessionId, messageId) {
+    if (typeof messageId !== 'string') return undefined
+    const row = this.db.prepare('SELECT * FROM runs WHERE session_id=? AND message_id=?').get(sessionId, messageId)
+    return row ? decodeRun(row) : undefined
+  }
+
   followups(ownerId, chatId, tracked = []) {
     if (!this.getChat(ownerId, chatId)) throw notFound('会话不存在或已被删除')
     if (tracked.length === 0) return []
@@ -711,6 +717,16 @@ export class WorkbenchDatabase {
   dispatchSubmission(ownerId, runId) {
     if (!this.getRun(ownerId, runId)) throw notFound('任务不存在')
     this.db.prepare('UPDATE run_submissions SET dispatched=1 WHERE run_id=?').run(runId)
+  }
+
+  editSubmission(ownerId, runId, content) {
+    const row = this.db.prepare(`SELECT s.content_json FROM run_submissions s JOIN runs r ON r.id=s.run_id
+      WHERE r.owner_id=? AND r.id=? AND r.status='queued' AND s.dispatched=0`).get(ownerId, runId)
+    if (!row) return false
+    const value = JSON.parse(row.content_json)
+    this.db.prepare('UPDATE run_submissions SET content_json=? WHERE run_id=?')
+      .run(JSON.stringify({ ...value, content }), runId)
+    return true
   }
 
   finishSubmission(ownerId, runId) {

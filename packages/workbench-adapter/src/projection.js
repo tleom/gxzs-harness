@@ -173,8 +173,14 @@ function projectEvent(database, sessionId, event, expectedOwnerId, context) {
 }
 
 /** Shared, side-effect-free display projection for live events and native history pages. */
-export function nativePresentation(run, event, { streamed = false, toolName = '' } = {}) {
+export function nativePresentation(run, event, { streamed = false, toolName = '', messageRun } = {}) {
   switch (event.type) {
+    case 'user/message': {
+      const id = messageRun?.id ?? event.data?.source?.rpcId
+      if (typeof id !== 'string' || id === run.id || (run.messageId && run.messageId === event.data?.id)) return []
+      return [{ event: 'workbench_steering', steering_id: id,
+        query: messageRun?.query ?? contentText(event.data?.content?.slice(0, 1)), native: event }]
+    }
     case 'deliverables/presented':
       return [{ event: 'workbench_presented', native: event, files: event.data?.files ?? [] }]
     case 'workspace/changes':
@@ -235,8 +241,19 @@ export function projectInboxClaim(database, { agent, message, turn }, expectedOw
   const chat = database.getChatBySession(sessionId)
   if (!chat || (expectedOwnerId && chat.ownerId !== expectedOwnerId)) return undefined
   let run
-  if (message.source?.kind === 'user' && typeof message.source.rpcId === 'string')
+  if (message.source?.kind === 'user' && typeof message.source.rpcId === 'string') {
+    const current = database.runForTurn(sessionId, turn)
     run = database.bindRunMessage(sessionId, message.source.rpcId, turn, message.id)
+    if (run && current && current.id !== run.id) {
+      if (run.status !== 'steered') {
+        database.transitionRun(chat.ownerId, run.id, 'steered')
+        database.appendEvent(chat.ownerId, run.id, { event: 'workbench_steered', steer_target_run_id: current.id })
+        database.appendEvent(chat.ownerId, current.id, { event: 'workbench_steering', steering_id: run.id,
+          query: run.query, attachments: run.attachments ?? [] })
+      }
+      return database.getRun(chat.ownerId, run.id)
+    }
+  }
   else if (message.source?.kind === 'goal' || (message.source?.kind === 'user' && !message.source.rpcId)) {
     const admitted = database.listRuns(chat.ownerId, chat.id).find(item => item.messageId === message.id) ?? nativeCommandRun(sessionId)
     if (admitted) {

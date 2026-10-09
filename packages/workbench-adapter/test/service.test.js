@@ -58,6 +58,26 @@ function activateNative(test, runId, queued = []) {
 }
 
 describe('followup and control service', () => {
+  it('opens history with steering at its native position before follow connects', async () => {
+    const { service, owner, chat, database, sessionController } = setup()
+    const { run } = database.createRun({ ownerId: owner.ownerId, chatId: chat.id, sessionId: chat.sessionId, query: 'first', selection: {} })
+    database.bindRunMessage(chat.sessionId, run.id, 1, 'm')
+    database.transitionRun(owner.ownerId, run.id, 'completed')
+    database.setRunSourceSeq(owner.ownerId, run.id, 'source_end_seq', 5)
+    service.sessionQuery = { observeSession: async () => ({ events: [{ seq: 5 }], [Symbol.dispose]() {} }) }
+    sessionController.page = async () => ({ hasMore: false, records: [
+      { event: { seq: 1, type: 'turn/start', data: { turn: 1 } } },
+      { event: { seq: 2, type: 'assistant/message', data: { turn: 1, step: 1, message: { content: [{ type: 'text', text: 'before' }] } } } },
+      { event: { seq: 3, type: 'user/message', data: { source: { rpcId: 'extra' }, content: [{ type: 'text', text: 'supplement' }] } } },
+      { event: { seq: 4, type: 'assistant/message', data: { turn: 1, step: 2, message: { content: [{ type: 'text', text: 'after' }] } } } },
+    ] })
+    const page = await service.historyPage(owner, chat.id, undefined, new AbortController().signal, true)
+    expect(page.runs).toHaveLength(1)
+    expect(page.runs[0].native_history).toBe(true)
+    expect(page.runs[0].events[2]).toMatchObject({ event: 'workbench_steering', steering_id: 'extra', query: 'supplement' })
+    expect(page.runs[0].events[1].data.text).toBe('before')
+    expect(page.runs[0].events[4].data.text).toBe('after')
+  })
   it('keeps the complete SSE snapshot when a task finishes after the native opening cut', async () => {
     const { service, owner, chat, database, sessionController } = setup()
     const { run } = database.createRun({ownerId:owner.ownerId,chatId:chat.id,sessionId:chat.sessionId,query:'运行中',selection:{}})
@@ -1351,6 +1371,24 @@ describe('forked conversations', () => {
 })
 
 describe('native queue edit', () => {
+  it('retains frozen resource hints when editing text with selected resources', async () => {
+    const { service, database, owner, chat } = setup()
+    const { run } = database.createRun({ ownerId: owner.ownerId, chatId: chat.id, sessionId: chat.sessionId, query: 'before', selection: { resource_mentions: { skills: ['selected'] } } })
+    const hint = { type: 'text', text: 'frozen resource instructions' }
+    database.saveSubmission(owner.ownerId, run.id, [{ type: 'text', text: 'before' }, hint])
+    await service.editQueued(owner, run.id, { content: [{ type: 'text', text: 'after' }] })
+    expect(database.submission(owner.ownerId, run.id).content).toEqual([{ type: 'text', text: 'after' }, hint])
+  })
+  it('edits durable admission content before the native inbox exists and retains the ticket', async () => {
+    const { service, database, owner, chat, sessionController } = setup()
+    const { run } = database.createRun({ ownerId: owner.ownerId, chatId: chat.id, sessionId: chat.sessionId, query: 'before', selection: {} })
+    database.saveSubmission(owner.ownerId, run.id, [{ type: 'text', text: 'before' }])
+    const ticketId = database.submission(owner.ownerId, run.id).ticketId
+    await service.editQueued(owner, run.id, { content: [{ type: 'text', text: 'after' }] })
+    expect(database.submission(owner.ownerId, run.id)).toMatchObject({ ticketId, dispatched: false, content: [{ type: 'text', text: 'after' }] })
+    expect(database.getRun(owner.ownerId, run.id).query).toBe('after')
+    expect(sessionController.updateQueue).not.toHaveBeenCalled()
+  })
   it('edits in place using the native inbox identity without changing ordering', async () => {
     const { service, owner, chat, database, sessionController } = setup()
     const run = await service.submitRun(owner, chat.id, { query: 'before' })
