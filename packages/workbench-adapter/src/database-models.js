@@ -4,7 +4,21 @@ import { httpError } from './http.js'
  * Native routes supply only execution capabilities; they cannot add models. */
 const applied = new WeakMap()
 const writes = new WeakMap()
+const nativeCatalogs = new WeakMap()
 const revision = (settings, name) => settings.describe().find(item => item.ns === name)?.revision
+
+function nativeCatalog(sessions, settings, models) {
+  const stamp = JSON.stringify([models, settings?.describe()])
+  const cached = nativeCatalogs.get(sessions)
+  if (cached?.stamp === stamp && cached.expires > Date.now()) return cached.promise
+  const entry = { stamp, expires: Date.now() + 30_000 }
+  entry.promise = Promise.resolve().then(() => sessions.modelCatalog()).catch(error => {
+    if (nativeCatalogs.get(sessions) === entry) nativeCatalogs.delete(sessions)
+    throw error
+  })
+  nativeCatalogs.set(sessions, entry)
+  return entry.promise
+}
 
 async function synchronize(settings, models) {
   if (!settings) return
@@ -40,7 +54,7 @@ export async function databaseModelCatalog(platformClient, sessions, owner, sett
       model?.enabled !== false && `${id}/${model?.id}` === config.models.default))
   if (!declaredDefault) throw httpError(503, '后台默认模型未启用')
   await synchronize(settings, config.models)
-  const native = await sessions.modelCatalog()
+  const native = await nativeCatalog(sessions, settings, config.models)
   const groups = []
   for (const [id, provider] of Object.entries(config.models.providers)) {
     if (!provider || provider.enabled === false) continue
