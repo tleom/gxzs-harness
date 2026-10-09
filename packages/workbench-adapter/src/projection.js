@@ -285,6 +285,7 @@ function projectControlEvent(database, chat, sessionId, event) {
       revision: goal.revision,
       objective: goal.objective,
       phase: goal.phase,
+      activation: goal.activation,
       reason: goal.blockedReason?.message ?? null,
       max_rounds: goal.maxGoalRounds ?? null,
       rounds_started: event.data?.roundsStarted ?? 0,

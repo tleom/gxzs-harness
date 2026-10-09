@@ -180,6 +180,51 @@ it('delivers a durable queued file through native upload and prompt admission', 
   expect(test.model.requests).toHaveLength(1)
 })
 
+it('retains sandbox-path file references when editing a goal with an older manager', async () => {
+  const test = await fixture(['hang'])
+  const service = new WorkbenchService({ database: test.db, sessionController: test.sessions, agents: test.ctx.agents,
+    scheduler: test.scheduler, commands: test.ctx.commands, goals: test.ctx.goals, workspace: '/workspace',
+    skills: { list: async () => [] }, platformClient: { json: async () => ({ tools: [] }) },
+    fileManager: { operate: async () => ({ kind: 'file', version: 'v1', data: Buffer.from('evidence').toString('base64') }) } })
+  await service.issueCommand(test.owner, test.chat.id, { command: '/goal Review evidence', request_key: 'legacy-goal' })
+  await vi.waitFor(() => expect(test.model.requests).toHaveLength(1))
+  const body = { command: '/goal edit Review new evidence', request_key: 'legacy-edit', files: [{ path: 'evidence.txt', version: 'v1' }] }
+  await service.issueCommand(test.owner, test.chat.id, body)
+  await service.issueCommand(test.owner, test.chat.id, body)
+  const messages = [...test.agent.inbox.nextTurn, ...test.agent.inbox.nextStep]
+  expect(messages.filter(message => JSON.stringify(message.content).includes('/workspace/evidence.txt'))).toHaveLength(1)
+  expect(test.ctx.goals.get(test.agent).objective).toBe('Review new evidence')
+  test.ctx.goals.pause(test.agent, test.ctx.goals.get(test.agent))
+  test.agent.cancel({ kind: 'user' })
+  await test.agent.whenIdle()
+})
+
+it('freezes a goal resource selection separately from the already running request', async () => {
+  let finishCurrent
+  const test = await fixture([new Promise(resolve => { finishCurrent = resolve }), 'hang'])
+  const current = test.create('Existing work')
+  test.db.saveSubmission(test.owner.ownerId, current.id, [{ type: 'text', text: current.query }])
+  await test.scheduler.tick()
+  await vi.waitFor(() => expect(test.model.requests).toHaveLength(1))
+  const service = new WorkbenchService({ database: test.db, sessionController: test.sessions, agents: test.ctx.agents,
+    scheduler: test.scheduler, commands: test.ctx.commands, goals: test.ctx.goals, workspace: '/workspace',
+    skills: { list: async () => [{ id: 'personal:evidence', name: 'evidence', enabled: true }] },
+    fileManager: { operate: async () => ({}) },
+    platformClient: { json: async () => ({ tools: [] }) } })
+  const response = await service.issueCommand(test.owner, test.chat.id, { command: '/goal Audit evidence', request_key: 'active-goal',
+    resource_mentions: { skills: ['personal:evidence'] } })
+  expect(response.run.id).not.toBe(current.id)
+  expect(test.db.getRun(test.owner.ownerId, current.id).mcpTools).toEqual(current.mcpTools)
+  expect(test.db.getRun(test.owner.ownerId, response.run.id).selection.resource_context).toContain('evidence')
+  finishCurrent('Previous request completed')
+  await vi.waitFor(() => expect(test.model.requests).toHaveLength(2))
+  expect(JSON.stringify(test.model.requests[1])).toContain('用户指定技能')
+  expect(JSON.stringify(test.model.requests[1])).toContain('evidence')
+  test.ctx.goals.pause(test.agent, test.ctx.goals.get(test.agent))
+  test.agent.cancel({ kind: 'user' })
+  await test.agent.whenIdle()
+})
+
 it('passes goal-edit files through the native attachment store and user inbox', async () => {
   const test = await fixture(['hang', 'hang'])
   const root = await mkdtemp(join(process.cwd(), '.attachment-test-'))

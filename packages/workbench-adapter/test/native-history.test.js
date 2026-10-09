@@ -16,6 +16,21 @@ const [{ Context }, { default: Llm, createMessage, createUserMessage }, { defaul
 // Exact published implementation, as used by SessionController.page().
 const { SessionHistoryController } = await import(pathToFileURL(join(dirname(require.resolve('@deepseek-ai/dsh-api-session-controller')), 'types/history.js')).href)
 const contexts = []
+
+it.each([false, true])('retains a terminal query that failed before native turn admission (live=%s)', async nativeLive => {
+  const { session, services } = await fixture()
+  const database = new WorkbenchDatabase(':memory:')
+  const owner = { ownerId: 'owner' }
+  try {
+    const chat = database.createChat({ ownerId: owner.ownerId, sessionId: session.id, selection: {} })
+    const { run } = database.createRun({ ownerId: owner.ownerId, chatId: chat.id, sessionId: session.id,
+      query: 'Keep my failed question', selection: {} })
+    database.transitionRun(owner.ownerId, run.id, 'failed', 'Model selection failed')
+    const service = new WorkbenchService({ database, sessionController: services.sessions, sessionQuery: services.sessionQuery })
+    const page = await service.historyPage(owner, chat.id, undefined, new AbortController().signal, nativeLive)
+    expect(page.runs).toEqual([expect.objectContaining({ id: run.id, query: 'Keep my failed question', status: 'failed', error: 'Model selection failed' })])
+  } finally { database.close() }
+})
 afterEach(async () => { for (const ctx of contexts.splice(0)) await ctx.fiber.dispose() })
 async function fixture() {
   const ctx = new Context(); contexts.push(ctx)

@@ -22,6 +22,19 @@ function bind(database, chat, run, turn = 1) {
 }
 
 describe('DSH session event projection', () => {
+  it('replays a disarmed goal completion before interrupted-run recovery without live context', () => {
+    const { database, chat, run } = setup()
+    bind(database, chat, run)
+    database.setGoalRun(chat.sessionId, run.id)
+    projectSessionEvent(database, chat.sessionId, { type: 'goal/change', seq: 11,
+      data: { operation: 'update', goal: { id: 'goal', revision: 2, objective: 'work', phase: 'active', activation: 'disarmed' } } })
+    projectSessionEvent(database, chat.sessionId, { type: 'turn/end', seq: 12,
+      data: { turn: 1, reason: { kind: 'completed' } } })
+    database.recoverInterrupted()
+    expect(database.getControl(chat.ownerId, chat.id).goal.activation).toBe('disarmed')
+    expect(database.getRun(chat.ownerId, run.id).status).toBe('completed')
+  })
+
   it('moves the exact bound run through start and completion', () => {
     const { database, chat, run } = setup()
     bind(database, chat, run)

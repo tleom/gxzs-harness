@@ -241,6 +241,7 @@ export class WorkbenchService {
     // Older windows are read-only; they must never replace a newer live view.
     if (cursor === undefined) for (const run of this.database.listRuns(owner.ownerId, chat.id)) {
       if (['queued', 'running', 'waiting_input', 'stopping'].includes(run.status)
+        || (run.sourceStartSeq == null && run.sourceEndSeq == null)
         || run.sourceEndSeq > page.through_seq || run.sourceStartSeq > page.through_seq) {
         runs.set(run.id, nativeLive ? (runs.get(run.id) ?? this.inputRunDto(owner, run))
           : { ...this.getRun(owner, run.id), history_complete: true })
@@ -622,8 +623,7 @@ export class WorkbenchService {
           await this.sessions.selectModel({ sessionId: chat.sessionId, ...splitModel(chat.selection.model),
             ...(chat.selection.model_parameters?.reasoning_effort ? { reasoningEffort: chat.selection.model_parameters.reasoning_effort } : {}) })
         }
-        goalRun = this.database.activeRunBySession(chat.sessionId)
-        if (!goalRun || goalRun.status !== 'running') {
+        {
           const objective = /^\/goal\s+resume\s*$/i.test(line)
             ? this.goals?.get(agent)?.objective ?? '继续目标' : line.replace(/^\/goal\s+(?:edit\s+)?/i, '')
           goalRun = this.database.createRun({ ownerId: owner.ownerId, chatId, sessionId: chat.sessionId,
@@ -641,6 +641,10 @@ export class WorkbenchService {
         execution = await this.commands.execute(agent, line, commandAttachments, new AbortController().signal)
         if (!execution) throw httpError(400, '命令不存在或参数无效')
         if (execution.result?.kind === 'error') throw httpError(409, execution.result.text)
+        // Older managers admit ordinary files as sandbox-path text. Preserve
+        // that content in native history for goal edits as well as new goals.
+        const fallbackFiles = admitted.content.filter(item => item.type === 'text')
+        if (fallbackFiles.length) agent.followup(createUserMessage({ content: fallbackFiles, source: { kind: 'user' } }))
       } catch (error) {
         if (createdGoalRun) {
           this.database.transitionRun(owner.ownerId, goalRun.id, 'failed', error.message)
