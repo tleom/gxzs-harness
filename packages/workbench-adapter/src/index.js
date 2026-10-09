@@ -49,6 +49,9 @@ export function apply(ctx, config) {
   service.workspaces = workspaces
   service.sessionReferences = ctx.sessionReferenceResolver
   service.fileReferences = ctx.fileReferences
+  service.subscribeGoal = (sessionId, listener) => ctx.on('goal/activation-changed', event => {
+    if (event.sessionId === sessionId) listener()
+  }, { global: true })
   let recovered = false
   let recoveryError
   let recoveryTimer
@@ -124,7 +127,7 @@ export function apply(ctx, config) {
     return {
       resources_pending: modelsOnly,
       activity_protocol: 1, human_input_protocol: 1, followup_protocol: 1, history_protocol: 1, native_history_protocol: 1,
-      control_protocol: 1, resources_protocol: 1, command_resources_protocol: 1, submission_control_protocol: 1,
+      control_protocol: 1, goal_events_protocol: 1, resources_protocol: 1, command_resources_protocol: 1, submission_control_protocol: 1,
       default_selection: { model: catalog.default ? `${catalog.default.provider}/${catalog.default.model}` : models[0]?.id ?? '', tools: [], skills: [], knowledge: [], model_parameters: {}, tool_parameters: {} },
       models, tools: mcpTools.map((tool) => ({
         id: tool.id, name: tool.name, display_name: tool.display_name,

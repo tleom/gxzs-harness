@@ -348,6 +348,10 @@ export class WorkbenchDatabase {
   }
 
   setGoalRun(sessionId, runId) {
+    if (!runId) {
+      this.db.prepare('DELETE FROM goal_runs WHERE session_id=?').run(sessionId)
+      return
+    }
     this.db.prepare('INSERT INTO goal_runs(session_id, run_id) VALUES (?, ?) ON CONFLICT(session_id) DO UPDATE SET run_id=excluded.run_id')
       .run(sessionId, runId)
   }
@@ -355,6 +359,11 @@ export class WorkbenchDatabase {
   goalRun(sessionId) {
     const row = this.db.prepare('SELECT r.* FROM runs r JOIN goal_runs g ON r.id=g.run_id WHERE g.session_id=?').get(sessionId)
     return row ? decodeRun(row) : undefined
+  }
+
+  updateRunResources(run, selection, mcpTools) {
+    this.db.prepare('UPDATE runs SET selection_json=?, mcp_tools_json=? WHERE id=? AND owner_id=?')
+      .run(JSON.stringify(selection), JSON.stringify(mcpTools), run.id, run.ownerId)
   }
 
   hasProjectedEvent(sessionId, seq) {

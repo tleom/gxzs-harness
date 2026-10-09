@@ -657,3 +657,118 @@ it.each(['local', 'native'])('direct-sends a %s queued file through DSH once', a
   expect(test.model.requests).toHaveLength(2)
   expect(test.db.getRun(test.owner.ownerId, run.id).status).toBe('steered')
 })
+function goalServiceFixture(test) {
+  return new WorkbenchService({ database: test.db, sessionController: test.sessions, agents: test.ctx.agents,
+    scheduler: test.scheduler, goals: test.ctx.goals, commands: test.ctx.commands, workspace: '/workspace',
+    platformClient: { json: async () => ({ data: { tools: [] } }) }, skills: { list: async () => [] }, fileManager: { operate: async () => ({}) } })
+}
+it('rejected duplicate creation preserves the active goal run binding', async () => {
+  const t = await fixture(['hang']); const s = goalServiceFixture(t)
+  const first = await s.issueCommand(t.owner,t.chat.id,{command:'/goal first objective',request_key:'first'})
+  await vi.waitFor(() => expect(t.model.requests).toHaveLength(1))
+  await expect(s.issueCommand(t.owner,t.chat.id,{command:'/goal second objective',request_key:'second'})).rejects.toMatchObject({status:409})
+  expect(t.ctx.goals.get(t.agent).objective).toBe('first objective')
+  expect(t.db.goalRun(t.agent.id).id).toBe(first.run.id)
+  expect(t.db.goalRun(t.agent.id).status).toBe('running')
+  t.ctx.goals.pause(t.agent,t.ctx.goals.get(t.agent)); await t.agent.whenIdle()
+})
+it('slash resume rejection preserves the active goal run binding', async () => {
+  const t = await fixture(['hang']); const s = goalServiceFixture(t)
+  const first = await s.issueCommand(t.owner,t.chat.id,{command:'/goal first objective',request_key:'first'})
+  await vi.waitFor(() => expect(t.model.requests).toHaveLength(1))
+  await expect(s.issueCommand(t.owner,t.chat.id,{command:'/goal resume',request_key:'resume'})).rejects.toMatchObject({status:409})
+  expect(t.db.goalRun(t.agent.id).id).toBe(first.run.id)
+  expect(t.db.goalRun(t.agent.id).status).toBe('running')
+  t.ctx.goals.pause(t.agent,t.ctx.goals.get(t.agent)); await t.agent.whenIdle()
+})
+it('cold control reports disarmed activation', async () => {
+  const t = await fixture([]); const run=t.create('goal'); t.db.setGoalRun(t.agent.id,run.id)
+  t.ctx.goals.create(t.agent,{objective:'cold objective'})
+  t.ctx.goals.disarm(t.agent)
+  const s=goalServiceFixture(t); s.agents={get:()=>undefined}
+  const state=await s.getControl(t.owner,t.chat.id)
+  expect(state.goal.phase).toBe('active'); expect(state.goal.activation).toBe('disarmed')
+})
+
+it('fork preserves all goal turn bindings', async () => {
+  const t=await fixture([]); const s=goalServiceFixture(t); const run=t.create('multi-round goal')
+  t.db.setGoalRun(t.agent.id,run.id); t.db.bindNativeTurn(run,1); t.db.bindNativeTurn(run,2)
+  t.db.setRunSourceSeq(t.owner.ownerId,run.id,'source_end_seq',20)
+  t.db.transitionRun(t.owner.ownerId,run.id,'completed')
+  s.sessions={fork:async()=>({sessionId:'forked-session'}),rename:async()=>({})}
+  const child=await s.fork(t.owner,run.id,{request_key:'fork'})
+  expect(t.db.runForTurn('forked-session',1)).toBeDefined()
+  expect(t.db.runForTurn('forked-session',2)?.id).toBe(child.runs[0].id)
+  expect(child.runs).toHaveLength(1)
+})
+it('native domain rejection retains conflict semantics', async () => {
+  const {sendError}=await import('../src/http.js')
+  const t=await fixture(['hang']);const s=goalServiceFixture(t)
+  await s.issueCommand(t.owner,t.chat.id,{command:'/goal first objective',request_key:'first'})
+  await vi.waitFor(()=>expect(t.model.requests).toHaveLength(1))
+  let failure;try{await s.mutateGoal(t.owner,t.chat.id,'resume',{ref:t.ctx.goals.get(t.agent)})}catch(e){failure=e}
+  expect(failure.code).toBe('GOAL_INVALID_TRANSITION')
+  const res={writeHead:vi.fn(),end:vi.fn()};sendError(res,failure)
+  expect(res.writeHead.mock.calls[0][0]).toBe(409)
+  expect(JSON.parse(res.end.mock.calls[0][0])).toMatchObject({code:'GOAL_INVALID_TRANSITION'})
+  t.ctx.goals.pause(t.agent,t.ctx.goals.get(t.agent));await t.agent.whenIdle()
+})
+it('editing objective updates selected resource context', async () => {
+  const t=await fixture(['hang']); const s=goalServiceFixture(t)
+  const first=await s.issueCommand(t.owner,t.chat.id,{command:'/goal first objective',request_key:'first'})
+  await vi.waitFor(()=>expect(t.model.requests).toHaveLength(1))
+  t.ctx.goals.pause(t.agent,t.ctx.goals.get(t.agent));await t.agent.whenIdle()
+  s.skills={list:async()=>[{name:'new-skill',description:'new evidence'}]}; const content=vi.spyOn(s,'resourceContent')
+  await s.issueCommand(t.owner,t.chat.id,{command:'/goal edit revised objective',request_key:'edit',resource_mentions:{skills:['new-skill']}})
+  expect(content).toHaveBeenCalled()
+  expect(t.ctx.goals.get(t.agent).objective).toBe('revised objective')
+  expect(t.db.getRun(t.owner.ownerId,first.run.id).selection.resource_mentions.skills).toEqual(['new-skill'])
+})
+it('rejected replacement leaves original goal continuation intact', async () => {
+  let release;const output=new Promise(resolve=>{release=resolve})
+  const t=await fixture([output,'hang']); const s=goalServiceFixture(t)
+  await s.issueCommand(t.owner,t.chat.id,{command:'/goal original objective',request_key:'original'})
+  await vi.waitFor(()=>expect(t.model.requests).toHaveLength(1))
+  await expect(s.issueCommand(t.owner,t.chat.id,{command:'/goal other objective',request_key:'other'})).rejects.toMatchObject({status:409})
+  release('first round complete')
+  await vi.waitFor(()=>expect(t.model.requests).toHaveLength(2))
+  t.ctx.goals.pause(t.agent,t.ctx.goals.get(t.agent));await t.agent.whenIdle()
+})
+
+it('cold control uses native projection round counter', async () => {
+  const t=await fixture(['hang']);const s=goalServiceFixture(t)
+  await s.issueCommand(t.owner,t.chat.id,{command:'/goal count rounds',request_key:'rounds'})
+  await vi.waitFor(()=>expect(t.model.requests).toHaveLength(1))
+  expect(t.ctx.goals.get(t.agent).roundsStarted).toBe(1)
+  const cold=goalServiceFixture(t);cold.agents={get:()=>undefined}; cold.sessionQuery={observeSession:async()=>({projections:t.ctx.sessionProjections.snapshot(t.agent.session,['goal']),events:[]})}
+  expect((await cold.getControl(t.owner,t.chat.id)).goal.rounds_started).toBe(1)
+  t.ctx.goals.pause(t.agent,t.ctx.goals.get(t.agent));await t.agent.whenIdle()
+})
+
+it.each(['approve', 'discuss'])('settles native plan review through the Workbench bridge: %s', async action => {
+  const t=await fixture(['Plan ready'])
+  const {default:Questions}=await native('dsh-user-questions')
+  const {default:Plan}=await native('dsh-plan-mode')
+  const {HumanInputBridge}=await import('../src/human-input.js')
+  await t.ctx.plugin(Questions);await t.ctx.plugin(Plan,{section:'Prepare a plan for review.'})
+  const s=new WorkbenchService({database:t.db,sessionController:t.sessions,agents:t.ctx.agents,scheduler:t.scheduler,commands:t.ctx.commands,workspace:'/workspace',skills:{list:async()=>[]},platformClient:{json:async()=>({tools:[]})},fileManager:{operate:async()=>({})}})
+  const response=await s.issueCommand(t.owner,t.chat.id,{command:'/plan Review evidence',request_key:'plan'})
+  await vi.waitFor(()=>expect(t.model.requests).toHaveLength(1));await t.agent.whenIdle()
+  const bridge=new HumanInputBridge({database:t.db,executionRun:()=>t.db.getRun(t.owner.ownerId,response.run.id)})
+  t.ctx.on('user-questions/request',bridge.handleRequest,{global:true,prepend:true})
+  const pending=t.ctx.tools.execute({callId:'review',name:'exit_plan_mode',arguments:{plan:'# Evidence plan\nReview facts.'},agent:t.agent,signal:new AbortController().signal})
+  await vi.waitFor(()=>expect(bridge.pendings.size).toBe(1))
+  const saved=t.db.getPendingInput(t.owner.ownerId,response.run.id)
+  expect(saved.deadlineAt).toBeNull()
+  if (action === 'discuss') bridge.skip(t.owner.ownerId,response.run.id,saved.requestId)
+  else bridge.resume(t.owner.ownerId,response.run.id,{ request_id: saved.requestId, answers: [{id:saved.payload.questions[0].id,selected:[saved.payload.questions[0].intent.approve]}] })
+  const result=await pending
+  if (action === 'discuss') {
+    expect(result.isError).toBe(true)
+    expect(JSON.stringify(result.content)).toContain('stay in plan mode, stop here, and wait for their message')
+    expect(t.ctx.sessionProjections.snapshot(t.agent.session,['plan']).values.plan.active).toBe(true)
+  } else {
+    expect(result.isError).not.toBe(true)
+    expect(t.ctx.planMode.get(t.agent)).toMatchObject({active:true,pending:false})
+  }
+})

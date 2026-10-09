@@ -165,6 +165,15 @@ describe('followup and control service', () => {
     await expect(service.followHistory({...owner,ownerId:'foreign'},chat.id,new AbortController().signal).next()).rejects.toMatchObject({status:404})
     expect(sessionController.follow).toHaveBeenCalledOnce()
   })
+  it.each(['plan/mode', 'command/run', 'command/done'])('pushes native plan controls with %s instead of waiting for polling', async type => {
+    const {service,owner,chat,sessionController}=setup()
+    const control={revision:4,plan:{active:true,pending:false}}
+    vi.spyOn(service,'getControl').mockResolvedValue(control)
+    sessionController.follow=vi.fn(async function*(){yield {type:'event',event:{seq:1,type,data:{active:true}}}})
+    const source=service.followHistory(owner,chat.id,new AbortController().signal)
+    expect((await source.next()).value.control).toEqual(control)
+    await source.return()
+  })
   it('retains plugin result labels when the native call is outside the loaded history window without replaying tool state', async () => {
     const {service,owner,chat,database,sessionController}=setup()
     const {run}=database.createRun({ownerId:owner.ownerId,chatId:chat.id,sessionId:chat.sessionId,query:'search',selection:{},

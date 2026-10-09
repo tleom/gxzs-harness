@@ -15,6 +15,7 @@ import { nativeTurn } from './native-turn.js'
 import { historyWindow, loadNativeHistoryPage } from './history-page.js'
 import { nativePresentation } from './projection.js'
 import { HistoryPresentation } from './history-presentation.js'
+import { withGoalUpdates } from './goal-updates.js'
 import { withNativeCommandRun, nativeCommandRecords } from './native-command.js'
 
 export class WorkbenchService {
@@ -263,7 +264,8 @@ export class WorkbenchService {
       messageId => this.database.runForMessage(chat.sessionId, messageId))
     const source = this.sessions.follow({ address: { kind: 'session', sessionId: chat.sessionId },
       ...historyWindow, assistantStream: true }, signal)
-    for await (const frame of source) {
+    for await (const frame of withGoalUpdates(source, this.subscribeGoal
+      ? listener => this.subscribeGoal(chat.sessionId, listener) : undefined, signal)) {
       signal.throwIfAborted()
       // Directory changes replace the native session. End the old subscription
       // instead of combining two different source logs in one conversation.
@@ -287,8 +289,12 @@ export class WorkbenchService {
         type: frame.type, cursor: frame.cursor, records: frame.records,
         hasMore: frame.hasMore, assistantStream: frame.assistantStream,
       } : frame
+      const updatesControl = frame.type === 'snapshot' || frame.type === 'goal-state'
+        || (frame.type === 'event' && (['goal/change', 'plan/mode', 'command/run', 'command/done', 'turn/end'].includes(frame.event.type)
+          || (frame.event.type === 'user/message' && frame.event.data?.source?.kind === 'goal')))
       yield { event: 'workbench_history', session_id: chat.sessionId, value, runs: [...runs.values()], bindings,
-        display: presentation.accept(frame) }
+        ...(updatesControl ? { control: await this.getControl(owner, chatId) } : {}),
+        display: frame.type === 'goal-state' ? { events: [], replace: false, retire_attempts: [] } : presentation.accept(frame) }
     }
   }
 
@@ -613,10 +619,20 @@ export class WorkbenchService {
         && (!editsGoal || this.goals?.get(agent)?.phase === 'complete')
       let goalRun
       let createdGoalRun = false
+      const previousGoalRun = this.database.goalRun(chat.sessionId)
       const admitted = body.files?.length
         ? await admitSandboxAttachments({ fileManager: this.fileManager, workspace: this.workspace, query: '', files: body.files, nativeFiles: this.nativeFileAttachments })
         : { content: [], attachments: [] }
       const commandAttachments = await this.commandAttachments(agent, admitted.content)
+      let editedResources
+      if (editsGoal && !startsGoal && body.resource_mentions !== undefined && previousGoalRun) {
+        const mentions = normalizeResourceMentions(body.resource_mentions)
+        const mcpTools = await this.freezeMcpTools(owner, mentions.tools)
+        editedResources = { mcpTools, selection: { ...previousGoalRun.selection,
+          resource_mentions: mentions, mentioned_resources: await this.mentionSnapshot(mentions, mcpTools),
+          skill_names: await this.skillNames(),
+          resource_context: (await this.resourceContent([], mentions, mcpTools)).map(item => item.text).join('\n') } }
+      }
       if (startsGoal) {
         const previous = /^\/goal\s+resume\s*$/i.test(line) ? this.database.goalRun(chat.sessionId) : undefined
         const mentions = normalizeResourceMentions(body.resource_mentions)
@@ -646,12 +662,14 @@ export class WorkbenchService {
         execution = await this.commands.execute(agent, line, commandAttachments, new AbortController().signal)
         if (!execution) throw httpError(400, '命令不存在或参数无效')
         if (execution.result?.kind === 'error') throw httpError(409, execution.result.text)
+        if (editedResources) this.database.updateRunResources(previousGoalRun, editedResources.selection, editedResources.mcpTools)
         // Older managers admit ordinary files as sandbox-path text. Preserve
         // that content in native history for goal edits as well as new goals.
         const fallbackFiles = admitted.content.filter(item => item.type === 'text')
         if (fallbackFiles.length) agent.followup(createUserMessage({ content: fallbackFiles, source: { kind: 'user' } }))
       } catch (error) {
         if (createdGoalRun) {
+          this.database.setGoalRun(chat.sessionId, previousGoalRun?.id)
           this.database.transitionRun(owner.ownerId, goalRun.id, 'failed', error.message)
           this.database.appendEvent(owner.ownerId, goalRun.id, { event: 'workbench_end', status: 'failed', error: error.message })
         }
@@ -699,6 +717,7 @@ export class WorkbenchService {
       if (!current || current.id !== ref?.id || current.revision !== ref?.revision)
         throw httpError(409, '目标已改变，请刷新后重试', 'GOAL_STALE_REF')
       let resumedRun
+      const previousGoalRun = this.database.goalRun(chat.sessionId)
       if (action === 'resume') {
         const previous = this.database.goalRun(chat.sessionId)
         const active = this.database.activeRunBySession(chat.sessionId)
@@ -714,7 +733,10 @@ export class WorkbenchService {
         const value = action === 'edit' ? this.goals.edit(agent, ref, body.request) : this.goals[action](agent, ref)
         return { value, state: await this.getControl(owner, chatId), run: resumedRun ? this.getRun(owner, resumedRun.id) : null }
       } catch (error) {
-        if (resumedRun) this.database.transitionRun(owner.ownerId, resumedRun.id, 'failed', error.message)
+        if (resumedRun) {
+          this.database.setGoalRun(chat.sessionId, previousGoalRun?.id)
+          this.database.transitionRun(owner.ownerId, resumedRun.id, 'failed', error.message)
+        }
         throw error
       }
     })
@@ -724,6 +746,7 @@ export class WorkbenchService {
     const chat = this.requireChat(owner, chatId)
     let state = this.database.getControl(owner.ownerId, chatId)
     const agent = this.agents.get(chat.sessionId)
+    if (!agent && state.goal) state = { ...state, goal: { ...state.goal, activation: 'disarmed' } }
     if (agent && this.goals) {
       const goal = this.goals.get(agent)
       state = { ...state, goal: goal ? { ...goal, reason: goal.blockedReason?.message ?? null,
@@ -733,6 +756,13 @@ export class WorkbenchService {
     const source = await this.sessionQuery.observeSession(chat.sessionId)
     try {
       const plan = source.projections?.values?.plan ?? { active: false, pending: false }
+      if (!agent) {
+        const projection = source.projections?.values?.goal
+        const goal = projection?.goal
+        state = { ...state, goal: goal ? { ...goal, activation: 'disarmed',
+          reason: goal.blockedReason?.message ?? null, max_rounds: goal.maxGoalRounds,
+          rounds_started: projection.roundsStarted, last_run_id: this.database.goalRun(chat.sessionId)?.id ?? null } : null }
+      }
       return { ...state, plan, commands: nativeCommandRecords(source.events ?? [], this.database.listRuns(owner.ownerId, chatId)) }
     } finally { source[Symbol.dispose]?.() }
   }

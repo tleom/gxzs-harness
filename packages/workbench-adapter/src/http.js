@@ -23,6 +23,10 @@ export function sendJson(res, status, value) {
 }
 
 export function sendError(res, error) {
+  if (Object.hasOwn(GOAL_ERRORS, error?.code ?? '')) {
+    const [status, message] = GOAL_ERRORS[error.code]
+    return sendJson(res, status, { code: error.code, message })
+  }
   const remote = error?.isDSHRemoteError === true && Object.hasOwn(REMOTE_ERRORS, error.code) ? REMOTE_ERRORS[error.code] : undefined
   const explicitStatus = Number(error?.status)
   const status = remote?.[0] ?? (Number.isInteger(explicitStatus) && explicitStatus >= 400 && explicitStatus <= 599 ? explicitStatus : 500)
@@ -32,6 +36,14 @@ export function sendError(res, error) {
     ? error.code : (STATUS_CODES[status] ?? 'REQUEST_FAILED')
   const message = remote?.[1] ?? (status === 500 ? '工作台请求失败，请稍后重试' : error?.message || '工作台请求失败，请稍后重试')
   sendJson(res, status, { code, message })
+}
+
+const GOAL_ERRORS = {
+  GOAL_INVALID_TRANSITION: [409, '当前目标状态不支持此操作；若轮次已耗尽，请先提高轮次上限'],
+  GOAL_STALE_REF: [409, '目标已改变，请刷新后重试'],
+  GOAL_INVALID_EDIT: [400, '请填写目标内容或有效的轮次上限'],
+  GOAL_INVALID_OBJECTIVE: [400, '目标内容不能为空'],
+  GOAL_INVALID_MAX_ROUNDS: [400, '目标轮次上限必须为正整数'],
 }
 
 const STATUS_CODES = { 400: 'INVALID_REQUEST', 401: 'UNAUTHORIZED', 403: 'FORBIDDEN', 404: 'NOT_FOUND', 409: 'STATE_CONFLICT', 413: 'PAYLOAD_TOO_LARGE', 429: 'RATE_LIMITED', 500: 'INTERNAL_ERROR', 502: 'UPSTREAM_ERROR', 503: 'UNAVAILABLE', 504: 'DEADLINE_EXCEEDED' }
