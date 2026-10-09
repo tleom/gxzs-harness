@@ -45,6 +45,7 @@ function activateNative(test, runId, queued = []) {
   database.transitionRun(owner.ownerId, runId, 'running')
   agent.status = 'running'
   agent.session = { snapshotEvents: () => [{ type: 'turn/start', data: { turn: 1 } }] }
+  agent.ctx = { sessionProjections: { stateOf: () => ({ openTurnStartSeq: 0, lastTurn: 1 }) } }
   agent.inbox = { nextTurn: queued, nextStep: [], remove: vi.fn(id => {
     const index = agent.inbox.nextTurn.findIndex(message => message.id === id)
     if (index < 0) return false
@@ -56,6 +57,188 @@ function activateNative(test, runId, queued = []) {
 }
 
 describe('followup and control service', () => {
+  it('keeps the complete SSE snapshot when a task finishes after the native opening cut', async () => {
+    const { service, owner, chat, database, sessionController } = setup()
+    const { run } = database.createRun({ownerId:owner.ownerId,chatId:chat.id,sessionId:chat.sessionId,query:'运行中',selection:{}})
+    database.bindRunMessage(chat.sessionId,run.id,1,'m1')
+    database.transitionRun(owner.ownerId,run.id,'running')
+    service.sessionQuery={observeSession:vi.fn(async()=>({events:[{seq:50}],[Symbol.dispose](){}}))}
+    sessionController.page=vi.fn(async()=>{
+      database.appendEvent(owner.ownerId,run.id,{event:'workbench_activity',data:{kind:'text',segment_id:'t1s1b0',text:'刚刚完成的输出'}})
+      database.setRunSourceSeq(owner.ownerId,run.id,'source_end_seq',51)
+      database.transitionRun(owner.ownerId,run.id,'completed')
+      return {records:[{type:'event',event:{seq:40,type:'turn/start',data:{turn:1}}}],hasMore:true}
+    })
+    const page=await service.historyPage(owner,chat.id,undefined,new AbortController().signal)
+    expect(page.through_seq).toBe(50)
+    expect(page.runs[0]).toMatchObject({status:'completed',history_complete:true,events_cursor:'1-0'})
+    expect(page.runs[0].events[0].data.text).toBe('刚刚完成的输出')
+  })
+  it('projects only the native page without replaying writes or losing named tools across goal rounds', async () => {
+    const { service, owner, chat, database, sessionController } = setup()
+    const { run } = database.createRun({ ownerId: owner.ownerId, chatId: chat.id, sessionId: chat.sessionId,
+      query: '分析', selection: {}, mcpTools: [{runtime_name:'mcp__search',server_id:'法律资料',tool_name:'检索资料'}] })
+    database.bindRunMessage(chat.sessionId, run.id, 1, 'message-1')
+    database.bindNativeTurn(run, 2)
+    const records = [
+      {seq:40,type:'tool/call',data:{turn:1,callId:'call-1',name:'mcp__search',arguments:'{}'}},
+      {seq:41,type:'tool/result',data:{turn:1,message:{source:{callId:'call-1'},content:[{type:'tool-result',content:[{type:'text',text:'找到了资料'}]}]}}},
+      {seq:42,type:'assistant/message',data:{turn:2,step:1,message:{content:[{type:'text',text:'下一轮结果'}]}}},
+      {seq:43,type:'workspace/changes',data:{turn:2}},
+      {seq:44,type:'deliverables/presented',data:{turn:2,files:[{path:'报告.md'}]}},
+    ].map(event=>({type:'event',event}))
+    sessionController.page=vi.fn(async()=>({records,hasMore:true}))
+    const allEvents=vi.spyOn(database,'allEvents'), append=vi.spyOn(database,'appendEvent')
+    const page=await service.historyPage(owner,chat.id,{sessionId:chat.sessionId,throughSeq:99,beforeSeq:50},new AbortController().signal)
+    expect(page.runs).toHaveLength(1)
+    expect(page.runs[0].events[0].data).toMatchObject({provider_name:'法律资料',display_name:'检索资料'})
+    expect(page.runs[0].events[1].data).toMatchObject({tool_name:'mcp__search',output:'找到了资料'})
+    expect(page.runs[0].events.map(event=>event.event)).toEqual(['workbench_activity','workbench_activity','workbench_assistant_final','workbench_activity','workbench_changes','workbench_presented'])
+    expect(new Set(page.runs[0].events.map(event=>event._id)).size).toBe(6)
+    expect(page.cursor.beforeSeq).toBe(40)
+    expect(allEvents).not.toHaveBeenCalled();expect(append).not.toHaveBeenCalled()
+  })
+  it('opens active native history and refreshes state without reading the complete run while retaining context usage', async () => {
+    const {service,owner,chat,database,sessionController}=setup()
+    const {run}=database.createRun({ownerId:owner.ownerId,chatId:chat.id,sessionId:chat.sessionId,query:'live',selection:{}})
+    database.bindRunMessage(chat.sessionId,run.id,1,'m')
+    database.transitionRun(owner.ownerId,run.id,'running')
+    database.appendEvent(owner.ownerId,run.id,{event:'workbench_activity',data:{kind:'text',text:'old long transcript'}})
+    database.appendEvent(owner.ownerId,run.id,{event:'workbench_context',used_tokens:42,model:'fixture'})
+    service.sessionQuery={observeSession:async()=>({events:[{seq:30}],[Symbol.dispose](){}})}
+    sessionController.page=vi.fn(async()=>({hasMore:true,records:[{type:'event',event:{seq:20,type:'assistant/message',data:{turn:1,step:2,message:{content:[{type:'text',text:'native window'}]}}}}]}))
+    const all=vi.spyOn(database,'allEvents')
+    const page=await service.historyPage(owner,chat.id,undefined,new AbortController().signal,true)
+    expect(page.runs[0].events.at(-1).data.text).toBe('native window')
+    expect(page.runs[0].history_complete).not.toBe(true)
+    expect(page.runs[0].context_usage).toMatchObject({used_tokens:42})
+    expect(service.getRun(owner,run.id,false)).toMatchObject({events:[],history_complete:false,context_usage:{used_tokens:42}})
+    expect(all).not.toHaveBeenCalled()
+  })
+  it('follows the native bounded snapshot and stream without reading full business transcripts', async () => {
+    const { service, owner, chat, database, sessionController } = setup()
+    const {run}=database.createRun({ownerId:owner.ownerId,chatId:chat.id,sessionId:chat.sessionId,query:'live',selection:{}})
+    database.bindRunMessage(chat.sessionId,run.id,1,'message-1')
+    const disposed=vi.fn(), allEvents=vi.spyOn(database,'allEvents')
+    sessionController.follow=vi.fn(async function* (request,signal) {
+      expect(request).toEqual({address:{kind:'session',sessionId:chat.sessionId},maxMessages:500,
+        turnWindow:{minMessages:50,minTurns:2},assistantStream:true})
+      expect(signal).toBeInstanceOf(AbortSignal)
+      try {
+        yield {type:'snapshot',header:{cwd:'/private/host'},projections:{private:'settings'},cursor:90,hasMore:true,
+          records:[{type:'event',event:{seq:90,type:'assistant/message',data:{turn:1}}}],
+          assistantStream:{revision:2,activeAttempt:{attemptId:'active',turn:1,step:2,startedAfterSeq:90,nextIndex:0,stream:[]}}}
+        yield {type:'assistant-stream',frame:{type:'chunk',revision:3}}
+      } finally { disposed() }
+    })
+    const source=service.followHistory(owner,chat.id,new AbortController().signal)
+    const snapshot=(await source.next()).value
+    expect(snapshot).toMatchObject({event:'workbench_history',session_id:chat.sessionId,
+      bindings:[{turn:1,run_id:run.id}],runs:[{id:run.id,events:[]}],value:{type:'snapshot',cursor:90,hasMore:true}})
+    expect(snapshot.value).not.toHaveProperty('header')
+    expect(snapshot.value).not.toHaveProperty('projections')
+    expect((await source.next()).value.value).toEqual({type:'assistant-stream',frame:{type:'chunk',revision:3}})
+    await source.return()
+    expect(disposed).toHaveBeenCalledOnce()
+    expect(allEvents).not.toHaveBeenCalled()
+    await expect(service.followHistory({...owner,ownerId:'foreign'},chat.id,new AbortController().signal).next()).rejects.toMatchObject({status:404})
+    expect(sessionController.follow).toHaveBeenCalledOnce()
+  })
+  it('retains plugin result labels when the native call is outside the loaded history window without replaying tool state', async () => {
+    const {service,owner,chat,database,sessionController}=setup()
+    const {run}=database.createRun({ownerId:owner.ownerId,chatId:chat.id,sessionId:chat.sessionId,query:'search',selection:{},
+      mcpTools:[{runtime_name:'mcp__search',server_id:'legal',provider_name:'法律资料',tool_name:'检索资料'}]})
+    database.bindRunMessage(chat.sessionId,run.id,1,'m')
+    database.startToolCall(owner.ownerId,run.id,'split-call','mcp__search')
+    const records=[{type:'event',event:{seq:40,type:'tool/result',data:{turn:1,message:{source:{callId:'split-call'},content:[{type:'tool-result',content:[{type:'text',text:'检索结果'}]}]}}}}]
+    sessionController.page=vi.fn(async()=>({records,hasMore:true}))
+    sessionController.follow=vi.fn(async function*(){yield {type:'snapshot',cursor:50,records,hasMore:true,assistantStream:{revision:0}}})
+    const finish=vi.spyOn(database,'finishToolCall'),append=vi.spyOn(database,'appendEvent'),all=vi.spyOn(database,'allEvents')
+    const page=await service.historyPage(owner,chat.id,{sessionId:chat.sessionId,throughSeq:50,beforeSeq:45},new AbortController().signal)
+    expect(page.runs[0].events[0].data).toMatchObject({tool_name:'mcp__search',provider_name:'法律资料',display_name:'检索资料',output:'检索结果'})
+    const source=service.followHistory(owner,chat.id,new AbortController().signal)
+    expect((await source.next()).value.display.events[0].event.data).toMatchObject({provider_name:'法律资料',display_name:'检索资料'})
+    await source.return()
+    expect(finish).not.toHaveBeenCalled();expect(append).not.toHaveBeenCalled();expect(all).not.toHaveBeenCalled()
+    expect(()=>database.toolCallName('foreign',run.id,'split-call')).toThrow('任务不存在')
+  })
+  it('authorizes history before reading native sessions and rejects old workspace cursors', async () => {
+    const { service, owner, chat, sessionController } = setup()
+    const dispose = vi.fn()
+    service.sessionQuery = { observeSession: vi.fn(async () => ({ events: [{ seq: 9 }], [Symbol.dispose]: dispose })) }
+    sessionController.page = vi.fn(async () => ({ records: [], hasMore: false }))
+    const signal = new AbortController().signal
+    await expect(service.historyPage({ ...owner, ownerId: 'another-owner' }, chat.id, undefined, signal)).rejects.toThrow('会话不存在')
+    expect(service.sessionQuery.observeSession).not.toHaveBeenCalled()
+    await expect(service.historyPage(owner, chat.id, { sessionId: 'previous-directory-session', throughSeq: 9, beforeSeq: 5 }, signal)).rejects.toThrow('游标无效')
+    expect(sessionController.page).not.toHaveBeenCalled()
+    expect(await service.historyPage(owner, chat.id, undefined, signal)).toMatchObject({ records: [], cursor: null, runs: [] })
+    expect(sessionController.page.mock.calls[0][0].address.sessionId).toBe(chat.sessionId)
+    expect(dispose).toHaveBeenCalledOnce()
+  })
+  it('projects native plan-review intent separately from ordinary questions', () => {
+    const { service, database, owner, chat } = setup()
+    vi.spyOn(database, 'activeRun').mockReturnValue({ id: 'waiting', status: 'waiting_input' })
+    const input = vi.spyOn(database, 'getPendingInput').mockReturnValue({ status: 'pending', payload: { questions: [{ intent: { kind: 'plan-review' } }] } })
+    expect(service.chatSummary(owner, chat)).toMatchObject({ needs_input: true, pending_interaction: 'plan-review', has_error: false })
+    input.mockReturnValue({ status: 'pending', payload: { questions: [{ question: '请选择材料' }] } })
+    expect(service.chatSummary(owner, chat).pending_interaction).toBe('question')
+  })
+  it('lists native file references before conversation references and passes the same cancellation signal', async () => {
+    const { service, owner, chat, agent } = setup()
+    const signal = new AbortController().signal
+    service.fileReferences = { list: vi.fn(async () => [{ path: '证据 原件.pdf', kind: 'file' }, { path: '材料', kind: 'directory' }]) }
+    service.sessionReferences = { remoteExportCandidates: vi.fn(async () => [{ sessionId: chat.sessionId, label: '当前对话', mention: 'native' }]) }
+    const candidates = await service.referenceCandidates(owner, chat.id, '证据', signal)
+    expect(candidates.map(item => item.group ?? 'sessions')).toEqual(['files', 'files', 'sessions'])
+    expect(candidates[0]).toMatchObject({ path: '证据 原件.pdf', kind: 'file' })
+    expect(service.fileReferences.list).toHaveBeenCalledWith(agent, '证据', signal)
+    expect(service.sessionReferences.remoteExportCandidates).toHaveBeenCalledWith(agent, '证据', signal)
+  })
+  it('uses native reference candidates and keeps only owner conversations without host paths', async () => {
+    const { service, owner, chat, database, agent } = setup()
+    const source = database.createChat({ ownerId: owner.ownerId, sessionId: 'source', selection: {} })
+    service.sessionReferences = { remoteExportCandidates: vi.fn(async () => [
+      { sessionId: 'source', label: '案件', mention: '@[案件](dsh-session:InNvdXJjZSI)', cwd: '/workspace/private' },
+      { sessionId: 'foreign', label: 'other', mention: 'foreign' },
+    ]) }
+    expect(await service.referenceCandidates(owner, chat.id, '案件')).toEqual([
+      { sessionId: 'source', chatId: source.id, label: '案件', mention: '@[案件](dsh-session:InNvdXJjZSI)' },
+    ])
+    expect(service.sessionReferences.remoteExportCandidates).toHaveBeenCalledWith(agent, '案件', expect.any(AbortSignal))
+    await expect(service.referenceCandidates({ ownerId: 'other' }, chat.id)).rejects.toMatchObject({ status: 404 })
+  })
+  it('creates a native workspace session and persists its directory without deleting workspace files', async () => {
+    const { service, owner, database, sessionController, fileManager } = setup()
+    service.workspaces = { requireWorkspace: vi.fn(async () => ({ workspaceId: 'ws-cases', path: 'cases' })) }
+    const chat = await service.createChat(owner, '/workspace', {}, 'ws-cases')
+    expect(service.workspaces.requireWorkspace).toHaveBeenCalledWith(owner, 'ws-cases', true)
+    expect(sessionController.create).toHaveBeenCalledWith({ workspaceId: 'ws-cases' })
+    expect(database.getChat(owner.ownerId, chat.id).directory).toBe('conversations/cases')
+    expect(service.chatDirectory(chat.id, chat.directory)).toBe('/workspace/conversations/cases')
+    expect(fileManager.operate).not.toHaveBeenCalled()
+    await service.deleteChat(owner, chat.id)
+    expect(database.getChat(owner.ownerId, chat.id)).toBeUndefined()
+    expect(fileManager.operate).not.toHaveBeenCalled()
+  })
+  it('rejects unavailable or invalid workspace selection before session creation', async () => {
+    const { service, owner, sessionController, fileManager } = setup()
+    await expect(service.createChat(owner, '/workspace', {}, 'missing')).rejects.toMatchObject({ status: 503 })
+    service.workspaces = { requireWorkspace: vi.fn(async () => { throw Object.assign(new Error('missing'), { status: 404 }) }) }
+    await expect(service.createChat(owner, '/workspace', {}, 'missing')).rejects.toMatchObject({ status: 404 })
+    expect(sessionController.create).not.toHaveBeenCalled()
+    expect(fileManager.operate).not.toHaveBeenCalled()
+  })
+  it('sends resume from the backend and persists the hidden continuation marker', async () => {
+    const { database, owner, chat, service, sessionController } = setup()
+    const first = await service.submitRun(owner, chat.id, { query: 'task', request_key: 'task' })
+    database.transitionRun(owner.ownerId, first.id, 'cancelled')
+    const resumed = await service.submitRun(owner, chat.id, { query: '', silent_resume: true, continue_run_id: first.id, request_key: 'resume' })
+    expect(resumed).toMatchObject({ query: 'resume', parent_run_id: first.id, is_continuation: true })
+    expect(sessionController.prompt.mock.calls.at(-1)[0].content).toContainEqual({ type: 'text', text: 'resume' })
+    expect(service.getChat(owner, chat.id).runs.at(-1).is_continuation).toBe(true)
+  })
+
   it('only stops the owning Goal between native rounds', async () => {
     const test = setup()
     const { database, owner, chat, service, sessionController, agent } = test
@@ -64,6 +247,7 @@ describe('followup and control service', () => {
     activateNative(test, goalRun.id)
     agent.status = 'idle'
     agent.session.snapshotEvents = () => [{ type: 'turn/start', data: { turn: 1 } }, { type: 'turn/end', data: { turn: 1 } }]
+    agent.ctx.sessionProjections.stateOf = () => ({ openTurnStartSeq: null, lastTurn: 1 })
     service.goals = { get: () => ({ id: 'goal', revision: 1, phase: 'active', activation: 'armed' }), pause: vi.fn() }
     const { run: stale } = database.createRun({ ownerId: owner.ownerId, chatId: chat.id, sessionId: chat.sessionId, query: 'stale', selection: {} })
     await expect(service.stopRun(owner, stale.id)).rejects.toMatchObject({ status: 409, code: 'STALE_RUN' })
@@ -122,7 +306,8 @@ describe('followup and control service', () => {
     activateNative(test, active.id)
     expect(sessionController.prompt).not.toHaveBeenCalled()
     expect(await service.steer(owner, next.id, active.id)).toMatchObject({ status: 'steered', steer_target_run_id: active.id })
-    expect(agent.steer).toHaveBeenCalledWith(expect.objectContaining({ source: { kind: 'user', rpcId: next.id } }))
+    expect(sessionController.prompt).toHaveBeenCalledWith({ sessionId: chat.sessionId, requestId: next.id, content: [{ type: 'text', text: 'supplement' }], mode: 'steer' })
+    expect(agent.steer).not.toHaveBeenCalled()
   })
 
   it('queues normal messages in order and steers only on an explicit request', async () => {
@@ -140,12 +325,12 @@ describe('followup and control service', () => {
     activateNative(test, active.id, [{ id: 'message-first', content: [{ type: 'text', text: 'first' }], source: { kind: 'user', rpcId: first.id } }])
     const direct = await service.steer(owner, first.id, active.id)
     expect(direct).toMatchObject({ status: 'steered', steer_target_run_id: active.id })
-    expect(agent.inbox.remove).toHaveBeenCalledWith('message-first')
+    expect(sessionController.updateQueue).toHaveBeenCalledWith({ sessionId: chat.sessionId, itemId: 'message-first', action: { kind: 'steer' } })
     expect(database.getRun(owner.ownerId, second.id).parentRunId).toBe(active.id)
     expect(service.getChat(owner, chat.id).runs.find((run) => run.id === active.id).steering_messages).toMatchObject([{ id: first.id, query: 'first' }])
     expect(service.followups(owner, chat.id, [first.id]).runs.find((run) => run.id === first.id).steer_target_run_id).toBe(active.id)
     await expect(service.steer(owner, first.id, active.id)).resolves.toMatchObject({ status: 'steered', steer_target_run_id: active.id })
-    expect(agent.steer).toHaveBeenCalledTimes(1)
+    expect(sessionController.updateQueue).toHaveBeenCalledTimes(1)
   })
 
   it('accepts further queued messages and repairs the chain after deletion', async () => {
@@ -277,6 +462,21 @@ describe('followup and control service', () => {
       mcp: [{ id: 'server', status: 'ready' }],
       global: { skills: [{ id: 'global', scope: 'global', readonly: true }] },
     })
+  })
+
+  it('surfaces existing global skill conflicts and prevents enabling the personal collision', async () => {
+    const { service, fileManager, skills } = setup()
+    skills.list.mockResolvedValue([{ name: 'demo', description: 'Global', provider: 'gxzs-filesystem' }])
+    fileManager.personalResources.mockResolvedValue({ skills: [{ id: 'demo', enabled: true,
+      content: '---\nname: demo\ndescription: Personal\n---\nBody' }] })
+    fileManager.personalMcp.mockResolvedValue({ mcp: [] })
+    const resources = await service.resources()
+    expect(resources.skills[0].error).toContain('与全局技能冲突')
+    expect(resources.warnings).toContain(resources.skills[0].error)
+    expect(resources.global.skills[0].name).toBe('demo')
+    fileManager.personalResources.mockClear()
+    await expect(service.mutateResource({ operation: 'skill_toggle', name: 'demo', enabled: true })).rejects.toMatchObject({ status: 409 })
+    expect(fileManager.personalResources).not.toHaveBeenCalled()
   })
 
   it('forwards validated resource mutations to fixed manager actions', async () => {
@@ -581,7 +781,7 @@ describe('followup and control service', () => {
     const content = sessionController.prompt.mock.calls[0][0].content
     expect(content[0].text).toContain('/workspace/case/notes.txt')
     expect(content[1]).toMatchObject({ type: 'image', mediaType: 'image/png', name: 'evidence.png' })
-    expect(service.getChat(owner, chat.id).title).toBe('分析附件')
+    expect(service.getChat(owner, chat.id).title).toBe('新会话')
   })
 
   it.each(['1.png', 'notes.txt'])('uses the full workspace path for a textless %s first message', async (name) => {
@@ -590,20 +790,20 @@ describe('followup and control service', () => {
     fileManager.operate.mockResolvedValue({ name, version: 'v1', data: bytes.toString('base64') })
     const run = await service.submitRun(owner, chat.id, { query: '', files: [{ path: `conversations/${chat.id}/${name}`, version: 'v1' }] })
     const title = `/workspace/conversations/${chat.id}/${name}`
-    expect(service.getChat(owner, chat.id).title).toBe(title)
+    expect(service.getChat(owner, chat.id).title).toBe('新会话')
     expect(sessionController.prompt.mock.calls[0][0].content[0]).toEqual(name.endsWith('.png') ? expect.objectContaining({ type: 'image', name }) : { type: 'text', text: title })
-    expect(database.allEvents(owner.ownerId, run.id)).toContainEqual(expect.objectContaining({ event: 'workbench_chat_title', title }))
+    expect(database.allEvents(owner.ownerId, run.id)).not.toContainEqual(expect.objectContaining({ event: 'workbench_chat_title' }))
     await service.submitRun(owner, chat.id, { query: '后续消息' })
-    expect(service.getChat(owner, chat.id).title).toBe(title)
+    expect(service.getChat(owner, chat.id).title).toBe('新会话')
   })
 
-  it('uses the first human text verbatim and preserves explicit names', async () => {
+  it('leaves automatic naming to DSH when admitting human messages', async () => {
     const { owner, chat, service, sessionController } = setup()
     await service.submitRun(owner, chat.id, { query: '检索资料，核对结论' })
-    expect(service.getChat(owner, chat.id).title).toBe('检索资料，核对结论')
+    expect(service.getChat(owner, chat.id).title).toBe('新会话')
     expect(sessionController.rename).not.toHaveBeenCalled()
     await service.submitRun(owner, chat.id, { query: '再检查一下' })
-    expect(service.getChat(owner, chat.id).title).toBe('检索资料，核对结论')
+    expect(service.getChat(owner, chat.id).title).toBe('新会话')
   })
 
   it('rejects changed attachments before creating or prompting a run', async () => {
@@ -652,7 +852,7 @@ describe('followup and control service', () => {
     expect(sessionController.updateQueue).not.toHaveBeenCalled()
   })
 
-  it('steers a queued message through the synchronous native inbox facade', async () => {
+  it('steers a queued message through the native queue controller', async () => {
     const test = setup()
     const { database, owner, chat, service, agent } = test
     const { run: active } = database.createRun({ ownerId: owner.ownerId, chatId: chat.id, sessionId: chat.sessionId, query: 'active', selection: {} })
@@ -661,7 +861,8 @@ describe('followup and control service', () => {
     database.bindRunMessage(chat.sessionId, queued.id, 2, 'message-2')
     activateNative(test, active.id, [{ id: 'message-2', source: { kind: 'user', rpcId: queued.id }, content: [{ type: 'text', text: 'queued' }] }])
     const result = await service.steer(owner, queued.id, active.id)
-    expect(agent.inbox.remove).toHaveBeenCalledWith('message-2')
+    expect(test.sessionController.updateQueue).toHaveBeenCalledWith({ sessionId: chat.sessionId, itemId: 'message-2', action: { kind: 'steer' } })
+    expect(agent.inbox.remove).not.toHaveBeenCalled()
     expect(result.status).toBe('steered')
   })
 
@@ -682,6 +883,51 @@ describe('followup and control service', () => {
     expect(sessionController.cancel).toHaveBeenCalledWith({ sessionId: chat.sessionId })
   })
 
+  it.each(['/plan off', '/plan  off', '/goal', '/goal pause', '/goal resume', '/goal clear', '/goal edit', '/goal PAUSE'])('rejects sandbox attachments on %s before changing native state', async command => {
+    const { owner, chat, service, commands, fileManager, database } = setup()
+    await expect(service.issueCommand(owner, chat.id, { command, request_key: 'control-file',
+      files: [{ path: 'evidence.txt', version: 'v1' }] })).rejects.toMatchObject({ status: 400 })
+    expect(commands.execute).not.toHaveBeenCalled()
+    expect(fileManager.operate).not.toHaveBeenCalled()
+    expect(database.listRuns(owner.ownerId, chat.id)).toHaveLength(0)
+  })
+
+  it.each(['pause after reviewing evidence', 'clear the evidence backlog'])('associates the native objective "%s" with an admitted run', async objective => {
+    const { owner, chat, service, commands, database } = setup()
+    const result = await service.issueCommand(owner, chat.id, { command: `/goal ${objective}`, request_key: 'objective-prefix' })
+    expect(result.run.query).toBe(objective)
+    expect(database.goalRun(chat.sessionId).id).toBe(result.run.id)
+    expect(commands.execute.mock.calls[0][1]).toBe(`/goal ${objective}`)
+  })
+
+  it.each(['pause', 'PAUSE', 'clear', 'CLEAR', 'edit', 'EDIT', 'EDIT revised objective'])('does not create a new run for native goal control %s', async control => {
+    const { owner, chat, service, database } = setup()
+    await service.issueCommand(owner, chat.id, { command: `/goal ${control}`, request_key: 'goal-control' })
+    expect(database.listRuns(owner.ownerId, chat.id)).toHaveLength(0)
+  })
+
+  it.each(['resume', 'RESUME'])('preserves the goal resource snapshot with native %s', async control => {
+    const { owner, chat, service, database, commands, agent } = setup()
+    const selection = { command: 'goal', resource_context: 'Use the selected evidence skill and sandbox file.',
+      resource_mentions: { skills: ['evidence'], tools: [] }, mentioned_resources: [{ kind: 'skills', name: '旧展示名' }] }
+    const attachments = [{ name: 'evidence.txt', path: 'evidence.txt', version: 'v1' }]
+    const mcpTools = [{ name: 'lookup', inputSchema: { type: 'object' } }]
+    const previous = database.createRun({ ownerId: owner.ownerId, chatId: chat.id, sessionId: chat.sessionId,
+      query: 'Review evidence', selection, attachments, mcpTools }).run
+    database.transitionRun(owner.ownerId, previous.id, 'completed')
+    database.setGoalRun(chat.sessionId, previous.id)
+    service.goals = { get: () => ({ id: 'goal', revision: 2, phase: 'active', objective: previous.query }) }
+    const freeze = vi.spyOn(service, 'freezeMcpTools')
+    const result = await service.issueCommand(owner, chat.id, { command: `/goal ${control}`, request_key: 'resume-command' })
+    const resumed = database.getRun(owner.ownerId, result.run.id)
+    expect(resumed.id).not.toBe(previous.id)
+    expect(resumed.selection).toEqual(previous.selection)
+    expect(resumed.attachments).toEqual(attachments)
+    expect(resumed.mcpTools).toEqual(mcpTools)
+    expect(freeze).not.toHaveBeenCalled()
+    expect(commands.execute).toHaveBeenCalledWith(agent, `/goal ${control}`, [], expect.any(AbortSignal))
+  })
+
   it('resumes a cold DSH session before executing a control command', async () => {
     const { owner, chat, service, sessionController, agents, commands, agent } = setup()
     agents.get.mockReturnValueOnce(undefined).mockReturnValue(agent)
@@ -697,6 +943,39 @@ describe('followup and control service', () => {
     await expect(service.issueCommand(owner, chat.id, {
       command: '/plan 调查证据', expected_revision: 0, request_key: 'plan-objective',
     })).resolves.toMatchObject({ state: { plan: { active: false, pending: false } } })
+  })
+
+  it('admits a plan task once and persists its mode, title and resource labels', async () => {
+    const { owner, chat, service, database, commands, sessionController, skills } = setup()
+    skills.list.mockResolvedValue([{ name: 'evidence', displayName: '证据整理', description: '整理材料' }])
+    const body = { command: '/plan 调查证据', request_key: 'one-plan', resource_mentions: { skills: ['evidence'] } }
+    const first = await service.issueCommand(owner, chat.id, body)
+    const replay = await service.issueCommand(owner, chat.id, body)
+    expect(replay.run.id).toBe(first.run.id)
+    expect(commands.execute).toHaveBeenCalledOnce()
+    expect(commands.execute.mock.calls[0][1]).toBe('/plan 调查证据')
+    expect(sessionController.prompt).not.toHaveBeenCalled()
+    expect(database.listRuns(owner.ownerId, chat.id)).toHaveLength(1)
+    expect(database.getChat(owner.ownerId, chat.id).title).toBe('新会话')
+    expect(first.run).toMatchObject({ command: 'plan', query: '调查证据', mentioned_resources: [{ name: '证据整理', kind: 'skills' }] })
+    skills.list.mockResolvedValue([{ name: 'evidence', displayName: '新名字' }])
+    expect(service.getRun(owner, first.run.id).mentioned_resources[0].name).toBe('证据整理')
+  })
+
+  it.each(['image.png', 'evidence.txt'])('submits an attachment-only native plan once for %s', async (name) => {
+    const { owner, chat, service, database, commands, fileManager, sessionController } = setup()
+    const data = name.endsWith('.png') ? Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]) : Buffer.from('evidence')
+    fileManager.operate.mockResolvedValue({ kind: 'file', version: 'v1', data: data.toString('base64') })
+    const body = { command: '/plan', request_key: 'attachment-plan', files: [{ path: name, version: 'v1' }] }
+    const result = await service.issueCommand(owner, chat.id, body)
+    await service.issueCommand(owner, chat.id, body)
+    expect(commands.execute).toHaveBeenCalledOnce()
+    expect(commands.execute.mock.calls[0][1]).toBe(name.endsWith('.png') ? '/plan' : '/plan /workspace/evidence.txt')
+    expect(commands.execute.mock.calls[0][2]).toEqual(name.endsWith('.png')
+      ? [expect.objectContaining({ type: 'image', name })] : [])
+    expect(result.run.attachments).toEqual([{ name, path: name, version: 'v1' }])
+    expect(database.listRuns(owner.ownerId, chat.id)).toHaveLength(1)
+    expect(sessionController.prompt).not.toHaveBeenCalled()
   })
 
   it('waits for native plan events after command admission', async () => {
@@ -774,7 +1053,7 @@ describe('explicit resource mentions', () => {
     const run = await service.submitRun(owner, chat.id, { query: '融资租赁', resource_mentions: mentions })
     expect(run.query).toBe('融资租赁')
     expect(run.resource_mentions).toEqual(mentions)
-    expect(database.getChat(owner.ownerId, chat.id).title).toBe('融资租赁')
+    expect(database.getChat(owner.ownerId, chat.id).title).toBe('新会话')
     const content = sessionController.prompt.mock.calls[0][0].content
     expect(content[0].text).toBe('融资租赁')
     expect(content[1].text).toContain('法律检索')
@@ -1080,3 +1359,32 @@ describe('native queue edit', () => {
     await expect(service.editQueued({ ownerId: 'foreign' }, run.id, { content: [] })).rejects.toMatchObject({ status: 404 })
   })
 })
+
+it('serves only the owning session native summary and strips host metadata',async()=>{
+  const {service,owner,chat}=setup()
+  const summary={turn:1,files:[],total:0,added:0,deleted:0,cwd:'/private',snapshot:{before:'a',after:'b'}}
+  service.workspaceChanges={summary:vi.fn(()=>summary),diff:vi.fn(async()=>({kind:'text',hunks:[]}))}
+  expect(await service.changes(owner,chat.id,'10',null)).toEqual({turn:1,files:[],total:0,added:0,deleted:0})
+  expect(service.workspaceChanges.summary).toHaveBeenCalledWith(chat.sessionId,10)
+  const signal=new AbortController().signal
+  await service.changes(owner,chat.id,'10','0',signal)
+  expect(service.workspaceChanges.diff).toHaveBeenCalledWith(chat.sessionId,10,0,signal)
+  await expect(service.changes({...owner,ownerId:'other'},chat.id,'10',null)).rejects.toMatchObject({status:404})
+  await expect(service.changes(owner,chat.id,'1e2',null)).rejects.toMatchObject({status:400})
+  service.workspaceChanges.summary.mockReturnValue(undefined)
+  await expect(service.changes(owner,chat.id,'10',null)).rejects.toMatchObject({status:404})
+})
+
+it('resolves review file open paths against the recorded cwd inside the owner workspace',async()=>{
+  const {service,owner,chat}=setup();
+  service.workspaceChanges={summary:()=>({turn:1,cwd:'/workspace/conversations/original',total:4,added:1,deleted:0,files:[
+    {path:'a.ts',display:'a.ts',added:1,deleted:0},
+    {path:'../shared.txt',display:'../shared.txt',added:0,deleted:0},
+    {path:'/workspace/cloud/file.pdf',display:'/workspace/cloud/file.pdf',added:0,deleted:0},
+    {path:'/outside/private.txt',display:'/outside/private.txt',added:0,deleted:0},
+  ]})};
+  const result=await service.changes(owner,chat.id,'10',null);
+  expect(result.files.map(file=>file.workspacePath)).toEqual(['conversations/original/a.ts','conversations/shared.txt','cloud/file.pdf',undefined]);
+  expect(result).not.toHaveProperty('cwd');
+  await expect(service.changes({...owner,ownerId:'foreign'},chat.id,'10',null)).rejects.toMatchObject({status:404});
+});

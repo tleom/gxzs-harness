@@ -1,6 +1,7 @@
 import { requireDatabaseModel } from './database-models.js'
 import { setTimeout as delay } from 'node:timers/promises'
 import { createHash } from 'node:crypto'
+import { nativeTurn } from './native-turn.js'
 
 const TERMINAL = new Set(['completed', 'cancelled', 'failed', 'interrupted', 'discarded', 'steered'])
 const DIAGNOSTIC_CODES = new Set(['ADMISSION_TICKET_FENCED', 'DEADLINE_EXCEEDED', 'UPSTREAM_RESPONSE_TOO_LARGE',
@@ -35,12 +36,10 @@ export async function fenceMcpExecutions(platformClient, owner, runIds, signal) 
 
 export function currentExecutionRun(database, agents, sessionId) {
   const agent = agents?.get(sessionId)
-  const events = agent?.session?.snapshotEvents?.()
-  if (events) {
-    const start = events.findLast(event => event.type === 'turn/start')
-    const end = events.findLast(event => event.type === 'turn/end')
-    if (!start || end?.data.turn === start.data.turn) return undefined
-    return database.runForTurn(sessionId, start.data.turn)
+  const boundary = nativeTurn(agent)
+  if (boundary) {
+    if (boundary.openTurnStartSeq === null) return undefined
+    return database.runForTurn(sessionId, boundary.lastTurn)
   }
   const active = database.activeRunBySession(sessionId)
   return ['running', 'waiting_input', 'stopping'].includes(active?.status) ? active : undefined
@@ -48,8 +47,9 @@ export function currentExecutionRun(database, agents, sessionId) {
 
 /** Durable admission tickets. After dispatch DSH owns the Session inbox and turns. */
 export class TaskScheduler {
-  constructor({ database, sessions, platformClient, ownerId, agents, modelSettings, goals, generation = process.env.GXZS_HOST_GENERATION ?? 'local' }) {
+  constructor({ database, sessions, platformClient, ownerId, agents, modelSettings, goals, prepareContent, generation = process.env.GXZS_HOST_GENERATION ?? 'local' }) {
     Object.assign(this, { database, sessions, platformClient, ownerId, agents, modelSettings, goals, generation })
+    this.prepareContent = prepareContent ?? (async (_sessionId, content) => content)
     this.pendingTick = null
     this.closed = false
     this.retrying = new Set()
@@ -87,6 +87,14 @@ export class TaskScheduler {
     // Return acceptance immediately. File/model/network startup belongs to the
     // dispatcher, not the browser request (which may be disconnected).
     void this.tick()
+  }
+
+  async prompt(run, content, markDispatched = false) {
+    const prepared = await this.prepareContent(run.sessionId, content)
+    if (this.closed || this.database.getRun(this.ownerId, run.id)?.status !== 'queued') return false
+    if (markDispatched) this.database.dispatchSubmission(this.ownerId, run.id)
+    await this.sessions.prompt({ requestId: run.id, sessionId: run.sessionId, mode: 'queue', content: prepared }, new AbortController().signal)
+    return true
   }
 
   async request(run, action, retry = false, signal, rotated = false) {
@@ -308,7 +316,7 @@ export class TaskScheduler {
           }
           if (lease.state !== 'running') { await cancel(holder, 'renew_state', { action: 'renew', state: lease.state, code: lease.code }); continue }
           if (this.closed || this.database.getRun(this.ownerId, run.id)?.status !== 'queued') continue
-          await this.sessions.prompt({ requestId: run.id, sessionId: run.sessionId, mode: 'queue', content: item.content }, new AbortController().signal)
+          if (!await this.prompt(run, item.content)) continue
           // Admission ended at the native prompt receipt. Session persistence now
           // owns this message; the original lease remains until its inbox drains.
           this.database.finishSubmission(this.ownerId, run.id)
@@ -334,8 +342,7 @@ export class TaskScheduler {
         if (this.database.getRun(this.ownerId, run.id).status !== 'queued') continue
         // Persist the delivery boundary before calling DSH. A crash is marked
         // interrupted on restart, never blindly replayed as a second task.
-        this.database.dispatchSubmission(this.ownerId, run.id)
-        await this.sessions.prompt({ requestId: run.id, sessionId: run.sessionId, mode: 'queue', content: item.content }, new AbortController().signal)
+        await this.prompt(run, item.content, true)
       } catch (error) {
         if (this.closed) return
         this.diagnostic(run, 'dispatch_failed', 'dispatch_error', { action: 'dispatch', error })

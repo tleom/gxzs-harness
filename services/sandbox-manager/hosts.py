@@ -133,7 +133,12 @@ class Hosts:
                     'GXZS_SANDBOX_MANAGER_TOKEN': owner_token(os.environ['WORKBENCH_SANDBOX_MANAGER_TOKEN'], owner, workspace, generation, instance),
                     'GXZS_SANDBOX_WORKSPACE_ID': workspace, 'GXZS_SANDBOX_WORKSPACE': '/workspace',
                     'GXZS_SANDBOX_SSH_HOST': sandbox, 'GXZS_SANDBOX_HELPER_HASH': os.environ['GXZS_SANDBOX_HELPER_HASH'],
+                    'GXZS_NATIVE_FILE_ATTACHMENTS': '1',
                 }
+                # Published roots are deployment-owned paths inside the Host.
+                # DSH handles discovery/watch; never infer them from a user's home.
+                if os.environ.get('GXZS_GLOBAL_SKILL_DIR'):
+                    env['GXZS_GLOBAL_SKILL_DIR'] = os.environ['GXZS_GLOBAL_SKILL_DIR']
                 if any('\n' in str(value) or '\r' in str(value) for value in env.values()):
                     raise ValueError('Invalid runtime configuration')
                 env_file = folder / 'host.env'
@@ -179,6 +184,13 @@ class Hosts:
         if not env_file.exists():
             raise ValueError('Host runtime configuration is missing; replacement is required')
         memory = os.environ.get('GXZS_HOST_MEMORY', '1g')
+        font_root = os.environ.get('GXZS_HOST_FONTS_DIR', '')
+        font_mount = []
+        if font_root:
+            if not PurePosixPath(font_root).is_absolute() or any(char in font_root for char in ':\r\n\0'):
+                raise ValueError('Host font directory must be an absolute Docker-host path')
+            font_mount = ['-v', font_root + ':/usr/local/share/fonts/workbench:ro']
+        sandbox, _ = self.identity(item['workspace_id'])
         self.docker('create', '--name', item['instance_id'], '--label', 'gxzs.owner=' + item['owner_id'],
                     '--label', 'gxzs.workspace=' + item['workspace_id'],
                     '--label', 'gxzs.generation=' + str(item['generation']), '--label', 'gxzs.credentials=owner-v1',
@@ -187,7 +199,8 @@ class Hosts:
                     '--cpus', os.environ.get('GXZS_HOST_CPUS', '0.5'),
                     '--memory', memory, '--memory-swap', memory, '--pids-limit', '256', *publish,
                     '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges:true', '--env-file', str(env_file),
-                    '-v', item['home_volume'] + ':/srv/dsh',
+                    *font_mount, '-v', item['home_volume'] + ':/srv/dsh',
+                    '-v', sandbox + '-workspace:/workspace:ro',
                     '-v', str(host_state / 'hosts' / item['workspace_id']) + ':/run/gxzs:ro',
                     '-v', str(host_state / 'hosts' / item['workspace_id'] / 'ssh') + ':/home/node/.ssh:ro', image)
 
@@ -367,14 +380,17 @@ class Hosts:
                 item = dict(owner_id=payload['owner_id'], generation=int(payload['generation']), instance_id=instance)
             if (item['owner_id'], item['generation'], item['instance_id']) != (payload['owner_id'], int(payload['generation']), payload['instance_id']):
                 raise ValueError('Scheduling host identity mismatch')
-            if item.get('state') in {'draining', 'fencing', 'stopped'} and payload['action'] == 'acquire':
+            draining_ticket = item.get('state') == 'draining' and self.admission.pending(
+                payload['owner_id'], int(payload['generation']), payload['instance_id'],
+                payload.get('ticket_id') or payload['run_id'], payload['chat_id']) is True
+            if item.get('state') in {'draining', 'fencing', 'stopped'} and payload['action'] == 'acquire' and not draining_ticket:
                 raise ValueError('Host is draining; new task admission is paused')
             if payload['action'] != 'release':
                 if info is None:
                     info = json.loads(self.docker('inspect', item['instance_id']).stdout)[0]
                 if not info['State']['Running']:
                     raise ValueError('Scheduling host is stopped')
-            if managed and payload['action'] == 'acquire' and item.get('ready') is not True:
+            if managed and payload['action'] == 'acquire' and item.get('ready') is not True and not draining_ticket:
                 raise ValueError('Host is not ready; new task admission is paused')
             (self.root.parent / workspace).touch()
             return self.admission.request(payload['owner_id'], int(payload['generation']), payload['instance_id'],

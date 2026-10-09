@@ -4,6 +4,7 @@ import { RunEventBus } from './events.js'
 import { HumanInputBridge } from './human-input.js'
 import { httpError, parseJson, readBody, sendError, sendJson } from './http.js'
 import { streamRunEvents } from './sse.js'
+import { streamHistoryEvents } from './history-events.js'
 import { WorkbenchDatabase } from './persistence.js'
 import { resolveWorkspacePath } from './paths.js'
 import { createAssistantStreamProjector, projectInboxClaim, projectSessionEvent, reconcileNativeSessions, settleNativeIdle } from './projection.js'
@@ -12,9 +13,14 @@ import { WorkbenchService } from './service.js'
 import { TaskScheduler } from './scheduler.js'
 import { registerDatabasePrompt } from './database-prompt.js'
 import { databaseModelCatalog } from './database-models.js'
+import { registerRunResourceContext } from './resource-mentions.js'
+import { prepareNativeFiles } from './attachments.js'
+import { WorkbenchWorkspaces } from './workspaces.js'
+import { streamWorkspaceEvents } from './workspace-events.js'
+import { nativeOfficePreview } from './office-preview.js'
 
 export const name = 'workbench-adapter'
-export const inject = ['webServer', 'sessionController', 'agents', 'commands', 'skills', 'systemPrompt', 'tokenMeter', 'workbenchFileManager', 'workbenchPlatformClient', 'sessionQuery', 'sessionProjections', 'agentPresets', 'agentDefaultModel', 'settings', 'attachments', 'goals']
+export const inject = ['webServer', 'sessionController', 'workspaceController', 'sessionReferenceResolver', 'fileReferences', 'officeToPdf', 'workspaceChanges', 'agents', 'commands', 'skills', 'systemPrompt', 'tokenMeter', 'workbenchFileManager', 'workbenchPlatformClient', 'sessionQuery', 'sessionProjections', 'agentPresets', 'agentDefaultModel', 'settings', 'attachments', 'fileUploads', 'goals']
 
 export const Config = z.object({
   basePath: z.string().default('/ai/workbench'),
@@ -34,10 +40,16 @@ export function apply(ctx, config) {
   const eventBus = new RunEventBus()
   const database = new WorkbenchDatabase(config.databasePath, { onEvent: (runId, event) => eventBus.publish(runId, event) })
   const runtime = new WorkbenchRuntime(ctx, database, config.ownerId)
-  const scheduler = new TaskScheduler({ database, sessions: ctx.sessionController, platformClient: ctx.workbenchPlatformClient, ownerId: config.ownerId, agents: ctx.agents, modelSettings: ctx.settings, goals: ctx.goals })
+  const workspaces = new WorkbenchWorkspaces({ controller: ctx.workspaceController, database, root: resolveWorkspacePath(config.workspace, 'conversations'), fileManager: ctx.workbenchFileManager, sessions: ctx.sessionController })
+  const scheduler = new TaskScheduler({ database, sessions: ctx.sessionController, platformClient: ctx.workbenchPlatformClient, ownerId: config.ownerId, agents: ctx.agents, modelSettings: ctx.settings, goals: ctx.goals,
+    prepareContent: (sessionId, content) => prepareNativeFiles(ctx.fileUploads, sessionId, content) })
   runtime.scheduler = scheduler
   scheduler.executionRun = (sessionId) => runtime.executionRun(sessionId)
-  const service = new WorkbenchService({ database, sessionController: ctx.sessionController, agents: ctx.agents, commands: ctx.commands, skills: ctx.skills, fileManager: ctx.workbenchFileManager, platformClient: ctx.workbenchPlatformClient, workspace: config.workspace, sessionQuery: ctx.sessionQuery, agentPresets: ctx.agentPresets, agentDefaultModel: ctx.agentDefaultModel, modelSettings: ctx.settings, scheduler, attachments: ctx.attachments, goals: ctx.goals })
+  const service = new WorkbenchService({ database, sessionController: ctx.sessionController, agents: ctx.agents, commands: ctx.commands, skills: ctx.skills, fileManager: ctx.workbenchFileManager, platformClient: ctx.workbenchPlatformClient, workspace: config.workspace, sessionQuery: ctx.sessionQuery, agentPresets: ctx.agentPresets, agentDefaultModel: ctx.agentDefaultModel, modelSettings: ctx.settings, scheduler, attachments: ctx.attachments, goals: ctx.goals, fileUploads: ctx.fileUploads, nativeFileAttachments: process.env.GXZS_NATIVE_FILE_ATTACHMENTS === '1' })
+  service.workspaceChanges = ctx.workspaceChanges
+  service.workspaces = workspaces
+  service.sessionReferences = ctx.sessionReferenceResolver
+  service.fileReferences = ctx.fileReferences
   let recovered = false
   let recoveryError
   let recoveryTimer
@@ -66,6 +78,7 @@ export function apply(ctx, config) {
   })
 
   registerDatabasePrompt(ctx, config.ownerId)
+  registerRunResourceContext(ctx)
 
   const projectAssistantStream = createAssistantStreamProjector(database, config.ownerId)
   ctx.on('user-questions/request', humanInput.handleRequest, { global: true, prepend: true })
@@ -109,13 +122,14 @@ export function apply(ctx, config) {
       id: `${group.id}/${model.id}`, name: model.name || model.id, provider: group.id, description: model.description,
     })))
     return {
-      activity_protocol: 1, human_input_protocol: 1, followup_protocol: 1,
-      control_protocol: 1, resources_protocol: 1, command_resources_protocol: 0, submission_control_protocol: 1,
+      activity_protocol: 1, human_input_protocol: 1, followup_protocol: 1, history_protocol: 1, native_history_protocol: 1,
+      control_protocol: 1, resources_protocol: 1, command_resources_protocol: 1, submission_control_protocol: 1,
       default_selection: { model: catalog.default ? `${catalog.default.provider}/${catalog.default.model}` : models[0]?.id ?? '', tools: [], skills: [], knowledge: [], model_parameters: {}, tool_parameters: {} },
       models, tools: mcpTools.map((tool) => ({
         id: tool.id, name: tool.name, display_name: tool.display_name,
         description: tool.description, scope: tool.scope,
         group: tool.group, provider: tool.provider, provider_name: tool.provider_name,
+        provider_call_name: tool.provider_call_name, provider_description: tool.provider_description,
         tool_name: tool.tool_name, runtime_name: tool.runtime_name,
       })),
       skills: skills.map((skill) => ({
@@ -154,11 +168,57 @@ export function apply(ctx, config) {
   }
 
   const routes = [
+    ['GET', /^\/chats\/([\w-]+)\/events$/, async ({ owner }, res, match) => {
+      await service.ensureChatDirectory(owner, match[1])
+      await streamHistoryEvents({ service, owner, chatId: match[1], res })
+    }],
+    ['GET', /^\/chats\/([\w-]+)\/history$/, async ({ owner, url }, res, match) => {
+      const abort = new AbortController()
+      const disconnected = () => abort.abort()
+      res.once('close', disconnected)
+      try {
+        const raw = url.searchParams.get('cursor')
+        let cursor
+        if (raw !== null) {
+          try { cursor = JSON.parse(raw) }
+          catch { throw httpError(400, '历史消息游标无效，请重新打开对话') }
+        }
+        if (raw === null) await service.ensureChatDirectory(owner, match[1])
+        const data = await service.historyPage(owner, match[1], cursor, abort.signal, url.searchParams.get('native') === '1')
+        if (!abort.signal.aborted) sendJson(res, 200, { data })
+      } finally { res.off('close', disconnected) }
+    }],
+    ['GET', /^\/chats\/([\w-]+)\/changes$/, async ({owner,url},res,match) => {
+      const abort=new AbortController()
+      const disconnected=()=>abort.abort()
+      res.once('close',disconnected)
+      try {
+        const data=await service.changes(owner,match[1],url.searchParams.get('seq'),url.searchParams.get('index'),abort.signal)
+        if(!abort.signal.aborted) sendJson(res,200,{data})
+      } finally {res.off('close',disconnected)}
+    }],
     ['GET', /^\/identity$/, async ({ owner }, res) => sendJson(res, 200, {
       user: { id: owner.userId, name: owner.name, email: '' }, workspaceId: owner.tenantId,
       workspaces: [{ id: owner.tenantId, name: owner.tenantId, current: true }],
     })],
     ['GET', /^\/catalog$/, async ({ owner }, res) => sendJson(res, 200, { data: await buildCatalog(owner) })],
+    ['GET', /^\/chats\/([\w-]+)\/references$/, async ({ owner, url }, res, match) => {
+      const abort = new AbortController()
+      const disconnected = () => abort.abort()
+      res.once('close', disconnected)
+      try {
+        const data = await service.referenceCandidates(owner, match[1], url.searchParams.get('query') || '', abort.signal)
+        if (!abort.signal.aborted) sendJson(res, 200, { data })
+      } finally { res.off('close', disconnected) }
+    }],
+    ['GET', /^\/workspaces$/, async ({ owner }, res) => sendJson(res, 200, { data: await workspaces.baseline(owner) })],
+    ['GET', /^\/workspaces\/events$/, async ({ owner }, res) => streamWorkspaceEvents({ workspaces, owner, res,
+      subscribe: changed => {
+        const stops = ['api-session/added', 'api-session/removed', 'api-session/status', 'api-session/activity'].map(event => ctx.on(event, changed))
+        return () => stops.forEach(stop => stop())
+      },
+    })],
+    ['POST', /^\/workspaces$/, async ({ owner, json }, res) => sendJson(res, 200, { data: await workspaces.mutate(owner, json) })],
     ['GET', /^\/models\/parameters$/, async ({ url, owner }, res) => sendJson(res, 200, { data: await service.modelParameters(url.searchParams.get('model'), owner) })],
     ['GET', /^\/resources$/, async (_context, res) => sendJson(res, 200, { data: await service.resources() })],
     ['POST', /^\/resources$/, async ({ json }, res) => {
@@ -167,12 +227,12 @@ export function apply(ctx, config) {
       sendJson(res, 200, { data: result })
     }],
     ['GET', /^\/chats$/, async ({ owner }, res) => sendJson(res, 200, { data: service.listChats(owner) })],
-    ['POST', /^\/chats$/, async ({ owner }, res) => {
+    ['POST', /^\/chats$/, async ({ owner, json }, res) => {
       const catalog = await databaseModelCatalog(ctx.workbenchPlatformClient, ctx.sessionController, owner, ctx.settings)
       const defaultModel = catalog.default ? `${catalog.default.provider}/${catalog.default.model}` : ''
       const chat = await service.createChat(owner, config.workspace, {
         model: defaultModel, tools: [], skills: [], knowledge: [], model_parameters: {}, tool_parameters: {},
-      })
+      }, json.workspaceId)
       sendJson(res, 201, { data: service.getChat(owner, chat.id) })
     }],
     ['GET', /^\/chats\/([\w-]+)$/, async ({ owner }, res, match) => {
@@ -189,6 +249,8 @@ export function apply(ctx, config) {
     ['GET', /^\/chats\/([\w-]+)\/control$/, async ({ owner }, res, match) => sendJson(res, 200, { data: await service.getControl(owner, match[1]) })],
     ['POST', /^\/chats\/([\w-]+)\/todos\/clear$/, async ({ owner, json }, res, match) =>
       sendJson(res, 200, { data: await service.clearTodos(owner, match[1], json) })],
+    ['POST', /^\/chats\/([\w-]+)\/goals\/(edit|pause|resume|clear)$/, async ({ owner, json }, res, match) =>
+      sendJson(res, 200, { data: await service.mutateGoal(owner, match[1], match[2], json) })],
     ['POST', /^\/chats\/([\w-]+)\/commands$/, async ({ owner, json }, res, match) =>
       sendJson(res, 200, { data: await service.issueCommand(owner, match[1], json) })],
     ['GET', /^\/chats\/([\w-]+)\/followups$/, async ({ owner, url }, res, match) => {
@@ -199,7 +261,7 @@ export function apply(ctx, config) {
       sendJson(res, 202, { data: await service.submitRun(owner, match[1], json) })],
     ['POST', /^\/chats\/([\w-]+)\/runs\/stop$/, async ({ owner, json }, res, match) =>
       sendJson(res, 200, { data: await service.stopSubmission(owner, match[1], json.request_key) })],
-    ['GET', /^\/runs\/([\w-]+)$/, async ({ owner }, res, match) => sendJson(res, 200, { data: service.getRun(owner, match[1]) })],
+    ['GET', /^\/runs\/([\w-]+)$/, async ({ owner, url }, res, match) => sendJson(res, 200, { data: service.getRun(owner, match[1], url.searchParams.get('view') !== 'state') })],
     ['GET', /^\/runs\/([\w-]+)\/mcp-authorization$/, async ({ owner, url }, res, match) =>
       sendJson(res, 200, { data: { authorized: runtime.authorizeRunMcp(owner.ownerId, match[1], url.searchParams.get('resource_id'), url.searchParams.get('version')) } })],
     ['POST', /^\/runs\/([\w-]+)\/fork$/, async ({ owner, json }, res, match) =>
@@ -232,7 +294,20 @@ export function apply(ctx, config) {
       humanInput.touch(owner.ownerId, match[1], json.request_id)
       sendJson(res, 200, { data: service.getRun(owner, match[1]) })
     }],
-    ['GET', /^\/files\/preview$/, async (context, res) => proxyPlatform(context, res, 'files/preview')],
+    ['GET', /^\/files\/preview$/, async (context, res) => {
+      const abort = new AbortController()
+      const disconnected = () => abort.abort()
+      res.once('close', disconnected)
+      try {
+        const pdf = await nativeOfficePreview({ owner: context.owner, path: context.url.searchParams.get('path'),
+          fileManager: ctx.workbenchFileManager, converter: ctx.officeToPdf, signal: abort.signal })
+        if (abort.signal.aborted) return
+        if (pdf === undefined) return await proxyPlatform(context, res, 'files/preview')
+        res.writeHead(200, { 'content-type': 'application/pdf', 'cache-control': 'no-store',
+          'content-length': pdf.length, 'x-content-type-options': 'nosniff' })
+        res.end(Buffer.from(pdf))
+      } finally { res.off('close', disconnected) }
+    }],
     ['POST', /^\/files\/preview$/, async (context, res) => proxyPlatform(context, res, 'files/preview')],
     ['GET', /^\/files\/shares$/, async (context, res) => proxyPlatform(context, res, 'files/shares')],
     ['POST', /^\/files\/shares$/, async (context, res) => proxyPlatform(context, res, 'files/shares')],

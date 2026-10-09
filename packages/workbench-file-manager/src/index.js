@@ -40,18 +40,18 @@ export class FileManagerClient {
     this.fetch = fetchImpl
   }
 
-  operate(payload) { return this.request('files', payload) }
+  operate(payload, signal) { return this.request('files', payload, signal) }
   personalResources(payload) { return this.request('personal-resources', payload) }
   personalMcp(payload) { return this.request('personal-mcp', payload) }
 
-  async request(action, payload) {
+  async request(action, payload, signal) {
     if (!ACTIONS[action]?.has(payload?.operation)) throw new TypeError(action === 'files' ? 'unsupported file operation' : `unsupported ${action} operation`)
     const response = await this.fetch(`${this.baseUrl}/sandboxes/${this.workspaceId}/${action}`, {
       method: 'POST',
       headers: { authorization: `Bearer ${this.token}`, 'content-type': 'application/json',
         'x-gxzs-owner': this.owner, 'x-gxzs-host-generation': this.generation, 'x-gxzs-host-instance': this.instance },
       body: JSON.stringify(payload),
-      signal: AbortSignal.timeout(this.timeoutMs),
+      signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(this.timeoutMs)]) : AbortSignal.timeout(this.timeoutMs),
       redirect: 'error',
     })
     const result = await managerJson(response, this.maxResponseBytes)

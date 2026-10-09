@@ -12,9 +12,6 @@ docker run --rm --network none --cap-drop ALL --security-opt no-new-privileges:t
   --memory 1g --cpus 1 --pids-limit 128 --entrypoint node "$host_image" \
   /opt/workbench/check-runtime-imports.mjs
 docker run --rm --network none --cap-drop ALL --security-opt no-new-privileges:true \
-  --memory 1g --cpus 1 --pids-limit 128 --entrypoint node \
-  -v "$script_dir/smoke-host-bootstrap.mjs:/smoke-host-bootstrap.mjs:ro" "$host_image" /smoke-host-bootstrap.mjs --session-create
-docker run --rm --network none --cap-drop ALL --security-opt no-new-privileges:true \
   --memory 256m --cpus 1 --pids-limit 64 --entrypoint node \
   -v "$script_dir/smoke-host-relay.mjs:/smoke-host-relay.mjs:ro" "$host_image" /smoke-host-relay.mjs
 docker run --rm --network none --entrypoint python "$manager_image" \
@@ -23,7 +20,7 @@ docker run --rm --network none --cap-drop ALL --security-opt no-new-privileges:t
   --memory 2g --cpus 2 --pids-limit 256 --entrypoint node "$sandbox_image" /opt/workbench/verify-runtime.mjs
 
 container_id=$(docker run -d --network none --cap-drop ALL --security-opt no-new-privileges:true \
-  --memory 2g --cpus 2 --pids-limit 256 "$sandbox_image" sleep 180)
+  --memory 2g --cpus 2 --pids-limit 256 "$sandbox_image" sleep 600)
 for attempt in {1..15}; do
   if docker exec "$container_id" /usr/local/bin/python -I -S -c \
       "import socket;assert socket.create_connection(('127.0.0.1',2222),2).recv(128).startswith(b'SSH-')"; then break; fi
@@ -31,6 +28,8 @@ for attempt in {1..15}; do
   sleep 1
 done
 python3 "$script_dir/smoke-sandbox-ssh.py" "$container_id" "$host_image"
+GXZS_SMOKE_BOOTSTRAP=1 GXZS_SMOKE_CRASH=1 GXZS_SMOKE_RUNNING=1 \
+  python3 "$script_dir/smoke-sandbox-ssh.py" "$container_id" "$host_image"
 docker exec "$container_id" /opt/office/python/bin/python -c \
   "from docx import Document;d=Document();d.add_paragraph('中文预览验证');d.save('/tmp/check.docx')"
 docker exec "$container_id" /usr/bin/python3 -I /opt/office/uno_worker.py /tmp/check.docx /tmp/check.pdf convert
@@ -38,4 +37,5 @@ docker exec "$container_id" /opt/office/python/bin/python -c \
   "import pymupdf;d=pymupdf.open('/tmp/check.pdf');assert '中文预览验证' in ''.join(p.get_text() for p in d)"
 docker exec "$container_id" /usr/local/bin/python -I -S -c \
   "import os;assert os.getuid()==1000;assert not os.access('/usr/local/bin/python',os.W_OK);assert not os.access('/opt/dsh/node_modules',os.W_OK);assert not os.path.exists('/var/run/docker.sock')"
+python3 "$script_dir/smoke-manager-lifecycle.py" "$manager_image" "$sandbox_image"
 printf '%s\n' 'All image smoke checks passed'

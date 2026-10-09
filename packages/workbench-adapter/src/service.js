@@ -1,8 +1,9 @@
 import { platformToolNames } from '@gxzs/dsh-workbench-mcp-tools/names'
 import { readSkillDefinition, skillDisplayName } from '@gxzs/dsh-workbench-sandbox-skills/definition'
 import { randomUUID } from 'node:crypto'
+import path from 'node:path'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
-import { admitSandboxAttachments } from './attachments.js'
+import { admitSandboxAttachments, prepareNativeFiles } from './attachments.js'
 import { normalizeResourceMentions, appendResourceInstructions } from './resource-mentions.js'
 import { httpError } from './http.js'
 import { resolveWorkspacePath } from './paths.js'
@@ -10,9 +11,14 @@ import { forkChat } from './fork-chat.js'
 import { toAnswer } from './human-input.js'
 import { requireDatabaseModel } from './database-models.js'
 import { currentExecutionRun, fenceMcpExecutions } from './scheduler.js'
+import { nativeTurn } from './native-turn.js'
+import { historyWindow, loadNativeHistoryPage } from './history-page.js'
+import { nativePresentation } from './projection.js'
+import { HistoryPresentation } from './history-presentation.js'
+import { withNativeCommandRun, nativeCommandRecords } from './native-command.js'
 
 export class WorkbenchService {
-  constructor({ database, sessionController, agents, commands, skills, fileManager, platformClient, workspace, sessionQuery, agentPresets, agentDefaultModel, modelSettings, scheduler, attachments, goals }) {
+  constructor({ database, sessionController, agents, commands, skills, fileManager, platformClient, workspace, sessionQuery, agentPresets, agentDefaultModel, modelSettings, scheduler, attachments, goals, fileUploads, nativeFileAttachments = false }) {
     this.database = database
     this.sessions = sessionController
     this.agents = agents
@@ -30,10 +36,19 @@ export class WorkbenchService {
     this.scheduler = scheduler
     this.attachments = attachments
     this.goals = goals
+    this.fileUploads = fileUploads
+    this.nativeFileAttachments = nativeFileAttachments
   }
 
-  async createChat(owner, workspace, selection) {
+  async createChat(owner, workspace, selection, workspaceId) {
     const id = randomUUID()
+    if (workspaceId !== undefined) {
+      if (!this.workspaces) throw httpError(503, '工作区服务尚未就绪')
+      const target = await this.workspaces.requireWorkspace(owner, workspaceId, true)
+      const created = await this.sessions.create({ workspaceId: target.workspaceId })
+      return this.database.createChat({ id, ownerId: owner.ownerId, sessionId: created.sessionId, selection,
+        directory: target.path === '.' ? 'conversations' : `conversations/${target.path}` })
+    }
     await this.fileManager.operate({ operation: 'mkdir', path: `conversations/${id}` })
     const created = await this.sessions.create({ cwd: this.chatDirectory(id) })
     const chat = this.database.createChat({ id, ownerId: owner.ownerId, sessionId: created.sessionId, selection })
@@ -41,6 +56,22 @@ export class WorkbenchService {
   }
 
   chatDirectory(chatId, directory) { return resolveWorkspacePath(this.workspace, directory ?? `conversations/${chatId}`) }
+
+  async referenceCandidates(owner, chatId, query = '', signal = new AbortController().signal) {
+    const chat = this.requireChat(owner, chatId)
+    await this.ensureChatSession(owner, chat)
+    const agent = this.agents.get(chat.sessionId)
+    if (!agent || !this.sessionReferences) throw httpError(503, '对话引用服务尚未就绪')
+    const [files, candidates] = await Promise.all([
+      this.fileReferences ? this.fileReferences.list(agent, query, signal) : [],
+      this.sessionReferences.remoteExportCandidates(agent, query, signal),
+    ])
+    const allowed = new Map(this.database.listChats(owner.ownerId).map(item => [item.sessionId, item.id]))
+    return [
+      ...files.map(item => ({ ...item, group: 'files', label: item.path })),
+      ...candidates.filter(item => allowed.has(item.sessionId)).map(({ cwd, ...item }) => ({ ...item, chatId: allowed.get(item.sessionId) })),
+    ]
+  }
 
   async ensureChatSession(owner, chat) {
     await this.ensureChatDirectory(owner, chat.id)
@@ -152,9 +183,10 @@ export class WorkbenchService {
           }
         }
         const path = chat.directory ?? `conversations/${chat.id}`
-        // Native forks share their source workspace. Delete files only for the last reference.
+        // Explicit directories belong to a workspace (including native forks),
+        // so deleting a chat never deletes that workspace's files.
         const shared = this.database.listChats(owner.ownerId).some((other) => other.id !== chat.id && (other.directory ?? `conversations/${other.id}`) === path)
-        if (shared || path === '.') { this.database.deleteChat(owner.ownerId, chatId); return }
+        if (shared || chat.directory || path === '.') { this.database.deleteChat(owner.ownerId, chatId); return }
         const entry = await this.fileManager.operate({ operation: 'stat', path })
         if (entry.kind !== 'missing')
           await this.fileManager.operate({ operation: 'delete', path, version: entry.version })
@@ -182,13 +214,113 @@ export class WorkbenchService {
     return { ...this.chatSummary(owner, chat), selection: chat.selection, runs: this.database.listRuns(owner.ownerId, chat.id).map((run) => this.getRun(owner, run.id)) }
   }
 
+  async historyPage(owner, chatId, cursor, signal, nativeLive = false) {
+    const chat = this.requireChat(owner, chatId)
+    const page = await loadNativeHistoryPage(this, chat.sessionId, cursor, signal)
+    const runs = new Map(), tools = new Map(), turns = new Map()
+    for (const { event } of page.records) {
+      const turn = event.data?.turn
+      if (!Number.isInteger(turn)) continue
+      if (!turns.has(turn)) turns.set(turn, this.database.runForTurn(chat.sessionId, turn))
+      const run = turns.get(turn)
+      if (!run) continue
+      let view = runs.get(run.id)
+      if (!view) {
+        view = this.inputRunDto(owner, run)
+        runs.set(run.id, view)
+      }
+      if (event.type === 'tool/call') tools.set(`${run.id}:${event.data.callId}`, event.data.name)
+      const block = event.data?.message?.content?.[0]
+      const callId = event.data?.message?.source?.callId ?? block?.toolCallId
+      for (const [index, payload] of nativePresentation(run, event, { toolName: tools.get(`${run.id}:${callId}`)
+        ?? (callId ? this.database.toolCallName(owner.ownerId, run.id, callId) : '') ?? '' }).entries()) {
+        view.events.push({ ...payload, _id: `history:${chat.sessionId}:${event.seq}:${index}` })
+      }
+    }
+    // The live run uses its existing SSE snapshot/cursor as one atomic pair.
+    // Older windows are read-only; they must never replace a newer live view.
+    if (cursor === undefined) for (const run of this.database.listRuns(owner.ownerId, chat.id)) {
+      if (['queued', 'running', 'waiting_input', 'stopping'].includes(run.status)
+        || run.sourceEndSeq > page.through_seq || run.sourceStartSeq > page.through_seq) {
+        runs.set(run.id, nativeLive ? (runs.get(run.id) ?? this.inputRunDto(owner, run))
+          : { ...this.getRun(owner, run.id), history_complete: true })
+      }
+    }
+    return { ...this.chatSummary(owner, chat), selection: chat.selection,
+      ...page, history_cursor: page.cursor, runs: [...runs.values()] }
+  }
+
+  async *followHistory(owner, chatId, signal) {
+    const chat = this.requireChat(owner, chatId)
+    const presentation = new HistoryPresentation(chat.sessionId, turn =>
+      Number.isInteger(turn) ? this.database.runForTurn(chat.sessionId, turn) : undefined,
+      (run, callId) => callId ? this.database.toolCallName(owner.ownerId, run.id, callId) : undefined)
+    const source = this.sessions.follow({ address: { kind: 'session', sessionId: chat.sessionId },
+      ...historyWindow, assistantStream: true }, signal)
+    for await (const frame of source) {
+      signal.throwIfAborted()
+      // Directory changes replace the native session. End the old subscription
+      // instead of combining two different source logs in one conversation.
+      if (this.requireChat(owner, chatId).sessionId !== chat.sessionId) return
+      const turns = new Set()
+      if (frame.type === 'snapshot') {
+        for (const { event } of frame.records) if (Number.isInteger(event.data?.turn)) turns.add(event.data.turn)
+        if (frame.assistantStream?.activeAttempt) turns.add(frame.assistantStream.activeAttempt.turn)
+      } else if (frame.type === 'event' && Number.isInteger(frame.event.data?.turn)) turns.add(frame.event.data.turn)
+      else if (frame.type === 'assistant-stream' && frame.frame.type === 'start') turns.add(frame.frame.turn)
+      const runs = new Map(), bindings = []
+      for (const turn of turns) {
+        const run = this.database.runForTurn(chat.sessionId, turn)
+        if (!run) continue
+        runs.set(run.id, this.inputRunDto(owner, run))
+        bindings.push({ turn, run_id: run.id })
+      }
+      // Headers and unrelated projection values may contain runtime paths or
+      // configuration. Only the native display log/stream crosses this boundary.
+      const value = frame.type === 'snapshot' ? {
+        type: frame.type, cursor: frame.cursor, records: frame.records,
+        hasMore: frame.hasMore, assistantStream: frame.assistantStream,
+      } : frame
+      yield { event: 'workbench_history', session_id: chat.sessionId, value, runs: [...runs.values()], bindings,
+        display: presentation.accept(frame) }
+    }
+  }
+
+  async changes(owner, chatId, seqValue, indexValue, signal) {
+    const chat = this.requireChat(owner, chatId)
+    const integer = value => typeof value === 'string' && /^(0|[1-9]\d*)$/.test(value) && Number.isSafeInteger(Number(value))
+    if (!integer(seqValue) || (indexValue !== null && !integer(indexValue))) throw httpError(400, '文件改动坐标无效')
+    if (!this.workspaceChanges) throw httpError(503, '文件改动服务尚未就绪')
+    const seq = Number(seqValue)
+    if (indexValue !== null) {
+      const value = await this.workspaceChanges.diff(chat.sessionId, seq, Number(indexValue), signal)
+      if (!value) throw httpError(404, '该轮文件差异已不可用')
+      return value
+    }
+    const value = this.workspaceChanges.summary(chat.sessionId, seq)
+    if (!value) throw httpError(404, '该轮文件改动摘要已不可用')
+    const {turn, files, total, added, deleted} = value
+    return {turn, files: files.map(file => {
+      // Native paths are relative to the recorded turn's cwd, not the current UI folder.
+      // Only owner-workspace files can be opened by the Workbench file service.
+      try {
+        const absolute = resolveWorkspacePath(this.workspace, path.posix.resolve(value.cwd, file.path))
+        return {...file, workspacePath: path.posix.relative(this.workspace, absolute)}
+      } catch { return file }
+    }), total, added, deleted}
+  }
+
   chatSummary(owner, chat) {
     const active = this.database.activeRun(owner.ownerId, chat.id)
+    const waiting = active?.status === 'waiting_input' ? this.database.getPendingInput(owner.ownerId, active.id) : null
+    const pendingInteraction = waiting?.payload?.questions?.some(question => question.intent?.kind === 'plan-review') ? 'plan-review' : 'question'
     return {
       id: chat.id, title: chat.title, version: chat.version, pinned: chat.pinned, favorited: chat.favorited,
       file_directory: chat.directory ?? `conversations/${chat.id}`,
       created_at: Math.floor(chat.createdAt / 1000), updated_at: Math.floor(chat.updatedAt / 1000),
       has_active_run: Boolean(active), is_running: ['running', 'stopping'].includes(active?.status), needs_input: active?.status === 'waiting_input',
+      pending_interaction: waiting?.status === 'pending' ? pendingInteraction : null,
+      has_error: !active && this.database.latestRunStatus(owner.ownerId, chat.id) === 'failed',
     }
   }
 
@@ -196,7 +328,7 @@ export class WorkbenchService {
     return this.withChatMutation(chatId, () => this.admitRun(owner, chatId, body))
   }
 
-  async admitRun(owner, chatId, body) {
+  async admitRun(owner, chatId, body, command) {
     let chat = this.requireChat(owner, chatId)
     const requestKey = typeof body.request_key === 'string' ? body.request_key : undefined
     if (requestKey !== undefined && (requestKey.length === 0 || requestKey.length > 128 || requestKey.includes('\0')))
@@ -207,7 +339,8 @@ export class WorkbenchService {
     if (existing) return this.getRun(owner, existing.id)
     if (body.version !== undefined && body.version !== chat.version)
       throw httpError(409, '配置版本已改变，请刷新后重试')
-    const query = String(body.query ?? '')
+    const silentResume = body.silent_resume === true && typeof body.continue_run_id === 'string'
+    const query = silentResume ? 'resume' : String(body.query ?? '')
     const mentions = normalizeResourceMentions(body.resource_mentions)
     const files = Array.isArray(body.files) ? body.files : []
     if (!query.trim() && !files.length) throw httpError(400, '消息内容不能为空')
@@ -235,23 +368,19 @@ export class WorkbenchService {
     // an extra authorization boundary or a native DSH invocation gesture.
     const mcpTools = await this.freezeMcpTools(owner, mentions.tools)
     checkCancelled()
-    const admitted = await admitSandboxAttachments({ fileManager: this.fileManager, workspace: this.workspace, query, files })
+    const admitted = await admitSandboxAttachments({ fileManager: this.fileManager, workspace: this.workspace, query, files, nativeFiles: this.nativeFileAttachments })
     admitted.content = await this.resourceContent(admitted.content, mentions, mcpTools)
     checkCancelled()
     chat = await this.ensureChatSession(owner, chat)
     checkCancelled()
     const { run, created } = this.database.createRun({
       ownerId: owner.ownerId, chatId, sessionId: chat.sessionId, query, attachments: admitted.attachments, mcpTools,
-      selection: { ...chat.selection, resource_mentions: mentions }, requestKey,
+      selection: { ...chat.selection, ...(silentResume ? { silent_resume: true } : {}), resource_mentions: mentions,
+        mentioned_resources: await this.mentionSnapshot(mentions, mcpTools),
+        skill_names: await this.skillNames(), ...(command ? { command } : {}) }, requestKey,
       parentRunId,
     })
     if (!created) return this.getRun(owner, run.id)
-    // Use the submitted human text, never the attachment instructions sent to DSH.
-    if (created && chat.title === '新会话' && this.database.listRuns(owner.ownerId, chatId).length === 1) {
-      const title = (query.trim() || admitted.attachments.map((file) => resolveWorkspacePath(this.workspace, file.path)).join('\n') || '新会话').slice(0, 200)
-      this.database.updateChat(owner.ownerId, chatId, { title })
-      this.database.appendEvent(owner.ownerId, run.id, { event: 'workbench_chat_title', chat_id: chatId, title, title_source: 'fallback' })
-    }
     this.database.appendEvent(owner.ownerId, run.id, { event: 'workbench_status', status: 'queued' })
     if (this.scheduler) {
       checkCancelled()
@@ -288,6 +417,24 @@ export class WorkbenchService {
     const mentions = normalizeResourceMentions(value)
     const skills = mentions.skills.length ? await this.listSkills() : []
     return appendResourceInstructions(content, mentions, tools, skills)
+  }
+
+  async mentionSnapshot(mentions, tools) {
+    const skills = mentions.skills.length ? await this.listSkills() : []
+    return [
+      ...mentions.tools.map(id => {
+        const tool = tools.find(item => item.id === id)
+        return { id, kind: 'tools', name: tool?.provider_name ?? tool?.server_id ?? id }
+      }),
+      ...mentions.skills.map(id => {
+        const skill = skills.find(item => item.id === id || item.name === id || `personal:${item.name}` === id)
+        return { id, kind: 'skills', name: skill?.displayName ?? skill?.name ?? id }
+      }),
+    ]
+  }
+
+  async skillNames() {
+    return Object.fromEntries((await this.listSkills()).map(skill => [skill.name, skill.displayName ?? skill.name]))
   }
 
   async mcpCatalog(owner, { required = false } = {}) {
@@ -327,6 +474,9 @@ export class WorkbenchService {
       try {
         const metadata = await readSkillDefinition(skill.content, { id: skill.id })
         if (metadata.name !== skill.id) throw new Error('技能目录名与 name 不一致')
+        if (globalSkills.some(global => global.scope === 'global' && global.name === metadata.name))
+          return { ...skill, ...metadata, content: skill.content, scope: 'personal', readonly: false,
+            error: `调用名 ${metadata.name} 与全局技能冲突，请修改个人技能的调用名` }
         return { ...skill, ...metadata, content: skill.content, scope: 'personal', readonly: false }
       } catch (error) {
         return { ...skill, name: skill.id, description: '', enabled: false, scope: 'personal', readonly: false, error: error.message }
@@ -334,7 +484,7 @@ export class WorkbenchService {
     }))
     return {
       skills, mcp: mcp.mcp ?? [],
-      warnings: [...(personal.warnings ?? []), ...(mcp.warnings ?? [])],
+      warnings: [...(personal.warnings ?? []), ...(mcp.warnings ?? []), ...skills.filter(skill => skill.error).map(skill => skill.error)],
       global: { files: [], tools: [], knowledge: [], skills: globalSkills.filter((skill) => skill.scope === 'global') },
     }
   }
@@ -352,12 +502,15 @@ export class WorkbenchService {
     if (operation === 'skill_import') {
       const inspected = await this.fileManager.personalResources({ ...body, operation: 'skill_inspect' })
       const metadata = await readImportedSkill(inspected.content)
+      await this.assertNoGlobalSkillCollision(metadata.name)
       return this.fileManager.personalResources({ ...body, name: metadata.name })
     }
     if (operation === 'skill_update') {
       const metadata = await readImportedSkill(body.content)
       if (metadata.name !== (body.new_name ?? body.name)) throw httpError(400, '技能调用名与 SKILL.md 中的 name 不一致')
+      if (metadata.name !== body.name) await this.assertNoGlobalSkillCollision(metadata.name)
     }
+    if (operation === 'skill_toggle' && body.enabled === true) await this.assertNoGlobalSkillCollision(body.name)
     if (operation.startsWith('mcp_')) return this.fileManager.personalMcp(body)
     if (!['skill_import', 'skill_update', 'skill_uninstall', 'skill_toggle', 'skill_pin'].includes(operation))
       throw httpError(400, '不支持的个人资源操作')
@@ -368,18 +521,23 @@ export class WorkbenchService {
     const skills = await this.skills.list({ cwd: this.workspace })
     return skills.map((skill) => ({
       id: skill.name, name: skill.name, displayName: skillDisplayName(skill), metadata: skill.metadata, source: skill.source, invocation: skill.invocation, description: skill.description, path: skill.path ?? '',
-      enabled: true, readonly: skill.source === 'custom' || skill.source === 'bundled',
-      scope: skill.source === 'custom' || skill.source === 'bundled' ? 'global' : 'personal',
+      enabled: true, readonly: skill.provider !== 'gxzs-sandbox-personal',
+      scope: skill.provider === 'gxzs-sandbox-personal' ? 'personal' : 'global',
       provider: skill.provider,
     }))
+  }
+
+  async assertNoGlobalSkillCollision(name) {
+    const existing = (await this.listSkills()).find(skill => skill.name === name)
+    if (existing?.scope === 'global') throw httpError(409, `技能调用名与全局技能冲突：${name}`)
   }
 
   async inspectSkill(name) {
     const skill = await this.skills.get(name, { cwd: this.workspace })
     if (!skill) throw httpError(404, '技能不存在')
     return { id: skill.name, name: skill.name, displayName: skillDisplayName(skill), metadata: skill.metadata, source: skill.source, invocation: skill.invocation, description: skill.description, path: skill.path ?? '', content: skill.content,
-      enabled: true, readonly: skill.source === 'custom' || skill.source === 'bundled',
-      scope: skill.source === 'custom' || skill.source === 'bundled' ? 'global' : 'personal' }
+      enabled: true, readonly: skill.provider !== 'gxzs-sandbox-personal',
+      scope: skill.provider === 'gxzs-sandbox-personal' ? 'personal' : 'global' }
   }
 
   async issueCommand(owner, chatId, body, { allowTodoClear = false } = {}) {
@@ -395,6 +553,14 @@ export class WorkbenchService {
     if (body.expected_revision !== undefined && body.expected_revision !== control.revision)
       throw httpError(409, '控制状态版本已改变，请刷新后重试')
     const line = String(body.command ?? '').trim()
+    if (/^\/compact(?:\s|$)/.test(line) && body.files?.length)
+      throw httpError(400, '/compact 不接受附件')
+    // Sandbox path receipts are not native AttachmentContent. Reject control
+    // attachments before converting them so non-image files cannot disappear.
+    if (/^\/plan\s+off$/.test(line) && body.files?.length)
+      throw httpError(400, 'Attachments cannot accompany /plan off.')
+    if (/^\/goal(?:\s+(?:pause|resume|clear|edit))?$/i.test(line) && body.files?.length)
+      throw httpError(400, 'Attachments only accompany a goal objective: /goal <objective> or /goal edit <objective>.')
     if (!/^\/(?:goal|plan|compact)(?:\s|$)/.test(line) && !(allowTodoClear && line === '/todos-clear'))
       throw httpError(400, '不支持的工作台命令')
     const operation = this.withChatMutation(chatId, async () => {
@@ -404,10 +570,53 @@ export class WorkbenchService {
       chat = await this.ensureChatSession(owner, this.requireChat(owner, chatId))
       const agent = this.agents.get(chat.sessionId)
       if (!agent) throw httpError(409, '会话暂时无法恢复，请稍后重试')
-      const startsGoal = /^\/goal\s+/.test(line) && !/^\/goal\s+(?:pause|clear)\s*$/.test(line)
+      const planTask = /^\/plan\s+(?!off\s*$)([\s\S]+)$/.exec(line)
+      if (planTask || line === '/plan' && body.files?.length) {
+        const mentions = normalizeResourceMentions(body.resource_mentions)
+        const mcpTools = await this.freezeMcpTools(owner, mentions.tools)
+        const admitted = body.files?.length
+          ? await admitSandboxAttachments({ fileManager: this.fileManager, workspace: this.workspace, query: '', files: body.files, nativeFiles: this.nativeFileAttachments })
+          : { content: [], attachments: [] }
+        const resourceContext = (await this.resourceContent(admitted.content.filter(item => item.type === 'text'), mentions, mcpTools))
+          .map(item => item.text).join('\n')
+        const planQuery = planTask?.[1] ?? admitted.content.filter(item => item.type === 'text').map(item => item.text).join('\n')
+        const planLine = planTask ? line : `/plan${planQuery ? ` ${planQuery}` : ''}`
+        if (agent.status !== 'running' && chat.selection.model) {
+          await requireDatabaseModel(this.platformClient, this.sessions, owner, chat.selection.model, this.modelSettings)
+          await this.sessions.selectModel({ sessionId: chat.sessionId, ...splitModel(chat.selection.model),
+            ...(chat.selection.model_parameters?.reasoning_effort ? { reasoningEffort: chat.selection.model_parameters.reasoning_effort } : {}) })
+        }
+        const run = this.database.createRun({ ownerId: owner.ownerId, chatId, sessionId: chat.sessionId,
+          query: planQuery, attachments: admitted.attachments, selection: { ...chat.selection, command: 'plan',
+            resource_mentions: mentions, mentioned_resources: await this.mentionSnapshot(mentions, mcpTools),
+            skill_names: await this.skillNames(), resource_context: resourceContext }, mcpTools, requestKey: `plan:${requestKey}` }).run
+        let execution
+        try {
+          execution = await withNativeCommandRun(run, async () => this.commands.execute(agent, planLine,
+            await this.commandAttachments(agent, admitted.content), new AbortController().signal))
+          if (!execution || execution.result?.kind === 'error') throw httpError(409, execution?.result?.text ?? '计划模式不可用')
+        } catch (error) {
+          this.database.transitionRun(owner.ownerId, run.id, 'failed', error.message)
+          throw error
+        }
+        const result = { state: await this.getControl(owner, chatId), message: execution.result?.text ?? '', run: this.getRun(owner, run.id) }
+        return this.database.saveCommandReceipt(owner.ownerId, chatId, requestKey, result)
+      }
+      const editsGoal = /^\/goal\s+edit\s/i.test(line)
+      const startsGoal = /^\/goal\s+/.test(line) && !/^\/goal\s+(?:pause|clear|edit)$/i.test(line)
+        && (!editsGoal || this.goals?.get(agent)?.phase === 'complete')
       let goalRun
       let createdGoalRun = false
+      const admitted = body.files?.length
+        ? await admitSandboxAttachments({ fileManager: this.fileManager, workspace: this.workspace, query: '', files: body.files, nativeFiles: this.nativeFileAttachments })
+        : { content: [], attachments: [] }
+      const commandAttachments = await this.commandAttachments(agent, admitted.content)
       if (startsGoal) {
+        const previous = /^\/goal\s+resume\s*$/i.test(line) ? this.database.goalRun(chat.sessionId) : undefined
+        const mentions = normalizeResourceMentions(body.resource_mentions)
+        const mcpTools = previous?.mcpTools ?? await this.freezeMcpTools(owner, mentions.tools)
+        const resourceContext = previous?.selection.resource_context ?? (await this.resourceContent(admitted.content.filter(item => item.type === 'text'), mentions, mcpTools))
+          .map(item => item.text).join('\n')
         if (agent.status !== 'running' && chat.selection.model) {
           await requireDatabaseModel(this.platformClient, this.sessions, owner, chat.selection.model, this.modelSettings)
           await this.sessions.selectModel({ sessionId: chat.sessionId, ...splitModel(chat.selection.model),
@@ -415,9 +624,13 @@ export class WorkbenchService {
         }
         goalRun = this.database.activeRunBySession(chat.sessionId)
         if (!goalRun || goalRun.status !== 'running') {
-          const mcpTools = await this.freezeMcpTools(owner, [])
+          const objective = /^\/goal\s+resume\s*$/i.test(line)
+            ? this.goals?.get(agent)?.objective ?? '继续目标' : line.replace(/^\/goal\s+(?:edit\s+)?/i, '')
           goalRun = this.database.createRun({ ownerId: owner.ownerId, chatId, sessionId: chat.sessionId,
-            query: line, selection: chat.selection, mcpTools, requestKey: `goal:${requestKey}` }).run
+            query: objective, attachments: previous?.attachments ?? admitted.attachments, selection: previous
+              ? { ...previous.selection, command: 'goal' } : { ...chat.selection, command: 'goal', resource_mentions: mentions,
+              mentioned_resources: await this.mentionSnapshot(mentions, mcpTools), skill_names: await this.skillNames(),
+              resource_context: resourceContext }, mcpTools, requestKey: `goal:${requestKey}` }).run
           createdGoalRun = true
           this.database.appendEvent(owner.ownerId, goalRun.id, { event: 'workbench_status', status: 'queued' })
         }
@@ -425,7 +638,7 @@ export class WorkbenchService {
       }
       let execution
       try {
-        execution = await this.commands.execute(agent, line, [], new AbortController().signal)
+        execution = await this.commands.execute(agent, line, commandAttachments, new AbortController().signal)
         if (!execution) throw httpError(400, '命令不存在或参数无效')
         if (execution.result?.kind === 'error') throw httpError(409, execution.result.text)
       } catch (error) {
@@ -453,13 +666,65 @@ export class WorkbenchService {
     return result.state
   }
 
+  async commandAttachments(agent, content) {
+    const result = []
+    for (const item of content) {
+      if (item.type === 'image') result.push(item)
+      if (item.type === 'file') {
+        if (!this.fileUploads) throw httpError(503, '原生文件上传服务尚未就绪')
+        const uploaded = await this.fileUploads.upload(agent, { name: item.name, data: item.data }, new AbortController().signal)
+        result.push({ type: 'file', receiptId: uploaded.receiptId })
+      }
+    }
+    return result
+  }
+
+  async mutateGoal(owner, chatId, action, body) {
+    if (!['edit', 'pause', 'resume', 'clear'].includes(action)) throw httpError(400, '未知目标操作')
+    return this.withChatMutation(chatId, async () => {
+      const chat = await this.ensureChatSession(owner, this.requireChat(owner, chatId))
+      const agent = this.agents.get(chat.sessionId)
+      if (!agent) throw httpError(409, '会话暂时无法恢复')
+      const ref = body.ref
+      const current = this.goals.get(agent)
+      if (!current || current.id !== ref?.id || current.revision !== ref?.revision)
+        throw httpError(409, '目标已改变，请刷新后重试', 'GOAL_STALE_REF')
+      let resumedRun
+      if (action === 'resume') {
+        const previous = this.database.goalRun(chat.sessionId)
+        const active = this.database.activeRunBySession(chat.sessionId)
+        if (!active || !['running', 'waiting_input'].includes(active.status)) {
+          resumedRun = this.database.createRun({ ownerId: owner.ownerId, chatId, sessionId: chat.sessionId,
+            query: current.objective, selection: { ...(previous?.selection ?? chat.selection), command: 'goal' },
+            attachments: previous?.attachments ?? [], mcpTools: previous?.mcpTools ?? await this.freezeMcpTools(owner, []),
+          }).run
+          this.database.setGoalRun(chat.sessionId, resumedRun.id)
+        }
+      }
+      try {
+        const value = action === 'edit' ? this.goals.edit(agent, ref, body.request) : this.goals[action](agent, ref)
+        return { value, state: await this.getControl(owner, chatId), run: resumedRun ? this.getRun(owner, resumedRun.id) : null }
+      } catch (error) {
+        if (resumedRun) this.database.transitionRun(owner.ownerId, resumedRun.id, 'failed', error.message)
+        throw error
+      }
+    })
+  }
+
   async getControl(owner, chatId) {
     const chat = this.requireChat(owner, chatId)
-    const state = this.database.getControl(owner.ownerId, chatId)
+    let state = this.database.getControl(owner.ownerId, chatId)
+    const agent = this.agents.get(chat.sessionId)
+    if (agent && this.goals) {
+      const goal = this.goals.get(agent)
+      state = { ...state, goal: goal ? { ...goal, reason: goal.blockedReason?.message ?? null,
+        max_rounds: goal.maxGoalRounds, rounds_started: goal.roundsStarted, last_run_id: this.database.goalRun(chat.sessionId)?.id ?? null } : null }
+    }
     if (!this.sessionQuery) return state
     const source = await this.sessionQuery.observeSession(chat.sessionId)
     try {
-      return { ...state, plan: source.projections?.values?.plan ?? { active: false, pending: false } }
+      const plan = source.projections?.values?.plan ?? { active: false, pending: false }
+      return { ...state, plan, commands: nativeCommandRecords(source.events ?? [], this.database.listRuns(owner.ownerId, chatId)) }
     } finally { source[Symbol.dispose]?.() }
   }
 
@@ -610,18 +875,17 @@ export class WorkbenchService {
       if (accepted.steer_target_run_id === targetRunId) return accepted
       throw httpError(409, '消息已直接发送到其他任务')
     }
-    // Image admission may await I/O. Perform it before the final synchronous
-    // check and native mutation so target completion cannot race the check.
+    // Upload durable files before checking the target; DSH owns prompt admission.
     let pending = this.scheduler && this.database.submission(owner.ownerId, run.id)
     const content = pending && !pending.dispatched
-      ? this.attachments ? await this.attachments.admitPromptContent(pending.content) : pending.content
+      ? await prepareNativeFiles(this.fileUploads, run.sessionId, pending.content)
       : undefined
     await this.scheduler?.pendingTick
     const active = this.database.getRun(owner.ownerId, targetRunId)
     const current = this.database.getRun(owner.ownerId, runId)
     const agent = this.agents.get(run.sessionId)
-    const turnStart = agent?.session?.snapshotEvents?.().findLast(event => event.type === 'turn/start')
-    const bound = turnStart && this.database.runForTurn(run.sessionId, turnStart.data.turn)
+    const boundary = nativeTurn(agent)
+    const bound = boundary?.openTurnStartSeq != null && this.database.runForTurn(run.sessionId, boundary.lastTurn)
     if (!active || active.sessionId !== run.sessionId || active.id === run.id
       || !['running', 'waiting_input'].includes(active.status) || current?.status !== 'queued'
       || agent?.status !== 'running' || bound?.id !== active.id
@@ -629,15 +893,12 @@ export class WorkbenchService {
       throw Object.assign(httpError(409, '目标任务已结束或正在切换，请刷新后重试'), { code: 'STALE_RUN' })
     pending = this.database.submission(owner.ownerId, runId)
     if (pending && !pending.dispatched) {
-      if (!content || content.some(part => part.type === 'image' && !part.attachment))
-        throw httpError(503, '图片尚未完成原生接入，请稍后重试')
-      agent.steer(createUserMessage({ content, source: { kind: 'user', rpcId: run.id } }))
+      await this.sessions.prompt({ sessionId: run.sessionId, requestId: run.id, content, mode: 'steer' })
       this.database.finishSubmission(owner.ownerId, run.id)
     } else {
       const message = [...agent.inbox.nextTurn, ...agent.inbox.nextStep].find(item => item.id === current.messageId)
       if (!message) throw Object.assign(httpError(409, '排队消息已被接收，请刷新后重试'), { code: 'STALE_RUN' })
-      agent.inbox.remove(message.id)
-      agent.steer(message)
+      await this.sessions.updateQueue({ sessionId: run.sessionId, itemId: message.id, action: { kind: 'steer' } })
     }
     this.database.transitionRun(owner.ownerId, run.id, 'steered')
     this.database.appendEvent(owner.ownerId, run.id, { event: 'workbench_steered', steer_target_run_id: targetRunId })
@@ -647,10 +908,10 @@ export class WorkbenchService {
     return this.getRun(owner, run.id)
   }
 
-  getRun(owner, runId) {
+  getRun(owner, runId, includeEvents = true) {
     const run = this.database.getRun(owner.ownerId, runId)
     if (!run) throw httpError(404, '任务不存在')
-    return this.inputRunDto(owner, run, this.database.allEvents(owner.ownerId, run.id))
+    return { ...this.inputRunDto(owner, run, includeEvents ? this.database.allEvents(owner.ownerId, run.id) : []), history_complete: includeEvents }
   }
 
   inputRunDto(owner, run, events = []) {
@@ -659,6 +920,7 @@ export class WorkbenchService {
       : this.database.steeringEvents(owner.ownerId, run.id)
     return {
       ...runDto(run, events, inputs.at(-1)),
+      context_usage: this.database.latestContextEvent(owner.ownerId, run.id),
       ...this.database.runTiming(owner.ownerId, run.id),
       steer_target_run_id: steering.find((event) => event.event === 'workbench_steered')?.steer_target_run_id,
       steering_messages: steering.filter((event) => event.event === 'workbench_steering').map((event) => ({
@@ -699,6 +961,8 @@ function normalizeMcpResource(value) {
     description: value.description, inputSchema: value.inputSchema,
     group: value.group ?? 'mcp', provider: value.provider ?? 'mcp',
     provider_name: value.provider_name ?? value.server_id,
+    provider_call_name: value.provider_call_name ?? value.server_id,
+    provider_description: value.provider_description ?? '',
   }
 }
 
@@ -733,6 +997,9 @@ export function runDto(run, events = [], pending = null) {
     created_at: run.createdAt / 1000,
     can_fork: ['completed', 'failed', 'cancelled', 'interrupted'].includes(run.status) && Number.isInteger(run.selection?.fork_source?.endSeq ?? run.sourceEndSeq),
     resource_mentions: normalizeResourceMentions(run.selection?.resource_mentions),
+    mentioned_resources: run.selection?.mentioned_resources ?? [],
+    ...(run.selection?.command ? { command: run.selection.command } : {}),
+    ...(run.selection?.silent_resume ? { is_continuation: true } : {}),
     status: run.status, error: run.error, feedback: run.feedback ?? null, events, events_cursor: `${run.seq}-0`,
     stop_confirmation: run.stopConfirmation ?? null,
     queue_order: run.queueOrder, parent_run_id: run.parentRunId ?? null,

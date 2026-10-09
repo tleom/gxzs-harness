@@ -48,7 +48,8 @@ def test_owner_network_names_are_deterministic_and_separate(server, monkeypatch)
     assert len(created) == 2
 
 
-def test_sandbox_uses_one_cpu_three_gigabytes_and_owner_network(server, monkeypatch):
+@pytest.mark.parametrize('native_attachments', [False, True])
+def test_sandbox_uses_one_cpu_three_gigabytes_and_owner_network(server, monkeypatch, native_attachments):
     containers, calls = {}, []
     monkeypatch.setattr(server, 'ensure_network', lambda key: 'owner-network-' + key[:8])
 
@@ -70,24 +71,52 @@ def test_sandbox_uses_one_cpu_three_gigabytes_and_owner_network(server, monkeypa
 
     monkeypatch.setattr(server, 'docker', docker)
     key = str(uuid4())
+    if native_attachments:
+        folder = server.HOSTS.root / key
+        folder.mkdir(parents=True)
+        (folder / 'host.json').write_text(json.dumps({'workspace_id': key, 'owner_id': 't:1', 'home_volume': 'owner-home'}))
     assert server.ensure(key)['endpoint'].endswith(':5004')
     create = next(call for call in calls if call[0] == 'create')
     assert create[create.index('--cpus') + 1] == '1'
     assert create[create.index('--memory') + 1] == '3g'
     assert create[create.index('--memory-swap') + 1] == '3g'
     assert create[create.index('--network') + 1] == 'owner-network-' + key[:8]
+    if native_attachments:
+        assert create[create.index('--mount') + 1] == 'type=volume,source=owner-home,destination=/srv/dsh/attachments,volume-subpath=attachments,readonly'
+        assert 'gxzs.attachment-home=owner-home' in create
+        assert 'owner-home:/srv/dsh' not in create
+        assert any(call[0] == 'run' and 'owner-home:/srv/dsh' in call for call in calls)
 
 
-def test_running_sandbox_on_old_network_returns_predictable_retry(server, monkeypatch):
+@pytest.mark.parametrize('changed', ['network', 'attachments'])
+def test_running_sandbox_on_old_network_returns_predictable_retry(server, monkeypatch, changed):
     key = str(uuid4())
     name, _ = server.identity(key)
     existing = {'Id': 'b' * 64, 'Config': {'Image': server.IMAGE}, 'State': {'Running': True},
-                'NetworkSettings': {'Networks': {'shared-network': {}}}}
+                'NetworkSettings': {'Networks': {('shared-network' if changed == 'network' else 'owner-network'): {}}}}
+    if changed == 'attachments':
+        folder = server.HOSTS.root / key
+        folder.mkdir(parents=True)
+        (folder / 'host.json').write_text(json.dumps({'workspace_id': key, 'owner_id': 't:1', 'home_volume': 'owner-home'}))
     monkeypatch.setattr(server, 'ensure_network', lambda _: 'owner-network')
     monkeypatch.setattr(server, 'docker', lambda *args, **kwargs: SimpleNamespace(
         returncode=0, stdout=json.dumps([existing]) if args[:2] == ('inspect', name) else ''))
     with pytest.raises(server.SandboxUpdatePending):
         server.ensure(key)
+
+
+@pytest.mark.parametrize('volume', ['/srv/private', '../other-home', 'home,volume-subpath=../', '', None])
+def test_attachment_volume_rejects_paths_and_mount_options(server, monkeypatch, volume):
+    key = str(uuid4())
+    folder = server.HOSTS.root / key
+    folder.mkdir(parents=True)
+    (folder / 'host.json').write_text(json.dumps({'workspace_id': key, 'owner_id': 't:1', 'home_volume': volume}))
+    monkeypatch.setattr(server, 'ensure_network', lambda _: 'owner-network')
+    docker = Mock()
+    monkeypatch.setattr(server, 'docker', docker)
+    with pytest.raises(ValueError, match='Invalid owner attachment volume'):
+        server.ensure(key)
+    docker.assert_not_called()
 
 
 def test_health_checks_workers_database_and_docker(server, monkeypatch):

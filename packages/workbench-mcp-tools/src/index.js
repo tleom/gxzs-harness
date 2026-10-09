@@ -132,7 +132,27 @@ export async function apply(ctx) {
     const assembly = await next()
     const allowed = allowedNames(context.scope)
     const mcpNames = new Set([...registrations.values()].map(({ tool }) => tool.public_name))
-    return { ...assembly, tools: assembly.tools.filter(tool => !mcpNames.has(tool.name) || allowed.has(tool.name)) }
+    const providers = new Map()
+    for (const { tool } of registrations.values()) {
+      if (!allowed.has(tool.public_name)) continue
+      const key = `${tool.scope}:${tool.server_id}`
+      if (!providers.has(key)) providers.set(key, {
+        name: tool.provider_call_name ?? tool.server_id,
+        displayName: tool.provider_name ?? tool.server_id,
+        description: tool.provider_description ?? '',
+        tools: [],
+      })
+      providers.get(key).tools.push(tool.public_name)
+    }
+    return {
+      ...assembly,
+      tools: assembly.tools.filter(tool => !mcpNames.has(tool.name) || allowed.has(tool.name)),
+      sections: providers.size ? [...assembly.sections, {
+        name: 'gxzs:mcp-provider-catalog',
+        text: `当前可用 MCP 插件（调用名、展示名、用途和已注册子工具）：\n${JSON.stringify([...providers.values()])}\n按任务选择真实子工具；用户说出插件调用名或展示名时，可据此找到对应子工具。`,
+        interpolate: false,
+      }] : assembly.sections,
+    }
   }, { global: true })
   ctx.effect(() => () => {
     disposed = true

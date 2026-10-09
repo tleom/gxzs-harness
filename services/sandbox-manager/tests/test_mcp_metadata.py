@@ -34,6 +34,18 @@ def config(**changes):
     })
 
 
+def test_server_output_schema_survives_cache_and_changes_manifest(ops, tmp_path):
+    saved = ops.personal_mcp({"operation": "mcp_save", "name": "demo", "content": config()}, str(tmp_path))
+    tool = {"name": "lookup", "description": "Lookup", "inputSchema": {"type": "object"},
+            "outputSchema": {"type": "object", "properties": {"found": {"type": "boolean"}}, "required": ["found"]}}
+    ops.personal_mcp({"operation": "mcp_cache", "name": "demo", "version": saved["version"], "tools": [tool]}, str(tmp_path))
+    item = ops.personal_mcp({"operation": "mcp_list"}, str(tmp_path))["mcp"][0]
+    assert item["tools"] == [tool]
+    assert ops.manifest_version([tool]) != ops.manifest_version([{**tool, "outputSchema": {"type": "object"}}])
+    with pytest.raises(ValueError):
+        ops.tool_manifest([{**tool, "outputSchema": {"type": "object", "$ref": "https://example.com/schema"}}])
+
+
 def test_metadata_edit_preserves_manifest_but_connection_edit_invalidates_it(ops, tmp_path):
     save = ops.personal_mcp({"operation": "mcp_save", "name": "demo", "content": config()}, str(tmp_path))
     tools = [{"name": "lookup", "description": "Lookup", "inputSchema": {"type": "object"}}]
@@ -58,3 +70,29 @@ def test_new_config_rejects_name_different_from_call_name(ops, tmp_path):
     with pytest.raises(ValueError, match="name"):
         ops.personal_mcp({"operation": "mcp_save", "name": "demo",
                           "content": config(name="different")}, str(tmp_path))
+
+
+def test_discovery_expires_and_authentication_edit_invalidates(ops, tmp_path, monkeypatch):
+    now = 1_000_000
+    monkeypatch.setattr(ops.time, "time", lambda: now)
+    save = ops.personal_mcp({"operation": "mcp_save", "name": "demo",
+                             "content": config(headers={"Authorization": "Bearer old"})}, str(tmp_path))
+    tools = [{"name": "lookup", "inputSchema": {"type": "object", "required": ["q"]}}]
+    ops.personal_mcp({"operation": "mcp_cache", "name": "demo", "version": save["version"],
+                      "tools": tools}, str(tmp_path))
+    assert ops.personal_mcp({"operation": "mcp_list"}, str(tmp_path))["mcp"][0]["status"] == "ready"
+    monkeypatch.setattr(ops.time, "time", lambda: now + ops.DISCOVERY_TTL)
+    assert ops.personal_mcp({"operation": "mcp_list"}, str(tmp_path))["mcp"][0]["status"] == "unverified"
+    monkeypatch.setattr(ops.time, "time", lambda: now)
+    ops.personal_mcp({"operation": "mcp_save", "name": "demo", "version": save["version"],
+                      "content": config(headers={"Authorization": "Bearer new"})}, str(tmp_path))
+    assert ops.personal_mcp({"operation": "mcp_list"}, str(tmp_path))["mcp"][0]["status"] == "unverified"
+
+
+def test_corrupt_cache_does_not_disable_valid_plugin(ops, tmp_path):
+    ops.personal_mcp({"operation": "mcp_save", "name": "demo", "content": config()}, str(tmp_path))
+    (tmp_path / ".mcp-cache").mkdir(exist_ok=True)
+    (tmp_path / ".mcp-cache" / "demo.json").write_text("not-json", encoding="utf-8")
+    item = ops.personal_mcp({"operation": "mcp_list"}, str(tmp_path))["mcp"][0]
+    assert item["enabled"] is True
+    assert item["status"] == "unverified"

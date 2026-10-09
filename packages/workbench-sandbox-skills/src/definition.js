@@ -32,6 +32,6 @@ export async function readSkillDefinition(content, { id, signal } = {}) {
 }
 
 export function skillDisplayName(skill) {
-  const value = skill.metadata?.['display-name'] ?? skill.metadata?.displayName
+  const value = skill.displayName ?? skill.metadata?.['display-name'] ?? skill.metadata?.displayName
   return typeof value === 'string' && value.trim() ? value.trim() : skill.name
 }

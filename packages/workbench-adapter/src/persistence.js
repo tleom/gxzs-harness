@@ -211,12 +211,12 @@ export class WorkbenchDatabase {
     return this.getChat(ownerId, id)
   }
 
-  createChat({ ownerId, sessionId, selection, title = '新会话', id = randomUUID(), now = Date.now() }) {
+  createChat({ ownerId, sessionId, selection, directory = null, title = '新会话', id = randomUUID(), now = Date.now() }) {
     const create = this.transaction(() => {
       this.db.prepare(`INSERT INTO chats
-        (id, owner_id, session_id, title, selection_json, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)`)
-        .run(id, ownerId, sessionId, title, JSON.stringify(selection), now, now)
+        (id, owner_id, session_id, title, selection_json, created_at, updated_at, directory)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+        .run(id, ownerId, sessionId, title, JSON.stringify(selection), now, now, directory)
       this.db.prepare('INSERT INTO control_state(chat_id, updated_at) VALUES (?, ?)').run(id, now)
       return this.getChat(ownerId, id)
     })
@@ -403,6 +403,11 @@ export class WorkbenchDatabase {
       .all(ownerId, chatId).map(decodeRun)
   }
 
+  latestRunStatus(ownerId, chatId) {
+    return this.db.prepare('SELECT status FROM runs WHERE owner_id = ? AND chat_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1')
+      .get(ownerId, chatId)?.status
+  }
+
   getCommandReceipt(ownerId, chatId, requestKey) {
     const row = this.db.prepare('SELECT result_json FROM command_receipts WHERE owner_id = ? AND chat_id = ? AND request_key = ?')
       .get(ownerId, chatId, requestKey)
@@ -534,6 +539,11 @@ export class WorkbenchDatabase {
     return row?.tool_name
   }
 
+  toolCallName(ownerId, runId, callId) {
+    if (!this.getRun(ownerId, runId)) throw notFound('任务不存在')
+    return this.db.prepare('SELECT tool_name FROM tool_calls WHERE run_id = ? AND call_id = ?').get(runId, callId)?.tool_name
+  }
+
   appendEvent(ownerId, runId, payload, now = Date.now()) {
     this.flushStreamEvents()
     this.eventSequenceStatement ??= this.db.prepare('SELECT next_seq FROM runs WHERE id = ? AND owner_id = ?')
@@ -628,6 +638,13 @@ export class WorkbenchDatabase {
       completed_at: ended == null ? null : ended / 1000,
       elapsed_seconds: ended != null && timing.started != null ? Math.max(0, ended - timing.started) / 1000 : null,
     }
+  }
+
+  latestContextEvent(ownerId, runId) {
+    if (!this.getRun(ownerId, runId)) throw notFound('任务不存在')
+    const row = this.db.prepare(`SELECT payload_json FROM run_events WHERE run_id = ?
+      AND json_extract(payload_json, '$.event') = 'workbench_context' ORDER BY seq DESC LIMIT 1`).get(runId)
+    return row ? JSON.parse(row.payload_json) : undefined
   }
 
   allEvents(ownerId, runId) {

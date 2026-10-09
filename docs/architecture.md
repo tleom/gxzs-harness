@@ -41,11 +41,15 @@ The adapter uses SQLite with WAL, full synchronous writes, foreign keys and tran
 3. Human input and crash semantics.
 4. Followup and control projections.
 5. Skills, personal MCP and platform resource metadata.
-6. Complete file capability, with preview/share/transcription delegated to platform services.
+6. Complete file capability: native DSH Office preview for sandbox files; platform services for local attachment preview, sharing and transcription.
 7. Tenant gray release, rollback switch and removal of the custom Dify Agent runtime.
 
 Knowledge MCP catalog/search/citations is intentionally deferred. The boundary remains reserved, but the current runtime performs no knowledge service calls.
 
 ## Office preview decision
 
-The current platform preview remains authoritative for the migration. It converts only supplied bytes inside a disposable offline container with no user volumes or network, enforces the existing 20 MiB product contract, protects OOXML expansion, applies the established Word exact-line-spacing compatibility fix, and retains the current Redis cache and Chinese error behavior. DSH `office-to-pdf` is broader and has strong queue/cache/cancellation bounds, but it runs in the DSH host, needs the separately packaged LibreOffice kit, uses different default 50/100 MiB limits, and would require moving remote sandbox bytes into the host. Replacing the platform service requires a separate fidelity, memory, font, isolation and failure-contract benchmark; the adapter should proxy the platform preview endpoint until that evidence exists.
+Sandbox Office files use DSH `OfficeToPdf` through `office-preview.js`. The fixed-workspace manager checks owner-scoped file metadata and supplies versioned bytes; DSH owns admission, conversion, cancellation and cache lifetime. Cache identity includes the owner, path and file version. The adapter preserves the 20 MiB source and PDF response limits and maps native conversion errors into the existing HTTP contract. The host image packages LibreOffice and fonts for this route.
+
+Local attachment uploads have no sandbox path and retain the platform byte-conversion route, including its offline container, OOXML expansion checks and Word line-spacing compatibility. Non-Office preview formats keep their existing handling. Sharing and transcription remain platform services.
+
+Disposable-image checks cover native DOCX/XLSX/PPTX conversion and cache reuse, and the full image smoke includes Chinese DOCX text extraction. These checks do not imply production rollout or fidelity for every user document; production validation and representative document review remain deployment acceptance checks.

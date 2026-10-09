@@ -12,7 +12,15 @@ export class SandboxSkillProvider {
 
   async list(options = {}) {
     this.checkAbort(options.signal)
-    const snapshot = await this.manager.personalResources({ operation: 'list' })
+    let snapshot
+    try {
+      snapshot = await this.manager.personalResources({ operation: 'list' })
+    } catch (error) {
+      this.checkAbort(options.signal)
+      // A failed personal provider cannot certify any of its entries. Publish
+      // an authoritative empty contribution so healthy global skills remain visible.
+      return { candidates: [], complete: true }
+    }
     this.checkAbort(options.signal)
     const candidates = []
     for (const item of snapshot.skills ?? []) {
@@ -22,8 +30,8 @@ export class SandboxSkillProvider {
         candidates.push({ ...summary, rank: 400, locator: { id: item.id, version: item.version } })
       } catch { /* Invalid personal skills never enter the model catalog. */ }
     }
-    // The manager can be mutated outside this host, so every lookup must revalidate.
-    return { candidates, complete: false }
+    // Each load still revalidates the enabled state and revision in the manager.
+    return { candidates, complete: true }
   }
 
   async get(candidate, options = {}) {
@@ -46,10 +54,17 @@ export class SandboxSkillProvider {
 }
 
 export function apply(ctx) {
-  ctx.effect(() => ctx.skills.registerProvider((control) => {
-    ctx.on('workbench/resources-changed', () => control.invalidate())
-    return new SandboxSkillProvider(ctx.workbenchFileManager, control)
-  }), 'gxzs remote personal skills')
+  ctx.effect(() => {
+    let timer
+    const dispose = ctx.skills.registerProvider((control) => {
+      ctx.on('workbench/resources-changed', () => control.invalidate())
+      // External sandbox writes bypass Host events; periodically re-observe them.
+      timer = setInterval(() => control.invalidate(), 30_000)
+      timer.unref?.()
+      return new SandboxSkillProvider(ctx.workbenchFileManager, control)
+    })
+    return () => { clearInterval(timer); dispose() }
+  }, 'gxzs remote personal skills')
 }
 
 async function parseSkill(item) {

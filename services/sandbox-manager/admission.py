@@ -81,6 +81,14 @@ class Admission:
                 (owner,),
             ).fetchone()[0]
 
+    def pending(self, owner, generation, instance, run, chat):
+        """Whether this exact ticket was admitted before a Host began draining."""
+        with self.guard:
+            return self.db.execute(
+                "SELECT 1 FROM task_admission WHERE owner=? AND generation=? AND instance=? AND run=? AND chat=? AND state IN ('running','waiting','retry')",
+                (owner, generation, instance, run, chat),
+            ).fetchone() is not None
+
     def ping(self):
         with self.guard:
             return self.db.execute('SELECT 1').fetchone()[0] == 1

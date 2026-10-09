@@ -2,7 +2,7 @@
 // Run inside the built host image with --network none and this script mounted
 // read-only. All HTTP fixtures, state and child processes stay in the container.
 import assert from 'node:assert/strict'
-import { spawn } from 'node:child_process'
+import { execFileSync, spawn } from 'node:child_process'
 import { createHash, createHmac, randomUUID } from 'node:crypto'
 import { access, constants, mkdtemp, mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import http from 'node:http'
@@ -20,6 +20,17 @@ const platformToken = 'synthetic-bootstrap-platform-token'
 const managerToken = 'synthetic-bootstrap-manager-token'
 const signingKey = Buffer.alloc(32, 7).toString('base64')
 const secrets = [platformToken, managerToken, signingKey]
+const fixtureTool = {
+  id: 'global:reference-smoke:lookup', runtime_name: 'global_mcp_reference_smoke_lookup',
+  version: 'v1', manifest_version: 'v1',
+  scope: 'global', server_id: 'reference-smoke', tool_name: 'fixture_lookup',
+  provider: 'global:reference-smoke', provider_name: '引用测试插件',
+  description: 'Synthetic reference lookup', inputSchema: { type: 'object', properties: {} },
+}
+const fixtureSkill = {
+  id: 'bootstrap-skill', version: 'v1', enabled: true,
+  content: '---\nname: bootstrap-skill\ndescription: Synthetic skill for assembly validation\nmetadata:\n  display-name: 技能装配测试\n---\nsynthetic-skill-body-verified',
+}
 let registered = false
 let deniedCatalogs = 0
 let acceptedCatalogs = 0
@@ -29,6 +40,18 @@ let childError
 let hostLogs = ''
 let passed = false
 const sessionCreate = process.argv.includes('--session-create')
+const realSsh = process.argv.includes('--real-ssh')
+const crashRestart = process.argv.includes('--crash-restart')
+const runningRestart = process.argv.includes('--running-restart')
+let modelPort
+let modelCalls = 0
+let titleCalls = 0
+let verifyReferenceContext = false
+let verifySkillContext = false
+let referenceContextVerified = false
+let pluginCalls = 0
+const remote = (command) => execFileSync('ssh', ['-T', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=5',
+  process.env.GXZS_SANDBOX_SSH_HOST, command], { encoding: 'utf8', timeout: 10_000 })
 const remoteDirectories = new Set()
 
 const sanitize = (text) => secrets.reduce((value, secret) => value.replaceAll(secret, '[fixture-redacted]'), String(text))
@@ -59,13 +82,28 @@ const fixture = (handler) => http.createServer(async (req, res) => {
 })
 const platform = fixture((req, res) => {
   checkIdentity(req, platformToken)
+  if (req.method === 'POST' && req.url === '/internal/workbench/mcp/call') {
+    assert.equal(req.fixtureBody.resource_id, fixtureTool.id)
+    assert.equal(req.fixtureBody.tool_name, fixtureTool.tool_name)
+    assert.equal(req.fixtureBody.version, fixtureTool.version)
+    assert.ok(req.fixtureBody.run_id && req.fixtureBody.request_key)
+    pluginCalls++
+    respond(res, 200, { data: { result: { content: [{ type: 'text', text: 'synthetic-plugin-result-verified' }] } } })
+    return
+  }
+  if (req.method === 'POST' && req.url === '/internal/workbench/scheduling') {
+    respond(res, 200, { data: { state: req.fixtureBody.action === 'release' ? 'done' : 'running' } }); return
+  }
+  if (req.method === 'POST' && req.url === '/internal/workbench/mcp/cancel') {
+    respond(res, 200, { data: { fenced: true } }); return
+  }
   if (req.method === 'GET' && req.url === '/internal/workbench/mcp/catalog') {
     if (!registered) {
       deniedCatalogs += 1
       respond(res, 401, { code: 'HOST_NOT_REGISTERED', message: 'Synthetic host registration pending' })
     } else {
       acceptedCatalogs += 1
-      respond(res, 200, { data: { tools: [] } })
+      respond(res, 200, { data: { tools: [fixtureTool] } })
     }
     return
   }
@@ -74,8 +112,8 @@ const platform = fixture((req, res) => {
     // synthetic route; neither check may perform a model call or submit a task.
     respond(res, 200, { data: sessionCreate ? {
       enabled: true, system_prompt: '', models: { default: 'smoke/smoke', providers: { smoke: {
-        api: 'openai-completions', baseURL: 'http://127.0.0.1:1/v1',
-        models: [{ id: 'smoke', name: 'Smoke', input: ['text'], contextWindow: 8192, maxTokens: 1024 }],
+        api: 'openai-completions', apiKeyEnv: 'GXZS_SMOKE_MODEL_KEY', baseURL: `http://127.0.0.1:${modelPort ?? 1}/v1`,
+        models: [{ id: 'smoke', name: 'Smoke', input: ['text'], contextWindow: 131072, maxTokens: 1024 }],
       } } },
     } : { enabled: false, system_prompt: '', models: { providers: {}, default: '' } } })
     return
@@ -86,17 +124,90 @@ const manager = fixture((req, res) => {
   checkIdentity(req, managerToken)
   assert.equal(req.method, 'POST', 'Manager fixture only accepts POST')
   const base = `/sandboxes/${workspace}/`
-  if (req.url === `${base}personal-resources`) { respond(res, 200, { skills: [] }); return }
+  if (req.url === `${base}personal-resources`) { respond(res, 200, { skills: [fixtureSkill] }); return }
   if (req.url === `${base}personal-mcp`) { respond(res, 200, { mcp: [] }); return }
   if (req.url === `${base}files`) {
     if (sessionCreate) {
       assert.equal(req.fixtureBody?.operation, 'mkdir')
       assert.match(req.fixtureBody.path, /^conversations\/[a-f0-9-]{36}$/)
+      if (realSsh) remote(`mkdir -p -- /workspace/${req.fixtureBody.path}`)
       remoteDirectories.add(req.fixtureBody.path)
     }
     respond(res, 200, { path: '.', entries: [] }); return
   }
   throw new Error(`Unexpected manager fixture request: ${req.method} ${req.url}`)
+})
+const model = fixture((req, res) => {
+  assert.equal(req.method, 'POST')
+  assert.equal(req.url, '/v1/chat/completions')
+  const tools = new Map((req.fixtureBody.tools ?? []).map(tool => [tool.function?.name, tool.function]))
+  if (req.fixtureBody.messages?.[0]?.role === 'system' &&
+    req.fixtureBody.messages[0].content?.startsWith('Create a concise title for an AI coding-assistant session')) {
+    assert.equal(tools.size, 0, 'Native title generation must not receive execution tools')
+    titleCalls++
+    res.writeHead(200, {'content-type':'text/event-stream'})
+    res.write(`data: ${JSON.stringify({id:'fixture-title',object:'chat.completion.chunk',created:1,model:'smoke',
+      choices:[{index:0,delta:{role:'assistant',content:'Reference fixture'},finish_reason:null}]})}\n\n`)
+    res.write(`data: ${JSON.stringify({id:'fixture-title',object:'chat.completion.chunk',created:1,model:'smoke',
+      choices:[{index:0,delta:{},finish_reason:'stop'}]})}\n\n`)
+    res.end('data: [DONE]\n\n')
+    return
+  }
+  for (const name of ['bash', 'job_output', 'job_kill']) {
+    assert.ok(tools.has(name), `Native standard preset must expose ${name} to the model; received: ${JSON.stringify([...tools.keys()])}`)
+  }
+  assert.ok(tools.get('bash').parameters?.properties?.run_in_background,
+    'Actual host assembly must expose native background execution')
+  if (verifyReferenceContext) {
+    const messages = JSON.stringify(req.fixtureBody.messages)
+    assert.ok(messages.includes('Explicit recovery retry'), 'Referenced user message must reach model context')
+    assert.ok(messages.includes('Restart fixture in progress'), 'Referenced assistant response must reach model context')
+    assert.ok(messages.includes('用户优先指定插件') && messages.includes('引用测试插件'),
+      'Explicit plugin preference must coexist with native conversation references')
+    assert.ok(tools.has('fixture_lookup'), 'The selected plugin child tool must be available to the actual model')
+    referenceContextVerified = true
+  }
+  modelCalls++
+  res.writeHead(200, { 'content-type': 'text/event-stream' })
+  if (verifySkillContext) {
+    assert.ok(tools.has('skill'), 'Native skill tool must be available to the actual model')
+    const messages = JSON.stringify(req.fixtureBody.messages)
+    assert.ok(messages.includes('用户指定技能') && messages.includes(fixtureSkill.id))
+    if (modelCalls === 5) {
+      res.write(`data: ${JSON.stringify({ id: 'fixture-skill', object: 'chat.completion.chunk', created: 1, model: 'smoke',
+        choices: [{ index: 0, delta: { role: 'assistant', tool_calls: [{ index: 0, id: 'fixture-skill-call', type: 'function',
+          function: { name: 'skill', arguments: JSON.stringify({ name: fixtureSkill.id }) } }] }, finish_reason: null }] })}\n\n`)
+      res.write(`data: ${JSON.stringify({ id: 'fixture-skill', object: 'chat.completion.chunk', created: 1, model: 'smoke',
+        choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] })}\n\n`)
+      res.end('data: [DONE]\n\n')
+      return
+    }
+    assert.equal(modelCalls, 6)
+    assert.ok(messages.includes('synthetic-skill-body-verified'), 'Loaded native skill body must reach the next model request')
+  }
+  if (verifyReferenceContext && modelCalls === 3) {
+    res.write(`data: ${JSON.stringify({ id: 'fixture-tool', object: 'chat.completion.chunk', created: 1, model: 'smoke',
+      choices: [{ index: 0, delta: { role: 'assistant', tool_calls: [{ index: 0, id: 'fixture-lookup-call', type: 'function',
+        function: { name: 'fixture_lookup', arguments: '{}' } }] }, finish_reason: null }] })}\n\n`)
+    res.write(`data: ${JSON.stringify({ id: 'fixture-tool', object: 'chat.completion.chunk', created: 1, model: 'smoke',
+      choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] })}\n\n`)
+    res.end('data: [DONE]\n\n')
+    return
+  }
+  if (verifyReferenceContext) {
+    assert.equal(pluginCalls, 1, 'Plugin must execute exactly once through the platform proxy')
+    assert.ok(JSON.stringify(req.fixtureBody.messages).includes('synthetic-plugin-result-verified'),
+      'Native tool result must return to the model')
+  }
+  res.write(`data: ${JSON.stringify({ id: 'fixture', object: 'chat.completion.chunk', created: 1, model: 'smoke',
+    choices: [{ index: 0, delta: { role: 'assistant', content: 'Restart fixture in progress' }, finish_reason: null }] })}\n\n`)
+  // Hold the native model stream open until the host process is killed.
+  if (modelCalls > 1) {
+    res.write(`data: ${JSON.stringify({ id: 'fixture', object: 'chat.completion.chunk', created: 1, model: 'smoke',
+      choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 } })}\n\n`)
+    res.end('data: [DONE]\n\n')
+  }
 })
 async function listen(server) {
   await new Promise((resolve, reject) => {
@@ -107,6 +218,7 @@ async function listen(server) {
 }
 async function waitForHealth(predicate, stage, timeoutMs = 60_000) {
   const deadline = Date.now() + timeoutMs
+  let lastHealth
   while (Date.now() < deadline) {
     if (fixtureFailure) throw fixtureFailure
     if (childError) throw childError
@@ -115,11 +227,13 @@ async function waitForHealth(predicate, stage, timeoutMs = 60_000) {
     try {
       const response = await fetch('http://127.0.0.1:3081/ai/workbench/health', { signal: AbortSignal.timeout(1500) })
       const body = await response.json()
+      lastHealth = {status:response.status, live:body.live, ready:body.ready,
+        recovery:body.recovery, resources:body.resources}
       if (predicate(response.status, body)) return body
     } catch { /* Relay can be listening before DSH mounts the adapter route. */ }
     await delay(100)
   }
-  throw new Error(`Timed out waiting for ${stage}`)
+  throw new Error(`Timed out waiting for ${stage}; ${JSON.stringify({lastHealth,deniedCatalogs,acceptedCatalogs})}`)
 }
 async function liveGroupMembers(group) {
   const members = []
@@ -137,9 +251,9 @@ function signalGroup(signal) {
   try { process.kill(-child.pid, signal) }
   catch (error) { if (error.code !== 'ESRCH') throw error }
 }
-async function stopHost() {
+async function stopHost(signal = 'SIGTERM') {
   if (!child?.pid) return
-  signalGroup('SIGTERM')
+  signalGroup(signal)
   let deadline = Date.now() + 5000
   while ((await liveGroupMembers(child.pid)).length && Date.now() < deadline) await delay(50)
   if ((await liveGroupMembers(child.pid)).length) signalGroup('SIGKILL')
@@ -165,7 +279,37 @@ async function signedRequest(method, route, value) {
   })
 }
 
+async function historySnapshot(chatId) {
+  const response = await signedRequest('GET', `/chats/${chatId}/events`)
+  assert.equal(response.status, 200, 'Signed native history stream must open')
+  assert.match(response.headers.get('content-type'), /^text\/event-stream/)
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let text = ''
+  try {
+    while (true) {
+      const chunk = await reader.read()
+      assert.equal(chunk.done, false, 'History stream ended before its opening snapshot')
+      text += decoder.decode(chunk.value, { stream: true })
+      let boundary
+      while ((boundary = text.indexOf('\n\n')) >= 0) {
+        const lines = text.slice(0, boundary).split('\n')
+        text = text.slice(boundary + 2)
+        const data = lines.filter(line => line.startsWith('data:')).map(line => line.slice(5).trimStart()).join('\n')
+        if (!data) continue
+        const frame = JSON.parse(data)
+        assert.equal(frame.event, 'workbench_history')
+        assert.equal(frame.value.type, 'snapshot')
+        assert.equal(frame.value.header, undefined, 'Native headers must stay private')
+        assert.equal(frame.display.replace, true)
+        return frame
+      }
+    }
+  } finally { await reader.cancel(); reader.releaseLock() }
+}
+
 try {
+  if (runningRestart) modelPort = await listen(model)
   const platformPort = await listen(platform)
   const managerPort = await listen(manager)
   const home = path.join(root, 'home')
@@ -195,6 +339,7 @@ try {
     PATH: `${bin}:${process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin'}`,
     HOME: home, USER: 'node', LANG: 'C.UTF-8',
     DSH_HOME: path.join(root, 'dsh'), DSH_TELEMETRY_DISABLED: '1', DSH_PERMISSION_MODE: 'danger-full-access',
+    GXZS_SMOKE_MODEL_KEY: 'synthetic-model-key',
     GXZS_HOST_OWNER_ID: owner, GXZS_HOST_GENERATION: '1', GXZS_HOST_INSTANCE_ID: instance,
     GXZS_ASSERTION_ISSUER: 'bootstrap-smoke', GXZS_ASSERTION_SIGNING_KEY: signingKey,
     GXZS_ASSERTION_AUDIENCE_PATH: '/ai/workbench',
@@ -207,6 +352,17 @@ try {
     // The host image deliberately has no sandbox ripgrep. Readiness resolves
     // this executable but must never perform a user search in this fixture.
     GXZS_SANDBOX_RG: '/usr/bin/false',
+  }
+  if (realSsh) {
+    assert.ok(process.env.GXZS_SANDBOX_SSH_HOST, 'Real SSH mode requires the isolated sandbox alias')
+    assert.match(process.env.GXZS_SANDBOX_HELPER_HASH ?? '', /^[a-f0-9]{64}$/)
+    Object.assign(env, {
+      PATH: process.env.PATH, HOME: process.env.HOME,
+      GXZS_SANDBOX_SSH_HOST: process.env.GXZS_SANDBOX_SSH_HOST,
+      GXZS_SANDBOX_HELPER: '/opt/dsh/node_modules/@deepseek-ai/dsh-ssh/lib/helper.js',
+      GXZS_SANDBOX_HELPER_HASH: process.env.GXZS_SANDBOX_HELPER_HASH,
+      GXZS_SANDBOX_RG: '/usr/bin/rg',
+    })
   }
   child = spawn('/usr/local/bin/start-workbench', [], { env, detached: true, stdio: ['ignore', 'pipe', 'pipe'] })
   child.once('error', (error) => { childError = error })
@@ -221,10 +377,37 @@ try {
     const response = await signedRequest('POST', '/chats')
     assert.equal(response.status, 201, 'Actual Workbench -> native sessionController.create must succeed')
     const chat = (await response.json()).data
+    assert.match(chat.id, /^[a-f0-9-]{36}$/)
     assert.ok(remoteDirectories.has(`conversations/${chat.id}`), 'Sandbox mkdir must run before native creation')
+    if (realSsh) remote(`printf restart-proof > /workspace/conversations/${chat.id}/restart-proof.txt`)
     assert.deepEqual(await readdir(`/workspace/conversations/${chat.id}`), [], 'Host cwd remains an empty placeholder')
     const detail = await signedRequest('GET', `/chats/${chat.id}`)
     assert.equal(detail.status, 200)
+    const nativeCommand = async (command) => {
+      const response = await signedRequest('POST', `/chats/${chat.id}/commands`, {command, request_key:randomUUID()})
+      assert.equal(response.status, 200, `Native command ${command} must be available in the composed host`)
+      return (await response.json()).data
+    }
+    const planned = await nativeCommand('/plan')
+    assert.equal(planned.state.plan.active, true, 'Plan command must update the native projection')
+    const unplanned = await nativeCommand('/plan off')
+    assert.equal(unplanned.state.plan.active, false, 'Plan exit must clear the native projection')
+    const goalStatus = await nativeCommand('/goal')
+    assert.equal(goalStatus.state.goal, null, 'Status-only goal command must not create an objective')
+    assert.equal(modelCalls, 0, 'Mode toggles and goal status must not submit a model turn')
+    const invalidCompact = await signedRequest('POST', `/chats/${chat.id}/commands`, {command:'/compact invalid', request_key:randomUUID()})
+    assert.equal(invalidCompact.status, 409, 'Registered native compact command must reject arguments')
+    assert.ok(JSON.stringify(await invalidCompact.json()).includes('Usage: /compact'), 'Expected the native compact argument validation')
+    console.log('PASS native commands: plan on/off projections; goal status without submission; compact argument validation')
+    if (realSsh) {
+      const references = await signedRequest('GET', `/chats/${chat.id}/references?query=restart-proof`)
+      assert.equal(references.status, 200, 'Native reference search must work through the full host')
+      const candidates = (await references.json()).data
+      assert.ok(candidates.some(item => item.group === 'files' && item.kind === 'file' && item.path === 'restart-proof.txt'),
+        `Reference search must find the sandbox file relative to the native session cwd: ${JSON.stringify(candidates)}`)
+      assert.ok(candidates.every(item => !item.cwd), 'Reference candidates must not expose host cwd')
+      console.log('PASS native file references: sandbox-only file discovered; host cwd not exposed')
+    }
     // Empty native sessions are lazy until their first event or explicit flush.
     const renamed = await signedRequest('PATCH', `/chats/${chat.id}`, { title: 'Native create smoke' })
     assert.equal(renamed.status, 200)
@@ -235,14 +418,119 @@ try {
       await delay(50)
     }
     assert.ok(sessions.some(name => name.endsWith('.zstd')), 'Native session must be persisted')
-    await stopHost()
+    let runningId
+    if (runningRestart) {
+      const submitted = await signedRequest('POST', `/chats/${chat.id}/runs`, { query: 'Synthetic recovery probe', request_key: 'crash-probe' })
+      assert.equal(submitted.status, 202)
+      runningId = (await submitted.json()).data.id
+      assert.ok(runningId)
+      const deadline = Date.now() + 20_000
+      while (!modelCalls && Date.now() < deadline) await delay(100)
+      if (!modelCalls) {
+        const diagnostic = await signedRequest('GET', `/runs/${runningId}`)
+        process.stderr.write(`Fixture run diagnostic: ${sanitize(JSON.stringify(await diagnostic.json()))}\n`)
+        if (fixtureFailure) throw fixtureFailure
+      }
+      assert.equal(modelCalls, 1, 'Native agent must reach the fixture model before restart')
+      const active = await signedRequest('GET', `/runs/${runningId}`)
+      assert.equal((await active.json()).data.status, 'running')
+    }
+    await stopHost(crashRestart ? 'SIGKILL' : 'SIGTERM')
     child = spawn('/usr/local/bin/start-workbench', [], { env, detached: true, stdio: ['ignore', 'pipe', 'pipe'] })
     child.once('error', error => { childError = error })
     for (const stream of [child.stdout, child.stderr]) stream.on('data', chunk => { hostLogs = (hostLogs + chunk.toString()).slice(-24_000) })
     await waitForHealth((status, body) => status === 200 && body.ready === true, 'restarted host with native session', 30_000)
+    if (runningRestart) {
+      const recovered = await signedRequest('GET', `/runs/${runningId}`)
+      assert.equal((await recovered.json()).data.status, 'interrupted', 'In-flight native turn must not stay falsely running')
+      await delay(1500)
+      assert.equal(modelCalls, 1, 'Recovery must not silently replay the admitted task')
+      const retried = await signedRequest('POST', `/chats/${chat.id}/runs`, {
+        query: 'Explicit recovery retry', request_key: 'crash-probe-retry', retry_of: runningId,
+      })
+      assert.equal(retried.status, 202)
+      const retryId = (await retried.json()).data.id
+      assert.notEqual(retryId, runningId, 'Explicit retry must retain the original interrupted receipt')
+      let retryStatus
+      const deadline = Date.now() + 20_000
+      while (Date.now() < deadline) {
+        const result = await signedRequest('GET', `/runs/${retryId}`)
+        retryStatus = (await result.json()).data.status
+        if (['completed', 'failed', 'interrupted'].includes(retryStatus)) break
+        await delay(100)
+      }
+      assert.equal(retryStatus, 'completed', 'Same session must execute a new explicit retry after recovery')
+      assert.equal(modelCalls, 2, 'Only the original attempt and explicit retry may call the model')
+    }
     const resumed = await signedRequest('PATCH', `/chats/${chat.id}`, { title: 'Native resume smoke' })
     assert.equal(resumed.status, 200, 'Native cold-session resume must succeed after host restart')
+    if (realSsh) assert.equal(remote(`cat /workspace/conversations/${chat.id}/restart-proof.txt`), 'restart-proof',
+      'Sandbox file must survive host restart')
     assert.deepEqual(await readdir(`/workspace/conversations/${chat.id}`), [], 'Native create and resume must leave cwd empty')
+    if (runningRestart) {
+      const targetResponse = await signedRequest('POST', '/chats')
+      assert.equal(targetResponse.status, 201)
+      const target = (await targetResponse.json()).data
+      const candidateResponse = await signedRequest('GET', `/chats/${target.id}/references?query=Native`)
+      assert.equal(candidateResponse.status, 200)
+      const source = (await candidateResponse.json()).data.find(item => item.chatId === chat.id)
+      assert.ok(source?.mention, 'Source conversation must provide a native mention token')
+      verifyReferenceContext = true
+      const submission = await signedRequest('POST', `/chats/${target.id}/runs`, {
+        query: `Summarize the referenced conversation ${source.mention}`, request_key: 'reference-context-probe',
+        resource_mentions: { tools: [fixtureTool.id] },
+      })
+      assert.equal(submission.status, 202)
+      const referenceRun = (await submission.json()).data.id
+      let status
+      const deadline = Date.now() + 20_000
+      while (Date.now() < deadline) {
+        if (fixtureFailure) throw fixtureFailure
+        status = (await (await signedRequest('GET', `/runs/${referenceRun}`)).json()).data.status
+        if (['completed', 'failed', 'interrupted'].includes(status)) break
+        await delay(100)
+      }
+      assert.equal(status, 'completed', 'Cross-conversation reference run must complete')
+      assert.ok(referenceContextVerified, 'Reference context must be observed in the actual model request')
+      assert.equal(pluginCalls, 1, 'Selected plugin must complete one actual tool roundtrip')
+      assert.equal(modelCalls, 4, 'Task requests must contain the initial attempt, retry, plugin call and plugin result')
+      console.log(`PASS native conversation reference and selected plugin roundtrip; task_model_calls=${modelCalls}; title_model_calls=${titleCalls}`)
+      const historyResponse = await signedRequest('GET', `/chats/${target.id}/history?native=1`)
+      assert.equal(historyResponse.status, 200, 'Signed native history page must be available after tool completion')
+      const history = (await historyResponse.json()).data
+      assert.ok(history.runs.some(run => run.id === referenceRun), 'Native page must retain the business run identity')
+      const first = await historySnapshot(target.id)
+      const second = await historySnapshot(target.id)
+      assert.equal(first.session_id, second.session_id, 'Reconnection must remain in the same native session')
+      assert.deepEqual(first.display.events, second.display.events, 'Reopening a completed session must not duplicate or rewrite output')
+      const toolResult = second.display.events.find(item => item.run_id === referenceRun && item.event.data?.stage === 'returned')
+      assert.equal(toolResult?.event.data?.provider_name, fixtureTool.provider_name)
+      assert.equal(toolResult?.event.data?.display_name, fixtureTool.tool_name)
+      assert.equal(modelCalls, 4, 'History reads and reconnects must not submit or replay a model turn')
+      console.log('PASS signed native history: completed plugin result; page/run identity; reconnect baseline stable; no model replay')
+      verifyReferenceContext = false
+      verifySkillContext = true
+      const skillResponse = await signedRequest('POST', `/chats/${target.id}/runs`, {
+        query: 'Use the named skill', request_key: 'skill-context-probe', resource_mentions: { skills: [fixtureSkill.id] },
+      })
+      assert.equal(skillResponse.status, 202)
+      const skillRun = (await skillResponse.json()).data.id
+      let skillStatus
+      const skillDeadline = Date.now() + 20_000
+      while (Date.now() < skillDeadline) {
+        if (fixtureFailure) throw fixtureFailure
+        skillStatus = (await (await signedRequest('GET', `/runs/${skillRun}?view=state`)).json()).data.status
+        if (['completed', 'failed', 'interrupted'].includes(skillStatus)) break
+        await delay(100)
+      }
+      assert.equal(skillStatus, 'completed', 'Named personal skill must complete through the native tool')
+      assert.equal(modelCalls, 6)
+      const skillHistory = await historySnapshot(target.id)
+      const skillCall = skillHistory.display.events.find(item => item.run_id === skillRun && item.event.data?.stage === 'started')
+      assert.equal(skillCall?.event.data?.tool_name, 'skill')
+      assert.equal(skillCall?.event.data?.display_name, '技能装配测试')
+      console.log('PASS named personal skill: native tool dispatch, skill body in model context, historical display name')
+    }
   }
   if (fixtureFailure) throw fixtureFailure
   passed = true
@@ -252,10 +540,10 @@ try {
 } finally {
   try { await stopHost() }
   catch (error) { passed = false; process.exitCode = 1; process.stderr.write(`FAIL host cleanup: ${sanitize(error.message)}\n`) }
-  for (const server of [platform, manager]) {
+  for (const server of [platform, manager, model]) {
     server.closeAllConnections()
     if (server.listening) await new Promise((resolve) => server.close(resolve))
   }
   await rm(root, { recursive: true, force: true })
 }
-if (passed) process.stdout.write(`PASS host bootstrap: unauthorized -> live/not-ready -> registered/ready${sessionCreate ? '; non-root native session create=201/detail=200/rename=200/cold-resume=200; empty local cwd and SSH tool overrides' : ''}; process group stopped\n`)
+if (passed) process.stdout.write(`PASS host bootstrap: unauthorized -> live/not-ready -> registered/ready${sessionCreate ? '; non-root native session create=201/detail=200/rename=200/cold-resume=200; empty local cwd and SSH tool overrides' : ''}${realSsh ? '; real SSH sandbox file survives host restart' : ''}; restart=${crashRestart ? 'SIGKILL' : 'SIGTERM'}${runningRestart ? '; active turn recovered as interrupted; no duplicate model request; explicit retry completed in same session' : ''}; process group stopped\n`)

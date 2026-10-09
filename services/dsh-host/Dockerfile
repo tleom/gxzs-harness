@@ -2,13 +2,24 @@ FROM node:24.20.0-bookworm-slim@sha256:ba849c60be29959425b8734d57b8b4b7d56f98edd
 ARG VCS_REF=unknown
 LABEL org.opencontainers.image.source="https://github.com/tleom/gxzs-harness" \
       org.opencontainers.image.revision=$VCS_REF
-RUN apt-get update && apt-get install -y --no-install-recommends openssh-client tini ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN node -e "require('fs').mkdirSync('/etc/ssl/certs',{recursive:true});require('fs').writeFileSync('/etc/ssl/certs/ca-certificates.crt',require('tls').rootCertificates.join('\n'))" \
+    && sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources \
+    && apt-get -o Acquire::Retries=3 -o Acquire::https::Timeout=30 update \
+    && apt-get -o Acquire::Retries=3 -o Acquire::https::Timeout=30 install -y --no-install-recommends openssh-client tini ca-certificates \
+      fontconfig fonts-dejavu-core fonts-liberation fonts-noto-cjk \
+    && fc-cache -f \
+    && rm -rf /var/lib/apt/lists/*
 WORKDIR /opt/workbench
 COPY packages ./packages
 COPY profiles/workbench ./profiles/workbench
+COPY scripts/prepare-workspace-changes.mjs /opt/workbench/scripts/prepare-workspace-changes.mjs
 COPY scripts/check-runtime-imports.mjs ./check-runtime-imports.mjs
-RUN cd profiles/workbench && npm ci --no-audit --no-fund \
-    && ln -s profiles/workbench/node_modules /opt/workbench/node_modules \
+COPY scripts/patch-dsh-skill-catalog.mjs /opt/workbench/scripts/patch-dsh-skill-catalog.mjs
+COPY scripts/check-dsh-skill-catalog.mjs /opt/workbench/scripts/check-dsh-skill-catalog.mjs
+RUN ln -s profiles/workbench/node_modules /opt/workbench/node_modules \
+    && cd profiles/workbench && npm ci --no-audit --no-fund \
+    && node /opt/workbench/scripts/patch-dsh-skill-catalog.mjs \
+    && node /opt/workbench/scripts/check-dsh-skill-catalog.mjs \
     && node /opt/workbench/check-runtime-imports.mjs
 COPY services/dsh-host/start.sh /usr/local/bin/start-workbench
 COPY services/dsh-host/relay.mjs /opt/workbench/relay.mjs

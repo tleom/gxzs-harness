@@ -26,6 +26,15 @@ function setup({ authorized = true } = {}) {
 }
 
 describe('platform MCP proxy tools', () => {
+  it('passes server output schemas to the native MCP definition', async () => {
+    const { ctx, definitions, platform } = setup()
+    const outputSchema = { type: 'object', properties: { found: { type: 'boolean' } }, required: ['found'] }
+    platform.json.mockResolvedValueOnce({ tools: [{ ...catalogTool, outputSchema }] })
+    await apply(ctx)
+    expect(definitions.get('search').output.schema).toMatchObject({
+      properties: { structuredContent: outputSchema }, required: ['content', 'structuredContent'],
+    })
+  })
   it('uses original names by default and adds stable disambiguation only when necessary', () => {
     expect(publicToolName('server', 'search')).toBe('search')
     expect(publicToolName('server', 'a.b')).not.toBe(publicToolName('server', 'a_b'))
@@ -271,7 +280,10 @@ describe('platform MCP proxy tools', () => {
     run = { ...run, mcpTools: [weather] }
     ctx.on.mock.calls.find(([event]) => event === 'agent/inbox/claimed')[1]({ agent })
     expect(dispose).toHaveBeenCalledOnce()
-    expect((await assemble({}, { scope: agent }, next)).tools.map(tool => tool.name)).toEqual(['read', 'maps_weather'])
+    const available = await assemble({}, { scope: agent }, next)
+    expect(available.tools.map(tool => tool.name)).toEqual(['read', 'maps_weather'])
+    expect(available.sections[0].text).toContain('"name":"gaode"')
+    expect(available.sections[0].text).toContain('maps_weather')
     ctx.workbenchRuntime.authorizeMcp.mockReturnValue({ ownerId: 't:1', runId: 'run-weather', resource: weather })
     await definitions.get('maps_weather').execute({ query: 'q' }, { callId: 'weather-call', agent, signal: new AbortController().signal })
     expect(JSON.parse(platform.json.mock.calls.at(-1)[0].body)).toMatchObject({ run_id: 'run-weather', resource_id: weather.id, server_id: 'gaode', tool_name: 'maps_weather' })

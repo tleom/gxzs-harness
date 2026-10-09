@@ -1,3 +1,5 @@
+import { nativeCommandRun } from './native-command.js'
+
 const END_STATUS = {
   completed: 'completed', aborted: 'cancelled', error: 'failed',
   'max-tokens': 'failed', blocked: 'failed', interrupted: 'interrupted',
@@ -76,16 +78,13 @@ function projectEvent(database, sessionId, event, expectedOwnerId, context) {
   }
 
   if (event.type === 'session/title') {
-    // The adapter sets the first-message fallback before dispatch. DSH's fallback
-    // includes model-only attachment context; only accept its generated/user titles.
-    if (event.data?.source?.kind === 'fallback') return undefined
     const title = typeof event.data?.title === 'string' ? event.data.title : ''
     if (!title) return undefined
     database.updateChat(chat.ownerId, chat.id, { title })
     const run = database.activeRun(chat.ownerId, chat.id)
     if (!run) return undefined
     return database.appendEvent(chat.ownerId, run.id, {
-      event: 'workbench_chat_title', chat_id: chat.id, title,
+      event: 'workbench_chat_title', chat_id: chat.id, title, title_source: event.data?.source?.kind,
     })
   }
 
@@ -143,49 +142,21 @@ function projectEvent(database, sessionId, event, expectedOwnerId, context) {
       return append({ event: 'workbench_end', status, error })
     }
     case 'deliverables/presented':
-      return append({ event: 'workbench_presented', native: event, files: event.data?.files ?? [] })
+    case 'workspace/changes':
+      return append(nativePresentation(run, event)[0])
     case 'tool/call':
       database.startToolCall(chat.ownerId, run.id, String(event.data?.callId ?? ''), String(event.data?.name ?? ''))
-      return append({
-        event: 'workbench_activity', native: event, backend_run_id: run.id,
-        data: {
-          kind: 'tool', workbench_run_id: run.id, call_id: String(event.data?.callId ?? ''),
-          tool_call_id: String(event.data?.callId ?? ''), tool_name: String(event.data?.name ?? ''),
-          activity_id: String(event.data?.callId ?? ''), stage: 'started',
-          input: typeof event.data?.arguments === 'string' ? event.data.arguments : JSON.stringify(event.data?.arguments ?? {}),
-        },
-      })
+      return append(nativePresentation(run, event)[0])
     case 'tool/result': {
       const block = Array.isArray(event.data?.message?.content) ? event.data.message.content[0] : undefined
       const callId = String(event.data?.message?.source?.callId ?? block?.toolCallId ?? '')
       const toolName = database.finishToolCall(chat.ownerId, run.id, callId) ?? ''
-      return append({
-        event: 'workbench_activity', native: event, backend_run_id: run.id,
-        data: {
-          kind: 'tool', workbench_run_id: run.id, call_id: callId, tool_call_id: callId,
-          tool_name: toolName, activity_id: callId,
-          stage: event.data?.error || block?.isError ? 'error' : 'returned',
-          output: contentText(block?.content ?? event.data?.message?.content),
-          ...(event.data?.meta === undefined ? {} : { result_meta: event.data.meta }),
-        },
-      })
+      return append(nativePresentation(run, event, { toolName })[0])
     }
     case 'assistant/message': {
-      const content = event.data?.message?.content ?? []
-      if (event.surfaceOp == null || event.surfaceOp === 'append') append({
-        event: 'workbench_assistant_final', turn: event.data.turn, step: event.data.step,
-        has_reply: content.some((block) => block.type === 'text' && block.text?.trim()),
-        has_tool_calls: content.some((block) => block.type === 'tool-call'),
-      })
-      if (!database.isStreamedStep(chat.ownerId, run.id, event.data.turn, event.data.step)) {
-        for (const [index, block] of (event.data?.message?.content ?? []).entries()) {
-          if ((block?.type === 'text' || block?.type === 'reasoning') && typeof block.text === 'string' && block.text)
-            append({
-              event: 'workbench_activity', native: event, backend_run_id: run.id,
-              data: { kind: block.type, workbench_run_id: run.id, segment_id: `t${event.data.turn}s${event.data.step}b${index}`, text: block.text },
-            })
-        }
-      }
+      for (const payload of nativePresentation(run, event, {
+        streamed: database.isStreamedStep(chat.ownerId, run.id, event.data.turn, event.data.step),
+      })) append(payload)
       const usage = event.data?.usage
       if (context || usage) return append({
         event: 'workbench_context', workbench_run_id: run.id, phase: 'usage',
@@ -201,6 +172,63 @@ function projectEvent(database, sessionId, event, expectedOwnerId, context) {
   }
 }
 
+/** Shared, side-effect-free display projection for live events and native history pages. */
+export function nativePresentation(run, event, { streamed = false, toolName = '' } = {}) {
+  switch (event.type) {
+    case 'deliverables/presented':
+      return [{ event: 'workbench_presented', native: event, files: event.data?.files ?? [] }]
+    case 'workspace/changes':
+      return [{ event: 'workbench_changes', turn: event.data?.turn, source_seq: event.seq }]
+    case 'tool/call':
+      return [{ event: 'workbench_activity', native: event, backend_run_id: run.id,
+        data: { kind: 'tool', workbench_run_id: run.id, call_id: String(event.data?.callId ?? ''),
+          tool_call_id: String(event.data?.callId ?? ''), tool_name: String(event.data?.name ?? ''),
+          activity_id: String(event.data?.callId ?? ''), stage: 'started',
+          ...toolPresentation(run, event.data),
+          input: typeof event.data?.arguments === 'string' ? event.data.arguments : JSON.stringify(event.data?.arguments ?? {}),
+        } }]
+    case 'tool/result': {
+      const block = Array.isArray(event.data?.message?.content) ? event.data.message.content[0] : undefined
+      const callId = String(event.data?.message?.source?.callId ?? block?.toolCallId ?? '')
+      return [{ event: 'workbench_activity', native: event, backend_run_id: run.id,
+        data: { kind: 'tool', workbench_run_id: run.id, call_id: callId, tool_call_id: callId,
+          tool_name: toolName, activity_id: callId,
+          ...toolPresentation(run, { name: toolName }),
+          stage: event.data?.error || block?.isError ? 'error' : 'returned',
+          output: contentText(block?.content ?? event.data?.message?.content),
+          ...(event.data?.meta === undefined ? {} : { result_meta: event.data.meta }),
+        } }]
+    }
+    case 'assistant/message': {
+      const result = [], content = event.data?.message?.content ?? []
+      if (event.surfaceOp == null || event.surfaceOp === 'append') result.push({
+        event: 'workbench_assistant_final', turn: event.data.turn, step: event.data.step,
+        has_reply: content.some(block => block.type === 'text' && block.text?.trim()),
+        has_tool_calls: content.some(block => block.type === 'tool-call'),
+      })
+      if (!streamed) for (const [index, block] of content.entries()) {
+        if ((block?.type === 'text' || block?.type === 'reasoning') && typeof block.text === 'string' && block.text)
+          result.push({ event: 'workbench_activity', native: event, backend_run_id: run.id,
+            data: { kind: block.type, workbench_run_id: run.id, segment_id: `t${event.data.turn}s${event.data.step}b${index}`, text: block.text } })
+      }
+      return result
+    }
+    default: return []
+  }
+}
+
+function toolPresentation(run, call) {
+  if (call?.name === 'skill') {
+    try {
+      const args = typeof call.arguments === 'string' ? JSON.parse(call.arguments) : call.arguments
+      const name = args?.name
+      if (typeof name === 'string') return { display_name: run.selection?.skill_names?.[name] ?? name }
+    } catch { /* Partial input has no reliable skill identity. */ }
+  }
+  const tool = run.mcpTools?.find(item => item.runtime_name === call?.name || item.public_name === call?.name)
+  return tool ? { provider_name: tool.provider_name ?? tool.server_id, display_name: tool.tool_name } : {}
+}
+
 export function projectInboxClaim(database, { agent, message, turn }, expectedOwnerId) {
   const sessionId = agent?.session?.id ?? agent?.id
   if (!Number.isInteger(turn) || typeof message?.id !== 'string') return undefined
@@ -209,8 +237,22 @@ export function projectInboxClaim(database, { agent, message, turn }, expectedOw
   let run
   if (message.source?.kind === 'user' && typeof message.source.rpcId === 'string')
     run = database.bindRunMessage(sessionId, message.source.rpcId, turn, message.id)
-  else if (message.source?.kind === 'goal') {
-    const active = database.goalRun(sessionId) ?? database.activeRunBySession(sessionId)
+  else if (message.source?.kind === 'goal' || (message.source?.kind === 'user' && !message.source.rpcId)) {
+    const admitted = database.listRuns(chat.ownerId, chat.id).find(item => item.messageId === message.id) ?? nativeCommandRun(sessionId)
+    if (admitted) {
+      const current = database.runForTurn(sessionId, turn)
+      run = database.bindRunMessage(sessionId, admitted.id, turn, message.id)
+      if (current && current.id !== admitted.id) {
+        database.transitionRun(chat.ownerId, admitted.id, 'steered')
+        database.appendEvent(chat.ownerId, admitted.id, { event: 'workbench_steered', steer_target_run_id: current.id })
+        database.appendEvent(chat.ownerId, current.id, { event: 'workbench_steering', steering_id: admitted.id,
+          query: admitted.query, attachments: admitted.attachments ?? [] })
+      }
+      return run
+    }
+    // Native /goal attachment followups carry user source without an RPC id.
+    // They belong to the existing goal run, never a second business submission.
+    const active = database.goalRun(sessionId) ?? (message.source?.kind === 'goal' ? database.activeRunBySession(sessionId) : undefined)
     if (active) run = database.bindNativeTurn(active, turn)
   }
   if (run?.status === 'queued') {
@@ -223,6 +265,10 @@ export function projectInboxClaim(database, { agent, message, turn }, expectedOw
 function adoptMessage(database, sessionId, message) {
   if (message?.source?.kind === 'user' && typeof message.source.rpcId === 'string' && typeof message?.id === 'string')
     database.adoptInboxMessage(sessionId, message.source.rpcId, message.id)
+  else if (message?.source?.kind === 'user' && typeof message.id === 'string') {
+    const run = nativeCommandRun(sessionId)
+    if (run) database.adoptInboxMessage(sessionId, run.id, message.id)
+  }
 }
 
 function projectControlEvent(database, chat, sessionId, event) {
@@ -239,7 +285,6 @@ function projectControlEvent(database, chat, sessionId, event) {
       revision: goal.revision,
       objective: goal.objective,
       phase: goal.phase,
-      activation: goal.activation,
       reason: goal.blockedReason?.message ?? null,
       max_rounds: goal.maxGoalRounds ?? null,
       rounds_started: event.data?.roundsStarted ?? 0,
@@ -298,9 +343,10 @@ export async function reconcileNativeSessions(database, sessionQuery, ownerId) {
         if (event.type === 'turn/start') turn = event.data.turn
         if (event.type === 'user/message' && Number.isInteger(turn)) {
           const message = event.data
-          if (message.source?.kind === 'user' && typeof message.source.rpcId === 'string')
-            database.bindRunMessage(chat.sessionId, message.source.rpcId, turn, message.id)
-          else if (message.source?.kind === 'goal') {
+          const admitted = database.listRuns(chat.ownerId, chat.id).find(item => item.messageId === message.id)
+          if (message.source?.kind === 'user' && (typeof message.source.rpcId === 'string' || admitted))
+            database.bindRunMessage(chat.sessionId, message.source.rpcId ?? admitted.id, turn, message.id)
+          else if (message.source?.kind === 'goal' || (message.source?.kind === 'user' && !message.source.rpcId)) {
             const run = database.goalRun(chat.sessionId)
             if (run) database.bindNativeTurn(run, turn)
           }
@@ -326,10 +372,11 @@ export async function reconcileNativeSessions(database, sessionQuery, ownerId) {
       }
       for (const message of [...inbox['next-turn'], ...inbox['next-step']]) {
         const requestId = message.source?.kind === 'user' ? message.source.rpcId : undefined
-        const run = requestId ? database.getRun(ownerId, requestId) : undefined
+        const run = requestId ? database.getRun(ownerId, requestId)
+          : database.listRuns(chat.ownerId, chat.id).find(item => item.messageId === message.id)
         if (run && run.sessionId === chat.sessionId) {
           queued.push(run.id)
-          database.adoptInboxMessage(chat.sessionId, requestId, message.id)
+          database.adoptInboxMessage(chat.sessionId, run.id, message.id)
         }
       }
     } finally { observed[Symbol.dispose]?.() }

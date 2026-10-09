@@ -59,6 +59,9 @@ with tempfile.TemporaryDirectory(prefix='gxzs-ssh-smoke-') as directory:
 
 
 def verify(container, host_image=None):
+    long_seconds = int(os.environ.get('GXZS_SMOKE_LONG_SECONDS', '70'))
+    if not 10 <= long_seconds <= 7200 or long_seconds % 10:
+        raise ValueError('Invalid sustained probe duration')
     if not re.fullmatch(r'[0-9a-f]{64}', container):
         raise ValueError('Expected the full ID of the disposable smoke container')
     source = Path(__file__).resolve().parents[1] / 'services/sandbox-manager/hosts.py'
@@ -116,7 +119,8 @@ def verify(container, host_image=None):
                     '--memory', '1g', '--cpus', '2', '--pids-limit', '256',
                     '-v', str(scripts) + ':/smoke:ro', '-e', 'GXZS_SANDBOX_SSH_HOST=fixture-sandbox',
                     '-e', 'GXZS_SANDBOX_HELPER_HASH=' + helper_hash,
-                    '--entrypoint', 'sleep', host_image, '120').stdout.strip()
+                    '-e', 'GXZS_SMOKE_LONG_SECONDS=' + str(long_seconds),
+                    '--entrypoint', 'sleep', host_image, str(max(300, long_seconds + 240))).stdout.strip()
             try:
                 # Preserve UID 1000 through the Docker archive API even when
                 # the CI runner has another uid; never grant CHOWN to runtime.
@@ -133,10 +137,18 @@ def verify(container, host_image=None):
                 subprocess.run(['docker', 'cp', '-a', '-', host + ':/home/node'],
                                input=archive.getvalue(), capture_output=True, check=True, timeout=20)
                 docker('start', host)
-                for script in ('smoke-native-ssh.mjs', 'smoke-native-sandbox-tools.mjs'):
+                selected_scripts = ('smoke-host-bootstrap.mjs',) if os.environ.get('GXZS_SMOKE_BOOTSTRAP') == '1' else ('smoke-native-ssh.mjs', 'smoke-native-sandbox-tools.mjs')
+                for script in selected_scripts:
                     before = bridge_processes(container)
-                    result = subprocess.run(['docker', 'exec', host, 'node', '/smoke/' + script],
-                                            text=True, capture_output=True, timeout=65)
+                    extra = ['--changes-check', '--long-check'] if script == 'smoke-native-sandbox-tools.mjs' and os.environ.get('GXZS_SMOKE_EXTENDED') == '1' else []
+                    if script == 'smoke-host-bootstrap.mjs':
+                        extra = ['--session-create', '--real-ssh']
+                        if os.environ.get('GXZS_SMOKE_CRASH') == '1':
+                            extra.append('--crash-restart')
+                        if os.environ.get('GXZS_SMOKE_RUNNING') == '1':
+                            extra.append('--running-restart')
+                    result = subprocess.run(['docker', 'exec', host, 'node', '/smoke/' + script, *extra],
+                                            text=True, capture_output=True, timeout=max(150, long_seconds + 90) if extra else 65)
                     print(result.stdout, end='')
                     if result.returncode:
                         print(result.stderr[-4000:], file=sys.stderr, end='')

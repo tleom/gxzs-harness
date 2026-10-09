@@ -8,6 +8,7 @@ All file traversal follows the same no-symlink contract as personal skills.
 import json
 import os
 import re
+import time
 import uuid
 from urllib.parse import urlsplit
 
@@ -19,6 +20,7 @@ PINS = ".mcp-pins.json"
 MAX_CONFIG = 65536
 MAX_MANIFEST = 1024 * 1024
 MAX_TOOLS = 200
+DISCOVERY_TTL = 300
 
 
 def server_name(value):
@@ -99,6 +101,16 @@ def connection_configuration(config):
             if key not in {"name", "display_name", "description"}}
 
 
+def connection_fingerprint(config):
+    return version(json.dumps(connection_configuration(config), sort_keys=True,
+                              separators=(",", ":")).encode())
+
+
+def authentication_version(config):
+    return version(json.dumps({key: config.get(key, {}) for key in ("headers", "env")},
+                              sort_keys=True, separators=(",", ":")).encode())
+
+
 def tool_manifest(tools):
     if not isinstance(tools, list) or len(tools) > MAX_TOOLS:
         raise ValueError("单个 MCP 最多提供 200 个工具")
@@ -111,7 +123,10 @@ def tool_manifest(tools):
             raise ValueError("MCP 工具名称无效或重复")
         if not isinstance(schema, dict) or schema.get("type") != "object":
             raise ValueError("MCP 工具参数必须是 object JSON Schema")
-        pending = [schema]
+        output_schema = tool.get("outputSchema")
+        if output_schema is not None and (not isinstance(output_schema, dict) or output_schema.get("type") != "object"):
+            raise ValueError("MCP 工具输出必须是 object JSON Schema")
+        pending = [schema, output_schema]
         while pending:
             part = pending.pop()
             if isinstance(part, dict):
@@ -124,7 +139,10 @@ def tool_manifest(tools):
         description = tool.get("description") or name
         if not isinstance(description, str) or len(description) > 16000:
             raise ValueError("MCP 工具说明过长或无效")
-        result.append({"name": name, "description": description, "inputSchema": schema})
+        declaration = {"name": name, "description": description, "inputSchema": schema}
+        if output_schema is not None:
+            declaration["outputSchema"] = output_schema
+        result.append(declaration)
         seen.add(name)
     if len(json.dumps(result).encode()) > MAX_MANIFEST:
         raise ValueError("MCP 工具目录超过 1 MiB")
@@ -201,12 +219,24 @@ def snapshot(rootfd, selected=None):
                     transport=config["transport"],
                     version=revision,
                 )
-                cached = json.loads(read_file(cachefd, name + ".json") or b"{}")
-                if isinstance(cached, dict) and cached.get("version") == revision:
-                    tools = tool_manifest(cached.get("tools", []))
-                    item.update(tools=tools, manifest_version=manifest_version(tools), status="ready")
             except (ValueError, OSError, RecursionError):
-                item.update(enabled=False, status="invalid", error="配置或工具目录无效，请编辑 mcp.json 后重新测试连接")
+                item.update(enabled=False, status="invalid", error="配置无效，请编辑 mcp.json 后重新测试连接")
+                items.append(item)
+                continue
+            try:
+                cached = json.loads(read_file(cachefd, name + ".json") or b"{}")
+                if (isinstance(cached, dict) and cached.get("version") == revision
+                        and cached.get("connection_fingerprint") == connection_fingerprint(config)
+                        and cached.get("authentication_version") == authentication_version(config)
+                        and isinstance(cached.get("discovered_at"), (int, float))
+                        and 0 <= time.time() - cached["discovered_at"] < DISCOVERY_TTL):
+                    tools = tool_manifest(cached.get("tools", []))
+                    fingerprint = manifest_version(tools)
+                    if fingerprint == cached.get("manifest_version"):
+                        item.update(tools=tools, manifest_version=fingerprint, status="ready",
+                                    discovered_at=cached["discovered_at"])
+            except (ValueError, OSError, RecursionError):
+                warnings.append(f"个人 MCP {name} 的目录缓存无效，正在重新发现")
             items.append(item)
         return {"mcp": items, "warnings": warnings}
     finally:
@@ -272,7 +302,9 @@ def personal_mcp(payload, root="/workspace"):
                                 cachefd = directory(rootfd, ".mcp-cache")
                                 try:
                                     cached = json.loads(read_file(cachefd, name + ".json") or b"{}")
-                                    if not isinstance(cached, dict) or cached.get("version") != revision:
+                                    if (not isinstance(cached, dict) or cached.get("version") != revision
+                                            or cached.get("connection_fingerprint") != connection_fingerprint(config)
+                                            or cached.get("authentication_version") != authentication_version(config)):
                                         cached = None
                                     else:
                                         tool_manifest(cached.get("tools", []))
@@ -320,10 +352,16 @@ def personal_mcp(payload, root="/workspace"):
                     return {"id": name, "removed": True}
                 if operation == "mcp_cache":
                     tools = tool_manifest(payload.get("tools"))
+                    config = configuration(raw)
                     cachefd = directory(rootfd, ".mcp-cache")
                     try:
                         atomic_write(
-                            cachefd, name + ".json", json.dumps({"version": revision, "tools": tools}).encode()
+                            cachefd, name + ".json", json.dumps({
+                                "version": revision, "connection_fingerprint": connection_fingerprint(config),
+                                "authentication_version": authentication_version(config),
+                                "discovered_at": time.time(), "manifest_version": manifest_version(tools),
+                                "tools": tools,
+                            }).encode()
                         )
                     finally:
                         os.close(cachefd)
