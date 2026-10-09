@@ -113,14 +113,16 @@ export function apply(ctx, config) {
     projectSessionEvent(database, session?.id ?? session?.header?.id, event, config.ownerId, context)
   }, { global: true })
 
-  const buildCatalog = async (owner) => {
+  const buildCatalog = async (owner, modelsOnly = false) => {
     const [catalog, mcpTools, skills] = await Promise.all([
-      databaseModelCatalog(ctx.workbenchPlatformClient, ctx.sessionController, owner, ctx.settings), service.mcpCatalog(owner), service.listSkills(),
+      databaseModelCatalog(ctx.workbenchPlatformClient, ctx.sessionController, owner, ctx.settings),
+      modelsOnly ? [] : service.mcpCatalog(owner), modelsOnly ? [] : service.listSkills(),
     ])
     const models = (catalog.groups ?? []).flatMap((group) => (group.models ?? []).map((model) => ({
       id: `${group.id}/${model.id}`, name: model.name || model.id, provider: group.id, description: model.description,
     })))
     return {
+      resources_pending: modelsOnly,
       activity_protocol: 1, human_input_protocol: 1, followup_protocol: 1, history_protocol: 1, native_history_protocol: 1,
       control_protocol: 1, resources_protocol: 1, command_resources_protocol: 1, submission_control_protocol: 1,
       default_selection: { model: catalog.default ? `${catalog.default.provider}/${catalog.default.model}` : models[0]?.id ?? '', tools: [], skills: [], knowledge: [], model_parameters: {}, tool_parameters: {} },
@@ -200,7 +202,7 @@ export function apply(ctx, config) {
       user: { id: owner.userId, name: owner.name, email: '' }, workspaceId: owner.tenantId,
       workspaces: [{ id: owner.tenantId, name: owner.tenantId, current: true }],
     })],
-    ['GET', /^\/catalog$/, async ({ owner }, res) => sendJson(res, 200, { data: await buildCatalog(owner) })],
+    ['GET', /^\/catalog$/, async ({ owner, url }, res) => sendJson(res, 200, { data: await buildCatalog(owner, url.searchParams.get('view') === 'models') })],
     ['GET', /^\/chats\/([\w-]+)\/references$/, async ({ owner, url }, res, match) => {
       const abort = new AbortController()
       const disconnected = () => abort.abort()
