@@ -51,6 +51,10 @@ const REMOTE_ERRORS = {
   'session/invalid-time-zone': [400, '时区参数无效'],
   'session/attachment-invalid': [400, '附件参数无效'],
   'session/title-invalid': [400, '会话标题无效'],
+  'workspace/invalid-path': [400, '所选目录无法用作工作区'],
+  'workspace/name-conflict': [409, '已存在同名工作区'],
+  'workspace/session-active': [409, '会话仍有运行中的任务，请先停止任务'],
+  'workspace/move-invalid': [409, '会话顺序已改变，请刷新工作区'],
 }
 
 export function encodeSse(entry) {

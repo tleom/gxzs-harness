@@ -24,10 +24,15 @@ describe('sandbox personal skill provider', () => {
     const manager = { personalResources: async () => ({ skills: [skill(), skill({ id: 'off', enabled: false }), skill({ id: 'bad' })] }) }
     const provider = new SandboxSkillProvider(manager, control())
     const observation = await provider.list()
-    expect(observation.complete).toBe(false)
+    expect(observation.complete).toBe(true)
     expect(observation.candidates).toHaveLength(1)
     expect(observation.candidates[0]).toMatchObject({ name: 'demo', source: 'user-dsh', resourceBase: { path: '/workspace/skills/demo' } })
     expect((await provider.get(observation.candidates[0])).content).toContain('Use this skill.')
+  })
+
+  it('does not hide healthy providers when the personal manager is unavailable', async () => {
+    const provider = new SandboxSkillProvider({ personalResources: async () => { throw new Error('manager unavailable') } }, control())
+    expect(await provider.list()).toEqual({ candidates: [], complete: true })
   })
 
   it('rejects stale or disabled skills at load time and invalidates the registry', async () => {
@@ -45,14 +50,33 @@ describe('sandbox personal skill provider', () => {
   it('integrates with the actual DSH skill registry', async () => {
     const ctx = new Context()
     const registry = new SkillRegistry(ctx)
-    let current = skill()
-    const dispose = registry.registerProvider((lifecycle) => new SandboxSkillProvider({ personalResources: async () => ({ skills: [current] }) }, lifecycle))
+    let current = skill({ content: '---\nname: demo\ndescription: Demo skill\nmetadata:\n  display-name: 办案材料整理\n---\nUse this skill.' })
+    let lifecycle
+    const dispose = registry.registerProvider((control) => {
+      lifecycle = control
+      return new SandboxSkillProvider({ personalResources: async () => ({ skills: [current] }) }, control)
+    })
     try {
       expect((await registry.list())[0].name).toBe('demo')
       expect((await registry.get('demo')).content).toContain('Use this skill.')
       current = skill({ enabled: false })
+      lifecycle.invalidate()
       expect(await registry.list()).toEqual([])
       expect(await registry.get('demo')).toBeUndefined()
     } finally { dispose() }
+  })
+
+  it('uses DSH custom-root precedence for an existing same-name personal skill', async () => {
+    const ctx = new Context()
+    const registry = new SkillRegistry(ctx)
+    const global = { ...await readSkillDefinition(skill({ content: '---\nname: demo\ndescription: Global\n---\nGlobal body' }).content), provider: 'gxzs-filesystem', source: 'custom' }
+    const disposeGlobal = registry.registerProvider(() => ({ name: 'gxzs-filesystem',
+      list: async () => ({ candidates: [{ ...global, source: 'custom', rank: 300, locator: {} }], complete: true }),
+      get: async () => global }))
+    const disposePersonal = registry.registerProvider(control => new SandboxSkillProvider({ personalResources: async () => ({ skills: [skill()] }) }, control))
+    try {
+      expect((await registry.list())[0].provider).toBe('gxzs-filesystem')
+      expect((await registry.get('demo')).content).toBe('Global body')
+    } finally { disposePersonal(); disposeGlobal() }
   })
 })

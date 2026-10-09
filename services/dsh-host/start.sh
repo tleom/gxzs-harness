@@ -3,10 +3,10 @@ set -eu
 mkdir -p "$DSH_HOME/profiles/workbench"
 # DSH writes the compiled cordis.yml into its profile. Keep that directory
 # owner-writable while sharing only immutable installed dependencies.
-for file in package.json package-lock.json cordis.patch.yml; do
+for file in package.json package-lock.json; do
   cp "/opt/workbench/profiles/workbench/$file" "$DSH_HOME/profiles/workbench/$file"
 done
-cp -R /opt/workbench/profiles/workbench/presets "$DSH_HOME/profiles/workbench/"
+cp /opt/workbench/profiles/workbench/cordis.runtime.patch.yml "$DSH_HOME/profiles/workbench/cordis.patch.yml"
 for target in "$DSH_HOME/profiles/workbench/node_modules" "$DSH_HOME/packages"; do
   if [ -e "$target" ] && [ ! -L "$target" ]; then
     # Preserve an older deployment's directory until its operator retires it.

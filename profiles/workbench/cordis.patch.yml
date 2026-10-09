@@ -15,14 +15,9 @@
 - id: web-fetch-http
   disabled: true
 
-- id: agent-presets
+- id: agent-preset-registry
   config:
     default: standard
-    includeShippedRoot: false
-    includeUserRoot: true
-    roots:
-      - path: !!js (process.env.DSH_HOME ?? process.cwd()) + '/profiles/workbench/presets'
-        trust: system
 
 - id: sandbox
   disabled: true
@@ -36,6 +31,12 @@
 - id: spill-local
   disabled: true
 
+- id: workspace-changes
+  disabled: true
+
+- id: file-reference-local
+  disabled: true
+
 - id: ptc-runtime
   config:
     nodeExecutable: !!js process.env.GXZS_SANDBOX_NODE ?? '/usr/local/bin/node'
@@ -47,6 +48,8 @@
     workspaceRoot: !!js process.env.GXZS_SANDBOX_WORKSPACE ?? '/workspace'
 
 - insert:
+    - id: gxzs-file-references
+      name: '@gxzs/dsh-workbench-sandbox-runtime/file-references'
     - id: gxzs-ssh
       name: '@gxzs/dsh-workbench-sandbox-runtime/ssh'
       config:
@@ -71,11 +74,13 @@
       name: '@gxzs/dsh-workbench-sandbox-runtime/spill'
       config:
         workspace: !!js process.env.GXZS_SANDBOX_WORKSPACE ?? '/workspace'
+    - id: gxzs-workspace-changes
+      name: '@gxzs/dsh-workbench-sandbox-runtime/changes'
     - id: gxzs-skill-filesystem
       name: '@deepseek-ai/dsh-skill-filesystem'
       config:
         providerName: gxzs-filesystem
-        includeDefaultRoots: true
+        includeDefaultRoots: false
         dshHome: !!js process.env.DSH_HOME
         customSkillDirs: !!js process.env.GXZS_GLOBAL_SKILL_DIR?.split(',').filter(Boolean) ?? []
         watch: true

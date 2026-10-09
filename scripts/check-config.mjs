@@ -17,6 +17,7 @@ cpSync(profileSource, profileTarget, {
   recursive: true,
   filter: (source) => !source.includes(`${path.sep}node_modules`),
 })
+cpSync(path.join(profileSource, 'cordis.runtime.patch.yml'), path.join(profileTarget, 'cordis.patch.yml'))
 for (const name of packages) {
   cpSync(path.resolve('packages', name), path.join(home, 'packages', name), {
     recursive: true,

@@ -1,4 +1,5 @@
 import { createHash, createHmac, randomUUID } from 'node:crypto'
+import { EventEmitter } from 'node:events'
 import { Readable } from 'node:stream'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { apply } from '../src/index.js'
@@ -75,15 +76,16 @@ async function call(handler, key, method, route, value, authenticated = true, us
   req.method = method
   req.url = `/ai/workbench${route}`
   req.headers = { 'content-type': 'application/json', ...(authenticated ? { 'x-gxzs-assertion': `${header}.${payload}.${signature}` } : {}), ...extraHeaders }
-  const response = { status: undefined, body: undefined }
-  const res = {
+  const response = { status: undefined, body: undefined, chunks: [] }
+  const res = Object.assign(new EventEmitter(), {
     headersSent: false,
-    writeHead(status) { response.status = status; this.headersSent = true },
+    writeHead(status, headers) { response.status = status; response.headers = headers; this.headersSent = true },
+    write(text) { response.chunks.push(text); return true },
     end(text) {
       if (!text) response.body = undefined
       else { try { response.body = JSON.parse(text) } catch { response.body = Buffer.from(text) } }
     },
-  }
+  })
   await handler(req, res)
   return response
 }
@@ -113,7 +115,7 @@ describe('authenticated workbench HTTP handler', () => {
     const { handler, key } = setup()
     await expect(call(handler, key, 'GET', '/catalog')).resolves.toMatchObject({
       status: 200,
-      body: { data: { resources_protocol: 1 } },
+      body: { data: { resources_protocol: 1, native_history_protocol: 1 } },
     })
   })
 
@@ -158,12 +160,52 @@ describe('authenticated workbench HTTP handler', () => {
 
   it('proxies only fixed platform preview/share routes with verified owner context', async () => {
     const { handler, key, context } = setup()
-    await call(handler, key, 'GET', '/files/preview?path=case%2Fa.docx')
+    const preview = await call(handler, key, 'GET', '/files/preview?path=case%2Fa.pdf')
+    expect(preview.status).toBe(200)
     expect(context.workbenchPlatformClient.request).toHaveBeenCalledWith(expect.objectContaining({
-      owner: expect.objectContaining({ ownerId: 't:42' }), method: 'GET', route: 'files/preview', query: '?path=case%2Fa.docx',
+      owner: expect.objectContaining({ ownerId: 't:42' }), method: 'GET', route: 'files/preview', query: '?path=case%2Fa.pdf',
     }))
     await call(handler, key, 'POST', '/files/shares', { path: 'case/a.docx', expires_days: 7 })
     expect(context.workbenchPlatformClient.request).toHaveBeenLastCalledWith(expect.objectContaining({ method: 'POST', route: 'files/shares' }))
+  })
+
+  it('converts sandbox Office files through native OfficeToPdf after owner authentication', async () => {
+    const { handler, key, context } = setup()
+    const pdf = Buffer.from('%PDF-1.7 native preview')
+    context.officeToPdf = { convert: vi.fn(async (request, signal) => {
+      expect(request).toMatchObject({ extension: 'docx', priority: 'foreground',
+        source: { key: JSON.stringify(['t:42', 'case/a.docx']), version: 'sha256-v1', bytes: 2 } })
+      await expect(request.source.read(signal, 1024)).resolves.toEqual({ bytes: Buffer.from([0, 255]), version: 'sha256-v1' })
+      return { pdf }
+    }) }
+    const route = '/files/preview?path=case%2Fa.docx'
+    await expect(call(handler, key, 'GET', route, undefined, false)).resolves.toMatchObject({ status: 401 })
+    await expect(call(handler, key, 'GET', route, undefined, true, '99')).resolves.toMatchObject({ status: 403 })
+    expect(context.officeToPdf.convert).not.toHaveBeenCalled()
+    await expect(call(handler, key, 'GET', route)).resolves.toMatchObject({
+      status: 200, body: pdf, headers: { 'content-type': 'application/pdf', 'cache-control': 'no-store' },
+    })
+    expect(context.officeToPdf.convert).toHaveBeenCalledTimes(1)
+    expect(context.workbenchPlatformClient.request).not.toHaveBeenCalled()
+  })
+
+  it('opens an owner-authorized native chat event stream through the public HTTP route', async () => {
+    const {handler,key,context}=setup()
+    const chat=await call(handler,key,'POST','/chats',{})
+    context.sessionController.follow=vi.fn(async function* (request,signal) {
+      expect(request).toMatchObject({address:{kind:'session'},assistantStream:true,maxMessages:500})
+      expect(signal).toBeInstanceOf(AbortSignal)
+      yield {type:'snapshot',header:{cwd:'/host/private'},projections:{},cursor:-1,records:[],hasMore:false,assistantStream:{revision:0}}
+    })
+    const route=`/chats/${chat.body.data.id}/events`
+    await expect(call(handler,key,'GET',route,undefined,false)).resolves.toMatchObject({status:401})
+    await expect(call(handler,key,'GET',route,undefined,true,'99')).resolves.toMatchObject({status:403})
+    expect(context.sessionController.follow).not.toHaveBeenCalled()
+    const stream=await call(handler,key,'GET',route)
+    expect(stream).toMatchObject({status:200,headers:{'content-type':'text/event-stream; charset=utf-8'}})
+    expect(JSON.parse(stream.chunks[0].slice(6))).toMatchObject({event:'workbench_history',value:{type:'snapshot',cursor:-1}})
+    expect(stream.chunks.join('')).not.toContain('/host/private')
+    expect(context.sessionController.follow).toHaveBeenCalledOnce()
   })
 
   it('routes binary file mutations to the fixed workspace manager', async () => {

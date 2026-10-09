@@ -2,7 +2,7 @@ import path from 'node:path'
 import { resolveWorkspacePath } from './paths.js'
 import { httpError } from './http.js'
 
-export async function admitSandboxAttachments({ fileManager, workspace, query, files = [] }) {
+export async function admitSandboxAttachments({ fileManager, workspace, query, files = [], nativeFiles = false }) {
   if (!Array.isArray(files) || files.length > 20) throw httpError(400, '最多允许 20 个附件')
   const content = []
   const attachments = []
@@ -25,8 +25,8 @@ export async function admitSandboxAttachments({ fileManager, workspace, query, f
     const looksLikeImage = /\.(png|jpe?g|gif|webp)$/i.test(name)
     if (looksLikeImage && !mediaType) throw httpError(400, '图片内容无效，请重新选择')
     if (mediaType) content.push({ type: 'image', mediaType, data: bytes.toString('base64'), name })
-    // Images use DSH admission exclusively. Non-images still need a remote-path
-    // receipt until upstream supports execution-world attachment storage/paths.
+    else if (nativeFiles) content.push({ type: 'file', data: bytes.toString('base64'), name })
+    // Older managers do not share the native attachment directory with the sandbox.
     else paths.push(absolute)
     attachments.push({ name, path: file.path, version: result.version })
   }
@@ -44,4 +44,17 @@ function imageMediaType(bytes) {
   if (bytes.length >= 6 && ['GIF87a', 'GIF89a'].includes(bytes.subarray(0, 6).toString('ascii'))) return 'image/gif'
   if (bytes.length >= 12 && bytes.subarray(0, 4).toString('ascii') === 'RIFF' && bytes.subarray(8, 12).toString('ascii') === 'WEBP') return 'image/webp'
   return undefined
+}
+
+// Queue storage keeps upload bytes, never Agent-scoped staged receipt IDs.
+// The native service resolves cold sessions and mints receipts at delivery.
+export async function prepareNativeFiles(fileUploads, sessionId, content) {
+  const prepared = []
+  for (const item of content) {
+    if (item.type !== 'file' || typeof item.data !== 'string') { prepared.push(item); continue }
+    const uploaded = await fileUploads.uploadStream({ sessionId, name: item.name,
+      data: (async function* () { yield Buffer.from(item.data, 'base64') })() })
+    prepared.push({ type: 'file', receiptId: uploaded.receiptId })
+  }
+  return prepared
 }

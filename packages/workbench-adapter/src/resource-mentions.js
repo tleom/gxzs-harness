@@ -1,5 +1,16 @@
 import { httpError } from './http.js'
 
+export function registerRunResourceContext(ctx) {
+  ctx.on('system-prompt/assemble', async (_assembly, context, next) => {
+    const assembly = await next()
+    const agent = context.scope
+    const run = ctx.workbenchRuntime.executionRun(agent?.session?.id ?? agent?.id)
+    const text = run?.selection?.resource_context
+    return text ? { ...assembly, sections: [...assembly.sections,
+      { name: 'gxzs:run-resources', text, interpolate: false }] } : assembly
+  }, { global: true })
+}
+
 export function normalizeResourceMentions(value) {
   if (value != null && (typeof value !== 'object' || Array.isArray(value))) throw httpError(400, '资源引用无效')
   const result = {}
@@ -21,7 +32,10 @@ export function appendResourceInstructions(content, mentions, tools, skills) {
     if (!tool) throw httpError(409, `引用的插件工具未启用或已不可用：${id}`)
     const provider = tool.provider && tool.provider !== 'mcp' ? tool.provider
       : tool.server_id ? `${tool.scope ?? 'global'}:${tool.server_id}` : tool.runtime_name
-    providers.set(provider, tool.provider_name ?? tool.server_id ?? provider)
+    providers.set(provider, {
+      name: tool.provider_call_name ?? tool.server_id ?? provider,
+      displayName: tool.provider_name ?? tool.server_id ?? provider,
+    })
   }
   for (const id of mentions.skills) {
     const skill = skills.find((item) => item.enabled !== false && (item.id === id || item.name === id || `personal:${item.name}` === id))
@@ -31,7 +45,7 @@ export function appendResourceInstructions(content, mentions, tools, skills) {
   }
   if (!providers.size && !preferredSkills.length) return content
   const hints = []
-  if (providers.size) hints.push(`用户指定插件：${JSON.stringify([...providers.values()])}。请先从当前实际可用的工具目录中选择该插件下合适的子工具调用；若不适用，再说明原因。不要猜测工具名称。`)
+  if (providers.size) hints.push(`用户优先指定插件：${JSON.stringify([...providers.values()])}。请先从当前实际可用的工具目录中选择该插件下合适的子工具调用；若不适用，再说明原因。不要猜测工具名称。`)
   if (preferredSkills.length) hints.push(`用户指定技能：${JSON.stringify(preferredSkills)}。请先按当前实际可用的技能目录中的准确名称调用；若不适用，再说明原因。不要猜测技能名称。`)
   return [...content, { type: 'text', text: hints.join('\n') }]
 }

@@ -5,6 +5,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import logging
 import os
+import re
 import sqlite3
 from pathlib import Path
 import subprocess
@@ -38,11 +39,46 @@ ADMISSION = Admission(str(STATE / 'admission.sqlite3'))
 MCP_API_URL = os.environ.get("WORKBENCH_MCP_API_URL", "http://wb-api:5001").rstrip("/")
 HEALTH = {'reaper': 0.0, 'hosts': 0.0}
 HEALTH_GUARD = threading.Lock()
+MCP_REFRESH_GUARD = threading.Lock()
+MCP_REFRESHING = set()
+MCP_REFRESH_ATTEMPTS = {}
 INSTALL_TIMEOUT = int(os.environ.get('WORKBENCH_ENVIRONMENT_TIMEOUT_SECONDS', '900'))
 OPERATION_RETENTION = int(os.environ.get('WORKBENCH_OPERATION_RETENTION_SECONDS', str(7 * 86400)))
 # Manager-owned scripts never inherit a user's interpreter, import path or
 # site initialization. User tasks keep their personal-environment-first PATH.
 MANAGER_PYTHON = ("/usr/local/bin/python", "-I", "-S")
+
+
+def schedule_mcp_refresh(key, items):
+    """Refresh expired personal catalogs without making list reads wait for a provider."""
+    for item in items:
+        if not isinstance(item, dict) or not item.get("enabled") or item.get("status") != "unverified" or not item.get("version"):
+            continue
+        identity = key, item["id"]
+        with MCP_REFRESH_GUARD:
+            if (len(MCP_REFRESHING) >= 8 or identity in MCP_REFRESHING
+                    or time.monotonic() - MCP_REFRESH_ATTEMPTS.get(identity, -float("inf")) < 30):
+                continue
+            if len(MCP_REFRESH_ATTEMPTS) > 1024:
+                cutoff = time.monotonic() - 60
+                for previous, attempted in list(MCP_REFRESH_ATTEMPTS.items()):
+                    if attempted < cutoff and previous not in MCP_REFRESHING:
+                        MCP_REFRESH_ATTEMPTS.pop(previous, None)
+            MCP_REFRESH_ATTEMPTS[identity] = time.monotonic()
+            MCP_REFRESHING.add(identity)
+
+        def refresh(target=identity, version=item["version"]):
+            try:
+                operation(target[0], "personal-mcp", {"operation": "mcp_test", "name": target[1],
+                                                      "version": version,
+                                                      "deadline_ms": int(time.time() * 1000) + 30_000})
+            except Exception:
+                LOGGER.warning("Personal MCP catalog refresh failed for %s", target[1])
+            finally:
+                with MCP_REFRESH_GUARD:
+                    MCP_REFRESHING.discard(target)
+
+        threading.Thread(target=refresh, name="mcp-catalog-refresh", daemon=True).start()
 
 
 def docker(*args, stdin=None, timeout=90, check=True):
@@ -130,11 +166,21 @@ def ensure(key):
     name, token = identity(key)
     with lock(key):
         network = ensure_network(key)
+        record = HOSTS.root / key / 'host.json'
+        home_volume = None
+        if record.exists():
+            host = json.loads(record.read_text(encoding='utf-8'))
+            home_volume = host.get('home_volume')
+            if host.get('workspace_id') != key or not isinstance(home_volume, str) or not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_.-]+', home_volume):
+                raise ValueError('Invalid owner attachment volume')
+        attachment_mount = (['--mount', 'type=volume,source=' + home_volume
+                             + ',destination=/srv/dsh/attachments,volume-subpath=attachments,readonly'] if home_volume else [])
         info = docker("inspect", name, check=False)
         if not info.returncode:
             existing = json.loads(info.stdout)[0]
             attached = set((existing.get('NetworkSettings', {}).get('Networks') or {}).keys())
-            if existing["Config"]["Image"] != IMAGE or attached != {network}:
+            mounted_home = (existing['Config'].get('Labels') or {}).get('gxzs.attachment-home')
+            if existing["Config"]["Image"] != IMAGE or attached != {network} or mounted_home != home_volume:
                 if existing["State"]["Running"]:
                     # Do not execute privileged helpers in a previous image.
                     # Deployment drains its runs before stopping/recreating it.
@@ -143,6 +189,13 @@ def ensure(key):
                 docker("rename", name, name + "-previous-" + existing["Id"][:12])
                 info = docker("inspect", name, check=False)
         if info.returncode:
+            if home_volume:
+                docker('volume', 'create', '--label', 'gxzs.owner=' + host['owner_id'], home_volume)
+                docker('run', '--rm', '--user', '0', '--network', 'none', '--entrypoint', MANAGER_PYTHON[0],
+                       '-v', home_volume + ':/srv/dsh', IMAGE, *MANAGER_PYTHON[1:], '-c',
+                       "import os; p='/srv/dsh/attachments'; "
+                       "assert not os.path.islink(p), 'Attachment root cannot be a symlink'; "
+                       "os.makedirs(p,exist_ok=True); os.chown(p,1000,1000); os.chmod(p,0o700)")
             for suffix in ("home", "files", "env"):
                 docker("volume", "create", "--label", "workbench=" + PREFIX, name + "-" + suffix)
             docker("run", "--rm", "--user", "0", "--network", "none", "--entrypoint", MANAGER_PYTHON[0],
@@ -157,6 +210,7 @@ def ensure(key):
                    "(site/'workbench_office.pth').write_text(str(base)+'\\n') if site.exists() and base.exists() else None")
             docker("create", "--name", name, "--label", "workbench=" + PREFIX,
                    '--label', 'gxzs.workspace=' + key, "--network", network,
+                   *(['--label', 'gxzs.attachment-home=' + home_volume] if home_volume else []), *attachment_mount,
                    '--log-driver', 'json-file', '--log-opt', 'max-size=10m', '--log-opt', 'max-file=3',
                    "--cpus", os.environ.get("WORKBENCH_SANDBOX_CPUS", "1"),
                    "--memory", os.environ.get("WORKBENCH_SANDBOX_MEMORY", "3g"),
@@ -301,6 +355,8 @@ def operation(key, action, payload):
             invalidate(key, payload["name"])
         if payload["operation"] in {"mcp_test", "mcp_call"}:
             output = invoke(key, name, payload, output, authorize=authorize_mcp)
+        elif payload["operation"] == "mcp_list":
+            schedule_mcp_refresh(key, output.get("mcp", []))
         touch(key)
         return output
     if action == "office-preview":

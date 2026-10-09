@@ -10,6 +10,8 @@ Public prefix: `/ai/workbench`. Priority: P0 is required for traffic switch, P1 
 | GET `/chats` | Conversations | Adapter | P0 | Owner isolation, update ordering and live-state flags |
 | POST `/chats` | Conversations | Adapter | P0 | Create DSH session and durable mapping |
 | GET `/chats/{chat_id}` | Conversations | Adapter | P0 | Runs, selection, owner and version |
+| GET `/chats/{chat_id}/history` | Conversation history | Native SessionController + adapter display projection | P1 | Owner-scoped native backwards pages; fixed opening cursor; standard 50-message/two-turn target and 500-message ceiling; `native=1` keeps active runs bounded and restores live content through native follow |
+| GET `/chats/{chat_id}/events` | Native conversation stream | Native SessionController.follow + native assistant publication fold | P1 | Owner-scoped bounded snapshot, unfinished-output baseline and continuous native events; business run mapping and plugin labels remain thin display projections; disconnect aborts the native follower |
 | PATCH `/chats/{chat_id}` | Conversations | Adapter | P1 | Rename/pin and DSH title sync |
 | DELETE `/chats/{chat_id}` | Conversations | Adapter + retention service | P1 | Session disposal and retention policy |
 | POST `/chats/draft/audio` | Speech | Platform service | P2 | Multipart limits and transcription |
@@ -17,7 +19,7 @@ Public prefix: `/ai/workbench`. Priority: P0 is required for traffic switch, P1 
 | PUT `/chats/{chat_id}/config` | Configuration | Adapter | P0 | Version CAS and immutable selection revision |
 | POST `/chats/{chat_id}/runs` | Runs | Adapter | P0 | Request-key idempotency, queue, continuation, attachments and mentions |
 | GET `/runs/{run_id}` | Runs | Adapter | P0 | Durable snapshot and owner check |
-| GET `/runs/{run_id}/events` | SSE | Adapter | P0 | Last-Event-ID precedence, monotonic replay, heartbeat and terminal close |
+| GET `/runs/{run_id}/events` | SSE | Adapter | P0 | Last-Event-ID precedence, monotonic replay, heartbeat and terminal close; native-history clients retain business state events while native follow owns conversation content |
 | POST `/runs/{run_id}/stop` | Runs | Adapter | P0 | Targeted, idempotent cancellation |
 | POST `/runs/{run_id}/resume` | Human input | Adapter | P0 | First answer wins and request-id idempotency |
 | POST `/runs/{run_id}/input-interaction` | Human input | Adapter | P0 | Cancel authoritative deadline |
@@ -30,15 +32,15 @@ Public prefix: `/ai/workbench`. Priority: P0 is required for traffic switch, P1 
 | POST `/runs/{run_id}/feedbacks` | Feedback | Platform service | P1 | Like/dislike/null without external telemetry |
 | POST `/runs/{run_id}/fork` | Fork conversation | Adapter | P1 | Idempotent new conversation with model and display history through the selected answer |
 | GET `/files` | Files | Adapter fs seam | P0 | Confined list and stable metadata |
-| POST `/files` | Files | Adapter + fixed-workspace manager capability | P0/P1 | Binary upload, version CAS and atomic write; implemented, live manager validation pending |
-| DELETE `/files` | Files | Adapter + fixed-workspace manager capability | P1 | Confined versioned deletion; implemented, live manager validation pending |
+| POST `/files` | Files | Adapter + fixed-workspace manager capability | P0/P1 | Binary upload, version CAS and atomic write; validated with disposable real manager/sandbox; production rollout pending |
+| DELETE `/files` | Files | Adapter + fixed-workspace manager capability | P1 | Confined versioned deletion; validated with disposable real manager/sandbox; production rollout pending |
 | GET `/files/stat` | Files | Adapter fs seam | P0 | Size, kind, version and downloadable flag |
-| POST `/files/directories` | Files | Adapter + fixed-workspace manager capability | P1 | Confined atomic mkdir; implemented, live manager validation pending |
+| POST `/files/directories` | Files | Adapter + fixed-workspace manager capability | P1 | Confined atomic mkdir; validated with disposable real manager/sandbox; production rollout pending |
 | GET `/files/text` | Files | Adapter fs seam | P1 | UTF-8 text <=2 MiB and version |
 | GET `/files/download` | Files | Adapter or platform streaming | P0 | Binary stream, ETag, filename and size bound |
 | GET `/files/links` | File delivery | Platform service | P1 | Owner-scoped signed preview/download URLs |
-| GET `/files/preview` | Office preview | Existing platform service | P1 | Keep disposable offline-container conversion, 20 MiB contract, OOXML guards and current error/cache semantics; DSH provider deferred pending benchmark |
-| POST `/files/preview` | Office preview | Existing platform service | P1 | Same platform converter for local attachment bytes; DSH provider deferred pending benchmark |
+| GET `/files/preview` | Office preview | Native OfficeToPdf + owner sandbox file seam | P1 | Supported remote Office files use the native converter and cache; owner-confined reads and cancellation; other formats retain platform handling |
+| POST `/files/preview` | Office preview | Existing platform service | P1 | Local attachment bytes retain the platform converter and its limits; no sandbox file exists to pass to the remote-file path |
 | GET `/files/shares` | Sharing | Platform service | P2 | Current active share |
 | POST `/files/shares` | Sharing | Platform service | P2 | Revocable audited token |
 | DELETE `/files/shares` | Sharing | Platform service | P2 | Immediate idempotent revocation |

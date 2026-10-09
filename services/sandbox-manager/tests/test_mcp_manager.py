@@ -93,6 +93,31 @@ def payload(key, binding, *, tool="slow", request="call-1"):
     }
 
 
+def test_background_catalog_refresh_keeps_each_observed_version(manager, monkeypatch):
+    module, _, _, _ = manager
+    pending, observed = [], []
+
+    class DeferredThread:
+        def __init__(self, target, **kwargs):
+            self.target = target
+
+        def start(self):
+            pending.append(self.target)
+
+    monkeypatch.setattr(module.threading, "Thread", DeferredThread)
+    monkeypatch.setattr(module, "operation", lambda key, resource, body: observed.append((key, resource, body)))
+    key = str(uuid4())
+    module.schedule_mcp_refresh(key, [
+        {"id": "first", "enabled": True, "status": "unverified", "version": "v1"},
+        {"id": "second", "enabled": True, "status": "unverified", "version": "v2"},
+    ])
+    for target in pending:
+        target()
+    assert [(body["name"], body["version"]) for _, _, body in observed] == [("first", "v1"), ("second", "v2")]
+    assert all(owner == key and resource == "personal-mcp" and body["operation"] == "mcp_test" for owner, resource, body in observed)
+    assert not module.MCP_REFRESHING
+
+
 def test_stop_and_catalog_do_not_wait_for_business_call_and_queued_calls_reauthorize(
     manager, monkeypatch
 ):

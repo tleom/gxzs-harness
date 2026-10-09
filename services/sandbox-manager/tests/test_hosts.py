@@ -57,6 +57,24 @@ def test_first_use_creates_once_and_reuses_workspace(tmp_path, monkeypatch):
     assert create[create.index('--memory') + 1] == '1g'
     assert create[create.index('--memory-swap') + 1] == '1g'
     assert create[create.index('--network') + 1] == 'owner-network'
+    assert 'sandbox-workspace-files:/workspace:ro' in create
+    assert not any(value.endswith(':/workspace') for value in create)
+
+
+def test_host_fonts_are_mounted_read_only(tmp_path, monkeypatch):
+    host, docker, _, payload, _ = setup(tmp_path, monkeypatch)
+    monkeypatch.setenv('GXZS_HOST_FONTS_DIR', '/srv/workbench-fonts')
+    host.ensure('workspace', payload)
+    create = next(call.args for call in docker.call_args_list if call.args[0] == 'create')
+    assert '/srv/workbench-fonts:/usr/local/share/fonts/workbench:ro' in create
+
+
+def test_host_fonts_reject_relative_mount_path(tmp_path, monkeypatch):
+    host, docker, _, payload, _ = setup(tmp_path, monkeypatch)
+    monkeypatch.setenv('GXZS_HOST_FONTS_DIR', '../fonts')
+    with pytest.raises(ValueError, match='font directory'):
+        host.ensure('workspace', payload)
+    assert not any(call.args[0] == 'create' for call in docker.call_args_list)
 
 
 def test_does_not_adopt_another_owners_container(tmp_path, monkeypatch):
@@ -64,6 +82,13 @@ def test_does_not_adopt_another_owners_container(tmp_path, monkeypatch):
     created.update(Config={'Image': 'host:test', 'Labels': {'gxzs.owner': 'other:2'}})
     with pytest.raises(ValueError, match='not managed'):
         host.ensure('workspace', payload)
+
+
+def test_explicit_global_skill_roots_reach_native_host_config(tmp_path, monkeypatch):
+    host, _, _, payload, _ = setup(tmp_path, monkeypatch)
+    monkeypatch.setenv('GXZS_GLOBAL_SKILL_DIR', '/srv/dsh/published-skills')
+    host.ensure('workspace', payload)
+    assert 'GXZS_GLOBAL_SKILL_DIR=/srv/dsh/published-skills\n' in (host.root / 'workspace' / 'host.env').read_text()
 
 
 def test_identity_mismatch_keeps_existing_workspace(tmp_path, monkeypatch):
@@ -537,6 +562,30 @@ def test_draining_keeps_heartbeat_and_existing_admission(tmp_path, monkeypatch):
     host.schedule('workspace', {**schedule, 'action': 'renew'})
     assert host.admission.request.call_args.args[5] == 'renew'
     host.admission.fence.assert_not_called()
+
+
+def test_draining_finishes_previously_queued_tickets_without_admitting_new_work(tmp_path, monkeypatch):
+    from admission import Admission
+    host, _, _, payload, _ = setup(tmp_path, monkeypatch)
+    host.ensure('workspace', payload)
+    host.admission = Admission(str(tmp_path / 'drain.sqlite3'))
+    try:
+        assert host.admission.request('t:1', 1, 'host-1', 'running', 'chat', 'acquire')['state'] == 'running'
+        assert host.admission.request('t:1', 1, 'host-1', 'queued', 'chat', 'acquire')['state'] == 'waiting'
+        result = host.replace('workspace', {**payload, 'generation': 2, 'instance_id': 'host-2',
+                                           'expected_generation': 1, 'expected_instance_id': 'host-1'})
+        assert result['state'] == 'draining'
+        schedule = {**payload, 'chat_id': 'chat'}
+        host.schedule('workspace', {**schedule, 'run_id': 'running', 'action': 'release'})
+        assert host.schedule('workspace', {**schedule, 'run_id': 'queued', 'action': 'acquire'})['state'] == 'running'
+        with pytest.raises(ValueError, match='draining'):
+            host.schedule('workspace', {**schedule, 'run_id': 'new', 'action': 'acquire'})
+        with pytest.raises(ValueError, match='draining'):
+            host.schedule('workspace', {**schedule, 'run_id': 'queued', 'chat_id': 'other-chat', 'action': 'acquire'})
+        host.schedule('workspace', {**schedule, 'run_id': 'queued', 'action': 'release'})
+        assert host.admission.busy('t:1') == 0
+    finally:
+        host.admission.db.close()
 
 
 def test_replace_stops_then_fences_and_keeps_home_across_restart(tmp_path, monkeypatch):

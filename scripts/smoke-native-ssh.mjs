@@ -7,7 +7,7 @@ import { promisify } from 'node:util'
 import fs from 'node:fs'
 const require = createRequire('/opt/workbench/profiles/workbench/package.json')
 const { Context } = await import(require.resolve('@deepseek-ai/cordis'))
-const { SshSubprocessRuntime } = await import(require.resolve('@deepseek-ai/dsh-subprocess-ssh'))
+const { default: WorkbenchSubprocess } = await import('/opt/workbench/packages/workbench-sandbox-runtime/src/subprocess.js')
 const { z } = await import(require.resolve('zod'))
 const source = fs.readFileSync('/opt/workbench/packages/workbench-sandbox-runtime/src/ssh.js', 'utf8').replace("'@deepseek-ai/dsh-ssh'", JSON.stringify(pathToFileURL(require.resolve('@deepseek-ai/dsh-ssh')).href))
 const {default: WorkbenchSsh} = await import('data:text/javascript;base64,' + Buffer.from(source).toString('base64'))
@@ -23,7 +23,7 @@ async function remoteBridges(){
 }
 try {
  const hello=await ssh.ready
- const runtime=new SshSubprocessRuntime(ctx)
+ const runtime=new WorkbenchSubprocess(ctx, {ripgrepExecutable:'/usr/bin/rg'})
  await check('ordinary_stdout_stderr_and_cleanup',async()=>{
   const p=runtime.spawn({argv:['/bin/sh','-c','printf bridge-ok; printf bridge-error >&2'],cwd:'/workspace',stdio:{stdin:'ignore',stdout:'pipe',stderr:'pipe'},graceMs:200})
   let out='',err='';p.stdout.on('data',b=>out+=b);p.stderr.on('data',b=>err+=b)
@@ -92,6 +92,45 @@ try {
   const ready=new Promise(r=>p.stdout.once('data',r));p.stderr.resume();await ready;controller.abort()
   await Promise.race([p.done.catch(()=>{}),new Promise((_,reject)=>{const t=setTimeout(()=>reject(new Error('cancel_exceeded_5s')),5000);t.unref()})]);assert.equal(await p.waitForExit(AbortSignal.timeout(3000)),true);await drained()
  })
+ // Exercise the configured thin adapter: upstream leaves an open stdin stream
+ // after cancellation; WorkbenchSubprocess closes streams at the native done boundary.
+ for (const disruption of ['cancel', 'disconnect']) {
+  await check(`${disruption}_one_process_preserves_concurrent_siblings`, async () => {
+   const controllers = Array.from({length:4}, () => new AbortController())
+   const processes = []
+   const outputs = []
+   try {
+    for (let index=0; index<4; index++) {
+     const process = runtime.spawn({argv:['/bin/sh','-c',`printf ready-${index}; read value; printf done-${index}`],cwd:'/workspace',stdio:{stdin:'pipe',stdout:'pipe',stderr:'pipe'},graceMs:200,signal:controllers[index].signal})
+     processes.push(process)
+     outputs[index] = ''
+     process.stdout.on('error',()=>{}); process.stderr.on('error',()=>{}); process.stdin.on('error',()=>{})
+     process.stdout.on('data', chunk => { outputs[index] += chunk })
+     process.stderr.resume()
+     // Observe rejection immediately, even when the deliberate disconnect happens before awaiting done.
+     void process.done.catch(()=>{})
+     await process.started
+    }
+    if (disruption === 'disconnect') {
+     const victim = [...ssh.bridges][0]
+     assert.ok(victim, 'Expected the first process stream bridge')
+     victim.child.kill('SIGKILL')
+     await victim.closed
+    }
+    controllers[0].abort()
+    await processes[0].done.catch(()=>{})
+    assert.equal(await processes[0].waitForExit(AbortSignal.timeout(3000)), true)
+    for (const process of processes.slice(1)) process.stdin.end('continue\n')
+    const results = await Promise.all(processes.slice(1).map(process => process.done))
+    assert.ok(results.every(result => result.exitCode === 0), 'Sibling task failed after unrelated disruption')
+    for (let index=1; index<4; index++) assert.equal(outputs[index], `ready-${index}done-${index}`, 'Sibling output was lost or crossed streams')
+   } finally {
+    controllers.forEach(controller => controller.abort())
+    await Promise.allSettled(processes.map(process => process.done))
+    await drained()
+   }
+  })
+ }
  await check('pty_shell_roundtrip',async()=>{
   const p=await runtime.spawnTerminal({argv:['/bin/bash','--noprofile','--norc'],cwd:'/workspace',rows:24,cols:80,terminalType:'xterm',graceMs:200})
   let out='';p.output.on('data',b=>out+=b);await p.write('printf "pty-bridge-ok\\n"; exit\n');assert.equal((await p.done).exitCode,0);await p.terminate();assert.match(out,/pty-bridge-ok/);await drained()

@@ -1,6 +1,7 @@
 import { afterEach, expect, it, vi } from 'vitest'
 import { WorkbenchDatabase } from '../src/persistence.js'
 import { TaskScheduler } from '../src/scheduler.js'
+import { prepareNativeFiles } from '../src/attachments.js'
 
 const databases = []
 const schedulers = []
@@ -19,6 +20,42 @@ function setup() {
   const create = (query) => db.createRun({ ownerId: 't:1', chatId: chat.id, sessionId: 's', query, selection: {} }).run
   return { db, sessions, scheduler, platform, create, agent, diagnostics, permit: () => { permitted = true } }
 }
+
+it('stages native file receipts only at dispatch and keeps bytes durable', async () => {
+  const { db, scheduler, create, sessions, permit } = setup()
+  const run = create('read file')
+  const content = [{ type: 'file', name: 'evidence.txt', data: Buffer.from('evidence').toString('base64') }]
+  const uploadStream = vi.fn(async ({ sessionId, data }) => {
+    expect(sessionId).toBe('s')
+    const chunks = []
+    for await (const chunk of data) chunks.push(chunk)
+    expect(Buffer.concat(chunks).toString()).toBe('evidence')
+    return { receiptId: 'native-receipt' }
+  })
+  scheduler.prepareContent = (sessionId, value) => prepareNativeFiles({ uploadStream }, sessionId, value)
+  await scheduler.enqueue(run, content)
+  await scheduler.tick()
+  expect(uploadStream).not.toHaveBeenCalled()
+  expect(db.submission('t:1', run.id).content).toEqual(content)
+  permit()
+  await scheduler.tick()
+  expect(sessions.prompt.mock.calls[0][0].content).toEqual([{ type: 'file', receiptId: 'native-receipt' }])
+  expect(db.submission('t:1', run.id).content).toEqual(content)
+})
+
+it('does not deliver or mark dispatched when cancellation happens during file staging', async () => {
+  const { db, scheduler, create, sessions, permit } = setup()
+  const run = create('read file')
+  scheduler.prepareContent = async (_sessionId, content) => {
+    db.transitionRun('t:1', run.id, 'cancelled')
+    return content
+  }
+  permit()
+  await scheduler.enqueue(run, [{ type: 'text', text: 'file' }])
+  await scheduler.tick()
+  expect(sessions.prompt).not.toHaveBeenCalled()
+  expect(db.submission('t:1', run.id)?.dispatched ?? false).toBe(false)
+})
 
 it('logs only reviewed scheduling metadata and rethrows the original request failure', async () => {
   const { db, scheduler, platform, create, diagnostics } = setup()

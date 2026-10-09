@@ -14,6 +14,15 @@ function create(fetchImpl) {
 }
 
 describe('restricted sandbox-manager file client', () => {
+  it('propagates caller cancellation to the authorized read', async () => {
+    const controller = new AbortController()
+    const manager = create(async (_url, options) => new Promise((_resolve, reject) => {
+      options.signal.addEventListener('abort', () => reject(options.signal.reason), {once:true})
+    }))
+    const reading = manager.operate({operation:'get',path:'test.docx'},controller.signal)
+    controller.abort()
+    await expect(reading).rejects.toMatchObject({name:'AbortError'})
+  })
   it('fails closed when host identity is missing and refuses redirect credentials', () => {
     const manager = create(vi.fn())
     vi.stubEnv('GXZS_HOST_OWNER_ID', '')

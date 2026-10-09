@@ -4,9 +4,10 @@ FROM node:24.20.0-bookworm-slim@sha256:ba849c60be29959425b8734d57b8b4b7d56f98edd
 WORKDIR /opt/workbench
 COPY packages ./packages
 COPY profiles/workbench ./profiles/workbench
+COPY scripts/prepare-workspace-changes.mjs /opt/workbench/scripts/prepare-workspace-changes.mjs
 COPY scripts/check-runtime-imports.mjs ./check-runtime-imports.mjs
-RUN cd profiles/workbench && npm ci --no-audit --no-fund \
-    && ln -s profiles/workbench/node_modules /opt/workbench/node_modules \
+RUN ln -s profiles/workbench/node_modules /opt/workbench/node_modules \
+    && cd profiles/workbench && npm ci --no-audit --no-fund \
     && node /opt/workbench/check-runtime-imports.mjs
 
 FROM langgenius/dify-agent-local-sandbox@sha256:f4d404c9dcdf80bd72f65e84c3f2bbd1f3404fd4b363db837176da8aaf771b1d
@@ -19,7 +20,8 @@ ENV DEBIAN_FRONTEND=noninteractive PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 \
     PUPPETEER_SKIP_DOWNLOAD=1 PUPPETEER_EXECUTABLE_PATH=/usr/bin/google-chrome \
     CHROME_BIN=/usr/bin/google-chrome LANG=C.UTF-8 PYTHONIOENCODING=utf-8 MPLBACKEND=Agg
 RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources \
-    && apt-get update && apt-get install -y --no-install-recommends \
+    && apt-get -o Acquire::Retries=3 -o Acquire::https::Timeout=30 update \
+    && apt-get -o Acquire::Retries=3 -o Acquire::https::Timeout=30 install -y --no-install-recommends \
       openssh-server tini bubblewrap ca-certificates curl unzip zip jq ripgrep git file \
       libreoffice-writer libreoffice-calc libreoffice-impress libreoffice-draw libreoffice-math python3-uno \
       poppler-utils fontconfig fonts-noto-cjk fonts-noto-color-emoji fonts-dejavu-core fonts-liberation \

@@ -10,7 +10,10 @@ function setup() {
     { id: 'other', models: [{ id: 'builtin' }] },
   ] })) }
   const values = new Map()
-  const settings = { get: (key) => values.get(key), replace: vi.fn(async (key, value) => values.set(key, value)) }
+  const revisions = new Map()
+  const settings = { get: (key) => values.get(key),
+    describe: () => [...revisions].map(([ns, revision]) => ({ ns, revision })),
+    replace: vi.fn(async (key, value) => { values.set(key, value); revisions.set(key, (revisions.get(key) ?? 0) + 1) }) }
   return { config, client, sessions, settings, model }
 }
 

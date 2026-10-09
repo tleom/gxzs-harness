@@ -4,13 +4,15 @@ import { httpError } from './http.js'
  * Native routes supply only execution capabilities; they cannot add models. */
 const applied = new WeakMap()
 const writes = new WeakMap()
+const revision = (settings, name) => settings.describe().find(item => item.ns === name)?.revision
 
 async function synchronize(settings, models) {
   if (!settings) return
   const task = (writes.get(settings) ?? Promise.resolve()).catch(() => {}).then(async () => {
     const stamp = JSON.stringify(models)
     const previous = applied.get(settings)
-    if (previous?.stamp === stamp && previous.source === settings.get('llm-pi-ai') && previous.defaultSource === settings.get('agent-default-model')) return
+    if (previous?.stamp === stamp && previous.source === revision(settings, 'llm-pi-ai')
+      && previous.defaultSource === revision(settings, 'agent-default-model')) return
     const providers = Object.fromEntries(Object.entries(models.providers).filter(([, p]) => p.enabled !== false).map(([id, p]) => {
       const { enabled, name, models: entries, ...connection } = p
       return [id, { ...connection, models: entries.filter((m) => m.enabled !== false).map(({ enabled, ...model }) => model) }]
@@ -20,7 +22,7 @@ async function synchronize(settings, models) {
     const provider = models.default.slice(0, slash)
     const reasoningEffort = models.providers[provider]?.reasoning
     await settings.replace('agent-default-model', { provider, model: models.default.slice(slash + 1), ...(reasoningEffort ? { reasoningEffort } : {}) })
-    applied.set(settings, { stamp, source: settings.get('llm-pi-ai'), defaultSource: settings.get('agent-default-model') })
+    applied.set(settings, { stamp, source: revision(settings, 'llm-pi-ai'), defaultSource: revision(settings, 'agent-default-model') })
   })
   writes.set(settings, task)
   return task

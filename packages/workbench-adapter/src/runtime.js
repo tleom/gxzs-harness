@@ -1,4 +1,5 @@
 import { Service } from '@deepseek-ai/cordis'
+import { nativeTurn } from './native-turn.js'
 
 export class WorkbenchRuntime extends Service {
   constructor(ctx, database, ownerId) {
@@ -14,7 +15,7 @@ export class WorkbenchRuntime extends Service {
     while (agent && !visited.has(agent.id)) {
       visited.add(agent.id)
       const id = agent.session?.id ?? agent.id
-      const turn = agent.session?.snapshotEvents?.().findLast(event => event.type === 'turn/start')?.data.turn
+      const turn = nativeTurn(agent)?.lastTurn
       const run = Number.isInteger(turn) ? this.database.runForTurn(id, turn) : this.database.activeRunBySession(id)
       if (run) return run.ownerId === this.ownerId ? run : undefined
       // Durable parentSession alone is not authority: require live registry ownership.

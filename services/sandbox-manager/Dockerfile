@@ -5,7 +5,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 ARG VCS_REF=unknown
 LABEL org.opencontainers.image.source="https://github.com/tleom/gxzs-harness" \
       org.opencontainers.image.revision=$VCS_REF
-RUN apt-get update && apt-get install -y --no-install-recommends openssh-client && rm -rf /var/lib/apt/lists/*
+RUN apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update \
+    && apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 install -y --no-install-recommends openssh-client \
+    && rm -rf /var/lib/apt/lists/*
 COPY --from=docker-cli /usr/local/bin/docker /usr/local/bin/docker
 WORKDIR /app
 COPY mcp_outcomes.py global_memory.py ./

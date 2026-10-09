@@ -22,6 +22,19 @@ function bind(database, chat, run, turn = 1) {
 }
 
 describe('DSH session event projection', () => {
+  it('replays a disarmed goal completion before interrupted-run recovery without live context', () => {
+    const { database, chat, run } = setup()
+    bind(database, chat, run)
+    database.setGoalRun(chat.sessionId, run.id)
+    projectSessionEvent(database, chat.sessionId, { type: 'goal/change', seq: 11,
+      data: { operation: 'update', goal: { id: 'goal', revision: 2, objective: 'work', phase: 'active', activation: 'disarmed' } } })
+    projectSessionEvent(database, chat.sessionId, { type: 'turn/end', seq: 12,
+      data: { turn: 1, reason: { kind: 'completed' } } })
+    database.recoverInterrupted()
+    expect(database.getControl(chat.ownerId, chat.id).goal.activation).toBe('disarmed')
+    expect(database.getRun(chat.ownerId, run.id).status).toBe('completed')
+  })
+
   it('moves the exact bound run through start and completion', () => {
     const { database, chat, run } = setup()
     bind(database, chat, run)
@@ -155,13 +168,13 @@ describe('DSH session event projection', () => {
     }))
   })
 
-  it('keeps the submitted fallback and persists a generated title after completion', () => {
+  it('projects the native fallback and persists a generated title after completion', () => {
     const { database, chat, run } = setup()
     database.updateChat(chat.ownerId, chat.id, { title: '检索资料，核对结论' })
     projectSessionEvent(database, chat.sessionId, {
       type: 'session/title', data: { title: '检索资料，核对结论 User selected', source: { kind: 'fallback' } },
     })
-    expect(database.getChat(chat.ownerId, chat.id).title).toBe('检索资料，核对结论')
+    expect(database.getChat(chat.ownerId, chat.id).title).toBe('检索资料，核对结论 User selected')
     database.transitionRun(chat.ownerId, run.id, 'completed')
     projectSessionEvent(database, chat.sessionId, {
       type: 'session/title', data: { title: '资料核对', source: { kind: 'provider' } },
@@ -230,4 +243,12 @@ describe('DSH session event projection', () => {
     expect(projectSessionEvent(database, chat.sessionId, { type: 'turn/start', data: { turn: 9 } })).toBeUndefined()
     expect(projectSessionEvent(database, 'other', { type: 'turn/start', data: { turn: 1 } })).toBeUndefined()
   })
+})
+
+it('projects native change coordinates once onto the owning run',()=>{
+  const {database,chat,run}=setup()
+  bind(database,chat,run)
+  const event={type:'workspace/changes',seq:12,data:{turn:1}}
+  expect(projectSessionEvent(database,chat.sessionId,event,chat.ownerId)).toMatchObject({event:'workbench_changes',turn:1,source_seq:12})
+  expect(projectSessionEvent(database,chat.sessionId,event,chat.ownerId)).toBeUndefined()
 })
