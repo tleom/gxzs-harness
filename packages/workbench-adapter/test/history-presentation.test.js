@@ -8,6 +8,19 @@ const run={id:'run',selection:{},mcpTools:[{runtime_name:'mcp__search',server_id
 const snapshot=(records=[],assistantStream={revision:0})=>({type:'snapshot',records,assistantStream})
 const durable=(seq,type,data)=>({type:'event',event:{seq,type,data,surfaceOp:'append'}})
 const frame=value=>({type:'assistant-stream',frame:value})
+it('renders automatic compaction once at its checkpoint in both live and restored history', () => {
+  const records = [durable(1, 'turn/start', { turn: 1 }),
+    durable(2, 'compaction/summary', { compactionId: 'compact', summary: [{ type: 'text', text: '保留事实' }], shadowedSeqs: [0], shadowedTokenCount: 500 }),
+    { ...durable(3, 'user/message', { source: { kind: 'compact-checkpoint', compactionId: 'compact' } }),
+      event: { seq: 3, type: 'user/message', data: { source: { kind: 'compact-checkpoint', compactionId: 'compact' } }, surfaceOp: { op: 'replace', startSeq: 0, endSeq: 0 } } }]
+  const restored = new HistoryPresentation('s', () => run).accept(snapshot(records)).events
+  const live = new HistoryPresentation('s', () => run)
+  live.accept(snapshot())
+  expect(records.flatMap(record => live.accept(record).events)).toEqual(restored)
+  expect(restored).toEqual([{ run_id: 'run', event: expect.objectContaining({ event: 'workbench_compaction', summary: '保留事实', items: 1, tokens: 500 }) }])
+  records[2].event.data.source.sourceCommandId = 'manual'
+  expect(new HistoryPresentation('s', () => run).accept(snapshot(records)).events).toHaveLength(0)
+})
 it('maps inherited native message identities to forked runs without duplicating the original prompt', () => {
   const fork = { ...run, id: 'fork-run', messageId: 'original-message' }
   const view = new HistoryPresentation('fork-session', () => fork, undefined,

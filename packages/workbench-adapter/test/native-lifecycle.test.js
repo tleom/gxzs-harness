@@ -552,6 +552,29 @@ it('delegates compact once to the native command without prompting the model or 
   await expect(service.issueCommand(test.owner, test.chat.id, { ...body, request_key: 'compact-file', files: [{ path: 'x' }] })).rejects.toMatchObject({ status: 400 })
 })
 
+it('acknowledges slow native compaction without holding chat admission and settles from native events', async () => {
+  const test = await fixture([])
+  let finish
+  const compactNow = vi.fn(() => new Promise(resolve => { finish = resolve }))
+  test.ctx.provide('compaction', { compactNow })
+  await test.ctx.plugin(await native('dsh-command-compact'))
+  const service = new WorkbenchService({ database: test.db, sessionController: test.sessions, agents: test.ctx.agents,
+    commands: test.ctx.commands, workspace: '/workspace', fileManager: { operate: async () => ({}) },
+    sessionQuery: { observeSession: async () => ({ events: test.agent.session.snapshotEvents(), [Symbol.dispose]() {} }) } })
+  const body = { command: '/compact', request_key: 'background-compact', background: true }
+  try {
+    const accepted = await service.issueCommand(test.owner, test.chat.id, body)
+    expect(accepted).toMatchObject({ accepted: true, command_id: expect.any(String), run: null })
+    expect(accepted.state.commands).toEqual([expect.objectContaining({ id: accepted.command_id, outcome: null })])
+    expect(await service.withChatMutation(test.chat.id, async () => 'available')).toBe('available')
+    expect(await service.issueCommand(test.owner, test.chat.id, body)).toEqual(accepted)
+    expect(compactNow).toHaveBeenCalledOnce()
+    finish(null)
+    await vi.waitFor(async () => expect((await service.getControl(test.owner, test.chat.id)).commands[0].outcome).toMatchObject({ kind: 'success' }))
+    expect(test.db.listRuns(test.owner.ownerId, test.chat.id)).toHaveLength(0)
+  } finally { finish?.(null) }
+})
+
 it('lets a native plan command steer the running turn and projects its message once', async () => {
   let release
   const test = await fixture([new Promise(resolve => { release = resolve }), 'plan response'])

@@ -291,7 +291,7 @@ export class WorkbenchService {
       } : frame
       const updatesControl = frame.type === 'snapshot' || frame.type === 'goal-state'
         || (frame.type === 'event' && (['goal/change', 'plan/mode', 'command/run', 'command/done', 'turn/end'].includes(frame.event.type)
-          || (frame.event.type === 'user/message' && frame.event.data?.source?.kind === 'goal')))
+          || (frame.event.type === 'user/message' && ['goal', 'compact-checkpoint'].includes(frame.event.data?.source?.kind))))
       yield { event: 'workbench_history', session_id: chat.sessionId, value, runs: [...runs.values()], bindings,
         ...(updatesControl ? { control: await this.getControl(owner, chatId) } : {}),
         display: frame.type === 'goal-state' ? { events: [], replace: false, retire_attempts: [] } : presentation.accept(frame) }
@@ -582,6 +582,21 @@ export class WorkbenchService {
       chat = await this.ensureChatSession(owner, this.requireChat(owner, chatId))
       const agent = this.agents.get(chat.sessionId)
       if (!agent) throw httpError(409, '会话暂时无法恢复，请稍后重试')
+      if (line === '/compact' && body.background === true) {
+        // DSH appends command/run synchronously before entering its handler.
+        // Release admission and HTTP as soon as that native identity exists;
+        // command/done remains the sole settlement authority, including errors.
+        const before = new Set(agent.session.snapshotEvents().filter(event => event.type === 'command/run').map(event => event.data.commandId))
+        const execution = this.commands.execute(agent, line, [], new AbortController().signal)
+        const started = agent.session.snapshotEvents().find(event => event.type === 'command/run' && !before.has(event.data.commandId))
+        if (!started) {
+          await execution
+          throw httpError(400, '压缩命令不可用')
+        }
+        void execution.catch(() => {}) // Native command/done records handler failures.
+        const result = { accepted: true, command_id: started.data.commandId, state: await this.getControl(owner, chatId), message: '', run: null }
+        return this.database.saveCommandReceipt(owner.ownerId, chatId, requestKey, result)
+      }
       const planTask = /^\/plan\s+(?!off\s*$)([\s\S]+)$/.exec(line)
       if (planTask || line === '/plan' && body.files?.length) {
         const mentions = normalizeResourceMentions(body.resource_mentions)
