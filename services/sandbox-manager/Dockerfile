@@ -13,8 +13,8 @@ WORKDIR /app
 COPY mcp_outcomes.py global_memory.py ./
 RUN python global_memory.py --install
 COPY server.py file_ops.py resource_ops.py environment.py stop_jobs.py office_preview.py planning.py planning_exec.py ./
-COPY mcp_ops.py mcp_worker.py mcp_runtime.py ./
-COPY hosts.py admission.py owner_auth.py mcp_authorization.py ./
+COPY mcp_ops.py mcp_worker.py mcp_runtime.py mcp_exec.py ./
+COPY hosts.py admission.py owner_auth.py mcp_authorization.py resource_limits.py ./
 COPY memory_exec.py ./
 EXPOSE 5010
 HEALTHCHECK --interval=15s --timeout=8s --start-period=45s --retries=3 \

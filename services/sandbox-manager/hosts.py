@@ -1,5 +1,6 @@
 """Owner-scoped host lifecycle. Runtime templates are administrator-controlled."""
 import json
+from resource_limits import cgroup_args, owner_cgroup
 import logging
 from concurrent.futures import ThreadPoolExecutor
 import ipaddress
@@ -94,6 +95,8 @@ class Hosts:
                     raise ValueError('Host image rollout requires draining before replacement')
                 if existing['Image'] != desired_digest:
                     raise ValueError('Host image digest changed; drain before replacement')
+                if (existing.get('HostConfig', {}).get('CgroupParent') or '') != owner_cgroup(workspace):
+                    raise ValueError('Host resource rollout requires draining before replacement')
                 attached = set((existing.get('NetworkSettings', {}).get('Networks') or {}).keys())
                 if attached != {network}:
                     raise ValueError('Host network rollout requires draining before replacement')
@@ -195,7 +198,7 @@ class Hosts:
                     '--label', 'gxzs.workspace=' + item['workspace_id'],
                     '--label', 'gxzs.generation=' + str(item['generation']), '--label', 'gxzs.credentials=owner-v1',
                     '--log-driver', 'json-file', '--log-opt', 'max-size=10m', '--log-opt', 'max-file=3',
-                    '--network', network, '--restart', 'no',
+                    '--network', network, '--restart', 'no', *cgroup_args(item['workspace_id']),
                     '--cpus', os.environ.get('GXZS_HOST_CPUS', '1'),
                     '--memory', memory, '--memory-swap', memory, '--pids-limit', '256', *publish,
                     '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges:true', '--env-file', str(env_file),

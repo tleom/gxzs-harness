@@ -533,6 +533,36 @@ it.each(['button', 'command'])('preserves native goal state and resource context
   expect((await service.getControl(test.owner, test.chat.id)).goal).toBeNull()
 })
 
+it('exposes the published DSH projected occupancy immediately after a compacted surface replacement', async () => {
+  const test = await fixture([])
+  const { default: TokenMeter } = await native('dsh-token-meter')
+  const { createMessage } = await native('dsh-llm')
+  await test.ctx.plugin(TokenMeter)
+  const session = test.agent.session
+  session.append('request/context', { provider: 'mock', model: 'mock', contextWindow: 100000 })
+  const first = session.append('user/message', createUserMessage({ content: [{ type: 'text', text: 'long context '.repeat(1000) }], source: { kind: 'test' } }), { surfaceOp: 'append' }).seq
+  const usage = { inputTokens: 9000, outputTokens: 20 }
+  session.append('step/start', { turn: 1, step: 1 })
+  const last = session.append('assistant/message', {
+    turn: 1, step: 1, usage, stream: [{ type: 'chunk', time: 0, chunk: { type: 'usage', usage } }],
+    message: createMessage({ role: 'assistant', content: [{ type: 'text', text: 'answer' }], source: { kind: 'model', provider: 'mock', model: 'mock' } }),
+  }, { surfaceOp: 'append' }).seq
+  session.append('step/end', { turn: 1, step: 1 })
+  const service = new WorkbenchService({ database: test.db, agents: test.ctx.agents,
+    sessionQuery: { observeSession: async () => ({ events: session.snapshotEvents(), projections: test.ctx.sessionProjections.snapshot(session) }) } })
+  const before = (await service.getControl(test.owner, test.chat.id)).contextPressure
+  const nodes = test.ctx.tokenMeter.measure(session).nodes.filter(node => node.seq >= first && node.seq <= last)
+  session.append('compaction/summary', { compactionId: 'compact-test', summary: [{ type: 'text', text: 'summary' }],
+    shadowedRange: { start: first, end: last }, shadowedSeqs: nodes.map(node => node.seq), shadowedTokenCount: nodes.reduce((total, node) => total + node.tokens, 0), provider: 'mock', model: 'mock' })
+  session.append('user/message', createUserMessage({ content: [{ type: 'text', text: 'summary' }], source: { kind: 'test' } }),
+    { surfaceOp: { op: 'replace', startSeq: first, endSeq: last }, sourceEventSeqs: [first, last] })
+  const after = (await service.getControl(test.owner, test.chat.id)).contextPressure
+  expect(after.pressureTokens).toBe(before.pressureTokens)
+  expect(after.projectedTokens).toBeLessThan(before.projectedTokens)
+  expect(after.contextWindow).toBe(100000)
+  expect(test.model.requests).toHaveLength(0)
+})
+
 it('delegates compact once to the native command without prompting the model or creating a business run', async () => {
   const test = await fixture([])
   const compactNow = vi.fn(async () => null)
@@ -777,12 +807,16 @@ it.each(['approve', 'discuss'])('settles native plan review through the Workbenc
   const s=new WorkbenchService({database:t.db,sessionController:t.sessions,agents:t.ctx.agents,scheduler:t.scheduler,commands:t.ctx.commands,workspace:'/workspace',skills:{list:async()=>[]},platformClient:{json:async()=>({tools:[]})},fileManager:{operate:async()=>({})}})
   const response=await s.issueCommand(t.owner,t.chat.id,{command:'/plan Review evidence',request_key:'plan'})
   await vi.waitFor(()=>expect(t.model.requests).toHaveLength(1));await t.agent.whenIdle()
-  const bridge=new HumanInputBridge({database:t.db,executionRun:()=>t.db.getRun(t.owner.ownerId,response.run.id)})
+  const bridge=new HumanInputBridge({database:t.db,executionRun:()=>t.db.getRun(t.owner.ownerId,response.run.id),
+    resumeInput:(run,signal)=>t.scheduler.resumeInput(run,signal)})
   t.ctx.on('user-questions/request',bridge.handleRequest,{global:true,prepend:true})
   const pending=t.ctx.tools.execute({callId:'review',name:'exit_plan_mode',arguments:{plan:'# Evidence plan\nReview facts.'},agent:t.agent,signal:new AbortController().signal})
   await vi.waitFor(()=>expect(bridge.pendings.size).toBe(1))
   const saved=t.db.getPendingInput(t.owner.ownerId,response.run.id)
   expect(saved.deadlineAt).toBeNull()
+  await t.scheduler.flushFences()
+  await t.scheduler.tick()
+  expect(t.scheduler.hasAdmission(t.agent.id)).toBe(false)
   if (action === 'discuss') bridge.skip(t.owner.ownerId,response.run.id,saved.requestId)
   else bridge.resume(t.owner.ownerId,response.run.id,{ request_id: saved.requestId, answers: [{id:saved.payload.questions[0].id,selected:[saved.payload.questions[0].intent.approve]}] })
   const result=await pending

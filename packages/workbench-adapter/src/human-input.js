@@ -1,11 +1,12 @@
 import { randomUUID } from 'node:crypto'
 
 export class HumanInputBridge {
-  constructor({ database, timeoutSeconds = 60, executionRun }) {
+  constructor({ database, timeoutSeconds = 60, executionRun, resumeInput }) {
     this.database = database
     this.timeoutSeconds = timeoutSeconds
     this.pendings = new Map()
     this.executionRun = executionRun
+    this.resumeInput = resumeInput
   }
 
   handleRequest = async (request, next) => {
@@ -27,7 +28,11 @@ export class HumanInputBridge {
     const abort = () => this.abort(pending)
     request.signal?.addEventListener('abort', abort, { once: true })
     if (request.signal?.aborted) abort()
-    try { return await answer }
+    try {
+      const value = await answer
+      await this.resumeInput?.(run, request.signal ?? new AbortController().signal)
+      return value
+    }
     finally { request.signal?.removeEventListener('abort', abort) }
   }
 

@@ -75,10 +75,13 @@ class Worker:
     def __init__(self, container, name, version, timeout):
         source = module_source("file_ops", "resource_ops", "mcp_ops")
         source += (Path(__file__).with_name("mcp_worker.py")).read_text()
+        supervisor = Path(__file__).with_name('mcp_exec.py').read_text()
+        source = supervisor + '\nsupervise(' + repr(source) + ',' + repr([name, version]) + ')\n'
         self.version, self.timeout = version, timeout
         self.responses = queue.Queue(maxsize=2)
         self.close_guard = threading.Lock()
         self.closed = False
+        self.fenced = threading.Event()
         self.process = subprocess.Popen(
             [
                 "docker",
@@ -113,7 +116,11 @@ class Worker:
             while line := self.process.stdout.readline(MAX_LINE):
                 if len(line) >= MAX_LINE or not line.endswith(b"\n"):
                     break
-                self.responses.put(json.loads(line), timeout=1)
+                response = json.loads(line)
+                if response.get('worker_group_fenced') is True:
+                    self.fenced.set()
+                    continue
+                self.responses.put(response, timeout=1)
         except (ValueError, OSError, queue.Full):
             pass
         finally:
@@ -165,10 +172,12 @@ class Worker:
                     pass
         try:
             self.process.wait(timeout=5)
-            return self.process.returncode == 0
+            # A failed MCP connection can exit nonzero after cleanup. Require
+            # the remote supervisor's proof instead of retaining it forever,
+            # or trusting disappearance of the local Docker client alone.
+            return self.process.returncode == 0 and self.fenced.wait(timeout=.5)
         except subprocess.TimeoutExpired:
-            # stdin EOF is observed concurrently by the sandbox worker, including
-            # during a business call; the SDK then tears down its child process.
+            # Never infer remote exit from a local Docker timeout.
             return False
 
 

@@ -1,0 +1,10 @@
+[Unit]
+Description=GXZS shared Host and sandbox resource pool
+
+[Slice]
+CPUAccounting=yes
+MemoryAccounting=yes
+CPUQuota=1500%
+MemoryHigh=28G
+MemoryMax=30G
+MemorySwapMax=0

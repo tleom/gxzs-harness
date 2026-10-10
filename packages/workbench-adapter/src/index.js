@@ -73,7 +73,8 @@ export function apply(ctx, config) {
     })
   }
   beginRecovery()
-  const humanInput = new HumanInputBridge({ database, timeoutSeconds: config.humanInputTimeoutSeconds, executionRun: sessionId => runtime.executionRun(sessionId) })
+  const humanInput = new HumanInputBridge({ database, timeoutSeconds: config.humanInputTimeoutSeconds,
+    executionRun: sessionId => runtime.executionRun(sessionId), resumeInput: (run, signal) => scheduler.resumeInput(run, signal) })
   const verifier = new AssertionVerifier({
     issuer: config.assertionIssuer,
     signingKey: process.env[config.assertionKeyEnv],
