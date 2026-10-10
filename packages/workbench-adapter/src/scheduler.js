@@ -113,6 +113,9 @@ export class TaskScheduler {
   }
 
   async request(run, action, retry = false, signal, rotated = false) {
+    // A release may succeed even when its response is lost. Continuations
+    // must reacquire capacity rather than trust the previous cached lease.
+    if (action === 'release') this.leases.delete(run.sessionId)
     this.database.ensureTicketGeneration(this.ownerId, run.id, this.generation)
     const ticketId = this.database.submission(this.ownerId, run.id)?.ticketId
     let value

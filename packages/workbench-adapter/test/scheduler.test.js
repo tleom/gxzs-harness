@@ -338,6 +338,28 @@ it('releases waiting-input capacity and reacquires before continuing without ano
   expect(sessions.prompt).toHaveBeenCalledTimes(1)
 })
 
+it('reacquires waiting-input capacity when the release response is lost', async () => {
+  const { db, scheduler, create, permit, platform, sessions } = setup()
+  const run = create('question')
+  db.saveSubmission('t:1', run.id, [])
+  permit()
+  await scheduler.tick()
+  expect(scheduler.hasAdmission('s')).toBe(true)
+  db.transitionRun('t:1', run.id, 'waiting_input')
+  platform.json.mockImplementationOnce(async () => {
+    expect(scheduler.hasAdmission('s')).toBe(false)
+    throw Object.assign(new Error('release response lost'), { status: 504 })
+  })
+  await scheduler.tick()
+  expect(scheduler.hasAdmission('s')).toBe(false)
+  db.transitionRun('t:1', run.id, 'running')
+  await scheduler.resumeInput(db.getRun('t:1', run.id), new AbortController().signal)
+  expect(platform.json.mock.calls.filter(([request]) => JSON.parse(request.body).action === 'acquire')).toHaveLength(2)
+  expect(scheduler.hasAdmission('s')).toBe(true)
+  expect(sessions.prompt).toHaveBeenCalledTimes(1)
+  expect(sessions.cancel).not.toHaveBeenCalled()
+})
+
 it('retries an idle release outage without fencing subsequent prompts', async () => {
   const { db, sessions, scheduler, create, permit, platform } = setup()
   const run = create('release-outage')
