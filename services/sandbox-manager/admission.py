@@ -4,6 +4,10 @@ import sqlite3
 import threading
 import time
 
+MAX_CONVERSATIONS_PER_OWNER = 3
+MAX_ACTIVE_OWNERS = 10
+MAX_ACTIVE_CONVERSATIONS = MAX_CONVERSATIONS_PER_OWNER * MAX_ACTIVE_OWNERS
+
 
 class Admission:
     def __init__(self, path):
@@ -53,16 +57,16 @@ class Admission:
                 for task in running:
                     counts[task['owner']] = counts.get(task['owner'], 0) + 1
                     chats.add((task['owner'], task['chat']))
-                if len(running) < 20:
+                if len(running) < MAX_ACTIVE_CONVERSATIONS:
                     for pending in self.db.execute("SELECT * FROM task_admission WHERE state='waiting' AND heartbeat>? ORDER BY seq", (now - 30,)):
                         user = pending['owner']
-                        if counts.get(user, 0) >= 2 or (user not in counts and len(counts) >= 10) or (user, pending['chat']) in chats:
+                        if counts.get(user, 0) >= MAX_CONVERSATIONS_PER_OWNER or (user not in counts and len(counts) >= MAX_ACTIVE_OWNERS) or (user, pending['chat']) in chats:
                             continue
                         if user == owner and pending['run'] == run:
                             self.db.execute("UPDATE task_admission SET state='running' WHERE seq=?", (pending['seq'],))
                         break
             current = self.db.execute('SELECT state FROM task_admission WHERE owner=? AND run=?', (owner, run)).fetchone()
-            return {'state': current['state'] if current else 'missing', 'limits': {'per_user': 2, 'users': 10, 'tasks': 20}}
+            return {'state': current['state'] if current else 'missing', 'limits': {'per_user': MAX_CONVERSATIONS_PER_OWNER, 'users': MAX_ACTIVE_OWNERS, 'tasks': MAX_ACTIVE_CONVERSATIONS}}
 
     def fence(self, owner, instance):
         """Call only AFTER that host and its sandbox have been stopped."""

@@ -19,16 +19,17 @@ def test_limits_and_fifo(tmp_path):
     def call(owner, run, action='acquire'):
         return queue.request(owner, 1, 'host-' + owner, run, run, action)['state']
     for user in range(10):
-        assert call(str(user), 'one') == 'running'
-        assert call(str(user), 'two') == 'running'
-    assert call('0', 'three') == 'waiting'
+        for run in ('one', 'two', 'three'):
+            assert call(str(user), run) == 'running'
+    assert call('0', 'four') == 'waiting'
     assert call('10', 'one') == 'waiting'
     call('0', 'one', 'release')
     assert call('10', 'one') == 'waiting'
-    assert call('0', 'three') == 'running'
-    call('1', 'one', 'release')
-    assert call('10', 'one') == 'waiting'  # 10 distinct users still running
-    call('1', 'two', 'release')
+    assert call('0', 'four') == 'running'
+    for run in ('one', 'two'):
+        call('1', run, 'release')
+        assert call('10', 'one') == 'waiting'
+    call('1', 'three', 'release')
     assert call('10', 'one') == 'running'
     queue.close()
 
@@ -80,13 +81,13 @@ def test_busy_includes_waiting_and_retry_but_prune_only_removes_done(tmp_path):
 def test_concurrent_owners_never_exceed_capacity(tmp_path):
     queue = Admission(str(tmp_path / 'queue.db'))
     def acquire(i):
-        return queue.request(str(i // 3), 1, 'h' + str(i // 3), str(i), str(i), 'acquire')
+        return queue.request(str(i // 4), 1, 'h' + str(i // 4), str(i), str(i), 'acquire')
     with ThreadPoolExecutor(max_workers=20) as pool:
         list(pool.map(acquire, range(90)))
     rows = queue.db.execute("SELECT owner,COUNT(*) n FROM task_admission WHERE state='running' GROUP BY owner").fetchall()
     assert len(rows) <= 10
-    assert sum(row['n'] for row in rows) <= 20
-    assert all(row['n'] <= 2 for row in rows)
+    assert sum(row['n'] for row in rows) <= 30
+    assert all(row['n'] <= 3 for row in rows)
     queue.close()
 
 
@@ -94,12 +95,12 @@ def test_independent_connections_serialize_admission(tmp_path):
     path = str(tmp_path / 'queue.db')
     queues = [Admission(path) for _ in range(4)]
     def acquire(i):
-        return queues[i % 4].request(str(i // 3), 1, 'h' + str(i // 3), str(i), str(i), 'acquire')
+        return queues[i % 4].request(str(i // 4), 1, 'h' + str(i // 4), str(i), str(i), 'acquire')
     with ThreadPoolExecutor(max_workers=20) as pool:
         list(pool.map(acquire, range(90)))
     rows = queues[0].db.execute("SELECT owner,COUNT(*) n FROM task_admission WHERE state='running' GROUP BY owner").fetchall()
     assert len(rows) <= 10
-    assert sum(row['n'] for row in rows) <= 20
-    assert all(row['n'] <= 2 for row in rows)
+    assert sum(row['n'] for row in rows) <= 30
+    assert all(row['n'] <= 3 for row in rows)
     for queue in queues:
         queue.close()

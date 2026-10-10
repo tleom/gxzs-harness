@@ -807,12 +807,16 @@ it.each(['approve', 'discuss'])('settles native plan review through the Workbenc
   const s=new WorkbenchService({database:t.db,sessionController:t.sessions,agents:t.ctx.agents,scheduler:t.scheduler,commands:t.ctx.commands,workspace:'/workspace',skills:{list:async()=>[]},platformClient:{json:async()=>({tools:[]})},fileManager:{operate:async()=>({})}})
   const response=await s.issueCommand(t.owner,t.chat.id,{command:'/plan Review evidence',request_key:'plan'})
   await vi.waitFor(()=>expect(t.model.requests).toHaveLength(1));await t.agent.whenIdle()
-  const bridge=new HumanInputBridge({database:t.db,executionRun:()=>t.db.getRun(t.owner.ownerId,response.run.id)})
+  const bridge=new HumanInputBridge({database:t.db,executionRun:()=>t.db.getRun(t.owner.ownerId,response.run.id),
+    resumeInput:(run,signal)=>t.scheduler.resumeInput(run,signal)})
   t.ctx.on('user-questions/request',bridge.handleRequest,{global:true,prepend:true})
   const pending=t.ctx.tools.execute({callId:'review',name:'exit_plan_mode',arguments:{plan:'# Evidence plan\nReview facts.'},agent:t.agent,signal:new AbortController().signal})
   await vi.waitFor(()=>expect(bridge.pendings.size).toBe(1))
   const saved=t.db.getPendingInput(t.owner.ownerId,response.run.id)
   expect(saved.deadlineAt).toBeNull()
+  await t.scheduler.flushFences()
+  await t.scheduler.tick()
+  expect(t.scheduler.hasAdmission(t.agent.id)).toBe(false)
   if (action === 'discuss') bridge.skip(t.owner.ownerId,response.run.id,saved.requestId)
   else bridge.resume(t.owner.ownerId,response.run.id,{ request_id: saved.requestId, answers: [{id:saved.payload.questions[0].id,selected:[saved.payload.questions[0].intent.approve]}] })
   const result=await pending

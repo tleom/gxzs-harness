@@ -353,7 +353,7 @@ describe('followup and control service', () => {
     const run = await service.submitRun(owner, chat.id, { query: 'wait for capacity' })
     expect(database.submission(owner.ownerId, run.id).dispatched).toBe(false)
     expect(sessionController.prompt).not.toHaveBeenCalled()
-    expect(service.chatSummary(owner, chat)).toMatchObject({ has_active_run: true, is_running: false })
+    expect(service.chatSummary(owner, chat)).toMatchObject({ has_active_run: true, is_running: true })
     expect(await service.stopRun(owner, run.id)).toMatchObject({ status: 'cancelled' })
     expect(sessionController.cancel).not.toHaveBeenCalled()
   })

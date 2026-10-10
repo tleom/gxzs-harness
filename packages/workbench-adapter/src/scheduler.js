@@ -202,6 +202,17 @@ export class TaskScheduler {
     if (chat.ownerId !== this.ownerId || this.closed || this.unfencedSessions.has(sessionId)) return { kind: 'reject' }
     const run = this.database.runForTurn(sessionId, turn)
     if (!run || TERMINAL.has(run.status)) return { kind: 'reject' }
+    return this.admitRun(run, signal, next)
+  }
+
+  async resumeInput(run, signal) {
+    // Serialize against a waiting-input release already in flight.
+    const admitted = await this.withSubmissionMutation(`input:${run.sessionId}`, () => this.admitRun(run, signal, () => true))
+    if (admitted !== true) throw Object.assign(new Error('Question continuation cancelled'), { name: 'AbortError' })
+  }
+
+  async admitRun(run, signal, next) {
+    const sessionId = run.sessionId
     while (!this.hasAdmission(sessionId)) {
       signal.throwIfAborted()
       if (this.closed || this.unfencedSessions.has(sessionId)
@@ -278,12 +289,24 @@ export class TaskScheduler {
       let run = this.database.getRun(this.ownerId, item.runId)
       if (run && this.deletingChats.has(run.chatId)) continue
       let admitted = false
+      let releasing = false
       let cancelAttempted = false
       const cancel = (...args) => { cancelAttempted = true; return this.cancelExecution(...args) }
       try {
         if (this.hasPendingFence(run.sessionId)) continue
         if (this.unfencedSessions.has(run.sessionId)) { await cancel(run, 'unfenced'); continue }
         if (item.dispatched) {
+          const execution = this.executionRun?.(run.sessionId) ?? this.database.activeRunBySession(run.sessionId)
+          if (execution?.status === 'waiting_input') {
+            releasing = true
+            await this.withSubmissionMutation(`input:${run.sessionId}`, async () => {
+              if (this.database.getRun(this.ownerId, execution.id)?.status !== 'waiting_input') return
+              // Keep the delivery receipt; answering reacquires this ticket
+              // without redelivering the user's original message.
+              await this.request(run, 'release', true)
+            })
+            continue
+          }
           const agent = this.agents?.get(run.sessionId)
           const goal = agent && this.goals?.get(agent)
           if (agent?.status === 'running' || (goal?.phase === 'active' && goal.activation === 'armed')) {
@@ -301,6 +324,7 @@ export class TaskScheduler {
           } else {
             // Cancel keeps DSH's inbox, but an idle Session holds no execution
             // slot. The next explicit prompt must pass admission again.
+            releasing = true
             await this.request(run, 'release')
             if (this.closed) return
             this.database.finishSubmission(this.ownerId, run.id)
@@ -309,6 +333,7 @@ export class TaskScheduler {
         }
         if (TERMINAL.has(run.status)) {
           // Cancelling before dispatch also removes its global waiting ticket.
+          releasing = true
           await this.request(run, 'release')
           if (this.closed) return
           this.database.finishSubmission(this.ownerId, run.id)
@@ -361,6 +386,9 @@ export class TaskScheduler {
       } catch (error) {
         if (this.closed) return
         this.diagnostic(run, 'dispatch_failed', 'dispatch_error', { action: 'dispatch', error })
+        // Retry idle-session release without cancelling an already finished
+        // task or fencing the Session's subsequent prompts.
+        if (releasing) continue
         // Admission outages leave queued work queued. Once dispatched, retain
         // its slot and stop execution; recovery must confirm the terminal state.
         const current = this.database.getRun(this.ownerId, item.runId)

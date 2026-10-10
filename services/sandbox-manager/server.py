@@ -17,6 +17,7 @@ from concurrent.futures import ThreadPoolExecutor
 from urllib.request import ProxyHandler, Request, build_opener
 
 from admission import Admission
+from resource_limits import cgroup_args, owner_cgroup
 from owner_auth import authorize as authorize_request
 
 
@@ -180,7 +181,8 @@ def ensure(key):
             existing = json.loads(info.stdout)[0]
             attached = set((existing.get('NetworkSettings', {}).get('Networks') or {}).keys())
             mounted_home = (existing['Config'].get('Labels') or {}).get('gxzs.attachment-home')
-            if existing["Config"]["Image"] != IMAGE or attached != {network} or mounted_home != home_volume:
+            if (existing["Config"]["Image"] != IMAGE or attached != {network} or mounted_home != home_volume
+                    or (existing.get('HostConfig', {}).get('CgroupParent') or '') != owner_cgroup(key)):
                 if existing["State"]["Running"]:
                     # Do not execute privileged helpers in a previous image.
                     # Deployment drains its runs before stopping/recreating it.
@@ -209,7 +211,7 @@ def ensure(key):
                    "base=Path('/opt/office/python/lib/python3.12/site-packages'); "
                    "(site/'workbench_office.pth').write_text(str(base)+'\\n') if site.exists() and base.exists() else None")
             docker("create", "--name", name, "--label", "workbench=" + PREFIX,
-                   '--label', 'gxzs.workspace=' + key, "--network", network,
+                   '--label', 'gxzs.workspace=' + key, "--network", network, *cgroup_args(key),
                    *(['--label', 'gxzs.attachment-home=' + home_volume] if home_volume else []), *attachment_mount,
                    '--log-driver', 'json-file', '--log-opt', 'max-size=10m', '--log-opt', 'max-file=3',
                    "--cpus", os.environ.get("WORKBENCH_SANDBOX_CPUS", "1"),

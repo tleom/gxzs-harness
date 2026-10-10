@@ -330,7 +330,7 @@ export class WorkbenchService {
       id: chat.id, title: chat.title, version: chat.version, pinned: chat.pinned, favorited: chat.favorited,
       file_directory: chat.directory ?? `conversations/${chat.id}`,
       created_at: Math.floor(chat.createdAt / 1000), updated_at: Math.floor(chat.updatedAt / 1000),
-      has_active_run: Boolean(active), is_running: ['running', 'stopping'].includes(active?.status), needs_input: active?.status === 'waiting_input',
+      has_active_run: Boolean(active), is_running: ['queued', 'running', 'stopping'].includes(active?.status), needs_input: active?.status === 'waiting_input',
       pending_interaction: waiting?.status === 'pending' ? pendingInteraction : null,
       has_error: !active && this.database.latestRunStatus(owner.ownerId, chat.id) === 'failed',
     }
