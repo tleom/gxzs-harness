@@ -53,7 +53,7 @@ def test_first_use_creates_once_and_reuses_workspace(tmp_path, monkeypatch):
     assert sandbox.call_count == 2
     assert 'platform_token' not in first
     create = next(call.args for call in docker.call_args_list if call.args[0] == 'create')
-    assert create[create.index('--cpus') + 1] == '0.5'
+    assert create[create.index('--cpus') + 1] == '1'
     assert create[create.index('--memory') + 1] == '1g'
     assert create[create.index('--memory-swap') + 1] == '1g'
     assert create[create.index('--network') + 1] == 'owner-network'

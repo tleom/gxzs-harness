@@ -1,23 +1,36 @@
 import { ClientAssistantStream } from './dsh/client-assistant-stream.js'
 import { nativePresentation } from './projection.js'
+import { compactionSummary } from './native-command.js'
 
 /** Map native publication decisions to existing Workbench display records. */
 export class HistoryPresentation {
-  constructor(sessionId, resolveRun, resolveToolName = () => undefined) {
+  constructor(sessionId, resolveRun, resolveToolName = () => undefined, resolveMessage = () => undefined) {
     this.sessionId = sessionId
     this.resolveRun = resolveRun
     this.resolveToolName = resolveToolName
+    this.resolveMessage = resolveMessage
     this.stream = new ClientAssistantStream()
     this.attempts = new Map()
     this.tools = new Map()
+    this.compactions = new Map()
     this.revision = 0
   }
 
   accept(frame) {
     const display = { replace: frame.type === 'snapshot', events: [], retire_attempts: [] }
     const project = entry => {
-      const event = entry.event, run = this.resolveRun(event.data?.turn)
+      const event = entry.event
+      if (event.type === 'compaction/summary') this.compactions.set(event.data.compactionId, event.data)
+      if (Number.isInteger(event.data?.turn)) this.turn = event.data.turn
+      const run = this.resolveRun(event.data?.turn ?? this.turn)
       if (!run) return
+      const checkpoint = event.type === 'user/message' && event.surfaceOp?.op === 'replace' ? event.data.source : undefined
+      if (checkpoint?.kind === 'compact-checkpoint' && !checkpoint.sourceCommandId) {
+        display.events.push({ run_id: run.id, event: { event: 'workbench_compaction',
+          _id: `history:${this.sessionId}:${event.seq}:compact`, compaction_id: checkpoint.compactionId,
+          ...compactionSummary(this.compactions.get(checkpoint.compactionId)) } })
+        return
+      }
       if (event.type === 'assistant/live-chunk') {
         const { chunk, attemptId, turn, step } = event.data
         if (!['text-delta', 'reasoning-delta'].includes(chunk.type) || !chunk.text) return
@@ -35,11 +48,14 @@ export class HistoryPresentation {
       }
       if (event.type === 'tool/call') this.tools.set(`${run.id}:${event.data.callId}`, event.data.name)
       const callId = event.data?.message?.source?.callId ?? event.data?.message?.content?.[0]?.toolCallId
-      for (const [index, value] of nativePresentation(run, event, { toolName: this.tools.get(`${run.id}:${callId}`) ?? this.resolveToolName(run, callId) ?? '' }).entries())
+      for (const [index, value] of nativePresentation(run, event, { toolName: this.tools.get(`${run.id}:${callId}`) ?? this.resolveToolName(run, callId) ?? '',
+        messageRun: event.type === 'user/message' ? this.resolveMessage(event.data?.id) : undefined }).entries())
         display.events.push({ run_id: run.id, event: { ...value, _id: `history:${this.sessionId}:${event.seq}:${index}` } })
     }
     if (frame.type === 'snapshot') {
+      this.turn = undefined
       this.attempts.clear(); this.tools.clear()
+      this.compactions.clear()
       this.revision = frame.assistantStream?.revision ?? 0
       const opening = frame.assistantStream?.activeAttempt
       if (opening) this.attempts.set(`${opening.turn}:${opening.step}`, opening.attemptId)

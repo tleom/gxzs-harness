@@ -17,10 +17,9 @@ import { registerRunResourceContext } from './resource-mentions.js'
 import { prepareNativeFiles } from './attachments.js'
 import { WorkbenchWorkspaces } from './workspaces.js'
 import { streamWorkspaceEvents } from './workspace-events.js'
-import { nativeOfficePreview } from './office-preview.js'
 
 export const name = 'workbench-adapter'
-export const inject = ['webServer', 'sessionController', 'workspaceController', 'sessionReferenceResolver', 'fileReferences', 'officeToPdf', 'workspaceChanges', 'agents', 'commands', 'skills', 'systemPrompt', 'tokenMeter', 'workbenchFileManager', 'workbenchPlatformClient', 'sessionQuery', 'sessionProjections', 'agentPresets', 'agentDefaultModel', 'settings', 'attachments', 'fileUploads', 'goals']
+export const inject = ['webServer', 'sessionController', 'workspaceController', 'sessionReferenceResolver', 'fileReferences', 'workspaceChanges', 'agents', 'commands', 'skills', 'systemPrompt', 'tokenMeter', 'workbenchFileManager', 'workbenchPlatformClient', 'sessionQuery', 'sessionProjections', 'agentPresets', 'agentDefaultModel', 'settings', 'attachments', 'fileUploads', 'goals']
 
 export const Config = z.object({
   basePath: z.string().default('/ai/workbench'),
@@ -50,6 +49,9 @@ export function apply(ctx, config) {
   service.workspaces = workspaces
   service.sessionReferences = ctx.sessionReferenceResolver
   service.fileReferences = ctx.fileReferences
+  service.subscribeGoal = (sessionId, listener) => ctx.on('goal/activation-changed', event => {
+    if (event.sessionId === sessionId) listener()
+  }, { global: true })
   let recovered = false
   let recoveryError
   let recoveryTimer
@@ -114,16 +116,18 @@ export function apply(ctx, config) {
     projectSessionEvent(database, session?.id ?? session?.header?.id, event, config.ownerId, context)
   }, { global: true })
 
-  const buildCatalog = async (owner) => {
+  const buildCatalog = async (owner, modelsOnly = false) => {
     const [catalog, mcpTools, skills] = await Promise.all([
-      databaseModelCatalog(ctx.workbenchPlatformClient, ctx.sessionController, owner, ctx.settings), service.mcpCatalog(owner), service.listSkills(),
+      databaseModelCatalog(ctx.workbenchPlatformClient, ctx.sessionController, owner, ctx.settings),
+      modelsOnly ? [] : service.mcpCatalog(owner), modelsOnly ? [] : service.listSkills(),
     ])
     const models = (catalog.groups ?? []).flatMap((group) => (group.models ?? []).map((model) => ({
       id: `${group.id}/${model.id}`, name: model.name || model.id, provider: group.id, description: model.description,
     })))
     return {
+      resources_pending: modelsOnly,
       activity_protocol: 1, human_input_protocol: 1, followup_protocol: 1, history_protocol: 1, native_history_protocol: 1,
-      control_protocol: 1, resources_protocol: 1, command_resources_protocol: 1, submission_control_protocol: 1,
+      control_protocol: 1, goal_events_protocol: 1, compact_events_protocol: 1, resources_protocol: 1, command_resources_protocol: 1, submission_control_protocol: 1,
       default_selection: { model: catalog.default ? `${catalog.default.provider}/${catalog.default.model}` : models[0]?.id ?? '', tools: [], skills: [], knowledge: [], model_parameters: {}, tool_parameters: {} },
       models, tools: mcpTools.map((tool) => ({
         id: tool.id, name: tool.name, display_name: tool.display_name,
@@ -201,7 +205,7 @@ export function apply(ctx, config) {
       user: { id: owner.userId, name: owner.name, email: '' }, workspaceId: owner.tenantId,
       workspaces: [{ id: owner.tenantId, name: owner.tenantId, current: true }],
     })],
-    ['GET', /^\/catalog$/, async ({ owner }, res) => sendJson(res, 200, { data: await buildCatalog(owner) })],
+    ['GET', /^\/catalog$/, async ({ owner, url }, res) => sendJson(res, 200, { data: await buildCatalog(owner, url.searchParams.get('view') === 'models') })],
     ['GET', /^\/chats\/([\w-]+)\/references$/, async ({ owner, url }, res, match) => {
       const abort = new AbortController()
       const disconnected = () => abort.abort()
@@ -294,20 +298,8 @@ export function apply(ctx, config) {
       humanInput.touch(owner.ownerId, match[1], json.request_id)
       sendJson(res, 200, { data: service.getRun(owner, match[1]) })
     }],
-    ['GET', /^\/files\/preview$/, async (context, res) => {
-      const abort = new AbortController()
-      const disconnected = () => abort.abort()
-      res.once('close', disconnected)
-      try {
-        const pdf = await nativeOfficePreview({ owner: context.owner, path: context.url.searchParams.get('path'),
-          fileManager: ctx.workbenchFileManager, converter: ctx.officeToPdf, signal: abort.signal })
-        if (abort.signal.aborted) return
-        if (pdf === undefined) return await proxyPlatform(context, res, 'files/preview')
-        res.writeHead(200, { 'content-type': 'application/pdf', 'cache-control': 'no-store',
-          'content-length': pdf.length, 'x-content-type-options': 'nosniff' })
-        res.end(Buffer.from(pdf))
-      } finally { res.off('close', disconnected) }
-    }],
+    // The platform renders Word in an offline, resource-limited container.
+    ['GET', /^\/files\/preview$/, async (context, res) => proxyPlatform(context, res, 'files/preview')],
     ['POST', /^\/files\/preview$/, async (context, res) => proxyPlatform(context, res, 'files/preview')],
     ['GET', /^\/files\/shares$/, async (context, res) => proxyPlatform(context, res, 'files/shares')],
     ['POST', /^\/files\/shares$/, async (context, res) => proxyPlatform(context, res, 'files/shares')],

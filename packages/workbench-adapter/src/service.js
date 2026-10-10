@@ -15,6 +15,7 @@ import { nativeTurn } from './native-turn.js'
 import { historyWindow, loadNativeHistoryPage } from './history-page.js'
 import { nativePresentation } from './projection.js'
 import { HistoryPresentation } from './history-presentation.js'
+import { withGoalUpdates } from './goal-updates.js'
 import { withNativeCommandRun, nativeCommandRecords } from './native-command.js'
 
 export class WorkbenchService {
@@ -218,8 +219,10 @@ export class WorkbenchService {
     const chat = this.requireChat(owner, chatId)
     const page = await loadNativeHistoryPage(this, chat.sessionId, cursor, signal)
     const runs = new Map(), tools = new Map(), turns = new Map()
+    let currentTurn
     for (const { event } of page.records) {
-      const turn = event.data?.turn
+      if (Number.isInteger(event.data?.turn)) currentTurn = event.data.turn
+      const turn = event.data?.turn ?? currentTurn
       if (!Number.isInteger(turn)) continue
       if (!turns.has(turn)) turns.set(turn, this.database.runForTurn(chat.sessionId, turn))
       const run = turns.get(turn)
@@ -232,7 +235,8 @@ export class WorkbenchService {
       if (event.type === 'tool/call') tools.set(`${run.id}:${event.data.callId}`, event.data.name)
       const block = event.data?.message?.content?.[0]
       const callId = event.data?.message?.source?.callId ?? block?.toolCallId
-      for (const [index, payload] of nativePresentation(run, event, { toolName: tools.get(`${run.id}:${callId}`)
+      for (const [index, payload] of nativePresentation(run, event, { messageRun: event.type === 'user/message' ? this.database.runForMessage(chat.sessionId, event.data?.id) : undefined,
+        toolName: tools.get(`${run.id}:${callId}`)
         ?? (callId ? this.database.toolCallName(owner.ownerId, run.id, callId) : '') ?? '' }).entries()) {
         view.events.push({ ...payload, _id: `history:${chat.sessionId}:${event.seq}:${index}` })
       }
@@ -248,17 +252,20 @@ export class WorkbenchService {
       }
     }
     return { ...this.chatSummary(owner, chat), selection: chat.selection,
-      ...page, history_cursor: page.cursor, runs: [...runs.values()] }
+      ...page, history_cursor: page.cursor,
+      runs: [...runs.values()].map(run => nativeLive ? { ...run, native_history: true } : run) }
   }
 
   async *followHistory(owner, chatId, signal) {
     const chat = this.requireChat(owner, chatId)
     const presentation = new HistoryPresentation(chat.sessionId, turn =>
       Number.isInteger(turn) ? this.database.runForTurn(chat.sessionId, turn) : undefined,
-      (run, callId) => callId ? this.database.toolCallName(owner.ownerId, run.id, callId) : undefined)
+      (run, callId) => callId ? this.database.toolCallName(owner.ownerId, run.id, callId) : undefined,
+      messageId => this.database.runForMessage(chat.sessionId, messageId))
     const source = this.sessions.follow({ address: { kind: 'session', sessionId: chat.sessionId },
       ...historyWindow, assistantStream: true }, signal)
-    for await (const frame of source) {
+    for await (const frame of withGoalUpdates(source, this.subscribeGoal
+      ? listener => this.subscribeGoal(chat.sessionId, listener) : undefined, signal)) {
       signal.throwIfAborted()
       // Directory changes replace the native session. End the old subscription
       // instead of combining two different source logs in one conversation.
@@ -282,8 +289,12 @@ export class WorkbenchService {
         type: frame.type, cursor: frame.cursor, records: frame.records,
         hasMore: frame.hasMore, assistantStream: frame.assistantStream,
       } : frame
+      const updatesControl = frame.type === 'snapshot' || frame.type === 'goal-state'
+        || (frame.type === 'event' && (['goal/change', 'plan/mode', 'command/run', 'command/done', 'turn/end'].includes(frame.event.type)
+          || (frame.event.type === 'user/message' && ['goal', 'compact-checkpoint'].includes(frame.event.data?.source?.kind))))
       yield { event: 'workbench_history', session_id: chat.sessionId, value, runs: [...runs.values()], bindings,
-        display: presentation.accept(frame) }
+        ...(updatesControl ? { control: await this.getControl(owner, chatId) } : {}),
+        display: frame.type === 'goal-state' ? { events: [], replace: false, retire_attempts: [] } : presentation.accept(frame) }
     }
   }
 
@@ -571,6 +582,21 @@ export class WorkbenchService {
       chat = await this.ensureChatSession(owner, this.requireChat(owner, chatId))
       const agent = this.agents.get(chat.sessionId)
       if (!agent) throw httpError(409, '会话暂时无法恢复，请稍后重试')
+      if (line === '/compact' && body.background === true) {
+        // DSH appends command/run synchronously before entering its handler.
+        // Release admission and HTTP as soon as that native identity exists;
+        // command/done remains the sole settlement authority, including errors.
+        const before = new Set(agent.session.snapshotEvents().filter(event => event.type === 'command/run').map(event => event.data.commandId))
+        const execution = this.commands.execute(agent, line, [], new AbortController().signal)
+        const started = agent.session.snapshotEvents().find(event => event.type === 'command/run' && !before.has(event.data.commandId))
+        if (!started) {
+          await execution
+          throw httpError(400, '压缩命令不可用')
+        }
+        void execution.catch(() => {}) // Native command/done records handler failures.
+        const result = { accepted: true, command_id: started.data.commandId, state: await this.getControl(owner, chatId), message: '', run: null }
+        return this.database.saveCommandReceipt(owner.ownerId, chatId, requestKey, result)
+      }
       const planTask = /^\/plan\s+(?!off\s*$)([\s\S]+)$/.exec(line)
       if (planTask || line === '/plan' && body.files?.length) {
         const mentions = normalizeResourceMentions(body.resource_mentions)
@@ -608,10 +634,20 @@ export class WorkbenchService {
         && (!editsGoal || this.goals?.get(agent)?.phase === 'complete')
       let goalRun
       let createdGoalRun = false
+      const previousGoalRun = this.database.goalRun(chat.sessionId)
       const admitted = body.files?.length
         ? await admitSandboxAttachments({ fileManager: this.fileManager, workspace: this.workspace, query: '', files: body.files, nativeFiles: this.nativeFileAttachments })
         : { content: [], attachments: [] }
       const commandAttachments = await this.commandAttachments(agent, admitted.content)
+      let editedResources
+      if (editsGoal && !startsGoal && body.resource_mentions !== undefined && previousGoalRun) {
+        const mentions = normalizeResourceMentions(body.resource_mentions)
+        const mcpTools = await this.freezeMcpTools(owner, mentions.tools)
+        editedResources = { mcpTools, selection: { ...previousGoalRun.selection,
+          resource_mentions: mentions, mentioned_resources: await this.mentionSnapshot(mentions, mcpTools),
+          skill_names: await this.skillNames(),
+          resource_context: (await this.resourceContent([], mentions, mcpTools)).map(item => item.text).join('\n') } }
+      }
       if (startsGoal) {
         const previous = /^\/goal\s+resume\s*$/i.test(line) ? this.database.goalRun(chat.sessionId) : undefined
         const mentions = normalizeResourceMentions(body.resource_mentions)
@@ -641,12 +677,14 @@ export class WorkbenchService {
         execution = await this.commands.execute(agent, line, commandAttachments, new AbortController().signal)
         if (!execution) throw httpError(400, '命令不存在或参数无效')
         if (execution.result?.kind === 'error') throw httpError(409, execution.result.text)
+        if (editedResources) this.database.updateRunResources(previousGoalRun, editedResources.selection, editedResources.mcpTools)
         // Older managers admit ordinary files as sandbox-path text. Preserve
         // that content in native history for goal edits as well as new goals.
         const fallbackFiles = admitted.content.filter(item => item.type === 'text')
         if (fallbackFiles.length) agent.followup(createUserMessage({ content: fallbackFiles, source: { kind: 'user' } }))
       } catch (error) {
         if (createdGoalRun) {
+          this.database.setGoalRun(chat.sessionId, previousGoalRun?.id)
           this.database.transitionRun(owner.ownerId, goalRun.id, 'failed', error.message)
           this.database.appendEvent(owner.ownerId, goalRun.id, { event: 'workbench_end', status: 'failed', error: error.message })
         }
@@ -694,6 +732,7 @@ export class WorkbenchService {
       if (!current || current.id !== ref?.id || current.revision !== ref?.revision)
         throw httpError(409, '目标已改变，请刷新后重试', 'GOAL_STALE_REF')
       let resumedRun
+      const previousGoalRun = this.database.goalRun(chat.sessionId)
       if (action === 'resume') {
         const previous = this.database.goalRun(chat.sessionId)
         const active = this.database.activeRunBySession(chat.sessionId)
@@ -709,7 +748,10 @@ export class WorkbenchService {
         const value = action === 'edit' ? this.goals.edit(agent, ref, body.request) : this.goals[action](agent, ref)
         return { value, state: await this.getControl(owner, chatId), run: resumedRun ? this.getRun(owner, resumedRun.id) : null }
       } catch (error) {
-        if (resumedRun) this.database.transitionRun(owner.ownerId, resumedRun.id, 'failed', error.message)
+        if (resumedRun) {
+          this.database.setGoalRun(chat.sessionId, previousGoalRun?.id)
+          this.database.transitionRun(owner.ownerId, resumedRun.id, 'failed', error.message)
+        }
         throw error
       }
     })
@@ -719,6 +761,7 @@ export class WorkbenchService {
     const chat = this.requireChat(owner, chatId)
     let state = this.database.getControl(owner.ownerId, chatId)
     const agent = this.agents.get(chat.sessionId)
+    if (!agent && state.goal) state = { ...state, goal: { ...state.goal, activation: 'disarmed' } }
     if (agent && this.goals) {
       const goal = this.goals.get(agent)
       state = { ...state, goal: goal ? { ...goal, reason: goal.blockedReason?.message ?? null,
@@ -728,6 +771,13 @@ export class WorkbenchService {
     const source = await this.sessionQuery.observeSession(chat.sessionId)
     try {
       const plan = source.projections?.values?.plan ?? { active: false, pending: false }
+      if (!agent) {
+        const projection = source.projections?.values?.goal
+        const goal = projection?.goal
+        state = { ...state, goal: goal ? { ...goal, activation: 'disarmed',
+          reason: goal.blockedReason?.message ?? null, max_rounds: goal.maxGoalRounds,
+          rounds_started: projection.roundsStarted, last_run_id: this.database.goalRun(chat.sessionId)?.id ?? null } : null }
+      }
       return { ...state, plan, commands: nativeCommandRecords(source.events ?? [], this.database.listRuns(owner.ownerId, chatId)) }
     } finally { source[Symbol.dispose]?.() }
   }
@@ -837,23 +887,48 @@ export class WorkbenchService {
   }
 
   async editQueued(owner, runId, body) {
+    return this.withQueueMutation(owner, runId, () => this.editQueuedMessage(owner, runId, body))
+  }
+
+  withQueueMutation(owner, runId, operation) {
+    const run = this.database.getRun(owner.ownerId, runId)
+    if (!run) throw httpError(404, '任务不存在')
+    return this.withChatMutation(run.chatId, () => this.scheduler?.withSubmissionMutation
+      ? this.scheduler.withSubmissionMutation(runId, operation) : operation())
+  }
+
+  async editQueuedMessage(owner, runId, body) {
     const run = this.database.getRun(owner.ownerId, runId)
     if (!run) throw httpError(404, '任务不存在')
     const text = body.content?.[0]?.text
     if (!Array.isArray(body.content) || body.content.length !== 1 || body.content[0].type !== 'text' || typeof text !== 'string' || !text.trim())
       throw httpError(400, '排队编辑仅接受非空文本')
-    if (run.attachments?.length || normalizeResourceMentions(run.selection.resource_mentions).skills.length || normalizeResourceMentions(run.selection.resource_mentions).tools.length)
-      throw httpError(409, '包含附件或资源选择的消息暂不支持文本编辑')
-    // Editing has exactly the same admission boundary as DSH updateQueue:
-    // only an inbox occurrence can be edited, never a currently executing turn.
-    if (!run.messageId) throw httpError(409, '消息尚未进入会话队列')
-    await this.sessions.updateQueue({ sessionId: run.sessionId, itemId: run.messageId, action: { kind: 'edit', content: body.content } })
-    // Update the display cache only after the native inbox accepts the edit.
+    if (run.attachments?.length) throw httpError(409, '包含附件的消息不支持文本编辑')
+    const inbox = this.agents?.get(run.sessionId)?.inbox
+    const original = this.database.submission(owner.ownerId, runId)?.content
+      ?? [...(inbox?.nextTurn ?? []), ...(inbox?.nextStep ?? [])].find(item => item.id === run.messageId)?.content
+    if (original?.some(part => part.type !== 'text')) throw httpError(409, '包含附件的消息不支持文本编辑')
+    // Keep frozen resource hints outside the editable user text.
+    const content = original ? [...body.content, ...original.slice(1)]
+      : await this.resourceContent(body.content, run.selection.resource_mentions, run.mcpTools)
+    // Before dispatch update the durable admission payload; afterward DSH's
+    // inbox decides whether the message is still editable.
+    if (!run.messageId) {
+      if (!this.database.editSubmission(owner.ownerId, runId, content))
+        throw httpError(409, '消息已离开队列，请刷新后重试', 'STALE_RUN')
+    } else {
+      await this.sessions.updateQueue({ sessionId: run.sessionId, itemId: run.messageId, action: { kind: 'edit', content } })
+    }
+    // Update the display cache only after the owning queue accepts the edit.
     this.database.db.prepare('UPDATE runs SET query = ? WHERE id = ? AND owner_id = ?').run(text, run.id, owner.ownerId)
     return this.getRun(owner, runId)
   }
 
   async removeQueued(owner, runId) {
+    return this.withQueueMutation(owner, runId, () => this.removeQueuedMessage(owner, runId))
+  }
+
+  async removeQueuedMessage(owner, runId) {
     const run = this.database.getRun(owner.ownerId, runId)
     if (!run) throw httpError(404, '任务不存在')
     if (run.status === 'discarded') return runDto(run)
@@ -866,9 +941,7 @@ export class WorkbenchService {
   }
 
   async steer(owner, runId, targetRunId) {
-    const original = this.database.getRun(owner.ownerId, runId)
-    if (!original) throw httpError(404, '任务不存在')
-    return this.withChatMutation(original.chatId, () => this.steerQueued(owner, runId, targetRunId))
+    return this.withQueueMutation(owner, runId, () => this.steerQueued(owner, runId, targetRunId))
   }
 
   async steerQueued(owner, runId, targetRunId) {
@@ -884,7 +957,6 @@ export class WorkbenchService {
     const content = pending && !pending.dispatched
       ? await prepareNativeFiles(this.fileUploads, run.sessionId, pending.content)
       : undefined
-    await this.scheduler?.pendingTick
     const active = this.database.getRun(owner.ownerId, targetRunId)
     const current = this.database.getRun(owner.ownerId, runId)
     const agent = this.agents.get(run.sessionId)
@@ -904,11 +976,13 @@ export class WorkbenchService {
       if (!message) throw Object.assign(httpError(409, '排队消息已被接收，请刷新后重试'), { code: 'STALE_RUN' })
       await this.sessions.updateQueue({ sessionId: run.sessionId, itemId: message.id, action: { kind: 'steer' } })
     }
-    this.database.transitionRun(owner.ownerId, run.id, 'steered')
-    this.database.appendEvent(owner.ownerId, run.id, { event: 'workbench_steered', steer_target_run_id: targetRunId })
-    this.database.appendEvent(owner.ownerId, targetRunId, {
-      event: 'workbench_steering', steering_id: run.id, query: run.query, attachments: run.attachments ?? [],
-    })
+    if (this.database.getRun(owner.ownerId, run.id)?.status !== 'steered') {
+      this.database.transitionRun(owner.ownerId, run.id, 'steered')
+      this.database.appendEvent(owner.ownerId, run.id, { event: 'workbench_steered', steer_target_run_id: targetRunId })
+      this.database.appendEvent(owner.ownerId, targetRunId, {
+        event: 'workbench_steering', steering_id: run.id, query: run.query, attachments: run.attachments ?? [],
+      })
+    }
     return this.getRun(owner, run.id)
   }
 

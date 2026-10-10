@@ -56,6 +56,7 @@ export class TaskScheduler {
     this.deletingChats = new Set()
     this.leases = new Map()
     this.nativeAdmissions = new Map()
+    this.submissionMutations = new Map()
     this.unfencedSessions = new Set()
     this.pendingFenceTick = null
     this.fenceLifetime = new AbortController()
@@ -90,6 +91,20 @@ export class TaskScheduler {
   }
 
   async prompt(run, content, markDispatched = false) {
+    return this.withSubmissionMutation(run.id, () => this.dispatchPrompt(run, content, markDispatched))
+  }
+
+  async withSubmissionMutation(runId, operation) {
+    const previous = this.submissionMutations.get(runId) ?? Promise.resolve()
+    const pending = previous.catch(() => {}).then(operation)
+    this.submissionMutations.set(runId, pending)
+    try { return await pending }
+    finally { if (this.submissionMutations.get(runId) === pending) this.submissionMutations.delete(runId) }
+  }
+
+  async dispatchPrompt(run, content, markDispatched) {
+    // A queue edit may have completed while admission was waiting on the network.
+    content = this.database.submission(this.ownerId, run.id)?.content ?? content
     const prepared = await this.prepareContent(run.sessionId, content)
     if (this.closed || this.database.getRun(this.ownerId, run.id)?.status !== 'queued') return false
     if (markDispatched) this.database.dispatchSubmission(this.ownerId, run.id)

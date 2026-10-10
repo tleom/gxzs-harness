@@ -19,6 +19,7 @@ export function nativeCommandRun(sessionId) {
 // command state is stored by Workbench, including during compaction failures.
 export function nativeCommandRecords(events, runs) {
   const commands = new Map()
+  const summaries = new Map()
   const orderedRuns = runs.filter(run => Number.isInteger(run.sourceStartSeq)).sort((a, b) => a.sourceStartSeq - b.sourceStartSeq)
   for (const event of events) {
     if (event.type === 'command/run') commands.set(event.data.commandId, {
@@ -28,6 +29,21 @@ export function nativeCommandRecords(events, runs) {
     })
     if (event.type === 'command/done' && commands.has(event.data.commandId))
       commands.get(event.data.commandId).outcome = event.data
+    if (event.type === 'compaction/summary') summaries.set(event.data.compactionId, event.data)
+    const source = event.type === 'user/message' && event.surfaceOp?.op === 'replace' ? event.data.source : undefined
+    if (source?.kind === 'compact-checkpoint' && commands.has(source.sourceCommandId)) {
+      const command = commands.get(source.sourceCommandId)
+      command.compaction = compactionSummary(summaries.get(source.compactionId))
+      command.before_run_id = orderedRuns.find(run => run.sourceStartSeq > event.seq)?.id ?? null
+    }
   }
   return [...commands.values()]
+}
+
+export function compactionSummary(data) {
+  return {
+    summary: Array.isArray(data?.summary) ? data.summary.filter(block => block.type === 'text').map(block => block.text).join('') || null : null,
+    items: Array.isArray(data?.shadowedSeqs) ? data.shadowedSeqs.length : null,
+    tokens: Number.isSafeInteger(data?.shadowedTokenCount) ? data.shadowedTokenCount : null,
+  }
 }

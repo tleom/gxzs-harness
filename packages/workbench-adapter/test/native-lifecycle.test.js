@@ -68,7 +68,7 @@ async function fixture(script) {
   const chat = db.createChat({ id: 'native-chat', ownerId: owner.ownerId, sessionId: agent.id, selection: {} })
   const controllerCtx = Object.create(ctx)
   controllerCtx.attachments = { admitPromptContent: async content => content }
-  controllerCtx.fileUploads = { bindPrompt: () => ({ commit() {}, [Symbol.dispose]() {} }) }
+  controllerCtx.fileUploads = { retirePrompt() {}, bindPrompt: () => ({ commit() {}, [Symbol.dispose]() {} }) }
   const controller = new SessionCommandController(controllerCtx, {
     resolveAgent: async () => ({ agent }), selectionFor: () => ({ current: { provider: 'mock', model: 'mock' } }),
   }, '/workspace')
@@ -100,6 +100,52 @@ async function fixture(script) {
   return { ctx, db, agent, owner, chat, model, scheduler, runtime, sessions, controllerCtx, requests, create,
     permit: value => { permitted = value } }
 }
+
+it.each(['local', 'native'])('edits and directly sends the selected %s queue item without waiting on unrelated scheduling', async placement => {
+  let release
+  const test = await fixture([new Promise(resolve => { release = resolve }), 'steered answer', 'queued answer'])
+  const first = test.create('original'), second = test.create('keep queued'), third = test.create('before edit')
+  await test.scheduler.enqueue(first, [{ type: 'text', text: first.query }])
+  await test.scheduler.tick()
+  await vi.waitFor(() => expect(test.model.requests).toHaveLength(1))
+  for (const run of [second, third]) test.db.saveSubmission(test.owner.ownerId, run.id, [{ type: 'text', text: run.query }])
+  if (placement === 'native') await test.scheduler.tick()
+  const service = new WorkbenchService({ database: test.db, sessionController: test.sessions, agents: test.ctx.agents, scheduler: test.scheduler })
+  await service.editQueued(test.owner, third.id, { content: [{ type: 'text', text: 'edited supplement' }] })
+  test.scheduler.pendingTick = new Promise(() => {})
+  try {
+    await service.steer(test.owner, third.id, first.id)
+    expect(test.agent.inbox.nextStep.map(item => item.content[0].text)).toEqual(['edited supplement'])
+    expect(test.db.getRun(test.owner.ownerId, second.id).status).toBe('queued')
+  } finally { test.scheduler.pendingTick = null }
+  await test.scheduler.tick()
+  release('first answer')
+  await test.agent.whenIdle()
+  expect(test.model.requests).toHaveLength(3)
+  expect(JSON.stringify(test.model.requests[1].messages)).toContain('edited supplement')
+  expect(JSON.stringify(test.model.requests[1].messages)).not.toContain('keep queued')
+  const messages = test.agent.session.snapshotEvents().filter(event => event.type === 'user/message')
+  expect(messages.map(event => event.data.source.rpcId)).toEqual([first.id, third.id, second.id])
+  expect(test.db.getRun(test.owner.ownerId, third.id).status).toBe('steered')
+})
+
+it.each(['local', 'native'])('removes only the selected %s queue item and consumes the remainder in order', async placement => {
+  let release
+  const test = await fixture([new Promise(resolve => { release = resolve }), 'answer A', 'answer C'])
+  const first = test.create('first'), a = test.create('A'), b = test.create('B'), c = test.create('C')
+  await test.scheduler.enqueue(first, [{ type: 'text', text: first.query }])
+  await test.scheduler.tick()
+  await vi.waitFor(() => expect(test.model.requests).toHaveLength(1))
+  for (const run of [a, b, c]) test.db.saveSubmission(test.owner.ownerId, run.id, [{ type: 'text', text: run.query }])
+  if (placement === 'native') await test.scheduler.tick()
+  const service = new WorkbenchService({ database: test.db, sessionController: test.sessions, agents: test.ctx.agents, scheduler: test.scheduler })
+  await service.removeQueued(test.owner, b.id)
+  await test.scheduler.tick()
+  release('first answer')
+  await test.agent.whenIdle()
+  expect(test.agent.session.snapshotEvents().filter(event => event.type === 'user/message').map(event => event.data.source.rpcId)).toEqual([first.id, a.id, c.id])
+  expect(test.db.getRun(test.owner.ownerId, b.id).status).toBe('discarded')
+})
 
 it('resolves a canonical conversation mention through native pre-step into model context', async () => {
   const test = await fixture(['reference received'])
@@ -506,6 +552,29 @@ it('delegates compact once to the native command without prompting the model or 
   await expect(service.issueCommand(test.owner, test.chat.id, { ...body, request_key: 'compact-file', files: [{ path: 'x' }] })).rejects.toMatchObject({ status: 400 })
 })
 
+it('acknowledges slow native compaction without holding chat admission and settles from native events', async () => {
+  const test = await fixture([])
+  let finish
+  const compactNow = vi.fn(() => new Promise(resolve => { finish = resolve }))
+  test.ctx.provide('compaction', { compactNow })
+  await test.ctx.plugin(await native('dsh-command-compact'))
+  const service = new WorkbenchService({ database: test.db, sessionController: test.sessions, agents: test.ctx.agents,
+    commands: test.ctx.commands, workspace: '/workspace', fileManager: { operate: async () => ({}) },
+    sessionQuery: { observeSession: async () => ({ events: test.agent.session.snapshotEvents(), [Symbol.dispose]() {} }) } })
+  const body = { command: '/compact', request_key: 'background-compact', background: true }
+  try {
+    const accepted = await service.issueCommand(test.owner, test.chat.id, body)
+    expect(accepted).toMatchObject({ accepted: true, command_id: expect.any(String), run: null })
+    expect(accepted.state.commands).toEqual([expect.objectContaining({ id: accepted.command_id, outcome: null })])
+    expect(await service.withChatMutation(test.chat.id, async () => 'available')).toBe('available')
+    expect(await service.issueCommand(test.owner, test.chat.id, body)).toEqual(accepted)
+    expect(compactNow).toHaveBeenCalledOnce()
+    finish(null)
+    await vi.waitFor(async () => expect((await service.getControl(test.owner, test.chat.id)).commands[0].outcome).toMatchObject({ kind: 'success' }))
+    expect(test.db.listRuns(test.owner.ownerId, test.chat.id)).toHaveLength(0)
+  } finally { finish?.(null) }
+})
+
 it('lets a native plan command steer the running turn and projects its message once', async () => {
   let release
   const test = await fixture([new Promise(resolve => { release = resolve }), 'plan response'])
@@ -610,4 +679,119 @@ it.each(['local', 'native'])('direct-sends a %s queued file through DSH once', a
   await test.scheduler.tick()
   expect(test.model.requests).toHaveLength(2)
   expect(test.db.getRun(test.owner.ownerId, run.id).status).toBe('steered')
+})
+function goalServiceFixture(test) {
+  return new WorkbenchService({ database: test.db, sessionController: test.sessions, agents: test.ctx.agents,
+    scheduler: test.scheduler, goals: test.ctx.goals, commands: test.ctx.commands, workspace: '/workspace',
+    platformClient: { json: async () => ({ data: { tools: [] } }) }, skills: { list: async () => [] }, fileManager: { operate: async () => ({}) } })
+}
+it('rejected duplicate creation preserves the active goal run binding', async () => {
+  const t = await fixture(['hang']); const s = goalServiceFixture(t)
+  const first = await s.issueCommand(t.owner,t.chat.id,{command:'/goal first objective',request_key:'first'})
+  await vi.waitFor(() => expect(t.model.requests).toHaveLength(1))
+  await expect(s.issueCommand(t.owner,t.chat.id,{command:'/goal second objective',request_key:'second'})).rejects.toMatchObject({status:409})
+  expect(t.ctx.goals.get(t.agent).objective).toBe('first objective')
+  expect(t.db.goalRun(t.agent.id).id).toBe(first.run.id)
+  expect(t.db.goalRun(t.agent.id).status).toBe('running')
+  t.ctx.goals.pause(t.agent,t.ctx.goals.get(t.agent)); await t.agent.whenIdle()
+})
+it('slash resume rejection preserves the active goal run binding', async () => {
+  const t = await fixture(['hang']); const s = goalServiceFixture(t)
+  const first = await s.issueCommand(t.owner,t.chat.id,{command:'/goal first objective',request_key:'first'})
+  await vi.waitFor(() => expect(t.model.requests).toHaveLength(1))
+  await expect(s.issueCommand(t.owner,t.chat.id,{command:'/goal resume',request_key:'resume'})).rejects.toMatchObject({status:409})
+  expect(t.db.goalRun(t.agent.id).id).toBe(first.run.id)
+  expect(t.db.goalRun(t.agent.id).status).toBe('running')
+  t.ctx.goals.pause(t.agent,t.ctx.goals.get(t.agent)); await t.agent.whenIdle()
+})
+it('cold control reports disarmed activation', async () => {
+  const t = await fixture([]); const run=t.create('goal'); t.db.setGoalRun(t.agent.id,run.id)
+  t.ctx.goals.create(t.agent,{objective:'cold objective'})
+  t.ctx.goals.disarm(t.agent)
+  const s=goalServiceFixture(t); s.agents={get:()=>undefined}
+  const state=await s.getControl(t.owner,t.chat.id)
+  expect(state.goal.phase).toBe('active'); expect(state.goal.activation).toBe('disarmed')
+})
+
+it('fork preserves all goal turn bindings', async () => {
+  const t=await fixture([]); const s=goalServiceFixture(t); const run=t.create('multi-round goal')
+  t.db.setGoalRun(t.agent.id,run.id); t.db.bindNativeTurn(run,1); t.db.bindNativeTurn(run,2)
+  t.db.setRunSourceSeq(t.owner.ownerId,run.id,'source_end_seq',20)
+  t.db.transitionRun(t.owner.ownerId,run.id,'completed')
+  s.sessions={fork:async()=>({sessionId:'forked-session'}),rename:async()=>({})}
+  const child=await s.fork(t.owner,run.id,{request_key:'fork'})
+  expect(t.db.runForTurn('forked-session',1)).toBeDefined()
+  expect(t.db.runForTurn('forked-session',2)?.id).toBe(child.runs[0].id)
+  expect(child.runs).toHaveLength(1)
+})
+it('native domain rejection retains conflict semantics', async () => {
+  const {sendError}=await import('../src/http.js')
+  const t=await fixture(['hang']);const s=goalServiceFixture(t)
+  await s.issueCommand(t.owner,t.chat.id,{command:'/goal first objective',request_key:'first'})
+  await vi.waitFor(()=>expect(t.model.requests).toHaveLength(1))
+  let failure;try{await s.mutateGoal(t.owner,t.chat.id,'resume',{ref:t.ctx.goals.get(t.agent)})}catch(e){failure=e}
+  expect(failure.code).toBe('GOAL_INVALID_TRANSITION')
+  const res={writeHead:vi.fn(),end:vi.fn()};sendError(res,failure)
+  expect(res.writeHead.mock.calls[0][0]).toBe(409)
+  expect(JSON.parse(res.end.mock.calls[0][0])).toMatchObject({code:'GOAL_INVALID_TRANSITION'})
+  t.ctx.goals.pause(t.agent,t.ctx.goals.get(t.agent));await t.agent.whenIdle()
+})
+it('editing objective updates selected resource context', async () => {
+  const t=await fixture(['hang']); const s=goalServiceFixture(t)
+  const first=await s.issueCommand(t.owner,t.chat.id,{command:'/goal first objective',request_key:'first'})
+  await vi.waitFor(()=>expect(t.model.requests).toHaveLength(1))
+  t.ctx.goals.pause(t.agent,t.ctx.goals.get(t.agent));await t.agent.whenIdle()
+  s.skills={list:async()=>[{name:'new-skill',description:'new evidence'}]}; const content=vi.spyOn(s,'resourceContent')
+  await s.issueCommand(t.owner,t.chat.id,{command:'/goal edit revised objective',request_key:'edit',resource_mentions:{skills:['new-skill']}})
+  expect(content).toHaveBeenCalled()
+  expect(t.ctx.goals.get(t.agent).objective).toBe('revised objective')
+  expect(t.db.getRun(t.owner.ownerId,first.run.id).selection.resource_mentions.skills).toEqual(['new-skill'])
+})
+it('rejected replacement leaves original goal continuation intact', async () => {
+  let release;const output=new Promise(resolve=>{release=resolve})
+  const t=await fixture([output,'hang']); const s=goalServiceFixture(t)
+  await s.issueCommand(t.owner,t.chat.id,{command:'/goal original objective',request_key:'original'})
+  await vi.waitFor(()=>expect(t.model.requests).toHaveLength(1))
+  await expect(s.issueCommand(t.owner,t.chat.id,{command:'/goal other objective',request_key:'other'})).rejects.toMatchObject({status:409})
+  release('first round complete')
+  await vi.waitFor(()=>expect(t.model.requests).toHaveLength(2))
+  t.ctx.goals.pause(t.agent,t.ctx.goals.get(t.agent));await t.agent.whenIdle()
+})
+
+it('cold control uses native projection round counter', async () => {
+  const t=await fixture(['hang']);const s=goalServiceFixture(t)
+  await s.issueCommand(t.owner,t.chat.id,{command:'/goal count rounds',request_key:'rounds'})
+  await vi.waitFor(()=>expect(t.model.requests).toHaveLength(1))
+  expect(t.ctx.goals.get(t.agent).roundsStarted).toBe(1)
+  const cold=goalServiceFixture(t);cold.agents={get:()=>undefined}; cold.sessionQuery={observeSession:async()=>({projections:t.ctx.sessionProjections.snapshot(t.agent.session,['goal']),events:[]})}
+  expect((await cold.getControl(t.owner,t.chat.id)).goal.rounds_started).toBe(1)
+  t.ctx.goals.pause(t.agent,t.ctx.goals.get(t.agent));await t.agent.whenIdle()
+})
+
+it.each(['approve', 'discuss'])('settles native plan review through the Workbench bridge: %s', async action => {
+  const t=await fixture(['Plan ready'])
+  const {default:Questions}=await native('dsh-user-questions')
+  const {default:Plan}=await native('dsh-plan-mode')
+  const {HumanInputBridge}=await import('../src/human-input.js')
+  await t.ctx.plugin(Questions);await t.ctx.plugin(Plan,{section:'Prepare a plan for review.'})
+  const s=new WorkbenchService({database:t.db,sessionController:t.sessions,agents:t.ctx.agents,scheduler:t.scheduler,commands:t.ctx.commands,workspace:'/workspace',skills:{list:async()=>[]},platformClient:{json:async()=>({tools:[]})},fileManager:{operate:async()=>({})}})
+  const response=await s.issueCommand(t.owner,t.chat.id,{command:'/plan Review evidence',request_key:'plan'})
+  await vi.waitFor(()=>expect(t.model.requests).toHaveLength(1));await t.agent.whenIdle()
+  const bridge=new HumanInputBridge({database:t.db,executionRun:()=>t.db.getRun(t.owner.ownerId,response.run.id)})
+  t.ctx.on('user-questions/request',bridge.handleRequest,{global:true,prepend:true})
+  const pending=t.ctx.tools.execute({callId:'review',name:'exit_plan_mode',arguments:{plan:'# Evidence plan\nReview facts.'},agent:t.agent,signal:new AbortController().signal})
+  await vi.waitFor(()=>expect(bridge.pendings.size).toBe(1))
+  const saved=t.db.getPendingInput(t.owner.ownerId,response.run.id)
+  expect(saved.deadlineAt).toBeNull()
+  if (action === 'discuss') bridge.skip(t.owner.ownerId,response.run.id,saved.requestId)
+  else bridge.resume(t.owner.ownerId,response.run.id,{ request_id: saved.requestId, answers: [{id:saved.payload.questions[0].id,selected:[saved.payload.questions[0].intent.approve]}] })
+  const result=await pending
+  if (action === 'discuss') {
+    expect(result.isError).toBe(true)
+    expect(JSON.stringify(result.content)).toContain('stay in plan mode, stop here, and wait for their message')
+    expect(t.ctx.sessionProjections.snapshot(t.agent.session,['plan']).values.plan.active).toBe(true)
+  } else {
+    expect(result.isError).not.toBe(true)
+    expect(t.ctx.planMode.get(t.agent)).toMatchObject({active:true,pending:false})
+  }
 })

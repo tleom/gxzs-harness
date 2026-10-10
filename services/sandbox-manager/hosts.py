@@ -196,7 +196,7 @@ class Hosts:
                     '--label', 'gxzs.generation=' + str(item['generation']), '--label', 'gxzs.credentials=owner-v1',
                     '--log-driver', 'json-file', '--log-opt', 'max-size=10m', '--log-opt', 'max-file=3',
                     '--network', network, '--restart', 'no',
-                    '--cpus', os.environ.get('GXZS_HOST_CPUS', '0.5'),
+                    '--cpus', os.environ.get('GXZS_HOST_CPUS', '1'),
                     '--memory', memory, '--memory-swap', memory, '--pids-limit', '256', *publish,
                     '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges:true', '--env-file', str(env_file),
                     *font_mount, '-v', item['home_volume'] + ':/srv/dsh',

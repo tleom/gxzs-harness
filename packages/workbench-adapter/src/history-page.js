@@ -16,7 +16,9 @@ export async function loadNativeHistoryPage({ sessions, sessionQuery }, sessionI
   }
   let throughSeq = cursor?.throughSeq
   if (throughSeq === undefined) {
-    const observation = await sessionQuery.observeSession(sessionId, { signal })
+    // Only the log cursor is needed here; avoid reconstructing every projection
+    // before the native controller reads the requested page.
+    const observation = await sessionQuery.observeSession(sessionId, { signal, projectionMode: 'none' })
     try {
       signal.throwIfAborted()
       throughSeq = observation.events.at(-1)?.seq ?? -1

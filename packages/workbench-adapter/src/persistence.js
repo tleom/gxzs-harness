@@ -348,6 +348,10 @@ export class WorkbenchDatabase {
   }
 
   setGoalRun(sessionId, runId) {
+    if (!runId) {
+      this.db.prepare('DELETE FROM goal_runs WHERE session_id=?').run(sessionId)
+      return
+    }
     this.db.prepare('INSERT INTO goal_runs(session_id, run_id) VALUES (?, ?) ON CONFLICT(session_id) DO UPDATE SET run_id=excluded.run_id')
       .run(sessionId, runId)
   }
@@ -355,6 +359,11 @@ export class WorkbenchDatabase {
   goalRun(sessionId) {
     const row = this.db.prepare('SELECT r.* FROM runs r JOIN goal_runs g ON r.id=g.run_id WHERE g.session_id=?').get(sessionId)
     return row ? decodeRun(row) : undefined
+  }
+
+  updateRunResources(run, selection, mcpTools) {
+    this.db.prepare('UPDATE runs SET selection_json=?, mcp_tools_json=? WHERE id=? AND owner_id=?')
+      .run(JSON.stringify(selection), JSON.stringify(mcpTools), run.id, run.ownerId)
   }
 
   hasProjectedEvent(sessionId, seq) {
@@ -385,6 +394,12 @@ export class WorkbenchDatabase {
     const row = this.db.prepare(`SELECT r.* FROM runs r LEFT JOIN run_turns t ON t.run_id=r.id
       WHERE r.session_id = ? AND (t.turn_number = ? OR r.turn_number = ?)
       AND r.status NOT IN ('steered', 'discarded') ORDER BY r.queue_order LIMIT 1`).get(sessionId, turn, turn)
+    return row ? decodeRun(row) : undefined
+  }
+
+  runForMessage(sessionId, messageId) {
+    if (typeof messageId !== 'string') return undefined
+    const row = this.db.prepare('SELECT * FROM runs WHERE session_id=? AND message_id=?').get(sessionId, messageId)
     return row ? decodeRun(row) : undefined
   }
 
@@ -711,6 +726,16 @@ export class WorkbenchDatabase {
   dispatchSubmission(ownerId, runId) {
     if (!this.getRun(ownerId, runId)) throw notFound('任务不存在')
     this.db.prepare('UPDATE run_submissions SET dispatched=1 WHERE run_id=?').run(runId)
+  }
+
+  editSubmission(ownerId, runId, content) {
+    const row = this.db.prepare(`SELECT s.content_json FROM run_submissions s JOIN runs r ON r.id=s.run_id
+      WHERE r.owner_id=? AND r.id=? AND r.status='queued' AND s.dispatched=0`).get(ownerId, runId)
+    if (!row) return false
+    const value = JSON.parse(row.content_json)
+    this.db.prepare('UPDATE run_submissions SET content_json=? WHERE run_id=?')
+      .run(JSON.stringify({ ...value, content }), runId)
+    return true
   }
 
   finishSubmission(ownerId, runId) {

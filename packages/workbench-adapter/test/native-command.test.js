@@ -15,3 +15,15 @@ it('projects durable native command outcomes in session order without storing a 
     { id: 'pending', name: 'compact', args: undefined, before_run_id: null, outcome: null },
   ])
 })
+
+it('folds each manual checkpoint and its own summary into one durable command', () => {
+  const events = [
+    { type: 'command/run', seq: 1, data: { name: 'compact', commandId: 'c' } },
+    { type: 'compaction/summary', seq: 2, data: { compactionId: 'x', sourceCommandId: 'c', shadowedSeqs: [0], shadowedTokenCount: 100, summary: [{ type: 'text', text: '摘要' }] } },
+    { type: 'user/message', seq: 3, surfaceOp: { op: 'replace' }, data: { source: { kind: 'compact-checkpoint', compactionId: 'x', sourceCommandId: 'c' } } },
+    { type: 'command/done', seq: 4, data: { commandId: 'c', kind: 'success', text: 'done' } },
+  ]
+  expect(nativeCommandRecords(events, [{ id: 'next', sourceStartSeq: 5 }])).toEqual([
+    expect.objectContaining({ id: 'c', before_run_id: 'next', compaction: { summary: '摘要', items: 1, tokens: 100 }, outcome: expect.objectContaining({ kind: 'success' }) }),
+  ])
+})

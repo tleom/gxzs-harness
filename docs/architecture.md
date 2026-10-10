@@ -48,8 +48,6 @@ Knowledge MCP catalog/search/citations is intentionally deferred. The boundary r
 
 ## Office preview decision
 
-Sandbox Office files use DSH `OfficeToPdf` through `office-preview.js`. The fixed-workspace manager checks owner-scoped file metadata and supplies versioned bytes; DSH owns admission, conversion, cancellation and cache lifetime. Cache identity includes the owner, path and file version. The adapter preserves the 20 MiB source and PDF response limits and maps native conversion errors into the existing HTTP contract. The host image packages LibreOffice and fonts for this route.
+Office previews (Word, Excel and PowerPoint), including sandbox files and local attachments, use the authenticated platform route. The file manager resolves the owner's source and LibreOffice runs in a disposable offline container with its own memory, CPU and time limits. This preserves OOXML expansion checks, Word line-spacing compatibility and 20 MiB source/PDF limits. The frontend caches versioned PDFs within the current owner scope.
 
-Local attachment uploads have no sandbox path and retain the platform byte-conversion route, including its offline container, OOXML expansion checks and Word line-spacing compatibility. Non-Office preview formats keep their existing handling. Sharing and transcription remain platform services.
-
-Disposable-image checks cover native DOCX/XLSX/PPTX conversion and cache reuse, and the full image smoke includes Chinese DOCX text extraction. These checks do not imply production rollout or fidelity for every user document; production validation and representative document review remain deployment acceptance checks.
+All three formats use the same PDF viewer. The Host's native OfficeToPdf plugin is disabled: its Linux WASM engine exceeded the 1 GiB conversation Host limit during production DOCX preview and terminated the conversation process. Preview conversion must remain isolated from the agent lifecycle.

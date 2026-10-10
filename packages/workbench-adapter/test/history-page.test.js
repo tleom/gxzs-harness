@@ -18,7 +18,7 @@ it('delegates the exact native window and keeps replacement records intact', asy
   expect(services.sessions.page).toHaveBeenCalledWith({ address: { kind: 'session', sessionId: 'session-a' },
     throughSeq: 99, maxMessages: 500, turnWindow: { minMessages: 50, minTurns: 2 } }, abort)
   expect(result.records).toBe(records)
-  expect(services.sessionQuery.observeSession).toHaveBeenCalledWith('session-a', { signal: abort })
+  expect(services.sessionQuery.observeSession).toHaveBeenCalledWith('session-a', { signal: abort, projectionMode: 'none' })
   expect(result.cursor).toEqual({ sessionId: 'session-a', throughSeq: 99, beforeSeq: 40 })
   expect(services.dispose).toHaveBeenCalledOnce()
 })
