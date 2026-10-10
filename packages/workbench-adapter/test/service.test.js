@@ -165,7 +165,7 @@ describe('followup and control service', () => {
     await expect(service.followHistory({...owner,ownerId:'foreign'},chat.id,new AbortController().signal).next()).rejects.toMatchObject({status:404})
     expect(sessionController.follow).toHaveBeenCalledOnce()
   })
-  it.each(['plan/mode', 'command/run', 'command/done'])('pushes native plan controls with %s instead of waiting for polling', async type => {
+  it.each(['plan/mode', 'command/run', 'command/done', 'compaction/end', 'request/context', 'assistant/message', 'assistant/attempt'])('pushes native controls with %s instead of waiting for polling', async type => {
     const {service,owner,chat,sessionController}=setup()
     const control={revision:4,plan:{active:true,pending:false}}
     vi.spyOn(service,'getControl').mockResolvedValue(control)
@@ -324,6 +324,28 @@ describe('followup and control service', () => {
     })) }
     expect((await service.getControl(owner, chat.id)).plan).toEqual({ active: true, pending: true })
     expect(dispose).toHaveBeenCalledOnce()
+  })
+  it('reads current context pressure from the native surface after compaction and on reload', async () => {
+    const { service, owner, chat } = setup()
+    let projectedTokens = 90000
+    service.sessionQuery = { observeSession: async () => ({ projections: { values: {
+      contextPressure: { pressureTokens: 90000, projectedTokens, contextWindow: 100000 },
+    } }, events: [] }) }
+    expect((await service.getControl(owner, chat.id)).contextPressure.projectedTokens).toBe(90000)
+    projectedTokens = 12000
+    expect((await service.getControl(owner, chat.id)).contextPressure).toEqual({ pressureTokens: 90000, projectedTokens: 12000, contextWindow: 100000 })
+    const restored = new WorkbenchService({ database: service.database, sessionQuery: service.sessionQuery, agents: { get: () => undefined } })
+    expect((await restored.getControl(owner, chat.id)).contextPressure.projectedTokens).toBe(12000)
+  })
+  it('pushes context pressure when a compaction checkpoint replaces the native surface', async () => {
+    const { service, owner, chat, sessionController } = setup()
+    vi.spyOn(service, 'getControl').mockResolvedValue({ revision: 1, contextPressure: { projectedTokens: 12000, contextWindow: 100000 } })
+    sessionController.follow = vi.fn(async function* () {
+      yield { type: 'event', event: { seq: 1, type: 'user/message', surfaceOp: { op: 'replace', startSeq: 0, endSeq: 0 }, data: { source: { kind: 'compact-checkpoint' } } } }
+    })
+    const source = service.followHistory(owner, chat.id, new AbortController().signal)
+    expect((await source.next()).value.control.contextPressure.projectedTokens).toBe(12000)
+    await source.return()
   })
   it('persists capacity-waiting tasks without sending them to DSH and allows cancellation', async () => {
     const { service, owner, chat, database, sessionController } = setup()

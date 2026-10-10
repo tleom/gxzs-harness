@@ -290,7 +290,7 @@ export class WorkbenchService {
         hasMore: frame.hasMore, assistantStream: frame.assistantStream,
       } : frame
       const updatesControl = frame.type === 'snapshot' || frame.type === 'goal-state'
-        || (frame.type === 'event' && (['goal/change', 'plan/mode', 'command/run', 'command/done', 'turn/end'].includes(frame.event.type)
+        || (frame.type === 'event' && (['goal/change', 'plan/mode', 'command/run', 'command/done', 'turn/end', 'request/context', 'assistant/message', 'assistant/attempt', 'compaction/end'].includes(frame.event.type)
           || (frame.event.type === 'user/message' && ['goal', 'compact-checkpoint'].includes(frame.event.data?.source?.kind))))
       yield { event: 'workbench_history', session_id: chat.sessionId, value, runs: [...runs.values()], bindings,
         ...(updatesControl ? { control: await this.getControl(owner, chatId) } : {}),
@@ -778,7 +778,8 @@ export class WorkbenchService {
           reason: goal.blockedReason?.message ?? null, max_rounds: goal.maxGoalRounds,
           rounds_started: projection.roundsStarted, last_run_id: this.database.goalRun(chat.sessionId)?.id ?? null } : null }
       }
-      return { ...state, plan, commands: nativeCommandRecords(source.events ?? [], this.database.listRuns(owner.ownerId, chatId)) }
+      return { ...state, plan, contextPressure: source.projections?.values?.contextPressure ?? null,
+        commands: nativeCommandRecords(source.events ?? [], this.database.listRuns(owner.ownerId, chatId)) }
     } finally { source[Symbol.dispose]?.() }
   }
 
