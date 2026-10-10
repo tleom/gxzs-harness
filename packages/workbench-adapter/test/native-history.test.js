@@ -163,7 +163,7 @@ it('carries a real native oversized snapshot and settlement through the Workbenc
   database.bindRunMessage(session.id,run.id,1,'first')
   database.bindNativeTurn(run,2)
   database.transitionRun(owner.ownerId,run.id,'running')
-  const service=new WorkbenchService({database,sessionController:services.sessions,sessionQuery:services.sessionQuery})
+  const service=new WorkbenchService({database,agents:ctx.agents,sessionController:services.sessions,sessionQuery:services.sessionQuery})
   const abort=new AbortController()
   const stream=service.followHistory(owner,chat.id,abort.signal)
   try {
