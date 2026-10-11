@@ -30,6 +30,10 @@ jobs:
       - name: Install deployment profile
         working-directory: profiles/workbench
         run: npm ci --no-audit --no-fund
+      - name: Apply and verify the Host skill catalog patch
+        run: |
+          node scripts/patch-dsh-skill-catalog.mjs
+          node scripts/check-dsh-skill-catalog.mjs
       - run: pnpm check
       - run: pnpm check:config
 
