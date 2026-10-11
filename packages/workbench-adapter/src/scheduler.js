@@ -2,6 +2,7 @@ import { requireDatabaseModel } from './database-models.js'
 import { setTimeout as delay } from 'node:timers/promises'
 import { createHash } from 'node:crypto'
 import { nativeTurn } from './native-turn.js'
+import { nativeError } from './http.js'
 
 const TERMINAL = new Set(['completed', 'cancelled', 'failed', 'interrupted', 'discarded', 'steered'])
 const DIAGNOSTIC_CODES = new Set(['ADMISSION_TICKET_FENCED', 'DEADLINE_EXCEEDED', 'UPSTREAM_RESPONSE_TOO_LARGE',
@@ -389,6 +390,7 @@ export class TaskScheduler {
       } catch (error) {
         if (this.closed) return
         this.diagnostic(run, 'dispatch_failed', 'dispatch_error', { action: 'dispatch', error })
+        const failure = nativeError(error)
         // Retry idle-session release without cancelling an already finished
         // task or fencing the Session's subsequent prompts.
         if (releasing) continue
@@ -407,8 +409,10 @@ export class TaskScheduler {
           continue
         }
         if (admitted && !TERMINAL.has(current.status) && !this.database.submission(this.ownerId, item.runId)?.dispatched) {
-          this.database.transitionRun(this.ownerId, item.runId, 'failed', '任务运行配置失败，请检查模型后重试')
-          this.database.appendEvent(this.ownerId, item.runId, { event: 'workbench_end', status: 'failed', error: '任务运行配置失败，请检查模型后重试' })
+          const message = failure?.message ?? '任务运行配置失败，请检查模型后重试'
+          this.database.transitionRun(this.ownerId, item.runId, 'failed', message)
+          this.database.appendEvent(this.ownerId, item.runId, { event: 'workbench_end', status: 'failed', error: message,
+            ...(failure ? { error_code: failure.code } : {}) })
           continue
         }
         if (this.database.submission(this.ownerId, item.runId)?.dispatched) {
@@ -418,8 +422,10 @@ export class TaskScheduler {
           // A direct prompt rejection without an observed receipt is an admission
           // failure. Native idle alone never means a failed turn.
           if (admitted && !current.messageId) {
-            this.database.transitionRun(this.ownerId, current.id, 'failed', '任务未能启动，请检查运行配置后重试')
-            this.database.appendEvent(this.ownerId, current.id, { event: 'workbench_end', status: 'failed', error: '任务未能启动，请检查运行配置后重试' })
+            const message = failure?.message ?? '任务未能启动，请检查运行配置后重试'
+            this.database.transitionRun(this.ownerId, current.id, 'failed', message)
+            this.database.appendEvent(this.ownerId, current.id, { event: 'workbench_end', status: 'failed', error: message,
+              ...(failure ? { error_code: failure.code } : {}) })
           }
         }
       }

@@ -1,5 +1,6 @@
 import { decodeCursor } from './cursor.js'
 import { encodeSse, httpError } from './http.js'
+import { presentRunEvent } from './run-failure.js'
 
 const TERMINAL = new Set(['completed', 'failed', 'cancelled', 'interrupted', 'discarded', 'steered'])
 
@@ -51,7 +52,7 @@ export function streamRunEvents({ database, eventBus, ownerId, runId, cursor, re
     try {
       const page = database.eventsAfter(ownerId, runId, sequence, Math.max(1, Math.min(pageSize, 1000)))
       for (const entry of page) {
-        const accepted = res.write(encodeSse(entry))
+        const accepted = res.write(encodeSse(presentRunEvent(entry)))
         sequence = decodeCursor(entry._id)
         if (closed) return
         if (accepted === false) { pause(); return }

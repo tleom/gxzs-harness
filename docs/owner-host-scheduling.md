@@ -57,4 +57,6 @@ docker build -t gxzs/harness-sandbox-manager:<版本> services/sandbox-manager
 
 manager 配置 `GXZS_OWNER_CGROUP_PREFIX=gxzs-workbench`，并将 `GXZS_HOST_CPUS=2`、`GXZS_HOST_MEMORY=4g`、`WORKBENCH_SANDBOX_CPUS=2`、`WORKBENCH_SANDBOX_MEMORY=4g` 设置为单容器上限；两容器合计仍受 owner slice 限制。MemoryHigh 在 owner 3 GiB / 全局 28 GiB 提前施加回收压力，禁用该池 swap。10 人同时运行时共享全局容量，每人 4 GiB 是弹性上限，不能视为每人保留 4 GiB。变更现有容器的 cgroup parent 需要排空后重建，个人数据卷继续复用。
 
+沙盒的 `WORKBENCH_SANDBOX_PIDS_LIMIT` 默认 1024，可配置为正整数；Linux 的该额度同时计算进程和线程。Chromium 与 Node/SSH 工具共用额度，原来的 256 可导致 `pthread_create` / 辅助进程启动失败。manager 在容器镜像、归属网络、附件卷和 cgroup 校验通过后，可在线提高已有容器额度，降低运行中容器额度需先排空。该额度不改变 2 CPU / 4 GiB owner 上限或 3 个运行中主对话限制，也不是子智能体数量限制。
+
 释放名额发生网络错误时保留投递记录并重试释放，不把已经空闲的对话转入取消流程。已经卡死的执行仍须先确认宿主和工具停止，再回收名额；不能按运行时间长短盲目过期。

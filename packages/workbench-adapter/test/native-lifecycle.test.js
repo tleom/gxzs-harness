@@ -11,6 +11,7 @@ import { createAssistantStreamProjector, projectInboxClaim, projectSessionEvent,
 import { apply as applyMcpTools } from '../../workbench-mcp-tools/src/index.js'
 import { registerRunResourceContext } from '../src/resource-mentions.js'
 import { prepareNativeFiles } from '../src/attachments.js'
+import WorkbenchFileSystem from '../../workbench-sandbox-runtime/src/fs.js'
 
 // Exercise the exact published DSH version installed by the production profile.
 // CI must install profiles/workbench before running this contract suite.
@@ -198,12 +199,71 @@ it('sends global and personal MCP schemas and skill display names to the real na
   expect(modelText).not.toContain('Only loaded on invocation')
 })
 
+it('publishes a skill catalog only when its actual display metadata changes', async () => {
+  const test = await fixture(['first', 'unchanged', 'renamed', 'unchanged again'])
+  const [{ default: Skills }, SkillTool] = await Promise.all([native('dsh-skill'), native('dsh-tool-skill')])
+  await test.ctx.plugin(Skills)
+  await test.ctx.plugin(SkillTool)
+  let label = '证据整理'
+  let invalidate
+  cleanups.push(test.ctx.skills.registerProvider(control => { invalidate = control.invalidate; return { name: 'fixture', list: async () => [{
+    name: 'evidence', description: 'Evidence', metadata: { 'display-name': label },
+    invocation: { modelInvocable: true, userInvocable: true }, source: 'custom', provider: 'fixture', rank: 100,
+  }], get: async () => undefined } }))
+  for (let index = 0; index < 4; index += 1) {
+    if (index === 2) { label = '证据复核'; invalidate() }
+    const run = test.create(`question ${index}`)
+    await test.scheduler.enqueue(run, [{ type: 'text', text: run.query }])
+    await test.scheduler.tick()
+    await vi.waitFor(async () => { await test.scheduler.tick(); expect(test.model.requests).toHaveLength(index + 1) })
+    await test.agent.whenIdle()
+  }
+  const catalogs = test.agent.session.snapshotEvents().filter(event => event.type === 'user/message' && event.data.source.kind === 'skill-catalog')
+  expect(catalogs).toHaveLength(2)
+  expect(catalogs.map(event => event.data.source.entries[0].displayName)).toEqual(['证据整理', '证据复核'])
+  expect(catalogs[1].data.source.update).toBe(true)
+})
+
+it('reuses a legacy skill catalog without a display name without rewriting its history', async () => {
+  const test = await fixture(['first', 'unchanged'])
+  const [{ default: Skills }, SkillTool] = await Promise.all([native('dsh-skill'), native('dsh-tool-skill')])
+  await test.ctx.plugin(Skills)
+  await test.ctx.plugin(SkillTool)
+  const source = { kind: 'skill-catalog', form: 'catalog', entries: [{ name: 'evidence', description: 'Evidence' }] }
+  test.agent.session.append('user/message', createUserMessage({ content: [{ type: 'text', text: 'Existing evidence catalog' }], source }), { surfaceOp: 'append' })
+  cleanups.push(test.ctx.skills.registerProvider(() => ({ name: 'fixture', list: async () => [{
+    name: 'evidence', description: 'Evidence', invocation: { modelInvocable: true, userInvocable: true },
+    source: 'custom', provider: 'fixture', rank: 100,
+  }], get: async () => undefined })))
+  for (let index = 0; index < 2; index += 1) {
+    const run = test.create(`question ${index}`)
+    await test.scheduler.enqueue(run, [{ type: 'text', text: run.query }])
+    await test.scheduler.tick()
+    await vi.waitFor(async () => { await test.scheduler.tick(); expect(test.model.requests).toHaveLength(index + 1) })
+    await test.agent.whenIdle()
+  }
+  const catalogs = test.agent.session.snapshotEvents().filter(event => event.type === 'user/message' && event.data.source.kind === 'skill-catalog')
+  expect(catalogs).toHaveLength(1)
+  expect(catalogs[0].data.source).toEqual(source)
+})
+
 it('delivers a durable queued file through native upload and prompt admission', async () => {
-  const test = await fixture(['File received'])
+  const test = await fixture(['File received', 'Restored file received'])
   const root = await mkdtemp(join(process.cwd(), '.attachment-test-'))
   cleanups.push(() => rm(root, { recursive: true, force: true }))
   const { LocalAttachmentStore } = await native('dsh-attachment-local')
   await test.ctx.plugin(LocalAttachmentStore, { dshHome: root })
+  const hostAttachmentRoot = join(root, 'attachments')
+  const sandboxAttachmentRoot = '/srv/dsh/attachments'
+  test.ctx.provide('sandboxPolicy', { defaultMode: 'danger-full-access' })
+  const ssh = { request: vi.fn(async (method, { target }) => {
+    expect(method).toBe('fs.readBytes')
+    expect(target.targetKey.startsWith(`${sandboxAttachmentRoot}/`)).toBe(true)
+    const relative = target.targetKey.slice(sandboxAttachmentRoot.length + 1)
+    return (await readFile(join(hostAttachmentRoot, ...relative.split('/')))).toString('base64')
+  }) }
+  test.ctx.provide('ssh', ssh)
+  await test.ctx.plugin(WorkbenchFileSystem, { attachmentHostRoot: hostAttachmentRoot, attachmentSandboxRoot: sandboxAttachmentRoot })
   test.ctx.provide('connection', { fetch: { register: () => () => {} } })
   const { FileUploads } = await native('dsh-client-file-upload')
   await test.ctx.plugin(FileUploads)
@@ -211,7 +271,8 @@ it('delivers a durable queued file through native upload and prompt admission', 
   test.controllerCtx.fileUploads = test.ctx.fileUploads
   test.scheduler.prepareContent = (sessionId, content) => prepareNativeFiles(test.ctx.fileUploads, sessionId, content)
   const run = test.create('Read the evidence')
-  const content = [{ type: 'text', text: run.query }, { type: 'file', name: 'evidence.txt', data: Buffer.from('durable evidence').toString('base64') }]
+  const name = "资料 '副本' (2026).txt"
+  const content = [{ type: 'text', text: run.query }, { type: 'file', name, data: Buffer.from('durable evidence').toString('base64') }]
   // Rehydrate the actual queue row without an in-memory upload receipt.
   test.db.saveSubmission(test.owner.ownerId, run.id, JSON.parse(JSON.stringify(content)))
   await test.scheduler.tick()
@@ -221,9 +282,39 @@ it('delivers a durable queued file through native upload and prompt admission', 
   const files = messages.flatMap(event => event.data.content ?? []).filter(part => part.type === 'file')
   expect(files).toHaveLength(1)
   expect(await readFile(test.ctx.attachments.fileHostPath(files[0].attachment), 'utf8')).toBe('durable evidence')
-  expect(JSON.stringify(test.model.requests[0])).toContain('evidence.txt')
+  const expectedPath = `${sandboxAttachmentRoot}/v1/files/${String(files[0].attachment.attachmentId).slice(7, 9)}/${String(files[0].attachment.attachmentId).slice(7)}/${name}`
+  const text = test.model.requests[0].messages.flatMap(message => message.content).filter(part => part.type === 'text').map(part => part.text).join('\n')
+  expect(text).toContain(`verbatim read-only copy saved at ${JSON.stringify(expectedPath)}`)
+  expect(text).not.toContain('cannot access a readable path')
+  expect(await test.ctx.fs.readBytes({ targetKey: expectedPath }, new AbortController().signal)).toEqual(Buffer.from('durable evidence'))
+  // History persists the reference, not a host path or an expired upload receipt.
+  const restoredMessages = JSON.parse(JSON.stringify(messages.map(event => event.data)))
+  expect(restoredMessages[0].content.some(part => part.type === 'file')).toBe(true)
+  expect(JSON.stringify(restoredMessages)).not.toContain(hostAttachmentRoot)
+  for await (const _ of test.ctx.llm.stream({ ...test.model.requests[0], messages: restoredMessages, signal: new AbortController().signal })) {}
+  expect(JSON.stringify(test.model.requests[1])).toContain('/srv/dsh/attachments/v1/files/')
+  expect(JSON.stringify(test.model.requests[1])).not.toContain('cannot access a readable path')
   await test.scheduler.tick()
-  expect(test.model.requests).toHaveLength(1)
+  expect(test.model.requests).toHaveLength(2)
+})
+
+it('resolves a normalized image through the same native attachment path contract', async () => {
+  const test = await fixture([])
+  const root = await mkdtemp(join(process.cwd(), '.attachment-test-'))
+  cleanups.push(() => rm(root, { recursive: true, force: true }))
+  const [{ LocalAttachmentStore }, { resolveImageAttachmentAccess, offloadedImageText }] = await Promise.all([
+    native('dsh-attachment-local'), native('dsh-llm'),
+  ])
+  await test.ctx.plugin(LocalAttachmentStore, { dshHome: root })
+  test.ctx.provide('sandboxPolicy', { defaultMode: 'danger-full-access' })
+  test.ctx.provide('ssh', { request: vi.fn() })
+  await test.ctx.plugin(WorkbenchFileSystem, { attachmentHostRoot: join(root, 'attachments') })
+  const ref = await test.ctx.attachments.saveImage({ name: 'pixel.png', mediaType: 'image/png',
+    data: Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64') })
+  const access = resolveImageAttachmentAccess(test.ctx.attachments, path => test.ctx.fs.processPathFromHostPath(path), ref)
+  expect(access.readonlyPath).toBe(`/srv/dsh/attachments/v1/objects/${String(ref.attachmentId).slice(7, 9)}/${String(ref.attachmentId).slice(7)}`)
+  expect(offloadedImageText(ref, access)).toContain(access.readonlyPath)
+  expect(offloadedImageText(ref, access)).not.toContain('No local normalized image path')
 })
 
 it('retains sandbox-path file references when editing a goal with an older manager', async () => {

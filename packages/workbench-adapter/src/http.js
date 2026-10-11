@@ -27,14 +27,14 @@ export function sendError(res, error) {
     const [status, message] = GOAL_ERRORS[error.code]
     return sendJson(res, status, { code: error.code, message })
   }
-  const remote = error?.isDSHRemoteError === true && Object.hasOwn(REMOTE_ERRORS, error.code) ? REMOTE_ERRORS[error.code] : undefined
+  const remote = nativeError(error)
   const explicitStatus = Number(error?.status)
-  const status = remote?.[0] ?? (Number.isInteger(explicitStatus) && explicitStatus >= 400 && explicitStatus <= 599 ? explicitStatus : 500)
+  const status = remote?.status ?? (Number.isInteger(explicitStatus) && explicitStatus >= 400 && explicitStatus <= 599 ? explicitStatus : 500)
   // Native diagnostic details can contain host paths and configuration. Only
   // publish reviewed domain failures; leave unexpected failures in host logs.
   const code = remote ? error.code : status !== 500 && typeof error?.code === 'string' && /^[A-Za-z][A-Za-z0-9_/-]{0,99}$/.test(error.code)
     ? error.code : (STATUS_CODES[status] ?? 'REQUEST_FAILED')
-  const message = remote?.[1] ?? (status === 500 ? '工作台请求失败，请稍后重试' : error?.message || '工作台请求失败，请稍后重试')
+  const message = remote?.message ?? (status === 500 ? '工作台请求失败，请稍后重试' : error?.message || '工作台请求失败，请稍后重试')
   sendJson(res, status, { code, message })
 }
 
@@ -67,6 +67,18 @@ const REMOTE_ERRORS = {
   'workspace/name-conflict': [409, '已存在同名工作区'],
   'workspace/session-active': [409, '会话仍有运行中的任务，请先停止任务'],
   'workspace/move-invalid': [409, '会话顺序已改变，请刷新工作区'],
+}
+
+// HTTP and queued admission share the same reviewed native failure projection.
+export function nativeError(error) {
+  if (error?.isDSHRemoteError !== true || !Object.hasOwn(REMOTE_ERRORS, error.code)) return undefined
+  const [status, fallback] = REMOTE_ERRORS[error.code]
+  const reason = error.code === 'session/attachment-invalid' ? error.details?.reason : undefined
+  const messages = {
+    MODEL_DOES_NOT_SUPPORT_IMAGES: '所选模型不支持图片输入，请选择支持图片的模型后重新发送',
+    FILE_NOT_STAGED: '附件上传凭据已失效，请重新上传后发送',
+  }
+  return { status, code: error.code, message: Object.hasOwn(messages, reason ?? '') ? messages[reason] : fallback }
 }
 
 export function encodeSse(entry) {

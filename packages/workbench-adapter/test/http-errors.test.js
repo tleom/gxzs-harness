@@ -8,6 +8,19 @@ function serialize(error) {
 }
 
 describe('public HTTP error contract', () => {
+  it.each([
+    ['MODEL_DOES_NOT_SUPPORT_IMAGES', '所选模型不支持图片输入'],
+    ['FILE_NOT_STAGED', '附件上传凭据已失效'],
+    ['UNKNOWN_REASON', '附件参数无效'],
+  ])('projects native attachment reason %s without exposing diagnostic details', (reason, message) => {
+    const error = Object.assign(new Error('/host/private/file secret'), {
+      isDSHRemoteError: true, code: 'session/attachment-invalid', details: { reason, token: 'secret' },
+    })
+    const result = serialize(error)
+    expect(result).toMatchObject({ status: 400, code: error.code, message: expect.stringContaining(message) })
+    expect(JSON.stringify(result)).not.toContain('secret')
+    expect(JSON.stringify(result)).not.toContain('/host')
+  })
   it.each(['session/queue-item-not-found', 'session/agent-busy', 'session/steer-unavailable'])('preserves native %s as a recoverable conflict', (code) => {
     const result = serialize(Object.assign(new Error('private host details'), { isDSHRemoteError: true, code, details: { token: 'secret' } }))
     expect(result).toMatchObject({ status: 409, code })

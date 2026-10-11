@@ -21,6 +21,23 @@ function setup() {
   return { db, sessions, scheduler, platform, create, agent, diagnostics, permit: () => { permitted = true } }
 }
 
+it.each(['prepare', 'prompt'])('preserves reviewed native attachment rejection during queued %s admission', async stage => {
+  const { db, scheduler, sessions, create, permit } = setup()
+  const error = Object.assign(new Error('/host/private/config secret'), {
+    isDSHRemoteError: true, code: 'session/attachment-invalid', details: { reason: 'MODEL_DOES_NOT_SUPPORT_IMAGES' },
+  })
+  if (stage === 'prepare') scheduler.prepareContent = async () => { throw error }
+  else sessions.prompt.mockRejectedValue(error)
+  permit()
+  const run = create('attachment admission')
+  await scheduler.enqueue(run, [{ type: 'image', mediaType: 'image/png', data: 'fixture' }])
+  await scheduler.tick()
+  await vi.waitFor(() => expect(db.getRun('t:1', run.id).status).toBe('failed'))
+  expect(db.getRun('t:1', run.id).error).toContain('所选模型不支持图片输入')
+  expect(db.getRun('t:1', run.id).errorCode).toBe(error.code)
+  expect(JSON.stringify(db.allEvents('t:1', run.id))).not.toContain('secret')
+})
+
 it('stages native file receipts only at dispatch and keeps bytes durable', async () => {
   const { db, scheduler, create, sessions, permit } = setup()
   const run = create('read file')

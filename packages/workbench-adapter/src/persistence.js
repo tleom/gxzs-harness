@@ -301,7 +301,14 @@ export class WorkbenchDatabase {
     this.flushStreamEvents()
     const row = this.db.prepare(`SELECT r.*, f.result_json AS stop_confirmation_json FROM runs r JOIN chats c ON c.id = r.chat_id LEFT JOIN run_fences f ON f.run_id=r.id
       WHERE r.id = ? AND r.owner_id = ? AND c.deleted_at IS NULL`).get(id, ownerId)
-    return row ? decodeRun(row) : undefined
+    return row ? { ...decodeRun(row), ...(row.error ? { errorCode: this.runErrorCode(ownerId, id) } : {}) } : undefined
+  }
+
+  runErrorCode(ownerId, id) {
+    const row = this.db.prepare(`SELECT e.payload_json FROM run_events e JOIN runs r ON r.id=e.run_id
+      WHERE e.run_id=? AND r.owner_id=? AND json_extract(e.payload_json, '$.event')='workbench_end'
+      ORDER BY e.seq DESC LIMIT 1`).get(id, ownerId)
+    return row ? JSON.parse(row.payload_json).error_code : undefined
   }
 
   setFeedback(ownerId, runId, rating, now = Date.now()) {
@@ -358,7 +365,7 @@ export class WorkbenchDatabase {
 
   goalRun(sessionId) {
     const row = this.db.prepare('SELECT r.* FROM runs r JOIN goal_runs g ON r.id=g.run_id WHERE g.session_id=?').get(sessionId)
-    return row ? decodeRun(row) : undefined
+    return row ? { ...decodeRun(row), ...(row.error ? { errorCode: this.runErrorCode(row.owner_id, row.id) } : {}) } : undefined
   }
 
   updateRunResources(run, selection, mcpTools) {

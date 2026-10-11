@@ -164,6 +164,9 @@ def save_operation(path, value):
 
 
 def ensure(key):
+    pids_limit = int(os.environ.get('WORKBENCH_SANDBOX_PIDS_LIMIT', '1024'))
+    if pids_limit <= 0:
+        raise ValueError('WORKBENCH_SANDBOX_PIDS_LIMIT must be positive')
     name, token = identity(key)
     with lock(key):
         network = ensure_network(key)
@@ -190,6 +193,12 @@ def ensure(key):
                 # Keep the stopped container as a rollback reference and reuse all owner volumes.
                 docker("rename", name, name + "-previous-" + existing["Id"][:12])
                 info = docker("inspect", name, check=False)
+            elif existing.get('HostConfig', {}).get('PidsLimit') != pids_limit:
+                previous = existing.get('HostConfig', {}).get('PidsLimit') or 0
+                if existing['State']['Running'] and (previous <= 0 or previous > pids_limit):
+                    raise SandboxUpdatePending("个人沙箱正在更新，请稍后重试；数据和环境已保留")
+                # Raising the task/thread allowance needs no container restart.
+                docker('update', '--pids-limit', str(pids_limit), name)
         if info.returncode:
             if home_volume:
                 docker('volume', 'create', '--label', 'gxzs.owner=' + host['owner_id'], home_volume)
@@ -216,7 +225,7 @@ def ensure(key):
                    '--log-driver', 'json-file', '--log-opt', 'max-size=10m', '--log-opt', 'max-file=3',
                    "--cpus", os.environ.get("WORKBENCH_SANDBOX_CPUS", "1"),
                    "--memory", os.environ.get("WORKBENCH_SANDBOX_MEMORY", "3g"),
-                   "--memory-swap", os.environ.get("WORKBENCH_SANDBOX_MEMORY", "3g"), "--pids-limit", "256",
+                   "--memory-swap", os.environ.get("WORKBENCH_SANDBOX_MEMORY", "3g"), "--pids-limit", str(pids_limit),
                    "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true",
                    "-v", name + "-home:/home/dify", "-v", name + "-files:/workspace",
                    "-v", name + "-env:/opt/user-env:ro",

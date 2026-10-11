@@ -80,6 +80,7 @@ def test_sandbox_uses_one_cpu_three_gigabytes_and_owner_network(server, monkeypa
     assert create[create.index('--cpus') + 1] == '1'
     assert create[create.index('--memory') + 1] == '3g'
     assert create[create.index('--memory-swap') + 1] == '3g'
+    assert create[create.index('--pids-limit') + 1] == '1024'
     assert create[create.index('--network') + 1] == 'owner-network-' + key[:8]
     if native_attachments:
         assert create[create.index('--mount') + 1] == 'type=volume,source=owner-home,destination=/srv/dsh/attachments,volume-subpath=attachments,readonly'
@@ -103,6 +104,42 @@ def test_running_sandbox_on_old_network_returns_predictable_retry(server, monkey
         returncode=0, stdout=json.dumps([existing]) if args[:2] == ('inspect', name) else ''))
     with pytest.raises(server.SandboxUpdatePending):
         server.ensure(key)
+
+
+@pytest.mark.parametrize('running,previous,desired,blocked', [
+    (True, 256, 1024, False), (False, 1024, 512, False),
+    (True, 1024, 512, True), (True, 0, 1024, True),
+])
+def test_reconciles_thread_limit_without_restarting_running_tasks(server, monkeypatch, running, previous, desired, blocked):
+    key = str(uuid4())
+    name, _ = server.identity(key)
+    existing = {'Id': 'b' * 64, 'Config': {'Image': server.IMAGE}, 'State': {'Running': running},
+                'HostConfig': {'PidsLimit': previous}, 'NetworkSettings': {'Networks': {'owner-network': {}}}}
+    calls = []
+    monkeypatch.setenv('WORKBENCH_SANDBOX_PIDS_LIMIT', str(desired))
+    monkeypatch.setattr(server, 'ensure_network', lambda _: 'owner-network')
+    def docker(*args, **kwargs):
+        calls.append(args)
+        return SimpleNamespace(returncode=0, stdout=json.dumps([existing]) if args[:2] == ('inspect', name) else '')
+    monkeypatch.setattr(server, 'docker', docker)
+    if blocked:
+        with pytest.raises(server.SandboxUpdatePending):
+            server.ensure(key)
+        assert not any(call[0] == 'update' for call in calls)
+    else:
+        server.ensure(key)
+        assert ('update', '--pids-limit', str(desired), name) in calls
+        assert not any(call[0] in ('create', 'rename', 'stop', 'restart') for call in calls)
+
+
+@pytest.mark.parametrize('value', ['0', '-1', 'not-a-number'])
+def test_invalid_thread_limit_rejected_before_provisioning(server, monkeypatch, value):
+    monkeypatch.setenv('WORKBENCH_SANDBOX_PIDS_LIMIT', value)
+    docker = Mock()
+    monkeypatch.setattr(server, 'docker', docker)
+    with pytest.raises(ValueError):
+        server.ensure(str(uuid4()))
+    docker.assert_not_called()
 
 
 @pytest.mark.parametrize('volume', ['/srv/private', '../other-home', 'home,volume-subpath=../', '', None])

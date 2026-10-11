@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "exports": {
+    "./fs": "./src/fs.js",
     "./ssh": "./src/ssh.js",
     "./subprocess": "./src/subprocess.js",
     "./spill": "./src/spill.js",
@@ -12,6 +13,7 @@
   },
   "engines": { "node": "^22.19.0 || >=24.0.0" },
   "dependencies": {
+    "@deepseek-ai/dsh-fs-ssh": "0.1.7-rc.1",
     "@deepseek-ai/dsh-file-reference-local": "0.1.7-rc.1",
     "@deepseek-ai/dsh-workspace-changes": "0.1.7-rc.1",
     "@deepseek-ai/dsh-ssh": "0.1.7-rc.1",

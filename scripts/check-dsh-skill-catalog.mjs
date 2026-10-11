@@ -19,6 +19,9 @@ try {
   const catalog = await readFile(new URL('../profiles/workbench/node_modules/@deepseek-ai/dsh-tool-skill/lib/index.js', import.meta.url), 'utf8')
   if (!catalog.includes('entry.displayName') || !catalog.includes('escapeText(entry.displayName)'))
     throw new Error('DSH model-facing skill catalog omits the display name')
+  if (!catalog.includes('displayName: typeof displayName === "string"')
+    || !catalog.includes('JSON.stringify([entry.name, entry.displayName ?? entry.name, entry.description])'))
+    throw new Error('DSH catalog history and digest disagree on display names')
 } finally {
   dispose()
 }
