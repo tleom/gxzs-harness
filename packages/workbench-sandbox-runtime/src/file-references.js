@@ -44,10 +44,12 @@ ready.catch(error=>{process.stderr.write(error.message);process.exit(1)});
 
 /** One native index per agent, transported by the existing DSH subprocess. */
 export class SandboxReferenceSearch {
-  constructor(subprocess,{root,config={},node='/usr/local/bin/node',workspace='/workspace'}) {
+  constructor(subprocess,{root,config={},node='/usr/local/bin/node',workspace='/workspace',idleMs=60_000}) {
     if(typeof root!=='string'||!posix.isAbsolute(root)||
       (posix.resolve(root)!==posix.resolve(workspace)&&!posix.resolve(root).startsWith(`${posix.resolve(workspace)}/`)))
       throw new Error('File reference workspace is outside the owner sandbox')
+    if(!Number.isSafeInteger(idleMs)||idleMs<1)throw new Error('File reference idle timeout must be a positive integer')
+    this.idleMs=idleMs
     this.pending=new Map()
     this.sequence=0
     this.buffer=''
@@ -71,6 +73,13 @@ export class SandboxReferenceSearch {
     this.handle.stdout.on('data',chunk=>this.receive(chunk))
     this.handle.stdout.on('error',()=>this.dispose(new Error('Sandbox reference transport failed')))
     this.handle.stdin.on('error',()=>this.dispose(new Error('Sandbox reference transport failed')))
+    this.armIdle()
+  }
+  armIdle() {
+    clearTimeout(this.idleTimer)
+    if(this.closed||this.pending.size)return
+    this.idleTimer=setTimeout(()=>this.dispose(),this.idleMs)
+    this.idleTimer.unref?.()
   }
   send(value) {
     if(this.closed)throw new Error('Sandbox reference search is closed')
@@ -100,11 +109,12 @@ export class SandboxReferenceSearch {
     signal.throwIfAborted()
     if(this.closed)return Promise.reject(new Error('Sandbox reference search is closed'))
     if(this.pending.size>=64)return Promise.reject(new Error('Too many file reference requests'))
+    clearTimeout(this.idleTimer)
     const id=++this.sequence
     return new Promise((resolve,reject)=>{
       let timer
       const finish=(callback,value)=>{
-        clearTimeout(timer);signal.removeEventListener('abort',cancel);this.pending.delete(id);callback(value)
+        clearTimeout(timer);signal.removeEventListener('abort',cancel);this.pending.delete(id);this.armIdle();callback(value)
       }
       const cancel=()=>{
         try{this.send({op:'cancel',id})}catch{}
@@ -123,6 +133,7 @@ export class SandboxReferenceSearch {
   dispose(error=new Error('Sandbox reference search disposed')) {
     if(this.closed)return
     this.closed=true
+    clearTimeout(this.idleTimer)
     for(const pending of this.pending.values())pending.reject(error)
     this.pending.clear();this.buffer='';this.lifetime.abort(error)
   }
@@ -136,8 +147,10 @@ export default class SandboxFileReferences extends LocalFileReferences {
     super(ctx,config)
     this.searchConfig=config
     this.remoteSearches=new Map()
+    this.disposedAgents=new WeakSet()
     this.stopped=false
     ctx.on('agent/disposed',async({agent})=>{
+      this.disposedAgents.add(agent)
       const search=this.remoteSearches.get(agent)
       this.remoteSearches.delete(agent)
       search?.dispose()
@@ -154,17 +167,36 @@ export default class SandboxFileReferences extends LocalFileReferences {
       await Promise.all(searches.map(search=>search.done))
     })
   }
-  list(agent,query,signal) {
+  async list(agent,query,signal) {
     signal.throwIfAborted()
-    if(this.stopped)return Promise.reject(new Error('Sandbox reference service disposed'))
+    if(this.stopped||this.disposedAgents?.has(agent))return Promise.reject(new Error('Sandbox reference service disposed'))
     let search=this.remoteSearches.get(agent)
+    // A replacement must not overlap a still-closing index and its SSH pipes.
+    if(search?.closed) {
+      let cancel
+      try {
+        await Promise.race([search.done,new Promise((_,reject)=>{
+          cancel=()=>reject(signal.reason)
+          signal.addEventListener('abort',cancel,{once:true})
+          if(signal.aborted)cancel()
+        })])
+      }finally{signal.removeEventListener('abort',cancel)}
+      signal.throwIfAborted()
+      if(this.stopped||this.disposedAgents?.has(agent))throw new Error('Sandbox reference service disposed')
+      search=this.remoteSearches.get(agent)
+    }
     if(!search||search.closed) {
       search=new SandboxReferenceSearch(this.ctx.subprocess,{
         root:agent.session.header.cwd,config:this.searchConfig,
         node:process.env.GXZS_SANDBOX_NODE||'/usr/local/bin/node',
         workspace:process.env.GXZS_SANDBOX_WORKSPACE||'/workspace',
+        idleMs:Number(process.env.GXZS_REFERENCE_IDLE_MS??60_000),
       })
       this.remoteSearches.set(agent,search)
+      const current=search
+      void search.done.then(()=>{
+        if(this.remoteSearches.get(agent)===current)this.remoteSearches.delete(agent)
+      })
     }
     return search.list(query,signal)
   }

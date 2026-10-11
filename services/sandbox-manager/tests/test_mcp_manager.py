@@ -314,6 +314,57 @@ def test_real_worker_close_keeps_unconfirmed_client_for_later_check():
     worker.process.terminate.assert_not_called()
 
 
+def test_cleanup_works_when_new_threads_cannot_start(manager, monkeypatch):
+    _, runtime, _, _ = manager
+    key = str(uuid4())
+    class Closing:
+        def close(self): return True
+    worker = Closing()
+    runtime.CLOSING[worker] = (key, 'demo', None)
+    monkeypatch.setattr(threading.Thread, 'start', lambda self: (_ for _ in ()).throw(RuntimeError('cannot start thread')))
+    assert runtime.close_workers([worker])
+    assert worker not in runtime.CLOSING
+
+
+def test_catalog_thread_failure_does_not_leave_permanent_refresh_marker(manager, monkeypatch):
+    module, _, _, _ = manager
+    key = str(uuid4())
+    monkeypatch.setattr(threading.Thread, 'start', lambda self: (_ for _ in ()).throw(RuntimeError('cannot start thread')))
+    module.schedule_mcp_refresh(key, [{'enabled':True,'status':'unverified','version':'v1','id':'demo'}])
+    assert (key, 'demo') not in module.MCP_REFRESHING
+
+
+def test_reader_start_failure_closes_pipe_and_retains_partial_worker(monkeypatch):
+    from io import BytesIO
+    import mcp_runtime as runtime
+    process = SimpleNamespace(stdin=BytesIO(), stdout=BytesIO())
+    monkeypatch.setattr(runtime.subprocess, 'Popen', lambda *args, **kwargs: process)
+    monkeypatch.setattr(threading.Thread, 'start', lambda self: (_ for _ in ()).throw(RuntimeError('cannot start thread')))
+    with pytest.raises(runtime.WorkerStartError) as error:
+        runtime.Worker('sandbox', 'demo', 'v1', 5)
+    assert process.stdin.closed
+    assert error.value.worker.process is process
+    assert len(error.value.worker.token) == 32
+
+
+def test_idle_cache_reaper_retains_active_workers_and_limits_idle_owner_connections(manager):
+    _, runtime, _, _ = manager
+    key = str(uuid4())
+    identities = [(key, str(index)) for index in range(6)]
+    for identity in identities:
+        runtime.WORKERS[identity] = runtime.Worker('sandbox', identity[1], 'v1', 5)
+        runtime.LAST_USED[identity] = time.monotonic()
+    busy = type('Busy', (), {'key':key,'name':'0'})()
+    runtime.ACTIVE.add(busy)
+    try:
+        runtime.reap_workers(max_owner_workers=4)
+        assert len(runtime.WORKERS) == 4
+        assert identities[0] in runtime.WORKERS
+        assert not runtime.CLOSING
+    finally:
+        runtime.ACTIVE.discard(busy)
+
+
 def test_saturated_business_capacity_keeps_root_cancel_available(manager, monkeypatch):
     from io import BytesIO
     from unittest.mock import Mock

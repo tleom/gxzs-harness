@@ -14,6 +14,48 @@ from global_memory import operate
 
 
 class RoutingTests(unittest.TestCase):
+    def test_reaper_retries_completed_close_without_interrupting_active_calls(self):
+        finished, active = memory.MemoryCall('owner-a', 'done'), memory.MemoryCall('owner-b', 'active')
+        finished.finished = True
+        finished.worker, active.worker = Mock(), Mock()
+        finished.worker.close.side_effect = [False, True]
+        memory.ACTIVE.update([finished, active])
+        try:
+            self.assertFalse(memory.reap_calls())
+            self.assertIn(finished, memory.ACTIVE)
+            self.assertTrue(memory.reap_calls())
+            self.assertNotIn(finished, memory.ACTIVE)
+            self.assertIn(active, memory.ACTIVE)
+            active.worker.close.assert_not_called()
+            self.assertFalse(active.cancelled.is_set())
+        finally:
+            memory.ACTIVE.difference_update([finished, active])
+
+    def test_cancel_keeps_unfinished_start_counted_until_startup_returns(self):
+        call = memory.MemoryCall('owner-a', 'starting')
+        memory.ACTIVE.add(call)
+        try:
+            self.assertFalse(memory.invalidate('owner-a', 'starting'))
+            self.assertIn(call, memory.ACTIVE)
+            self.assertTrue(call.cancelled.is_set())
+            call.finished = True
+            self.assertTrue(memory.reap_calls())
+            self.assertNotIn(call, memory.ACTIVE)
+        finally:
+            memory.ACTIVE.discard(call)
+
+    def test_cancel_does_not_need_a_new_cleanup_thread(self):
+        worker = Mock()
+        worker.close.return_value = True
+        call = memory.MemoryCall('owner-a','binding-a')
+        call.worker = worker
+        memory.ACTIVE.add(call)
+        try:
+            with patch.object(threading.Thread,'start',side_effect=RuntimeError('cannot start thread')):
+                self.assertTrue(memory.invalidate('owner-a','binding-a'))
+            self.assertNotIn(call,memory.ACTIVE)
+        finally:
+            memory.ACTIVE.discard(call)
     def test_sandbox_embedded_source_does_not_import_manager_state(self):
         code = (
             "import pathlib,sys; source=pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'); "

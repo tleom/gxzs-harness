@@ -1,5 +1,6 @@
 """Private container control plane; exposes no arbitrary Docker or shell operation."""
 import hashlib
+import errno
 import hmac
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -17,7 +18,7 @@ from concurrent.futures import ThreadPoolExecutor
 from urllib.request import ProxyHandler, Request, build_opener
 
 from admission import Admission
-from resource_limits import cgroup_args, owner_cgroup
+from resource_limits import cgroup_args, owner_cgroup, ResourceUnavailable
 from owner_auth import authorize as authorize_request
 
 
@@ -79,12 +80,24 @@ def schedule_mcp_refresh(key, items):
                 with MCP_REFRESH_GUARD:
                     MCP_REFRESHING.discard(target)
 
-        threading.Thread(target=refresh, name="mcp-catalog-refresh", daemon=True).start()
+        try:
+            threading.Thread(target=refresh, name="mcp-catalog-refresh", daemon=True).start()
+        except (RuntimeError, OSError):
+            with MCP_REFRESH_GUARD:
+                MCP_REFRESHING.discard(identity)
+            LOGGER.warning('Unable to start personal MCP catalog refresh')
 
 
 def docker(*args, stdin=None, timeout=90, check=True):
-    result = subprocess.run(["docker", *args], input=stdin, capture_output=True, text=True, timeout=timeout)
+    try:
+        result = subprocess.run(["docker", *args], input=stdin, capture_output=True, text=True, timeout=timeout)
+    except OSError as error:
+        if error.errno == errno.EAGAIN:
+            raise ResourceUnavailable('沙盒管理服务暂时无法创建进程或线程，请稍后重试；数据已保留') from error
+        raise
     if check and result.returncode:
+        if any(marker in result.stderr.lower() for marker in ('resource temporarily unavailable', 'unable to spawn stage', 'pthread_create')):
+            raise ResourceUnavailable('沙盒暂时无法创建进程或线程，请稍后重试；数据已保留')
         # Never echo command arguments (which may contain the sandbox auth token).
         raise RuntimeError(result.stderr[-2000:] or "Docker operation failed")
     return result
@@ -202,7 +215,8 @@ def ensure(key):
         if info.returncode:
             if home_volume:
                 docker('volume', 'create', '--label', 'gxzs.owner=' + host['owner_id'], home_volume)
-                docker('run', '--rm', '--user', '0', '--network', 'none', '--entrypoint', MANAGER_PYTHON[0],
+                docker('run', '--rm', *cgroup_args(key), '--memory', '256m', '--cpus', '1', '--pids-limit', '128',
+                       '--user', '0', '--network', 'none', '--entrypoint', MANAGER_PYTHON[0],
                        '-v', home_volume + ':/srv/dsh', IMAGE, *MANAGER_PYTHON[1:], '-c',
                        "import os; p='/srv/dsh/attachments'; "
                        "assert not os.path.islink(p), 'Attachment root cannot be a symlink'; "
@@ -210,12 +224,14 @@ def ensure(key):
                        "os.makedirs(p,exist_ok=True); os.chown(p,1000,1000); os.chmod(p,0o700)")
             for suffix in ("home", "files", "env"):
                 docker("volume", "create", "--label", "workbench=" + PREFIX, name + "-" + suffix)
-            docker("run", "--rm", "--user", "0", "--network", "none", "--entrypoint", MANAGER_PYTHON[0],
+            docker("run", "--rm", *cgroup_args(key), '--memory', '256m', '--cpus', '1', '--pids-limit', '128',
+                   "--user", "0", "--network", "none", "--entrypoint", MANAGER_PYTHON[0],
                    "-v", name + "-home:/home/dify", "-v", name + "-files:/workspace", "-v", name + "-env:/opt/user-env",
                    IMAGE, *MANAGER_PYTHON[1:], "-c", "import os; paths=['/home/dify','/workspace','/workspace/conversations','/workspace/" + key + "','/opt/user-env']; "
                    "[(os.makedirs(p,exist_ok=True),os.chown(p,1000,1000)) for p in paths]")
             # Existing personal venvs gain the immutable office fallback without replacing their packages.
-            docker("run", "--rm", "--user", "1000", "--network", "none", "--entrypoint", MANAGER_PYTHON[0],
+            docker("run", "--rm", *cgroup_args(key), '--memory', '256m', '--cpus', '1', '--pids-limit', '128',
+                   "--user", "1000", "--network", "none", "--entrypoint", MANAGER_PYTHON[0],
                    "-v", name + "-env:/opt/user-env", IMAGE, *MANAGER_PYTHON[1:], "-c",
                    "from pathlib import Path; site=Path('/opt/user-env/current/python/lib/python3.12/site-packages'); "
                    "base=Path('/opt/office/python/lib/python3.12/site-packages'); "
@@ -233,9 +249,10 @@ def ensure(key):
                    "-e", "SHELLCTL_AUTH_TOKEN=" + token,
                    "-e", "PATH=/opt/user-env/current/python/bin:/opt/office/python/bin:/opt/user-env/current/node/node_modules/.bin:/opt/office/node/node_modules/.bin:/usr/local/bin:/usr/bin:/bin",
                    "-e", "NODE_PATH=/opt/user-env/current/node/node_modules:/opt/office/node/node_modules", IMAGE)
-        docker("start", name)
-        docker("exec", "--user", "0", name, *MANAGER_PYTHON, "-c",
-               "import os; os.makedirs('/opt/workbench-global', mode=0o755, exist_ok=True)")
+        if info.returncode or not existing['State']['Running']:
+            docker("start", name)
+            docker("exec", "--user", "0", name, *MANAGER_PYTHON, "-c",
+                   "import os; os.makedirs('/opt/workbench-global', mode=0o755, exist_ok=True)")
         touch(key)
         return {"endpoint": "http://" + name + ":5004", "auth_token": token}
 
@@ -377,7 +394,7 @@ def operation(key, action, payload):
         with lock(key):
             try:
                 script = Path(__file__).with_name("office_preview.py").read_text()
-                result = docker("run", "--rm", "--name", preview_name, "--network", "none",
+                result = docker("run", "--rm", "--name", preview_name, *cgroup_args(key), "--network", "none",
                                 "--read-only", "--tmpfs", "/tmp:rw,nosuid,noexec,size=256m",
                                 "--user", "1000", "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true",
                                 "--memory", "1g", "--cpus", "1", "--pids-limit", "128", "-e", "HOME=/tmp",
@@ -434,7 +451,7 @@ def operation(key, action, payload):
             script = Path(__file__).with_name("environment.py").read_text()
             # No Home, files, Docker socket or credentials are mounted into the installer.
             try:
-                result = docker("run", "--rm", "--name", installer, "--user", "1000", "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true",
+                result = docker("run", "--rm", "--name", installer, *cgroup_args(key), "--user", "1000", "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true",
                     "--memory", "1g", "--cpus", "1", "--pids-limit", "256", "--entrypoint", MANAGER_PYTHON[0],
                     "-v", name + "-env:/opt/user-env", "-i", IMAGE, *MANAGER_PYTHON[1:], "-c", script,
                     stdin=json.dumps(payload), timeout=INSTALL_TIMEOUT)
@@ -558,7 +575,9 @@ class Handler(BaseHTTPRequestHandler):
             if output.get("conflict"):
                 code = 409
         except CapacityError as error:
-            code, output = 503, {'error': str(error), 'code': 'MANAGER_BUSY'}
+            code, output = 503, {'error': str(error), 'code': 'MANAGER_BUSY', 'retry_after': 1}
+        except ResourceUnavailable as error:
+            code, output = 503, {'error': str(error), 'code': error.code, 'retry_after': error.retry_after}
         except SandboxUpdatePending as error:
             code, output = 503, {'error': str(error), 'code': 'SANDBOX_UPDATING', 'retry_after': 5}
         except PermissionError as error:
@@ -576,6 +595,8 @@ class Handler(BaseHTTPRequestHandler):
             REQUEST_CONTEXT.owner = None
             if admitted:
                 OPERATION_CAPACITY.release()
+        if code >= 400:
+            output.setdefault('request_id', request_id)
         data = json.dumps(output).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
@@ -598,17 +619,30 @@ class BoundedHTTPServer(ThreadingHTTPServer):
 
     def process_request(self, request, client_address):
         if not self.capacity.acquire(blocking=False):
-            try:
-                request.sendall(b'HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nRetry-After: 1\r\nConnection: close\r\n\r\n')
-            finally:
-                self.shutdown_request(request)
+            self.reject_request(request, 'MANAGER_BUSY', '沙盒管理服务繁忙，本次操作未开始，请稍后重试')
             return
-        request.settimeout(30)
         try:
+            request.settimeout(30)
             super().process_request(request, client_address)
+        except (RuntimeError, OSError) as error:
+            self.capacity.release()
+            if isinstance(error, OSError) and error.errno != errno.EAGAIN:
+                raise
+            self.reject_request(request, 'RESOURCE_BUSY', '沙盒管理服务暂时无法创建请求线程，本次操作未开始，请稍后重试')
         except BaseException:
             self.capacity.release()
             raise
+
+    def reject_request(self, request, code, message):
+        try:
+            request.settimeout(1)
+            body = json.dumps({'error': message, 'code': code, 'retry_after': 1,
+                               'request_id': uuid.uuid4().hex[:12]}).encode()
+            headers = ('HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: '
+                       + str(len(body)) + '\r\nRetry-After: 1\r\nConnection: close\r\n\r\n').encode()
+            request.sendall(headers + body)
+        finally:
+            self.shutdown_request(request)
 
     def process_request_thread(self, request, client_address):
         try:
@@ -644,6 +678,8 @@ def reap():
             reap_operations()
             from mcp_runtime import reap_workers
             reap_workers()
+            from global_memory import reap_calls
+            reap_calls()
             for item in STATE.iterdir():
                 try:
                     key = str(uuid.UUID(item.name))

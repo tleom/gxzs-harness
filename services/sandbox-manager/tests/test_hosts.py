@@ -8,6 +8,15 @@ from unittest.mock import Mock
 import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from hosts import Hosts
+from resource_limits import ResourceUnavailable
+
+
+def test_missing_host_port_has_a_stable_startup_error(tmp_path, monkeypatch):
+    host, control, _, payload, created = setup(tmp_path, monkeypatch)
+    created.update(State={'Running':False,'ExitCode':1},NetworkSettings={'Ports':{}})
+    with pytest.raises(ResourceUnavailable) as error:
+        host._container_identity(payload, '10.16.9.237')
+    assert error.value.code == 'HOST_START_PENDING'
 
 
 def setup(tmp_path, monkeypatch):
@@ -252,6 +261,25 @@ def test_external_catalog_degradation_pauses_admission_without_restarting_pair(t
     assert json.loads(record.read_text()) == {**item, 'ready': False}
     assert 'host-1' not in host.failures
     assert 'host-1' not in host.recoveries
+
+
+def test_current_pid_pressure_pauses_admission_and_recovers_without_restart(tmp_path, monkeypatch):
+    host, docker, _, payload, _ = setup(tmp_path, monkeypatch)
+    host.ensure('workspace', payload)
+    record = host.root / 'workspace' / 'host.json'
+    item = json.loads(record.read_text())
+    item.update(state='ready', ready=True)
+    record.write_text(json.dumps(item))
+    host.alive = Mock(return_value=True)
+    host.failures['host-1'] = 0
+    monkeypatch.setattr('hosts.pid_pressure', lambda info: True)
+    docker.reset_mock()
+    host.maintain()
+    assert not any(call.args[0] in ('stop','rename','create') for call in docker.call_args_list)
+    assert json.loads(record.read_text())['ready'] is False
+    monkeypatch.setattr('hosts.pid_pressure', lambda info: False)
+    host.maintain()
+    assert json.loads(record.read_text())['ready'] is True
 
 
 def test_dead_host_pair_is_fenced_and_restarted_after_liveness_grace(tmp_path, monkeypatch):

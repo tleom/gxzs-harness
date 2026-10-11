@@ -14,6 +14,10 @@ function create(fetchImpl) {
 }
 
 describe('restricted sandbox-manager file client', () => {
+  it('retains temporary capacity errors and safe correlation metadata', async () => {
+    const manager = create(async () => new Response(JSON.stringify({error:'资源繁忙',code:'MANAGER_BUSY',request_id:'request-1',retry_after:2}),{status:503}))
+    await expect(manager.operate({operation:'list'})).rejects.toMatchObject({status:503,code:'MANAGER_BUSY',request_id:'request-1',retry_after:2})
+  })
   it('propagates caller cancellation to the authorized read', async () => {
     const controller = new AbortController()
     const manager = create(async (_url, options) => new Promise((_resolve, reject) => {

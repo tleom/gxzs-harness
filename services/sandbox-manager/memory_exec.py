@@ -56,12 +56,12 @@ def serve(source):
         os.read(sys.stdin.fileno(), 1)
         stop()
 
-    threading.Thread(target=monitor, daemon=True).start()
     timeout = max(0.001, min(60, float(request.get('remaining_seconds', 60))))
     timer = threading.Timer(timeout, stop)
     timer.daemon = True
-    timer.start()
     try:
+        threading.Thread(target=monitor, daemon=True).start()
+        timer.start()
         child.stdin.write(json.dumps({'tool': request['tool'], 'arguments': request['arguments']}, ensure_ascii=False).encode())
         child.stdin.close()
         # Bound captured output while still draining or killing the child.
@@ -75,7 +75,7 @@ def serve(source):
             result = {'error': '记忆调用已停止或失败，执行结果未知，请先核实状态', 'uncertain': True}
         else:
             result = json.loads(output)
-    except (ValueError, OSError):
+    except (ValueError, OSError, RuntimeError):
         stop()
         child.wait()
         result = {'error': '记忆调用结果未知，请先核实状态', 'uncertain': True}
@@ -89,6 +89,8 @@ def serve(source):
             except ProcessLookupError:
                 pass
             done.set()
+        child.stdin.close()
+        child.stdout.close()
     until = time.monotonic() + 2
     try:
         while group_running(child.pid) and time.monotonic() < until:

@@ -1,6 +1,6 @@
 import {PassThrough} from 'node:stream'
 import {expect,it,vi} from 'vitest'
-import {SandboxReferenceSearch} from '../src/file-references.js'
+import SandboxFileReferences,{SandboxReferenceSearch} from '../src/file-references.js'
 const options=()=>({root:'/workspace/conversations/example',config:{maxResults:20,maxEntries:50000,excludedDirectories:[]}})
 function runtime(){
  const messages=[],stdin=new PassThrough(),stdout=new PassThrough()
@@ -78,4 +78,51 @@ it('times out one request while preserving the shared index',async()=>{
   await vi.advanceTimersByTimeAsync(30000);await rejected
   expect(search.closed).toBe(false);expect(provider.messages.at(-1).op).toBe('cancel')
  }finally{search.dispose();await search.done;vi.useRealTimers()}
+})
+it('reclaims an idle index even when tool results keep invalidating it',async()=>{
+ vi.useFakeTimers()
+ const provider=runtime(),search=new SandboxReferenceSearch(provider,{...options(),idleMs:1000})
+ try{
+  await vi.advanceTimersByTimeAsync(700);search.invalidate()
+  await vi.advanceTimersByTimeAsync(300);await search.done
+  expect(search.closed).toBe(true)
+ }finally{search.dispose();vi.useRealTimers()}
+})
+it('keeps in-flight searches alive and starts the idle deadline after their last response',async()=>{
+ vi.useFakeTimers()
+ const provider=runtime(),search=new SandboxReferenceSearch(provider,{...options(),idleMs:1000})
+ try{
+  const pending=search.list('active',new AbortController().signal)
+  await vi.advanceTimersByTimeAsync(2000);expect(search.closed).toBe(false)
+  provider.reply(1,[]);await pending
+  await vi.advanceTimersByTimeAsync(999);expect(search.closed).toBe(false)
+  await vi.advanceTimersByTimeAsync(1);expect(search.closed).toBe(true)
+ }finally{search.dispose();await search.done;vi.useRealTimers()}
+})
+it('waits for the old index to exit and shares a single lazy replacement',async()=>{
+ const provider=runtime(),agent={session:{header:{cwd:options().root}}}
+ let finish
+ const old={closed:true,done:new Promise(resolve=>{finish=resolve})}
+ const service=Object.assign(Object.create(SandboxFileReferences.prototype),{
+  ctx:{subprocess:provider},searchConfig:options().config,remoteSearches:new Map([[agent,old]]),stopped:false,
+ })
+ const first=service.list(agent,'a',new AbortController().signal)
+ const second=service.list(agent,'b',new AbortController().signal)
+ expect(provider.spawn).not.toHaveBeenCalled();finish();await Promise.resolve();await Promise.resolve()
+ expect(provider.spawn).toHaveBeenCalledTimes(1)
+ provider.reply(1,[]);provider.reply(2,[]);await Promise.all([first,second])
+ const search=service.remoteSearches.get(agent);search.dispose();await search.done
+ expect(service.remoteSearches.size).toBe(0)
+})
+it('does not rebuild an index when the agent is disposed while the old process exits',async()=>{
+ const provider=runtime(),agent={session:{header:{cwd:options().root}}}
+ let finish
+ const old={closed:true,done:new Promise(resolve=>{finish=resolve})}
+ const disposedAgents=new WeakSet()
+ const service=Object.assign(Object.create(SandboxFileReferences.prototype),{
+  ctx:{subprocess:provider},searchConfig:options().config,remoteSearches:new Map([[agent,old]]),disposedAgents,stopped:false,
+ })
+ const rejected=expect(service.list(agent,'a',new AbortController().signal)).rejects.toThrow('disposed')
+ disposedAgents.add(agent);finish();await rejected
+ expect(provider.spawn).not.toHaveBeenCalled()
 })
