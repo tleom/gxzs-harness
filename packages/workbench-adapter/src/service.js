@@ -18,6 +18,7 @@ import { nativePresentation } from './projection.js'
 import { HistoryPresentation } from './history-presentation.js'
 import { withGoalUpdates } from './goal-updates.js'
 import { withNativeCommandRun, nativeCommandRecords } from './native-command.js'
+import { dispatchRunPrompt } from './native-prompt.js'
 import { goalFailureReason, presentRunEvent, resumeGoalSelection, runFailure } from './run-failure.js'
 
 export class WorkbenchService {
@@ -367,10 +368,13 @@ export class WorkbenchService {
     if (existing) return this.getRun(owner, existing.id)
     if (body.version !== undefined && body.version !== chat.version)
       throw httpError(409, '配置版本已改变，请刷新后重试')
-    const silentResume = body.silent_resume === true && typeof body.continue_run_id === 'string'
+    if (body.silent_resume === true && typeof body.continue_run_id !== 'string')
+      throw httpError(400, '继续任务必须指定原任务')
+    const silentResume = body.silent_resume === true
     const query = silentResume ? 'resume' : String(body.query ?? '')
     const mentions = normalizeResourceMentions(body.resource_mentions)
     const files = Array.isArray(body.files) ? body.files : []
+    if (silentResume && files.length) throw httpError(400, '后台继续不能携带附件，请发送新消息')
     if (!query.trim() && !files.length) throw httpError(400, '消息内容不能为空')
     const cancelled = () => requestKey && this.database.getCommandReceipt(owner.ownerId, chatId, `run-stop:${requestKey}`)
     const checkCancelled = () => { if (cancelled()) throw httpError(409, '消息已取消') }
@@ -428,10 +432,7 @@ export class WorkbenchService {
         else if (active?.selection?.model !== run.selection.model) throw httpError(409, '排队任务不能切换当前运行模型')
       }
       checkCancelled()
-      await this.sessions.prompt({
-        requestId: run.id, sessionId: chat.sessionId, mode: 'queue',
-        content: admitted.content,
-      }, new AbortController().signal)
+      await dispatchRunPrompt(this, run, admitted.content)
     } catch (error) {
       this.database.transitionRun(owner.ownerId, run.id, cancelled() ? 'cancelled' : 'failed',
         cancelled() ? undefined : `任务提交失败：${error?.message ?? error}`)
@@ -679,10 +680,11 @@ export class WorkbenchService {
           const objective = /^\/goal\s+resume\s*$/i.test(line)
             ? this.goals?.get(agent)?.objective ?? '继续目标' : line.replace(/^\/goal\s+(?:edit\s+)?/i, '')
           goalRun = this.database.createRun({ ownerId: owner.ownerId, chatId, sessionId: chat.sessionId,
-            query: objective, attachments: previous?.attachments ?? admitted.attachments, selection: previous
-              ? resumeGoalSelection(previous.selection, chat.selection) : { ...chat.selection, command: 'goal', resource_mentions: mentions,
+            query: objective, attachments: previous?.attachments ?? admitted.attachments, selection: /^\/goal\s+resume\s*$/i.test(line)
+              ? resumeGoalSelection(previous?.selection, chat.selection) : { ...chat.selection, command: 'goal', resource_mentions: mentions,
               mentioned_resources: await this.mentionSnapshot(mentions, mcpTools), skill_names: await this.skillNames(),
-              resource_context: resourceContext }, mcpTools, requestKey: `goal:${requestKey}` }).run
+              resource_context: resourceContext }, mcpTools, requestKey: `goal:${requestKey}`,
+            parentRunId: previous?.id }).run
           createdGoalRun = true
           this.database.appendEvent(owner.ownerId, goalRun.id, { event: 'workbench_status', status: 'queued' })
         }
@@ -756,6 +758,7 @@ export class WorkbenchService {
           resumedRun = this.database.createRun({ ownerId: owner.ownerId, chatId, sessionId: chat.sessionId,
             query: current.objective, selection: resumeGoalSelection(previous?.selection, chat.selection),
             attachments: previous?.attachments ?? [], mcpTools: previous?.mcpTools ?? await this.freezeMcpTools(owner, []),
+            parentRunId: previous?.id,
           }).run
           this.database.setGoalRun(chat.sessionId, resumedRun.id)
         }
@@ -882,7 +885,8 @@ export class WorkbenchService {
       throw Object.assign(httpError(409, '当前任务正在切换，请稍后重试补答'), { code: 'STALE_RUN' })
     const { run, created } = this.database.createRun({
       ownerId: owner.ownerId, chatId: chat.id, sessionId: chat.sessionId,
-      query: answer, mcpTools: existing?.mcpTools ?? (active ? source.mcpTools : await this.freezeMcpTools(owner, [])), selection: source.selection, requestKey,
+      query: answer, mcpTools: existing?.mcpTools ?? (active ? source.mcpTools : await this.freezeMcpTools(owner, [])),
+      selection: { ...source.selection, silent_resume: false, is_continuation: false }, requestKey,
       parentRunId: source.id,
     })
     if (created || (run.status === 'queued' && !run.messageId)) {
@@ -1095,7 +1099,7 @@ export function runDto(run, events = [], pending = null) {
     resource_mentions: normalizeResourceMentions(run.selection?.resource_mentions),
     mentioned_resources: run.selection?.mentioned_resources ?? [],
     ...(run.selection?.command ? { command: run.selection.command } : {}),
-    ...(run.selection?.silent_resume ? { is_continuation: true } : {}),
+    ...(run.selection?.silent_resume || run.selection?.is_continuation ? { is_continuation: true } : {}),
     status: run.status, error: run.error ? runFailure({ message: run.error, code: run.errorCode }).message : run.error,
     feedback: run.feedback ?? null, events: events.map(presentRunEvent), events_cursor: `${run.seq}-0`,
     stop_confirmation: run.stopConfirmation ?? null,

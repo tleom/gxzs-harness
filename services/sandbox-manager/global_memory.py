@@ -6,11 +6,8 @@ import sqlite3
 import sys
 import time
 import threading
-import subprocess
-import queue
 import copy
 from uuid import uuid4
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 REVISION = "bf846ebffca0d33c6d3b1468e12e16c7358fd715"
@@ -88,52 +85,20 @@ class MemoryWorker:
         engine = Path(__file__).read_text(encoding='utf-8')
         supervisor = Path(__file__).with_name('memory_exec.py').read_text(encoding='utf-8')
         source = supervisor + '\nserve(' + repr(engine) + ')\n'
-        self.process = subprocess.Popen(['docker', 'exec', '--user', '1000', '-i', container,
-            '/usr/bin/env', '-i', 'HOME=/home/dify', 'LANG=C.UTF-8', 'PATH=/usr/local/bin:/usr/bin:/bin',
-            '/usr/local/bin/python', '-I', '-S', '-u', '-c', source], stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        self.responses, self.timeout = queue.Queue(maxsize=2), 60
-        self.fenced = threading.Event()
-        self.close_guard, self.closed = threading.Lock(), False
-        threading.Thread(target=Worker._read, args=(self,), daemon=True).start()
+        self.transport = Worker(container, 'memory', VERSION, 60, source=source, interpreter='/usr/local/bin/python')
 
     def response(self, cancelled=None, timeout=None):
-        from mcp_runtime import Worker
-        response = Worker.response(self, cancelled, timeout)
+        response = self.transport.response(cancelled, timeout)
         if 'process_group_fenced' in response:
-            if response['process_group_fenced'] is True:
-                self.fenced.set()
             return response['output']
         return response
 
     def send(self, tool, arguments, remaining, cancelled=None, on_dispatch=None):
         from mcp_runtime import write_request
-        return write_request(self.process, {'tool': tool, 'arguments': arguments, 'remaining_seconds': remaining}, cancelled, timeout=min(5, remaining), guard=self.close_guard, on_dispatch=on_dispatch)
+        return write_request(self.transport.process, {'tool': tool, 'arguments': arguments, 'remaining_seconds': remaining}, cancelled, timeout=min(5, remaining), guard=self.transport.close_guard, on_dispatch=on_dispatch)
 
     def close(self):
-        with self.close_guard:
-            if not self.closed:
-                self.closed = True
-                try:
-                    self.process.stdin.close()
-                except OSError:
-                    pass
-        try:
-            self.process.wait(timeout=6)
-            # Require the trusted sandbox supervisor's acknowledgment, not
-            # merely disappearance of the local Docker client process.
-            until = time.monotonic() + 1
-            while not self.fenced.is_set() and time.monotonic() < until:
-                try:
-                    response = self.responses.get(timeout=.05)
-                    if response.get('process_group_fenced') is True:
-                        self.fenced.set()
-                except queue.Empty:
-                    pass
-            return self.process.returncode == 0 and self.fenced.is_set()
-        except subprocess.TimeoutExpired:
-            # Killing the Docker client is not proof the sandbox group exited.
-            return False
+        return self.transport.close()
 
 
 class MemoryCall:
@@ -141,6 +106,7 @@ class MemoryCall:
         self.key, self.binding = key, binding
         self.call_id = uuid4().hex
         self.cancelled, self.worker = threading.Event(), None
+        self.finished = False
         self.dispatch_started, self.dispatch_done, self.dispatched = threading.Event(), threading.Event(), threading.Event()
 
 
@@ -149,17 +115,37 @@ def invalidate(key, binding=None):
         calls = [call for call in ACTIVE if call.key == key and (binding is None or call.binding == binding)]
         for call in calls:
             call.cancelled.set()
-    def close(call):
-        confirmed = call.worker is None or call.worker.close()
-        if confirmed and call.worker is not None:
-            with GUARD:
-                ACTIVE.discard(call)
-        return confirmed
-    with ThreadPoolExecutor(max_workers=min(8, max(1, len(calls)))) as pool:
-        confirmed = all(list(pool.map(close, calls)))
+    confirmed = close_calls(calls)
     from mcp_runtime import wait_dispatch
     wait_dispatch(calls)
     return confirmed
+
+
+def close_calls(calls):
+    def close(call):
+        confirmed = call.finished if call.worker is None else call.worker.close()
+        if confirmed:
+            with GUARD:
+                ACTIVE.discard(call)
+        return confirmed
+    deadline = time.monotonic() + 6
+    outcomes = []
+    for call in sorted(calls, key=lambda item: getattr(getattr(item.worker, 'transport', None), 'last_close_attempt', 0)):
+        if time.monotonic() >= deadline:
+            break
+        try:
+            outcomes.append(bool(close(call)))
+        except (OSError, RuntimeError):
+            outcomes.append(False)
+    return len(outcomes) == len(calls) and all(outcomes)
+
+
+def reap_calls():
+    # A failed close remains counted, but must not require another user stop.
+    # Do not cancel or close a memory call that is still executing.
+    with GUARD:
+        calls = [call for call in ACTIVE if call.finished]
+    return close_calls(calls)
 
 
 def binding_inflight(key, binding):
@@ -321,7 +307,16 @@ def operate(key, payload, *, docker, ensure, identity, lock, authorize, worker_f
         with GUARD:
             if call.cancelled.is_set():
                 return {'error': '记忆调用已停止，本次操作未执行'}
-            call.worker = (worker_factory or MemoryWorker)(container)
+        # Process startup and pipe cleanup must not hold the cross-owner lock.
+        from mcp_runtime import WorkerStartError
+        try:
+            worker = (worker_factory or MemoryWorker)(container)
+        except WorkerStartError as error:
+            with GUARD:
+                call.worker = error.worker
+            return {'error': '记忆连接启动失败，本次操作未执行', 'code': 'MCP_START_FAILED'}
+        with GUARD:
+            call.worker = worker
         ready = call.worker.response(call.cancelled, timeout=min(10, max(0, (deadline - time.time() * 1000) / 1000)))
         if not ready.get('ready'):
             return ready
@@ -348,8 +343,10 @@ def operate(key, payload, *, docker, ensure, identity, lock, authorize, worker_f
         return output
     finally:
         confirmed = False
+        with GUARD:
+            call.finished = True
         try:
-            confirmed = call.worker is None or call.worker.close()
+            confirmed = close_calls([call])
         finally:
             try:
                 if tracked and not outcome_uncertain:

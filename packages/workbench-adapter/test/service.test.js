@@ -344,13 +344,29 @@ describe('followup and control service', () => {
     expect(fileManager.operate).toHaveBeenCalledExactlyOnceWith({ operation: 'list', path: path === '.' ? 'conversations' : 'conversations/cases' })
   })
   it('sends resume from the backend and persists the hidden continuation marker', async () => {
-    const { database, owner, chat, service, sessionController } = setup()
+    const { database, owner, chat, service, sessionController, agent } = setup()
+    agent.followup = vi.fn()
     const first = await service.submitRun(owner, chat.id, { query: 'task', request_key: 'task' })
     database.transitionRun(owner.ownerId, first.id, 'cancelled')
     const resumed = await service.submitRun(owner, chat.id, { query: '', silent_resume: true, continue_run_id: first.id, request_key: 'resume' })
     expect(resumed).toMatchObject({ query: 'resume', parent_run_id: first.id, is_continuation: true })
-    expect(sessionController.prompt.mock.calls.at(-1)[0].content).toContainEqual({ type: 'text', text: 'resume' })
+    expect(sessionController.prompt).toHaveBeenCalledTimes(1)
+    expect(agent.followup).toHaveBeenCalledWith(expect.objectContaining({
+      content: [{ type: 'text', text: 'resume' }], source: { kind: 'workbench-resume', rpcId: resumed.id },
+    }))
     expect(service.getChat(owner, chat.id).runs.at(-1).is_continuation).toBe(true)
+  })
+
+  it('rejects background Continue without the original task instead of creating a Resume chat', async () => {
+    const { database, owner, chat, service, sessionController } = setup()
+    await expect(service.submitRun(owner, chat.id, { silent_resume: true, query: 'resume' })).rejects.toMatchObject({ status: 400 })
+    expect(database.listRuns(owner.ownerId, chat.id)).toEqual([])
+    expect(sessionController.prompt).not.toHaveBeenCalled()
+  })
+
+  it('keeps attachment admission on the ordinary prompt path', async () => {
+    const { owner, chat, service } = setup()
+    await expect(service.submitRun(owner, chat.id, { silent_resume: true, continue_run_id: 'old', files: [{ path: 'file' }] })).rejects.toMatchObject({ status: 400 })
   })
 
   it('only stops the owning Goal between native rounds', async () => {
@@ -1057,7 +1073,8 @@ describe('followup and control service', () => {
     const result = await service.issueCommand(owner, chat.id, { command: `/goal ${control}`, request_key: 'resume-command' })
     const resumed = database.getRun(owner.ownerId, result.run.id)
     expect(resumed.id).not.toBe(previous.id)
-    expect(resumed.selection).toEqual({ ...previous.selection, model: chat.selection.model, model_parameters: {} })
+    expect(resumed.selection).toEqual({ ...previous.selection, model: chat.selection.model, model_parameters: {}, silent_resume: false, is_continuation: true })
+    expect(result.run).toMatchObject({ is_continuation: true, parent_run_id: previous.id })
     expect(resumed.attachments).toEqual(attachments)
     expect(resumed.mcpTools).toEqual(mcpTools)
     expect(freeze).not.toHaveBeenCalled()
@@ -1080,6 +1097,8 @@ describe('followup and control service', () => {
     expect(dto.events[0]).toMatchObject({ error_code: 'data_inspection_failed', error: dto.error })
     expect(database.getRun(owner.ownerId, previous.id).error).toBe(raw)
     const result = await service.mutateGoal(owner, chat.id, 'resume', { ref: { id: goal.id, revision: goal.revision } })
+    expect(service.goals.resume).toHaveBeenCalledExactlyOnceWith(expect.anything(), { id: goal.id, revision: goal.revision })
+    expect(result.run).toMatchObject({ is_continuation: true, parent_run_id: previous.id })
     expect(database.getRun(owner.ownerId, result.run.id).selection).toMatchObject({ model: 'p/m', resource_context: 'Original evidence' })
   })
 

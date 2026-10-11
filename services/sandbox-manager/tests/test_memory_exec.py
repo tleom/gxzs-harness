@@ -107,6 +107,17 @@ print('{"ok":true}')
     process.stdin.close()
 
 
+def test_monitor_start_failure_fences_child_before_business_dispatch():
+    base = str(Path(__file__).resolve().parents[1])
+    code = f'import sys; sys.path.insert(0,{base!r}); import memory_exec as m; '
+    code += 'm.threading.Thread.start=lambda self: (_ for _ in ()).throw(RuntimeError("cannot start thread")); m.serve("import time; time.sleep(120)")'
+    result = subprocess.run([sys.executable,'-I','-u','-c',code],
+                            input=json.dumps({'tool':'cg','arguments':{}})+'\n',capture_output=True,text=True,timeout=5)
+    reply = json.loads(result.stdout.splitlines()[-1])
+    assert reply['process_group_fenced'] is True
+    assert reply['output']['uncertain']
+
+
 def test_blocked_pipe_writer_is_bounded_and_cancellable():
     import threading
     from concurrent.futures import ThreadPoolExecutor

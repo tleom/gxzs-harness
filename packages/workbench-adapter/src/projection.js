@@ -1,4 +1,5 @@
 import { nativeCommandRun } from './native-command.js'
+import { runPromptId } from './native-prompt.js'
 import { presentRunEvent } from './run-failure.js'
 
 const END_STATUS = {
@@ -244,7 +245,7 @@ export function projectInboxClaim(database, { agent, message, turn }, expectedOw
   const chat = database.getChatBySession(sessionId)
   if (!chat || (expectedOwnerId && chat.ownerId !== expectedOwnerId)) return undefined
   let run
-  if (message.source?.kind === 'user' && typeof message.source.rpcId === 'string') {
+  if (runPromptId(message)) {
     const current = database.runForTurn(sessionId, turn)
     run = database.bindRunMessage(sessionId, message.source.rpcId, turn, message.id)
     if (run && current && current.id !== run.id) {
@@ -283,7 +284,7 @@ export function projectInboxClaim(database, { agent, message, turn }, expectedOw
 }
 
 function adoptMessage(database, sessionId, message) {
-  if (message?.source?.kind === 'user' && typeof message.source.rpcId === 'string' && typeof message?.id === 'string')
+  if (runPromptId(message) && typeof message?.id === 'string')
     database.adoptInboxMessage(sessionId, message.source.rpcId, message.id)
   else if (message?.source?.kind === 'user' && typeof message.id === 'string') {
     const run = nativeCommandRun(sessionId)
@@ -365,7 +366,7 @@ export async function reconcileNativeSessions(database, sessionQuery, ownerId) {
         if (event.type === 'user/message' && Number.isInteger(turn)) {
           const message = event.data
           const admitted = database.listRuns(chat.ownerId, chat.id).find(item => item.messageId === message.id)
-          if (message.source?.kind === 'user' && (typeof message.source.rpcId === 'string' || admitted))
+          if (runPromptId(message) || (message.source?.kind === 'user' && admitted))
             database.bindRunMessage(chat.sessionId, message.source.rpcId ?? admitted.id, turn, message.id)
           else if (message.source?.kind === 'goal' || (message.source?.kind === 'user' && !message.source.rpcId)) {
             const run = database.goalRun(chat.sessionId)
@@ -392,7 +393,7 @@ export async function reconcileNativeSessions(database, sessionQuery, ownerId) {
         projectSessionEvent(database, chat.sessionId, event, ownerId)
       }
       for (const message of [...inbox['next-turn'], ...inbox['next-step']]) {
-        const requestId = message.source?.kind === 'user' ? message.source.rpcId : undefined
+        const requestId = runPromptId(message)
         const run = requestId ? database.getRun(ownerId, requestId)
           : database.listRuns(chat.ownerId, chat.id).find(item => item.messageId === message.id)
         if (run && run.sessionId === chat.sessionId) {

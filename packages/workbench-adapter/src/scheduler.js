@@ -2,6 +2,7 @@ import { requireDatabaseModel } from './database-models.js'
 import { setTimeout as delay } from 'node:timers/promises'
 import { createHash } from 'node:crypto'
 import { nativeTurn } from './native-turn.js'
+import { dispatchRunPrompt } from './native-prompt.js'
 import { nativeError } from './http.js'
 
 const TERMINAL = new Set(['completed', 'cancelled', 'failed', 'interrupted', 'discarded', 'steered'])
@@ -109,7 +110,7 @@ export class TaskScheduler {
     const prepared = await this.prepareContent(run.sessionId, content)
     if (this.closed || this.database.getRun(this.ownerId, run.id)?.status !== 'queued') return false
     if (markDispatched) this.database.dispatchSubmission(this.ownerId, run.id)
-    await this.sessions.prompt({ requestId: run.id, sessionId: run.sessionId, mode: 'queue', content: prepared }, new AbortController().signal)
+    await dispatchRunPrompt(this, run, prepared)
     return true
   }
 

@@ -23,6 +23,7 @@ CALL_LOCKS = {}
 ACTIVE = set()
 LAST_USED = {}
 CLOSING = {}
+STARTING = set()
 PATH = "/opt/user-env/current/python/bin:/opt/office/python/bin:/opt/user-env/current/node/node_modules/.bin:/opt/office/node/node_modules/.bin:/usr/local/bin:/usr/bin:/bin"
 
 
@@ -71,18 +72,31 @@ def module_source(*names):
     return source
 
 
+class WorkerStartError(RuntimeError):
+    def __init__(self, worker):
+        super().__init__('MCP worker could not start')
+        self.worker = worker
+
+
 class Worker:
-    def __init__(self, container, name, version, timeout):
-        source = module_source("file_ops", "resource_ops", "mcp_ops")
-        source += (Path(__file__).with_name("mcp_worker.py")).read_text()
+    def __init__(self, container, name, version, timeout, *, source=None, interpreter='/opt/workbench-mcp/bin/python'):
+        if source is None:
+            source = module_source("file_ops", "resource_ops", "mcp_ops")
+            source += (Path(__file__).with_name("mcp_worker.py")).read_text()
         supervisor = Path(__file__).with_name('mcp_exec.py').read_text()
-        source = supervisor + '\nsupervise(' + repr(source) + ',' + repr([name, version]) + ')\n'
+        self.token, self.container, self.interpreter = uuid4().hex, container, interpreter
+        source = supervisor + '\nsupervise(' + repr(source) + ',' + repr([name, version]) + ',' + repr(self.token) + ',' + repr(time.time() + 25) + ')\n'
         self.version, self.timeout = version, timeout
         self.responses = queue.Queue(maxsize=2)
         self.close_guard = threading.Lock()
+        self.cleanup_guard = threading.Lock()
+        self.last_close_attempt = 0
         self.closed = False
         self.fenced = threading.Event()
-        self.process = subprocess.Popen(
+        self.process = None
+        self.ready = None
+        try:
+            self.process = subprocess.Popen(
             [
                 "docker",
                 "exec",
@@ -96,20 +110,27 @@ class Worker:
                 "LANG=C.UTF-8",
                 "PATH=" + PATH,
                 "NODE_PATH=/opt/user-env/current/node/node_modules:/opt/office/node/node_modules",
-                "/opt/workbench-mcp/bin/python",
+                interpreter,
                 "-I",
                 "-u",
                 "-c",
                 source,
                 name,
                 version,
+                'gxzs-mcp-worker:' + self.token,
             ],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
         )
-        threading.Thread(target=self._read, daemon=True).start()
-        self.ready = None
+            threading.Thread(target=self._read, daemon=True).start()
+        except (OSError, RuntimeError) as error:
+            if self.process is not None:
+                try:
+                    self.process.stdin.close()
+                except (OSError, ValueError):
+                    pass
+            raise WorkerStartError(self) from error
 
     def _read(self):
         try:
@@ -117,7 +138,9 @@ class Worker:
                 if len(line) >= MAX_LINE or not line.endswith(b"\n"):
                     break
                 response = json.loads(line)
-                if response.get('worker_group_fenced') is True:
+                if not isinstance(response, dict):
+                    break
+                if response.get('worker_group_fenced') is True and response.get('worker_id') == self.token:
                     self.fenced.set()
                     continue
                 self.responses.put(response, timeout=1)
@@ -163,22 +186,55 @@ class Worker:
         return write_request(self.process, request, cancelled, guard=self.close_guard, on_dispatch=on_dispatch)
 
     def close(self):
+        if self.process is None:
+            return True
         with self.close_guard:
             if not self.closed:
                 self.closed = True
                 try:
                     self.process.stdin.close()
-                except OSError:
+                except (OSError, ValueError):
                     pass
-        try:
-            self.process.wait(timeout=5)
-            # A failed MCP connection can exit nonzero after cleanup. Require
-            # the remote supervisor's proof instead of retaining it forever,
-            # or trusting disappearance of the local Docker client alone.
-            return self.process.returncode == 0 and self.fenced.wait(timeout=.5)
-        except subprocess.TimeoutExpired:
-            # Never infer remote exit from a local Docker timeout.
+        # Closing is retried by the existing reaper; no cleanup thread needs to
+        # be created and repeated probes cannot pile up for the same worker.
+        cleanup_guard = getattr(self, 'cleanup_guard', None)
+        if cleanup_guard is not None and not cleanup_guard.acquire(blocking=False):
             return False
+        try:
+            self.last_close_attempt = time.monotonic()
+            try:
+                self.process.wait(timeout=.2)
+            except subprocess.TimeoutExpired:
+                pass
+            confirmed = bool(getattr(self, 'fenced', None) and self.fenced.is_set())
+            if not confirmed and getattr(self, 'token', None):
+                source = Path(__file__).with_name('mcp_exec.py').read_text()
+                source += '\nprint(json.dumps({"worker_group_fenced":fence_worker(' + repr(self.token) + '),"worker_id":' + repr(self.token) + '}))\n'
+                try:
+                    result = subprocess.run(['docker', 'exec', '--user', '1000', self.container,
+                                             self.interpreter, '-I', '-u', '-c', source],
+                                            capture_output=True, timeout=2.5)
+                    receipt = json.loads(result.stdout)
+                    confirmed = (result.returncode == 0 and isinstance(receipt, dict)
+                                 and receipt.get('worker_group_fenced') is True and receipt.get('worker_id') == self.token)
+                except (OSError, ValueError, subprocess.TimeoutExpired):
+                    confirmed = False
+            if confirmed:
+                # Only a remote exit receipt authorizes local transport cleanup.
+                if self.process.poll() is None:
+                    self.process.terminate()
+                    try:
+                        self.process.wait(timeout=.2)
+                    except subprocess.TimeoutExpired:
+                        self.process.kill()
+                        self.process.wait(timeout=.2)
+                self.process.stdout.close()
+            return confirmed
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            return False
+        finally:
+            if cleanup_guard is not None:
+                cleanup_guard.release()
 
 
 class Invocation:
@@ -198,27 +254,22 @@ class Invocation:
 
 
 def close_workers(workers):
-    outcomes = {}
-    outcome_guard = threading.Lock()
-    def close(worker):
-        confirmed = worker.close() is True
-        with outcome_guard:
-            outcomes[worker] = confirmed
-    threads = [
-        threading.Thread(target=close, args=(worker,), daemon=True) for worker in set(workers)
-    ]
-    for thread in threads:
-        thread.start()
+    workers = set(workers)
+    finished = {}
     deadline = time.monotonic() + 6
-    for thread in threads:
-        thread.join(max(0, deadline - time.monotonic()))
-    with outcome_guard:
-        finished = dict(outcomes)
+    for worker in sorted(workers, key=lambda item: getattr(item, 'last_close_attempt', 0)):
+        if time.monotonic() >= deadline:
+            break
+        try:
+            finished[worker] = worker.close() is True
+        except Exception:
+            finished[worker] = False
+            logging.getLogger(__name__).exception('Unable to fence MCP worker')
     with GUARD:
         for worker, confirmed in finished.items():
             if confirmed:
                 CLOSING.pop(worker, None)
-    return len(finished) == len(set(workers)) and all(finished.values())
+    return len(finished) == len(workers) and all(finished.values())
 
 
 def retire(worker, key, name, binding=None):
@@ -330,7 +381,15 @@ def invoke(key, container, payload, state, *, authorize=None):
             retire(worker, key, name, call.binding)
             worker = None
         if worker is None:
-            worker = Worker(container, name, state["version"], state["timeout"])
+            with GUARD:
+                if len(WORKERS) + len(STARTING) + len(CLOSING) >= 64:
+                    return {"error": "MCP 连接容量暂满，本次操作未执行", "code": "MCP_BUSY"}
+                STARTING.add(call)
+            try:
+                worker = Worker(container, name, state["version"], state["timeout"])
+            except WorkerStartError as error:
+                retire(error.worker, key, name, call.binding)
+                return {"error": "MCP 连接启动失败，本次操作未执行，请稍后重试", "code": "MCP_START_FAILED"}
             with GUARD:
                 call.worker = worker
             worker.ready = worker.response(call.cancelled, timeout=max(0, min(25, call.deadline - time.monotonic())))
@@ -382,6 +441,7 @@ def invoke(key, container, payload, state, *, authorize=None):
         finally:
             with GUARD:
                 ACTIVE.discard(call)
+                STARTING.discard(call)
                 LAST_USED[identity] = time.monotonic()
             if acquired:
                 mutex.release()
@@ -395,13 +455,17 @@ def statistics():
         return {"active_calls": len(ACTIVE), "workers": len(WORKERS), "closing_workers": len(CLOSING), "call_locks": len(CALL_LOCKS)}
 
 
-def reap_workers(idle_seconds=300, max_workers=64):
+def reap_workers(idle_seconds=300, max_workers=32, max_owner_workers=4):
     expired = []
     with GUARD:
         busy = {(call.key, call.name) for call in ACTIVE}
+        owner_counts = {}
+        for key, _ in WORKERS:
+            owner_counts[key] = owner_counts.get(key, 0) + 1
         for identity in sorted(WORKERS, key=lambda item: LAST_USED.get(item, 0)):
-            if identity not in busy and (len(WORKERS) > max_workers or time.monotonic() - LAST_USED.get(identity, 0) > idle_seconds):
+            if identity not in busy and (len(WORKERS) > max_workers or owner_counts[identity[0]] > max_owner_workers or time.monotonic() - LAST_USED.get(identity, 0) > idle_seconds):
                 worker = WORKERS.pop(identity)
+                owner_counts[identity[0]] -= 1
                 expired.append(worker)
                 CLOSING[worker] = (identity[0], identity[1], None)
                 LAST_USED.pop(identity, None)

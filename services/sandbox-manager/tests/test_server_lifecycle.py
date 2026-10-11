@@ -142,6 +142,37 @@ def test_invalid_thread_limit_rejected_before_provisioning(server, monkeypatch, 
     docker.assert_not_called()
 
 
+def test_healthy_sandbox_ensure_does_not_spawn_initialization_helpers(server, monkeypatch):
+    key = str(uuid4())
+    name, _ = server.identity(key)
+    info = {'Id':'a' * 64,'Config':{'Image':server.IMAGE},'State':{'Running':True},
+            'HostConfig':{'PidsLimit':1024},'NetworkSettings':{'Networks':{'owner-network':{}}}}
+    calls = []
+    monkeypatch.setattr(server,'ensure_network',lambda _: 'owner-network')
+    def docker(*args, **kwargs):
+        calls.append(args)
+        return SimpleNamespace(returncode=0,stdout=json.dumps([info]))
+    monkeypatch.setattr(server,'docker',docker)
+    server.ensure(key)
+    assert calls == [('inspect',name)]
+
+
+def test_temporary_initializers_share_the_owner_resource_cap(server, monkeypatch):
+    key = str(uuid4())
+    monkeypatch.setenv('GXZS_OWNER_CGROUP_PREFIX','gxzs-workbench')
+    monkeypatch.setattr(server,'ensure_network',lambda _: 'owner-network')
+    calls = []
+    def docker(*args, **kwargs):
+        calls.append(args)
+        return SimpleNamespace(returncode=1 if args[0] == 'inspect' else 0,stdout='')
+    monkeypatch.setattr(server,'docker',docker)
+    server.ensure(key)
+    for call in calls:
+        if call[0] in ('create','run'):
+            assert call[call.index('--cgroup-parent') + 1] == server.owner_cgroup(key)
+            assert '--memory' in call and '--cpus' in call and '--pids-limit' in call
+
+
 @pytest.mark.parametrize('volume', ['/srv/private', '../other-home', 'home,volume-subpath=../', '', None])
 def test_attachment_volume_rejects_paths_and_mount_options(server, monkeypatch, volume):
     key = str(uuid4())
@@ -186,3 +217,25 @@ def test_expired_installer_is_killed_and_record_is_bounded(server, monkeypatch):
     monkeypatch.setattr(server, 'OPERATION_RETENTION', 1)
     server.reap_operations(now=3)
     assert not record.exists()
+
+
+@pytest.mark.parametrize('reason', ['capacity', 'thread', 'process'])
+def test_http_resource_failure_returns_correlated_json_without_leaking_capacity(server, monkeypatch, reason):
+    instance = object.__new__(server.BoundedHTTPServer)
+    instance.capacity = server.threading.BoundedSemaphore(1)
+    instance.shutdown_request = Mock()
+    request = Mock()
+    if reason == 'capacity':
+        instance.capacity.acquire()
+    else:
+        failure = RuntimeError('cannot start thread') if reason == 'thread' else OSError(11, 'Resource temporarily unavailable')
+        monkeypatch.setattr(server.ThreadingHTTPServer, 'process_request', Mock(side_effect=failure))
+    instance.process_request(request, ('127.0.0.1', 1))
+    packet = request.sendall.call_args.args[0]
+    headers, body = packet.split(b'\r\n\r\n', 1)
+    value = json.loads(body)
+    assert headers.startswith(b'HTTP/1.1 503')
+    assert value['code'] == ('MANAGER_BUSY' if reason == 'capacity' else 'RESOURCE_BUSY')
+    assert value['retry_after'] == 1 and len(value['request_id']) == 12
+    assert not instance.capacity.acquire(blocking=False) if reason == 'capacity' else instance.capacity.acquire(blocking=False)
+    instance.shutdown_request.assert_called_once_with(request)

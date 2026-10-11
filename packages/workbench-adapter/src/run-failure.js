@@ -37,5 +37,6 @@ export function goalFailureReason(goal, run) {
 
 export function resumeGoalSelection(previous, current) {
   return { ...(previous ?? current),
-    ...(current?.model ? { model: current.model, model_parameters: current.model_parameters ?? {} } : {}), command: 'goal' }
+    ...(current?.model ? { model: current.model, model_parameters: current.model_parameters ?? {} } : {}),
+    silent_resume: false, is_continuation: true, command: 'goal' }
 }

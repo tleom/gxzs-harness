@@ -59,4 +59,10 @@ manager 配置 `GXZS_OWNER_CGROUP_PREFIX=gxzs-workbench`，并将 `GXZS_HOST_CPU
 
 沙盒的 `WORKBENCH_SANDBOX_PIDS_LIMIT` 默认 1024，可配置为正整数；Linux 的该额度同时计算进程和线程。Chromium 与 Node/SSH 工具共用额度，原来的 256 可导致 `pthread_create` / 辅助进程启动失败。manager 在容器镜像、归属网络、附件卷和 cgroup 校验通过后，可在线提高已有容器额度，降低运行中容器额度需先排空。该额度不改变 2 CPU / 4 GiB owner 上限或 3 个运行中主对话限制，也不是子智能体数量限制。
 
+引用搜索辅助进程默认空闲 60 秒退出，`GXZS_REFERENCE_IDLE_MS` 可配置正整数毫秒；查询进行中不回收，工具结果使索引失效不会延长空闲时间。下次引用沿用 DSH 原生索引重新建立，等待旧进程退出后再启动。MCP 连接在空闲 300 秒后回收，管理器最多保留 32 个缓存连接、每个 owner 最多保留 4 个；这些仅是空闲缓存目标，正在调用的连接不受该回收规则限制。MCP 和记忆调用退出尚未确认时仍计入占用，现有回收程序继续确认已结束调用的退出，外部调用的未知结果记录也继续保留。取消和清理不额外创建清理线程；Docker 客户端退出本身不能证明远端进程已退出，必须收到匹配的沙盒退出确认。
+
+manager 的 Docker `--pids-limit` 部署目标为 1024，保留 `WORKBENCH_MANAGER_MAX_OPERATIONS=24` 和 `WORKBENCH_MANAGER_MAX_REQUESTS=32` 的有界并发；额度同时容纳 Docker 客户端线程、MCP 读取线程和控制请求。隔离测试中，10 个 owner 各保留 3 路真实 MCP 连接时 manager 占用 365 个 PID/TID，清理后回到基线 1；256 不足以容纳该场景。该测试验证辅助连接的容量和回收，不代表 30 个模型任务或浏览器任务的完整负载验收。不能用增大额度替代回收。给 manager 增加只读 `/sys/fs/cgroup:/host-cgroup:ro` 挂载，并设置 `WORKBENCH_HOST_CGROUP_ROOT=/host-cgroup`；维护程序从当前 `pids.current/pids.max` 判断压力，在压力解除前暂停新调度并保留运行中的 Host。没有该挂载时无法确认这一压力原因，仍按原健康维护规则处理。不能以累计 `pids.events:max` 单独判断当前故障。
+
+计划调查、预览、环境安装和短暂初始化容器均使用所属 owner 的 `CgroupParent`，计入同一个 2 CPU / 4 GiB 上限及全局池。初始化容器另设 1 CPU / 256 MiB / 128 PID 上限。管理器返回的临时容量错误携带 `code`、`request_id` 和 `retry_after`，网关保留状态及这些字段；重试成功仅清除对应文件读取错误，不自动重发模型消息或外部 MCP 操作。
+
 释放名额发生网络错误时保留投递记录并重试释放，不把已经空闲的对话转入取消流程。已经卡死的执行仍须先确认宿主和工具停止，再回收名额；不能按运行时间长短盲目过期。

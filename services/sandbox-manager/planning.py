@@ -8,6 +8,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import uuid
+from resource_limits import cgroup_args
 
 
 @dataclass
@@ -158,6 +159,8 @@ def inspect_plan(
                 "--name",
                 initializer,
                 *labels,
+                *cgroup_args(key),
+                '--memory', '256m', '--cpus', '1', '--pids-limit', '128',
                 "--network",
                 "none",
                 "--user",
@@ -195,6 +198,8 @@ def inspect_plan(
                 "create",
                 "--name",
                 name,
+                # Every user-work container shares its owner's aggregate cap.
+                *cgroup_args(key),
                 "--label",
                 "workbench=" + prefix,
                 "--label",

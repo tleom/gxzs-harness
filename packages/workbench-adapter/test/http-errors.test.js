@@ -38,4 +38,10 @@ describe('public HTTP error contract', () => {
       expect(serialize(error)).toEqual({ status: 500, code: 'INTERNAL_ERROR', message: '工作台请求失败，请稍后重试' })
     }
   })
+  it('preserves bounded resource correlation metadata and rejects invalid values', () => {
+    const error = Object.assign(httpError(503, '服务繁忙', 'RESOURCE_BUSY'), { request_id: 'req_123', retry_after: 2 })
+    expect(serialize(error)).toEqual({ status: 503, code: 'RESOURCE_BUSY', message: '服务繁忙', request_id: 'req_123', retry_after: 2 })
+    expect(serialize(Object.assign(error, { request_id: '/host/private', retry_after: 61 })))
+      .toEqual({ status: 503, code: 'RESOURCE_BUSY', message: '服务繁忙' })
+  })
 })

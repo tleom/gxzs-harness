@@ -20,5 +20,5 @@ it('formats old persisted terminal events consistently without rewriting their o
 })
 it('uses current model preferences on goal resume while preserving frozen resources', () => {
   expect(resumeGoalSelection({ model: 'old/model', model_parameters: { reasoning_effort: 'off' }, resource_context: 'Original resources' },
-    { model: 'selected/model', model_parameters: { reasoning_effort: 'high' } })).toEqual({ model: 'selected/model', model_parameters: { reasoning_effort: 'high' }, resource_context: 'Original resources', command: 'goal' })
+    { model: 'selected/model', model_parameters: { reasoning_effort: 'high' } })).toEqual({ model: 'selected/model', model_parameters: { reasoning_effort: 'high' }, resource_context: 'Original resources', silent_resume: false, is_continuation: true, command: 'goal' })
 })

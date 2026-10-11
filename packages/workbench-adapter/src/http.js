@@ -35,7 +35,10 @@ export function sendError(res, error) {
   const code = remote ? error.code : status !== 500 && typeof error?.code === 'string' && /^[A-Za-z][A-Za-z0-9_/-]{0,99}$/.test(error.code)
     ? error.code : (STATUS_CODES[status] ?? 'REQUEST_FAILED')
   const message = remote?.message ?? (status === 500 ? '工作台请求失败，请稍后重试' : error?.message || '工作台请求失败，请稍后重试')
-  sendJson(res, status, { code, message })
+  const metadata = {}
+  if (typeof error?.request_id === 'string' && /^[a-zA-Z0-9_-]{1,128}$/.test(error.request_id)) metadata.request_id = error.request_id
+  if (Number.isInteger(error?.retry_after) && error.retry_after >= 0 && error.retry_after <= 60) metadata.retry_after = error.retry_after
+  sendJson(res, status, { code, message, ...metadata })
 }
 
 const GOAL_ERRORS = {

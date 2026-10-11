@@ -1,6 +1,6 @@
 """Owner-scoped host lifecycle. Runtime templates are administrator-controlled."""
 import json
-from resource_limits import cgroup_args, owner_cgroup
+from resource_limits import cgroup_args, owner_cgroup, pid_pressure, ResourceUnavailable
 import logging
 from concurrent.futures import ThreadPoolExecutor
 import ipaddress
@@ -209,7 +209,12 @@ class Hosts:
 
     def _container_identity(self, item, advertise):
         info = json.loads(self.docker('inspect', item['instance_id']).stdout)[0]
-        ports = info['NetworkSettings']['Ports']['3081/tcp']
+        ports = (info.get('NetworkSettings', {}).get('Ports') or {}).get('3081/tcp')
+        if not ports or not isinstance(ports[0], dict) or not str(ports[0].get('HostPort', '')).isdecimal():
+            state = info.get('State', {})
+            logging.getLogger(__name__).warning('Host endpoint unavailable instance=%s running=%s exit_code=%s oom=%s',
+                                              item['instance_id'], state.get('Running'), state.get('ExitCode'), state.get('OOMKilled'))
+            raise ResourceUnavailable('个人 Host 尚未启动就绪，请稍后重试；数据已保留', 'HOST_START_PENDING', 3)
         endpoint = 'http://' + advertise + ':' + str(ports[0]['HostPort'])
         return {'endpoint': endpoint, 'image_digest': info['Image']}
 
@@ -441,6 +446,8 @@ class Hosts:
             alive = bool(healthy or (host_running and item.get('endpoint') and self.alive(item['endpoint'])))
             dependency_degraded = bool(not healthy and alive and sandbox_healthy
                                        and self.dependency_degraded(item['endpoint']))
+            process_pressure = bool(host_running and sandbox_running and
+                                    (pid_pressure(info) or pid_pressure(sandbox_info)))
             with self.lock(record.parent.name):
                 item = json.loads(record.read_text())
                 if item != observed:
@@ -459,7 +466,7 @@ class Hosts:
                     self.failures.pop(item['instance_id'], None)
                     self.recoveries.pop(item['instance_id'], None)
                     return
-                if healthy:
+                if healthy and not process_pressure:
                     self.failures.pop(item['instance_id'], None)
                     self.recoveries.pop(item['instance_id'], None)
                     if item.get('state') == 'draining':
@@ -476,7 +483,7 @@ class Hosts:
                 # degraded state, not evidence that either local container is
                 # damaged. Pause new admission, retain the current generation,
                 # and let the Host's catalog poller recover in place.
-                if dependency_degraded:
+                if dependency_degraded or process_pressure:
                     self.failures.pop(item['instance_id'], None)
                     self.recoveries.pop(item['instance_id'], None)
                     if item.get('ready') is not False:

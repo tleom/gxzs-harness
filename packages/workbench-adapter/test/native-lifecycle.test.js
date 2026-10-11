@@ -11,6 +11,7 @@ import { createAssistantStreamProjector, projectInboxClaim, projectSessionEvent,
 import { apply as applyMcpTools } from '../../workbench-mcp-tools/src/index.js'
 import { registerRunResourceContext } from '../src/resource-mentions.js'
 import { prepareNativeFiles } from '../src/attachments.js'
+import { dispatchRunPrompt } from '../src/native-prompt.js'
 import WorkbenchFileSystem from '../../workbench-sandbox-runtime/src/fs.js'
 
 // Exercise the exact published DSH version installed by the production profile.
@@ -101,6 +102,34 @@ async function fixture(script) {
   return { ctx, db, agent, owner, chat, model, scheduler, runtime, sessions, controllerCtx, requests, create,
     permit: value => { permitted = value } }
 }
+
+it('runs background resume through the native inbox without making it a title input, including replay', async () => {
+  const test = await fixture(['continued answer', 'human answer'])
+  await test.ctx.plugin((await native('dsh-session-title')).default,
+    { fallbackMaxWords: 8, fallbackMaxBytes: 100, maxTitleBytes: 200 })
+  const original = test.create('Goal objective')
+  test.db.transitionRun(test.owner.ownerId, original.id, 'cancelled')
+  const resumed = test.db.createRun({ ownerId: test.owner.ownerId, chatId: test.chat.id, sessionId: test.agent.id,
+    query: 'resume', parentRunId: original.id, selection: { silent_resume: true } }).run
+  await test.scheduler.enqueue(resumed, [{ type: 'text', text: 'resume' }])
+  await test.scheduler.tick()
+  await vi.waitFor(() => expect(test.model.requests).toHaveLength(1))
+  await test.agent.whenIdle()
+  expect(test.db.getRun(test.owner.ownerId, resumed.id).status).toBe('completed')
+  const events = test.agent.session.snapshotEvents()
+  expect(events.filter(event => event.type === 'session/title')).toEqual([])
+  expect(events.find(event => event.type === 'user/message').data.source).toEqual({ kind: 'workbench-resume', rpcId: resumed.id })
+  await dispatchRunPrompt(test.scheduler, resumed, [{ type: 'text', text: 'resume' }])
+  expect(test.model.requests).toHaveLength(1)
+  await reconcileNativeSessions(test.db, { observeSession: async () => ({ events }) }, test.owner.ownerId)
+  expect(test.db.runForTurn(test.agent.id, 1).id).toBe(resumed.id)
+  const human = test.create('中文企业画像')
+  await test.scheduler.enqueue(human, [{ type: 'text', text: human.query }])
+  await test.scheduler.tick()
+  await vi.waitFor(async () => { await test.scheduler.tick(); expect(test.model.requests).toHaveLength(2) })
+  await test.agent.whenIdle()
+  await vi.waitFor(() => expect(test.db.getChat(test.owner.ownerId, test.chat.id).title).toBe(human.query))
+})
 
 it.each(['local', 'native'])('edits and directly sends the selected %s queue item without waiting on unrelated scheduling', async placement => {
   let release
