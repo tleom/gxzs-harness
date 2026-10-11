@@ -43,6 +43,9 @@ const sessionCreate = process.argv.includes('--session-create')
 const realSsh = process.argv.includes('--real-ssh')
 const crashRestart = process.argv.includes('--crash-restart')
 const runningRestart = process.argv.includes('--running-restart')
+const nativeAttachments = process.argv.includes('--native-attachments')
+if (nativeAttachments && (!realSsh || !sessionCreate || !runningRestart || process.env.GXZS_SMOKE_DSH_HOME !== '/srv/dsh'))
+  throw new Error('Native attachment smoke requires the disposable shared home, real SSH and running restart fixture')
 let modelPort
 let modelCalls = 0
 let titleCalls = 0
@@ -50,6 +53,9 @@ let verifyReferenceContext = false
 let verifySkillContext = false
 let referenceContextVerified = false
 let pluginCalls = 0
+let verifyAttachmentContext = false
+let attachmentPaths
+const fixtureFiles = new Map()
 const remote = (command) => execFileSync('ssh', ['-T', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=5',
   process.env.GXZS_SANDBOX_SSH_HOST, command], { encoding: 'utf8', timeout: 10_000 })
 const remoteDirectories = new Set()
@@ -108,12 +114,12 @@ const platform = fixture((req, res) => {
     return
   }
   if (req.method === 'GET' && req.url === '/internal/workbench/workbench/config') {
-    // Readiness has no models. The creation check uses a deliberately unreachable
-    // synthetic route; neither check may perform a model call or submit a task.
+    // Readiness has no models; session checks use the local fixture provider.
     respond(res, 200, { data: sessionCreate ? {
       enabled: true, system_prompt: '', models: { default: 'smoke/smoke', providers: { smoke: {
         api: 'openai-completions', apiKeyEnv: 'GXZS_SMOKE_MODEL_KEY', baseURL: `http://127.0.0.1:${modelPort ?? 1}/v1`,
-        models: [{ id: 'smoke', name: 'Smoke', input: ['text'], contextWindow: 131072, maxTokens: 1024 }],
+        models: [{ id: 'smoke', name: 'Smoke', input: nativeAttachments ? ['text', 'image'] : ['text'], contextWindow: 131072, maxTokens: 1024 },
+          ...(nativeAttachments ? [{ id: 'text-only', name: 'Text only', input: ['text'], contextWindow: 131072, maxTokens: 1024 }] : [])],
       } } },
     } : { enabled: false, system_prompt: '', models: { providers: {}, default: '' } } })
     return
@@ -127,6 +133,23 @@ const manager = fixture((req, res) => {
   if (req.url === `${base}personal-resources`) { respond(res, 200, { skills: [fixtureSkill] }); return }
   if (req.url === `${base}personal-mcp`) { respond(res, 200, { mcp: [] }); return }
   if (req.url === `${base}files`) {
+    const value = req.fixtureBody
+    if (nativeAttachments && ['upload', 'get'].includes(value?.operation)) {
+      assert.match(value.path, /^conversations\/[a-f0-9-]{36}\/native-evidence\.(txt|png)$/)
+      if (value.operation === 'upload') {
+        assert.equal(value.version, null)
+        assert.ok(!fixtureFiles.has(value.path), 'Cold continuation must not upload the attachment again')
+        assert.match(value.data, /^[A-Za-z0-9+/]+={0,2}$/)
+        remote(`printf '%s' '${value.data}' | base64 -d > /workspace/${value.path}`)
+        fixtureFiles.set(value.path, createHash('sha256').update(Buffer.from(value.data, 'base64')).digest('hex'))
+      }
+      const data = remote(`base64 -w0 -- /workspace/${value.path}`)
+      const version = createHash('sha256').update(Buffer.from(data, 'base64')).digest('hex')
+      assert.equal(version, fixtureFiles.get(value.path))
+      respond(res, 200, { path: value.path, name: path.basename(value.path), kind: 'file', version,
+        size: Buffer.from(data, 'base64').length, ...(value.operation === 'get' ? { data } : {}) })
+      return
+    }
     if (sessionCreate) {
       assert.equal(req.fixtureBody?.operation, 'mkdir')
       assert.match(req.fixtureBody.path, /^conversations\/[a-f0-9-]{36}$/)
@@ -168,6 +191,28 @@ const model = fixture((req, res) => {
     referenceContextVerified = true
   }
   modelCalls++
+  if (verifyAttachmentContext) {
+    const text = req.fixtureBody.messages.flatMap(message => typeof message.content === 'string' ? [message.content]
+      : (message.content ?? []).filter(part => part.type === 'text').map(part => part.text)).join('\n')
+    assert.ok(!text.includes('cannot access a readable path') && !text.includes('No local normalized image path'))
+    const readable = [...new Set([...text.matchAll(/"(\/srv\/dsh\/attachments\/v1\/[^"\s]+)"/g)].map(match => match[1]))].sort()
+    assert.equal(readable.length, 2, 'File and image must expose native sandbox paths')
+    if (attachmentPaths) assert.deepEqual(readable, attachmentPaths, 'Cold native history must preserve attachment identity')
+    attachmentPaths = readable
+    for (const target of readable) {
+      assert.match(target, /^\/srv\/dsh\/attachments\/v1\/[A-Za-z0-9/._-]+$/)
+      const remoteBytes = Buffer.from(remote(`base64 -w0 -- ${target}`), 'base64')
+      const localBytes = execFileSync('cat', [path.join(process.env.GXZS_SMOKE_DSH_HOME, 'attachments', target.slice('/srv/dsh/attachments/'.length))])
+      assert.deepEqual(remoteBytes, localBytes, 'Real SSH must read the exact native bytes after restart')
+      if (target.endsWith('.txt')) assert.equal(remoteBytes.toString(), 'durable-native-evidence')
+      else {
+        const imageUrls = req.fixtureBody.messages.flatMap(message => Array.isArray(message.content) ? message.content : [])
+          .filter(part => part.type === 'image_url').map(part => part.image_url.url)
+        assert.ok(imageUrls.some(url => url.startsWith('data:image/') && Buffer.from(url.slice(url.indexOf(',') + 1), 'base64').equals(remoteBytes)),
+          'The model must receive the same normalized image bytes available through SSH')
+      }
+    }
+  }
   res.writeHead(200, { 'content-type': 'text/event-stream' })
   if (verifySkillContext) {
     assert.ok(tools.has('skill'), 'Native skill tool must be available to the actual model')
@@ -338,7 +383,8 @@ try {
   const env = {
     PATH: `${bin}:${process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin'}`,
     HOME: home, USER: 'node', LANG: 'C.UTF-8',
-    DSH_HOME: path.join(root, 'dsh'), DSH_TELEMETRY_DISABLED: '1', DSH_PERMISSION_MODE: 'danger-full-access',
+    DSH_HOME: nativeAttachments ? process.env.GXZS_SMOKE_DSH_HOME : path.join(root, 'dsh'),
+    GXZS_NATIVE_FILE_ATTACHMENTS: nativeAttachments ? '1' : '0', DSH_TELEMETRY_DISABLED: '1', DSH_PERMISSION_MODE: 'danger-full-access',
     GXZS_SMOKE_MODEL_KEY: 'synthetic-model-key',
     GXZS_HOST_OWNER_ID: owner, GXZS_HOST_GENERATION: '1', GXZS_HOST_INSTANCE_ID: instance,
     GXZS_ASSERTION_ISSUER: 'bootstrap-smoke', GXZS_ASSERTION_SIGNING_KEY: signingKey,
@@ -530,6 +576,72 @@ try {
       assert.equal(skillCall?.event.data?.tool_name, 'skill')
       assert.equal(skillCall?.event.data?.display_name, '技能装配测试')
       console.log('PASS named personal skill: native tool dispatch, skill body in model context, historical display name')
+      if (nativeAttachments) {
+        verifyReferenceContext = false
+        verifySkillContext = false
+        const uploads = []
+        for (const [extension, data] of [
+          ['txt', Buffer.from('durable-native-evidence').toString('base64')],
+          ['png', 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII='],
+        ]) {
+          const response = await signedRequest('POST', '/files', { path: `conversations/${target.id}/native-evidence.${extension}`, data, version: null })
+          assert.equal(response.status, 200, 'Actual file upload route must accept the fixture')
+          uploads.push((await response.json()).data)
+        }
+        verifyAttachmentContext = true
+        async function attachmentTurn(query, files = []) {
+          const response = await signedRequest('POST', `/chats/${target.id}/runs`, { query, files, request_key: randomUUID() })
+          assert.equal(response.status, 202)
+          const run = (await response.json()).data
+          const deadline = Date.now() + 20_000
+          while (Date.now() < deadline) {
+            if (fixtureFailure) throw fixtureFailure
+            const state = (await (await signedRequest('GET', `/runs/${run.id}?view=state`)).json()).data
+            if (state.status === 'completed') return run.id
+            assert.ok(!['failed', 'interrupted'].includes(state.status), JSON.stringify(state))
+            await delay(100)
+          }
+          throw new Error('Native attachment turn did not complete')
+        }
+        await attachmentTurn('Read uploaded file and image', uploads.map(({ path, version }) => ({ path, version })))
+        assert.equal(modelCalls, 7)
+        await stopHost()
+        child = spawn('/usr/local/bin/start-workbench', [], { env, detached: true, stdio: ['ignore', 'pipe', 'pipe'] })
+        child.once('error', error => { childError = error })
+        for (const stream of [child.stdout, child.stderr]) stream.on('data', chunk => { hostLogs = (hostLogs + chunk.toString()).slice(-24_000) })
+        await waitForHealth((status, body) => status === 200 && body.ready === true, 'cold native attachment resume', 30_000)
+        await attachmentTurn('Read the same attachments after cold restart')
+        assert.equal(modelCalls, 8, 'Cold continuation must submit only the new user turn')
+        assert.equal(fixtureFiles.size, 2)
+        console.log('PASS native file/image upload: real shared mount, native model paths, exact SSH bytes, cold history continuation without reupload')
+        const current = (await (await signedRequest('GET', `/chats/${target.id}`)).json()).data
+        const changed = await signedRequest('PUT', `/chats/${target.id}/config`, {
+          version: current.version, selection: { ...current.selection, model: 'smoke/text-only' },
+        })
+        assert.equal(changed.status, 200)
+        const rejected = await signedRequest('POST', `/chats/${target.id}/runs`, {
+          query: 'Image validation must remain owned by native DSH',
+          files: uploads.filter(file => file.path.endsWith('.png')).map(({ path, version }) => ({ path, version })),
+          request_key: randomUUID(),
+        })
+        assert.equal(rejected.status, 202)
+        const rejectedId = (await rejected.json()).data.id
+        let rejectedState
+        const rejectionDeadline = Date.now() + 20_000
+        while (Date.now() < rejectionDeadline) {
+          if (fixtureFailure) throw fixtureFailure
+          rejectedState = (await (await signedRequest('GET', `/runs/${rejectedId}`)).json()).data
+          if (['failed', 'completed', 'interrupted'].includes(rejectedState.status)) break
+          await delay(100)
+        }
+        assert.equal(rejectedState.status, 'failed')
+        assert.equal(rejectedState.error, '所选模型不支持图片输入，请选择支持图片的模型后重新发送')
+        assert.ok(rejectedState.events.some(event => event.event === 'workbench_end' && event.error_code === 'session/attachment-invalid'))
+        const stateOnly = (await (await signedRequest('GET', `/runs/${rejectedId}?view=state`)).json()).data
+        assert.equal(stateOnly.error, rejectedState.error)
+        assert.equal(modelCalls, 8, 'Native attachment validation must reject before requesting the model')
+        console.log('PASS native image admission rejection: specific reason preserved in full and state-only history; no model request')
+      }
     }
   }
   if (fixtureFailure) throw fixtureFailure

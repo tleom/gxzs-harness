@@ -5,7 +5,11 @@ manager_image=${2:?manager image}
 sandbox_image=${3:?sandbox image}
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 container_id=''
-cleanup() { if [[ -n "$container_id" ]]; then docker rm -f "$container_id" >/dev/null; fi; }
+attachment_volume=''
+cleanup() {
+  if [[ -n "$container_id" ]]; then docker rm -f "$container_id" >/dev/null; fi
+  if [[ -n "$attachment_volume" ]]; then docker volume rm "$attachment_volume" >/dev/null; fi
+}
 trap cleanup EXIT
 
 docker run --rm --network none --cap-drop ALL --security-opt no-new-privileges:true \
@@ -19,7 +23,13 @@ docker run --rm --network none --entrypoint python "$manager_image" \
 docker run --rm --network none --cap-drop ALL --security-opt no-new-privileges:true \
   --memory 2g --cpus 2 --pids-limit 256 --entrypoint node "$sandbox_image" /opt/workbench/verify-runtime.mjs
 
+attachment_volume="gxzs-smoke-attachments-$(date +%s)-$$"
+docker volume create "$attachment_volume" >/dev/null
+docker run --rm --network none --user 0 --entrypoint /usr/local/bin/python \
+  -v "$attachment_volume:/srv/dsh" "$sandbox_image" -I -S -c \
+  "import os;os.chown('/srv/dsh',1000,1000);os.makedirs('/srv/dsh/attachments');os.chown('/srv/dsh/attachments',1000,1000);os.chmod('/srv/dsh/attachments',0o700)"
 container_id=$(docker run -d --network none --cap-drop ALL --security-opt no-new-privileges:true \
+  --mount "type=volume,source=$attachment_volume,destination=/srv/dsh/attachments,volume-subpath=attachments,readonly" \
   --memory 2g --cpus 2 --pids-limit 256 "$sandbox_image" sleep 600)
 for attempt in {1..15}; do
   if docker exec "$container_id" /usr/local/bin/python -I -S -c \
@@ -28,7 +38,7 @@ for attempt in {1..15}; do
   sleep 1
 done
 python3 "$script_dir/smoke-sandbox-ssh.py" "$container_id" "$host_image"
-GXZS_SMOKE_BOOTSTRAP=1 GXZS_SMOKE_CRASH=1 GXZS_SMOKE_RUNNING=1 \
+GXZS_SMOKE_BOOTSTRAP=1 GXZS_SMOKE_CRASH=1 GXZS_SMOKE_RUNNING=1 GXZS_SMOKE_NATIVE_ATTACHMENTS=1 \
   python3 "$script_dir/smoke-sandbox-ssh.py" "$container_id" "$host_image"
 docker exec "$container_id" /opt/office/python/bin/python -c \
   "from docx import Document;d=Document();d.add_paragraph('中文预览验证');d.save('/tmp/check.docx')"

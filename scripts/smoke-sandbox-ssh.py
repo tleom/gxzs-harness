@@ -103,8 +103,8 @@ def verify(container, host_image=None):
                stdin=json.dumps({'private': key.read_text(), 'public': key.with_suffix('.pub').read_text(),
                                  'known_hosts': known}))
         if host_image:
-            # Share only this disposable sandbox's network namespace. The host
-            # receives fresh fixture SSH keys, never sandbox/user data mounts.
+            # The host shares the disposable sandbox's network namespace and
+            # fixture SSH keys; attachment checks also mount its dedicated home.
             ssh_folder = folder / 'ssh'
             (ssh_folder / 'known_hosts').write_text(known)
             (ssh_folder / 'config').write_text('Host fixture-sandbox\n  HostName 127.0.0.1\n'
@@ -114,12 +114,20 @@ def verify(container, host_image=None):
             helper_hash = docker('exec', container, 'sha256sum',
                 '/opt/dsh/node_modules/@deepseek-ai/dsh-ssh/lib/helper.js').stdout.split()[0]
             scripts = Path(__file__).resolve().parent
+            attachment_args = []
+            if os.environ.get('GXZS_SMOKE_NATIVE_ATTACHMENTS') == '1':
+                info = json.loads(docker('inspect', container).stdout)[0]
+                mount = next(item for item in info['Mounts'] if item['Destination'] == '/srv/dsh/attachments')
+                assert mount['Type'] == 'volume' and mount['RW'] is False
+                attachment_args = ['--mount', 'type=volume,source=' + mount['Name'] + ',destination=/srv/dsh',
+                                   '-e', 'GXZS_SMOKE_DSH_HOME=/srv/dsh']
             host = docker('create', '--network', 'container:' + container,
                     '--user', '1000:1000', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges:true',
                     '--memory', '1g', '--cpus', '2', '--pids-limit', '256',
                     '-v', str(scripts) + ':/smoke:ro', '-e', 'GXZS_SANDBOX_SSH_HOST=fixture-sandbox',
                     '-e', 'GXZS_SANDBOX_HELPER_HASH=' + helper_hash,
                     '-e', 'GXZS_SMOKE_LONG_SECONDS=' + str(long_seconds),
+                    *attachment_args,
                     '--entrypoint', 'sleep', host_image, str(max(300, long_seconds + 240))).stdout.strip()
             try:
                 # Preserve UID 1000 through the Docker archive API even when
@@ -147,6 +155,8 @@ def verify(container, host_image=None):
                             extra.append('--crash-restart')
                         if os.environ.get('GXZS_SMOKE_RUNNING') == '1':
                             extra.append('--running-restart')
+                        if attachment_args:
+                            extra.append('--native-attachments')
                     result = subprocess.run(['docker', 'exec', host, 'node', '/smoke/' + script, *extra],
                                             text=True, capture_output=True, timeout=max(150, long_seconds + 90) if extra else 65)
                     print(result.stdout, end='')

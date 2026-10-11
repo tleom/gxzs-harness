@@ -44,7 +44,7 @@ metadata:
 | --- | --- | --- |
 | 外部 MCP JSON Schema | 原生 tools 校验是子集，不接受 minimum、maximum、minItems、maxItems、format 等服务器字段 | 唯一兼容模块 `workbench-mcp-tools/src/schema.js`。原生接受的 schema 原样传入；需要兼容时仅投影当前支持的额外约束为说明，原始 schema 用标准 Ajv 校验。删除自写的不完整参数验证器。未支持的其他结构仍报错，不静默放宽 |
 | MCP publicToolName | 此版本 root export 只有 createMcpToolDefinition，没有导出原生 publicToolName；发布包也不包含 src | `names.js` 集中保持与 DSH 同一命名算法（字符规则、64 字符上限和哈希后缀）。上游公开该函数后应直接替换这一处；没有在 Java/前端另写算法 |
-| 普通文件附件 receipt | 原生 fileUploads 依赖 attachment-local；LLM 文件路径经 fileHostPath → fs.processPathFromHostPath。当前 SSH filesystem 不提供远程附件映射 | 非图片附件的远程路径说明仍集中在 `attachments.js`，没有假装已经原生化。暂不把文件存入 Host 来换取原生 receipt。图片已消除重复路径说明 |
+| 普通文件附件 receipt | 原生 fileUploads → attachment-local → fileHostPath → fs.processPathFromHostPath → 原生 LLM 文件提示 | 启用 `GXZS_NATIVE_FILE_ATTACHMENTS=1` 的 owner Host 将附件子目录只读挂载到其沙盒；Workbench SSH filesystem 只映射该共享目录。队列保留上传字节，投递时由 DSH 创建 receipt；历史保存原生附件引用，恢复时重新计算沙盒可读路径 |
 | workspace-files 与产品文件 API | 原生 workspace-files 按 session cwd 读取，read/stat 的范围与产品工作区边界不同；版本 token、目录 stat、CAS、批量下载接口也不等价 | 产品文件 API 继续集中走 workbench-file-manager → sandbox-manager/file_ops.py。模型常规 fs/read/write/edit/glob/grep/bash 保持 DSH SSH/runtime。没有先检查一次路径、再用不受相同 fd 约束的 Host 读取方式替换 |
 | 分支标题与 Workbench 展示历史 | DSH 的标题递增规则在 client 端私有函数；Workbench 还有 runs、用户反馈、标签、问题历史和自身 SSE 投影 | 标题规则保留在 fork-chat.js；Workbench 展示记录复制用于当前 UI 兼容，DSH 模型历史由原生 fork 负责。未宣称 Workbench Session/cache/SSE 已全面变为单一原生事实源 |
 | 旧 opaque MCP 历史记录 | 历史持久记录保留当时的名字 | 新目录、新调用改用公共名称；没有批量改写旧日志或已结束会话历史 |

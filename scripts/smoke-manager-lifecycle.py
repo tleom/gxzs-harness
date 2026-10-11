@@ -1,6 +1,9 @@
 """Disposable manager + real Docker file lifecycle; no production credentials."""
 import concurrent.futures
+import hashlib
+import ipaddress
 import json
+import os
 import secrets
 import subprocess
 import sys
@@ -63,6 +66,9 @@ def healthy():
 
 def files(workspace, operation, **values):
     result = request('/sandboxes/' + workspace + '/files', {'operation': operation, **values})
+    if result['status'] != 200:
+        logs = docker('logs', manager, check=False)
+        print((logs.stdout + logs.stderr).replace(token, '[fixture-redacted]')[-6000:], file=sys.stderr)
     assert result['status'] == 200, result
     return result['body']
 
@@ -75,6 +81,20 @@ try:
            '-e', 'WORKBENCH_SANDBOX_NETWORK=' + prefix,
            '-e', 'WORKBENCH_SANDBOX_IMAGE=' + sandbox_image, manager_image)
     healthy()
+    # Optional explicit test ranges avoid consuming the daemon's production pool.
+    if os.environ.get('GXZS_SMOKE_SUBNETS'):
+        subnets = [ipaddress.ip_network(value) for value in os.environ['GXZS_SMOKE_SUBNETS'].split(',')]
+        assert len(subnets) == len(workspaces) and all(value.version == 4 for value in subnets)
+        assert not subnets[0].overlaps(subnets[1])
+        networks = docker('network', 'ls', '-q').stdout.split()
+        used = [ipaddress.ip_network(config['Subnet'])
+                for network in json.loads(docker('network', 'inspect', *networks).stdout)
+                for config in (network.get('IPAM', {}).get('Config') or []) if config.get('Subnet')]
+        assert not any(subnet.version == existing.version and subnet.overlaps(existing) for subnet in subnets for existing in used)
+        for workspace, subnet in zip(workspaces, subnets):
+            docker('network', 'create', '--driver', 'bridge', '--subnet', str(subnet),
+                   '--label', 'workbench=' + prefix, '--label', 'gxzs.workspace=' + workspace,
+                   prefix + '-' + hashlib.sha256(workspace.encode()).hexdigest()[:16])
 
     def populate(index):
         workspace = workspaces[index]
@@ -92,6 +112,14 @@ try:
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
         results = list(pool.map(populate, range(2)))
     print('PASS real manager: parallel owner provisioning, binary roundtrip, stale-version conflict', flush=True)
+    sandbox = prefix + '-' + workspaces[0]
+    before = json.loads(docker('inspect', sandbox).stdout)[0]
+    assert before['HostConfig']['PidsLimit'] == 1024
+    docker('update', '--pids-limit', '256', sandbox)
+    assert files(workspaces[0], 'get', path='probe/data.bin')['data'] == results[0][1]
+    after = json.loads(docker('inspect', sandbox).stdout)[0]
+    assert after['HostConfig']['PidsLimit'] == 1024 and after['State']['StartedAt'] == before['State']['StartedAt']
+    print('PASS thread limit: running legacy sandbox updated from 256 to 1024 without restart', flush=True)
     with tempfile.TemporaryDirectory(prefix=prefix) as host_state:
         (Path(host_state) / 'hosts' / workspaces[0] / 'ssh').mkdir(parents=True)
         create_host = '''

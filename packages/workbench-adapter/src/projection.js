@@ -1,4 +1,5 @@
 import { nativeCommandRun } from './native-command.js'
+import { presentRunEvent } from './run-failure.js'
 
 const END_STATUS = {
   completed: 'completed', aborted: 'cancelled', error: 'failed',
@@ -139,7 +140,8 @@ function projectEvent(database, sessionId, event, expectedOwnerId, context) {
         return append({ event: 'workbench_status', status: 'running', turn, goal_round_complete: true })
       }
       database.transitionRun(chat.ownerId, run.id, status, error)
-      return append({ event: 'workbench_end', status, error })
+      return append(presentRunEvent({ event: 'workbench_end', status, error,
+        ...(event.data?.reason?.error?.code ? { error_code: event.data.reason.error.code } : {}) }))
     }
     case 'deliverables/presented':
     case 'workspace/changes':
@@ -179,6 +181,7 @@ export function nativePresentation(run, event, { streamed = false, toolName = ''
       const id = messageRun?.id ?? event.data?.source?.rpcId
       if (typeof id !== 'string' || id === run.id || (run.messageId && run.messageId === event.data?.id)) return []
       return [{ event: 'workbench_steering', steering_id: id,
+        created_at: messageRun?.createdAt != null ? messageRun.createdAt / 1000 : undefined,
         query: messageRun?.query ?? contentText(event.data?.content?.slice(0, 1)), native: event }]
     }
     case 'deliverables/presented':
@@ -200,7 +203,7 @@ export function nativePresentation(run, event, { streamed = false, toolName = ''
         data: { kind: 'tool', workbench_run_id: run.id, call_id: callId, tool_call_id: callId,
           tool_name: toolName, activity_id: callId,
           ...toolPresentation(run, { name: toolName }),
-          stage: event.data?.error || block?.isError ? 'error' : 'returned',
+          stage: event.data?.error || event.data?.message?.isError || block?.isError ? 'error' : 'returned',
           output: contentText(block?.content ?? event.data?.message?.content),
           ...(event.data?.meta === undefined ? {} : { result_meta: event.data.meta }),
         } }]

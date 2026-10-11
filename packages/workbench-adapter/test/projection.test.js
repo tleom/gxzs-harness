@@ -130,6 +130,22 @@ describe('DSH session event projection', () => {
     expect(tools[1].data).toMatchObject({ tool_name: 'bash', stage: 'returned', output: '/workspace' })
   })
 
+  it.each([true, false])('preserves native ToolResultMessage isError=%s without error metadata', (isError) => {
+    const { database, chat, run } = setup()
+    bind(database, chat, run)
+    projectSessionEvent(database, chat.sessionId, {
+      type: 'tool/call', data: { turn: 1, callId: 'native-result', name: 'read', arguments: {} },
+    })
+    projectSessionEvent(database, chat.sessionId, { type: 'tool/result', data: {
+      turn: 1, message: { role: 'tool', source: { kind: 'tool', callId: 'native-result' },
+        toolCallId: 'native-result', content: [{ type: 'text', text: 'tool response' }], isError },
+    } })
+    expect(database.eventsAfter(chat.ownerId, run.id, 0).at(-1).data).toMatchObject({
+      tool_name: 'read', call_id: 'native-result', stage: isError ? 'error' : 'returned', output: 'tool response',
+    })
+    expect(database.getRun(chat.ownerId, run.id).status).toBe('running')
+  })
+
   it('preserves DSH result metadata for typed frontend cards', () => {
     const { database, chat, run } = setup()
     bind(database, chat, run)

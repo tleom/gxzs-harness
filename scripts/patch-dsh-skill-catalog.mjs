@@ -13,8 +13,9 @@ async function replaceExact(path, changes) {
   let source = await readFile(path, 'utf8')
   for (const [before, after] of changes) {
     if (source.includes(after)) continue
-    if (source.split(before).length !== 2) throw new Error(`DSH catalog patch anchor changed: ${path}`)
-    source = source.replace(before, after)
+    const anchors = (Array.isArray(before) ? before : [before]).filter(value => source.split(value).length === 2)
+    if (anchors.length !== 1) throw new Error(`DSH catalog patch anchor changed: ${path}`)
+    source = source.replace(anchors[0], after)
   }
   await writeFile(path, source)
 }
@@ -33,7 +34,11 @@ await replaceExact(catalog, [
     'return entries.map((entry) => `- \\`${entry.name}\\`${entry.displayName && entry.displayName !== entry.name ? `（${escapeText(entry.displayName)}）` : ""}: ${escapeText(entry.description)}`);',
   ],
   [
-    'JSON.stringify([entry.name, entry.description])',
-    'JSON.stringify([entry.name, entry.displayName, entry.description])',
+    ['JSON.stringify([entry.name, entry.description])', 'JSON.stringify([entry.name, entry.displayName, entry.description])'],
+    'JSON.stringify([entry.name, entry.displayName ?? entry.name, entry.description])',
+  ],
+  [
+    'const { name, description } = entry;\n\t\tif (typeof name !== "string" || name === "" || typeof description !== "string") return void 0;\n\t\treadable.push({\n\t\t\tname,\n\t\t\tdescription',
+    'const { name, displayName, description } = entry;\n\t\tif (typeof name !== "string" || name === "" || typeof description !== "string") return void 0;\n\t\treadable.push({\n\t\t\tname,\n\t\t\tdisplayName: typeof displayName === "string" && displayName.trim() ? displayName : name,\n\t\t\tdescription',
   ],
 ])

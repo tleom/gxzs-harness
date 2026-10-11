@@ -4,6 +4,15 @@ import { WorkbenchDatabase } from '../src/persistence.js'
 import { WorkbenchService } from '../src/service.js'
 import { projectSessionEvent } from '../src/projection.js'
 import { publishedModels } from './model-fixture.js'
+import { Context } from '@deepseek-ai/cordis'
+import SessionReferences from '@deepseek-ai/dsh-session-reference'
+import { goalFailureReason } from '../src/run-failure.js'
+
+function referenceResolver(test, candidates) {
+  test.service.sessionQuery = { listSessions: vi.fn(async () => candidates),
+    observeSession: async () => ({ header: { cwd: test.service.chatDirectory(test.chat.id) } }) }
+  test.service.sessionReferences = { config: { candidateLimit: 50 }, listCandidates: vi.fn(async () => candidates) }
+}
 
 const opened = []
 afterEach(() => opened.splice(0).forEach((database) => database.close()))
@@ -58,6 +67,20 @@ function activateNative(test, runId, queued = []) {
 }
 
 describe('followup and control service', () => {
+  it('uses the persisted native error code in full history, state snapshots and goal reasons', () => {
+    const { service, database, owner, chat } = setup()
+    const { run } = database.createRun({ ownerId: owner.ownerId, chatId: chat.id, sessionId: chat.sessionId, query: 'evidence', selection: {} })
+    database.bindRunMessage(chat.sessionId, run.id, 1, 'native-message')
+    database.setGoalRun(chat.sessionId, run.id)
+    const nativeError = { code: 'data_inspection_failed', message: 'Input text data may contain inappropriate content.' }
+    const live = projectSessionEvent(database, chat.sessionId, { type: 'turn/end', seq: 2, data: { turn: 1, reason: { kind: 'error', error: nativeError } } })
+    expect(service.getRun(owner, run.id).error).toBe(live.error)
+    expect(service.getRun(owner, run.id, false).error).toBe(live.error)
+    expect(service.inputRunDto(owner, database.listRuns(owner.ownerId, chat.id)[0]).error).toBe(live.error)
+    expect(goalFailureReason({ phase: 'active', activation: 'disarmed' }, database.goalRun(chat.sessionId))).toBe(live.error)
+    expect(database.getRun(owner.ownerId, run.id).error).toBe(nativeError.message)
+    expect(database.runErrorCode('foreign-owner', run.id)).toBeUndefined()
+  })
   it('opens history with steering at its native position before follow connects', async () => {
     const { service, owner, chat, database, sessionController } = setup()
     const { run } = database.createRun({ ownerId: owner.ownerId, chatId: chat.id, sessionId: chat.sessionId, query: 'first', selection: {} })
@@ -215,28 +238,78 @@ describe('followup and control service', () => {
     expect(service.chatSummary(owner, chat).pending_interaction).toBe('question')
   })
   it('lists native file references before conversation references and passes the same cancellation signal', async () => {
-    const { service, owner, chat, agent } = setup()
+    const test = setup()
+    const { service, owner, chat, agent } = test
     const signal = new AbortController().signal
     service.fileReferences = { list: vi.fn(async () => [{ path: '证据 原件.pdf', kind: 'file' }, { path: '材料', kind: 'directory' }]) }
-    service.sessionReferences = { remoteExportCandidates: vi.fn(async () => [{ sessionId: chat.sessionId, label: '当前对话', mention: 'native' }]) }
+    referenceResolver(test, [{ sessionId: chat.sessionId, label: '当前对话' }])
     const candidates = await service.referenceCandidates(owner, chat.id, '证据', signal)
     expect(candidates.map(item => item.group ?? 'sessions')).toEqual(['files', 'files', 'sessions'])
     expect(candidates[0]).toMatchObject({ path: '证据 原件.pdf', kind: 'file' })
     expect(service.fileReferences.list).toHaveBeenCalledWith(agent, '证据', signal)
-    expect(service.sessionReferences.remoteExportCandidates).toHaveBeenCalledWith(agent, '证据', signal)
+    expect(service.sessionReferences.listCandidates).toHaveBeenCalledWith(agent, '证据', 1, signal)
   })
   it('uses native reference candidates and keeps only owner conversations without host paths', async () => {
-    const { service, owner, chat, database, agent } = setup()
+    const test = setup()
+    const { service, owner, chat, database, agent } = test
     const source = database.createChat({ ownerId: owner.ownerId, sessionId: 'source', selection: {} })
-    service.sessionReferences = { remoteExportCandidates: vi.fn(async () => [
-      { sessionId: 'source', label: '案件', mention: '@[案件](dsh-session:InNvdXJjZSI)', cwd: '/workspace/private' },
-      { sessionId: 'foreign', label: 'other', mention: 'foreign' },
-    ]) }
+    referenceResolver(test, [
+      { sessionId: 'source', label: '案件', cwd: '/workspace/private' },
+      { sessionId: 'foreign', label: 'other' },
+    ])
     expect(await service.referenceCandidates(owner, chat.id, '案件')).toEqual([
       { sessionId: 'source', chatId: source.id, label: '案件', mention: '@[案件](dsh-session:InNvdXJjZSI)' },
     ])
-    expect(service.sessionReferences.remoteExportCandidates).toHaveBeenCalledWith(agent, '案件', expect.any(AbortSignal))
+    expect(service.sessionReferences.listCandidates).toHaveBeenCalledWith(agent, '案件', 2, expect.any(AbortSignal))
     await expect(service.referenceCandidates({ ownerId: 'other' }, chat.id)).rejects.toMatchObject({ status: 404 })
+  })
+  it('excludes archived native sessions from reference candidates and restores them after unarchiving', async () => {
+    const test = setup()
+    const { service, owner, chat, database } = test
+    const source = database.createChat({ ownerId: owner.ownerId, sessionId: 'source', selection: {} })
+    let archivedSessionIds = ['source']
+    service.workspaces = { baseline: vi.fn(async () => ({ archivedSessionIds })) }
+    service.fileReferences = { list: vi.fn(async () => [{ path: '证据.pdf', kind: 'file' }]) }
+    referenceResolver(test, [{ sessionId: 'source', label: '案件' }])
+    const signal = new AbortController().signal
+    expect(await service.referenceCandidates(owner, chat.id, '', signal)).toEqual([
+      { path: '证据.pdf', kind: 'file', group: 'files', label: '证据.pdf' },
+    ])
+    expect(service.workspaces.baseline).toHaveBeenCalledWith(owner, signal)
+    archivedSessionIds = []
+    expect((await service.referenceCandidates(owner, chat.id)).at(-1)).toMatchObject({ chatId: source.id })
+  })
+  it('applies native candidate limits after archive and ownership filtering, resolving renamed mentions by native URI', async () => {
+    const { service, owner, chat, database, agent } = setup()
+    const records = [], archivedSessionIds = []
+    const cwd = service.chatDirectory(chat.id)
+    for (let index = 0; index < 55; index++) {
+      const sessionId = `archived-${index}`
+      database.createChat({ ownerId: owner.ownerId, sessionId, selection: {} })
+      archivedSessionIds.push(sessionId)
+      records.push({ header: { id: sessionId, cwd, createdAt: index } })
+    }
+    for (let index = 0; index < 55; index++) {
+      const sessionId = `visible-${index}`
+      database.createChat({ ownerId: owner.ownerId, sessionId, selection: {} })
+      records.push({ header: { id: sessionId, cwd, createdAt: 55 + index }, projections: { sessionTitle: { title: '新标题' } } })
+    }
+    const ctx = new Context()
+    try {
+      ctx.provide('sessionQuery', { listSessions: vi.fn(async () => records) })
+      service.sessionQuery = ctx.sessionQuery
+      agent.session = { header: { cwd } }
+      service.sessionReferences = new SessionReferences(ctx)
+      service.workspaces = { baseline: async () => ({ archivedSessionIds }) }
+      const candidates = await service.referenceCandidates(owner, chat.id)
+      expect(candidates).toHaveLength(50)
+      expect(candidates.every(item => item.sessionId.startsWith('visible-'))).toBe(true)
+      const uri = candidates[0].mention.match(/\]\(([^)]+)\)$/)[1]
+      expect(await service.referenceCandidates(owner, chat.id, uri)).toEqual([candidates[0]])
+      archivedSessionIds.push(candidates[0].sessionId)
+      expect(await service.referenceCandidates(owner, chat.id, uri)).toEqual([])
+      await expect(service.referenceCandidates(owner, chat.id, 'dsh-session:invalid')).rejects.toMatchObject({ status: 400 })
+    } finally { await ctx.fiber.dispose() }
   })
   it('creates a native workspace session and persists its directory without deleting workspace files', async () => {
     const { service, owner, database, sessionController, fileManager } = setup()
@@ -390,7 +463,7 @@ describe('followup and control service', () => {
     expect(direct).toMatchObject({ status: 'steered', steer_target_run_id: active.id })
     expect(sessionController.updateQueue).toHaveBeenCalledWith({ sessionId: chat.sessionId, itemId: 'message-first', action: { kind: 'steer' } })
     expect(database.getRun(owner.ownerId, second.id).parentRunId).toBe(active.id)
-    expect(service.getChat(owner, chat.id).runs.find((run) => run.id === active.id).steering_messages).toMatchObject([{ id: first.id, query: 'first' }])
+    expect(service.getChat(owner, chat.id).runs.find((run) => run.id === active.id).steering_messages).toMatchObject([{ id: first.id, query: 'first', created_at: first.created_at }])
     expect(service.followups(owner, chat.id, [first.id]).runs.find((run) => run.id === first.id).steer_target_run_id).toBe(active.id)
     await expect(service.steer(owner, first.id, active.id)).resolves.toMatchObject({ status: 'steered', steer_target_run_id: active.id })
     expect(sessionController.updateQueue).toHaveBeenCalledTimes(1)
@@ -984,11 +1057,30 @@ describe('followup and control service', () => {
     const result = await service.issueCommand(owner, chat.id, { command: `/goal ${control}`, request_key: 'resume-command' })
     const resumed = database.getRun(owner.ownerId, result.run.id)
     expect(resumed.id).not.toBe(previous.id)
-    expect(resumed.selection).toEqual(previous.selection)
+    expect(resumed.selection).toEqual({ ...previous.selection, model: chat.selection.model, model_parameters: {} })
     expect(resumed.attachments).toEqual(attachments)
     expect(resumed.mcpTools).toEqual(mcpTools)
     expect(freeze).not.toHaveBeenCalled()
     expect(commands.execute).toHaveBeenCalledWith(agent, `/goal ${control}`, [], expect.any(AbortSignal))
+  })
+
+  it('shows provider rejection in historical Goal state and resumes with current model preferences', async () => {
+    const { owner, chat, service, database } = setup()
+    const raw = '400 data: {"error":{"code":"data_inspection_failed","message":"Input text data may contain inappropriate content."}}'
+    const previous = database.createRun({ ownerId: owner.ownerId, chatId: chat.id, sessionId: chat.sessionId,
+      query: 'Report', selection: { command: 'goal', model: 'old/model', resource_context: 'Original evidence' }, mcpTools: [] }).run
+    database.setGoalRun(chat.sessionId, previous.id)
+    database.transitionRun(owner.ownerId, previous.id, 'failed', raw)
+    database.appendEvent(owner.ownerId, previous.id, { event: 'workbench_end', status: 'failed', error: raw })
+    const goal = { id: 'g1', revision: 1, objective: 'Report', phase: 'active', activation: 'disarmed' }
+    service.goals = { get: () => goal, resume: vi.fn() }
+    expect((await service.getControl(owner, chat.id)).goal.reason).toContain('模型服务拒绝')
+    const dto = service.getRun(owner, previous.id)
+    expect(dto.error).toContain('相同上下文')
+    expect(dto.events[0]).toMatchObject({ error_code: 'data_inspection_failed', error: dto.error })
+    expect(database.getRun(owner.ownerId, previous.id).error).toBe(raw)
+    const result = await service.mutateGoal(owner, chat.id, 'resume', { ref: { id: goal.id, revision: goal.revision } })
+    expect(database.getRun(owner.ownerId, result.run.id).selection).toMatchObject({ model: 'p/m', resource_context: 'Original evidence' })
   })
 
   it('resumes a cold DSH session before executing a control command', async () => {

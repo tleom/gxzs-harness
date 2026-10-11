@@ -3,6 +3,7 @@ import { readSkillDefinition, skillDisplayName } from '@gxzs/dsh-workbench-sandb
 import { randomUUID } from 'node:crypto'
 import path from 'node:path'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
+import { decodeSessionReferenceUri, formatSessionReferenceMention } from '@deepseek-ai/dsh-session-reference'
 import { admitSandboxAttachments, prepareNativeFiles } from './attachments.js'
 import { normalizeResourceMentions, appendResourceInstructions } from './resource-mentions.js'
 import { httpError } from './http.js'
@@ -17,6 +18,7 @@ import { nativePresentation } from './projection.js'
 import { HistoryPresentation } from './history-presentation.js'
 import { withGoalUpdates } from './goal-updates.js'
 import { withNativeCommandRun, nativeCommandRecords } from './native-command.js'
+import { goalFailureReason, presentRunEvent, resumeGoalSelection, runFailure } from './run-failure.js'
 
 export class WorkbenchService {
   constructor({ database, sessionController, agents, commands, skills, fileManager, platformClient, workspace, sessionQuery, agentPresets, agentDefaultModel, modelSettings, scheduler, attachments, goals, fileUploads, nativeFileAttachments = false }) {
@@ -63,14 +65,28 @@ export class WorkbenchService {
     await this.ensureChatSession(owner, chat)
     const agent = this.agents.get(chat.sessionId)
     if (!agent || !this.sessionReferences) throw httpError(503, '对话引用服务尚未就绪')
-    const [files, candidates] = await Promise.all([
-      this.fileReferences ? this.fileReferences.list(agent, query, signal) : [],
-      this.sessionReferences.remoteExportCandidates(agent, query, signal),
+    const byIdentity = query.startsWith('dsh-session:')
+    let sessionQuery = query
+    if (byIdentity) {
+      try { sessionQuery = decodeSessionReferenceUri(query) }
+      catch { throw httpError(400, '无效的对话引用') }
+    }
+    const [files, metadata, workspace] = await Promise.all([
+      this.fileReferences && !byIdentity ? this.fileReferences.list(agent, query, signal) : [],
+      this.sessionQuery.listSessions(signal),
+      this.workspaces?.baseline(owner, signal),
     ])
-    const allowed = new Map(this.database.listChats(owner.ownerId).map(item => [item.sessionId, item.id]))
+    // DSH owns matching and ranking. Apply its display limit after platform visibility.
+    const candidates = await this.sessionReferences.listCandidates(agent, sessionQuery, Math.max(1, metadata.length), signal)
+    const archived = new Set(workspace?.archivedSessionIds ?? [])
+    const allowed = new Map(this.database.listChats(owner.ownerId)
+      .filter(item => !archived.has(item.sessionId)).map(item => [item.sessionId, item.id]))
     return [
       ...files.map(item => ({ ...item, group: 'files', label: item.path })),
-      ...candidates.filter(item => allowed.has(item.sessionId)).map(({ cwd, ...item }) => ({ ...item, chatId: allowed.get(item.sessionId) })),
+      ...candidates.filter(item => allowed.has(item.sessionId) && (!byIdentity || item.sessionId === sessionQuery))
+        .slice(0, this.sessionReferences.config.candidateLimit)
+        .map(({ cwd, ...item }) => ({ ...item, chatId: allowed.get(item.sessionId),
+          mention: formatSessionReferenceMention({ sessionId: item.sessionId, label: item.displayTitle ?? item.label }) })),
     ]
   }
 
@@ -664,7 +680,7 @@ export class WorkbenchService {
             ? this.goals?.get(agent)?.objective ?? '继续目标' : line.replace(/^\/goal\s+(?:edit\s+)?/i, '')
           goalRun = this.database.createRun({ ownerId: owner.ownerId, chatId, sessionId: chat.sessionId,
             query: objective, attachments: previous?.attachments ?? admitted.attachments, selection: previous
-              ? { ...previous.selection, command: 'goal' } : { ...chat.selection, command: 'goal', resource_mentions: mentions,
+              ? resumeGoalSelection(previous.selection, chat.selection) : { ...chat.selection, command: 'goal', resource_mentions: mentions,
               mentioned_resources: await this.mentionSnapshot(mentions, mcpTools), skill_names: await this.skillNames(),
               resource_context: resourceContext }, mcpTools, requestKey: `goal:${requestKey}` }).run
           createdGoalRun = true
@@ -738,7 +754,7 @@ export class WorkbenchService {
         const active = this.database.activeRunBySession(chat.sessionId)
         if (!active || !['running', 'waiting_input'].includes(active.status)) {
           resumedRun = this.database.createRun({ ownerId: owner.ownerId, chatId, sessionId: chat.sessionId,
-            query: current.objective, selection: { ...(previous?.selection ?? chat.selection), command: 'goal' },
+            query: current.objective, selection: resumeGoalSelection(previous?.selection, chat.selection),
             attachments: previous?.attachments ?? [], mcpTools: previous?.mcpTools ?? await this.freezeMcpTools(owner, []),
           }).run
           this.database.setGoalRun(chat.sessionId, resumedRun.id)
@@ -764,7 +780,7 @@ export class WorkbenchService {
     if (!agent && state.goal) state = { ...state, goal: { ...state.goal, activation: 'disarmed' } }
     if (agent && this.goals) {
       const goal = this.goals.get(agent)
-      state = { ...state, goal: goal ? { ...goal, reason: goal.blockedReason?.message ?? null,
+      state = { ...state, goal: goal ? { ...goal, reason: goalFailureReason(goal, this.database.goalRun(chat.sessionId)),
         max_rounds: goal.maxGoalRounds, rounds_started: goal.roundsStarted, last_run_id: this.database.goalRun(chat.sessionId)?.id ?? null } : null }
     }
     if (!this.sessionQuery) return state
@@ -775,7 +791,7 @@ export class WorkbenchService {
         const projection = source.projections?.values?.goal
         const goal = projection?.goal
         state = { ...state, goal: goal ? { ...goal, activation: 'disarmed',
-          reason: goal.blockedReason?.message ?? null, max_rounds: goal.maxGoalRounds,
+          reason: goalFailureReason({ ...goal, activation: 'disarmed' }, this.database.goalRun(chat.sessionId)), max_rounds: goal.maxGoalRounds,
           rounds_started: projection.roundsStarted, last_run_id: this.database.goalRun(chat.sessionId)?.id ?? null } : null }
       }
       return { ...state, plan, contextPressure: source.projections?.values?.contextPressure ?? null,
@@ -998,12 +1014,13 @@ export class WorkbenchService {
     const steering = events.length ? events.filter(event => event.event === 'workbench_steering' || event.event === 'workbench_steered')
       : this.database.steeringEvents(owner.ownerId, run.id)
     return {
-      ...runDto(run, events, inputs.at(-1)),
+      ...runDto({ ...run, errorCode: run.errorCode ?? (run.error ? this.database.runErrorCode(owner.ownerId, run.id) : undefined) }, events, inputs.at(-1)),
       context_usage: this.database.latestContextEvent(owner.ownerId, run.id),
       ...this.database.runTiming(owner.ownerId, run.id),
       steer_target_run_id: steering.find((event) => event.event === 'workbench_steered')?.steer_target_run_id,
       steering_messages: steering.filter((event) => event.event === 'workbench_steering').map((event) => ({
         id: event.steering_id, query: event.query, attachments: event.attachments ?? [],
+        created_at: (this.database.getRun(owner.ownerId, event.steering_id)?.createdAt / 1000) || event.created_at,
       })),
       human_input_history: inputs.filter((input) => ['skipped', 'timeout', 'aborted', 'submitted'].includes(input.status)).map((input) => {
         const answers = input.answer?.answers ?? []
@@ -1079,7 +1096,8 @@ export function runDto(run, events = [], pending = null) {
     mentioned_resources: run.selection?.mentioned_resources ?? [],
     ...(run.selection?.command ? { command: run.selection.command } : {}),
     ...(run.selection?.silent_resume ? { is_continuation: true } : {}),
-    status: run.status, error: run.error, feedback: run.feedback ?? null, events, events_cursor: `${run.seq}-0`,
+    status: run.status, error: run.error ? runFailure({ message: run.error, code: run.errorCode }).message : run.error,
+    feedback: run.feedback ?? null, events: events.map(presentRunEvent), events_cursor: `${run.seq}-0`,
     stop_confirmation: run.stopConfirmation ?? null,
     queue_order: run.queueOrder, parent_run_id: run.parentRunId ?? null,
     activity_protocol: 1, followup_protocol: 1, message_id: run.messageId ?? null, attachments: run.attachments ?? [],
