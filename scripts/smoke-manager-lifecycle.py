@@ -120,6 +120,35 @@ try:
     after = json.loads(docker('inspect', sandbox).stdout)[0]
     assert after['HostConfig']['PidsLimit'] == 1024 and after['State']['StartedAt'] == before['State']['StartedAt']
     print('PASS thread limit: running legacy sandbox updated from 256 to 1024 without restart', flush=True)
+    # Provision a fresh managed home through the actual initializer, before the
+    # Host image can seed its ownership. The fixture uses the existing test
+    # network and a separate process-local manager state.
+    fresh_sandbox = prefix + '-fresh-home'
+    provision_home = '''
+import json, sys
+from pathlib import Path
+import server
+value=json.load(sys.stdin)
+server.STATE=Path('/tmp/fresh-owner-home-probe')
+server.STATE.mkdir(exist_ok=True)
+server.HOSTS.root=server.STATE/'hosts'
+folder=server.HOSTS.root/value['workspace']
+folder.mkdir(parents=True,exist_ok=True)
+(folder/'host.json').write_text(json.dumps({'workspace_id':value['workspace'], 'owner_id':'probe:1', 'home_volume':value['home']}))
+server.identity=lambda _: (value['sandbox'], 'fixture-only-token')
+server.ensure_network=lambda _: value['network']
+server.ensure(value['workspace'])
+'''
+    network = next(iter(before['NetworkSettings']['Networks']))
+    docker('exec', '-i', manager, 'python', '-c', provision_home, stdin=json.dumps({
+        'workspace': workspaces[0], 'home': host_home, 'sandbox': fresh_sandbox, 'network': network}))
+    docker('run', '--rm', '--network', 'none', '--user', '1000', '--entrypoint', 'node',
+           '-v', host_home + ':/srv/dsh', host_image, '-e',
+           "const fs=require('node:fs');if(fs.statSync('/srv/dsh').uid!==1000)throw Error('Host home is not owned by node');"
+           "fs.mkdirSync('/srv/dsh/profiles/workbench',{recursive:true});fs.writeFileSync('/srv/dsh/profiles/workbench/probe','owner');"
+           "fs.writeFileSync('/srv/dsh/attachments/probe','attachment')")
+    docker('rm', '-f', fresh_sandbox)
+    print('PASS fresh managed home: non-root Host can create profile and attachment files', flush=True)
     with tempfile.TemporaryDirectory(prefix=prefix) as host_state:
         (Path(host_state) / 'hosts' / workspaces[0] / 'ssh').mkdir(parents=True)
         create_host = '''

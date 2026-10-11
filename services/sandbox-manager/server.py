@@ -206,6 +206,7 @@ def ensure(key):
                        '-v', home_volume + ':/srv/dsh', IMAGE, *MANAGER_PYTHON[1:], '-c',
                        "import os; p='/srv/dsh/attachments'; "
                        "assert not os.path.islink(p), 'Attachment root cannot be a symlink'; "
+                       "os.chown('/srv/dsh',1000,1000); "
                        "os.makedirs(p,exist_ok=True); os.chown(p,1000,1000); os.chmod(p,0o700)")
             for suffix in ("home", "files", "env"):
                 docker("volume", "create", "--label", "workbench=" + PREFIX, name + "-" + suffix)
