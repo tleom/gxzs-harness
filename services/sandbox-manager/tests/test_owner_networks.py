@@ -199,3 +199,14 @@ def test_legacy_unconfigured_pool_reports_default_docker_exhaustion(tmp_path):
     with pytest.raises(ResourceUnavailable) as failure:
         allocator(tmp_path, response, pool=None).ensure(str(uuid4()))
     assert failure.value.code == 'NETWORK_POOL_EXHAUSTED'
+
+
+@pytest.mark.parametrize('name', ['Dockerfile', 'Dockerfile.cached'])
+def test_manager_image_includes_all_runtime_modules(name):
+    root = Path(__file__).parents[1]
+    copied = set()
+    for line in (root / name).read_text().splitlines():
+        if line.startswith('COPY ') and '--from=' not in line:
+            for source in line.split()[1:-1]:
+                copied.update(p.name for p in root.glob(source) if p.is_file())
+    assert {p.name for p in root.glob('*.py')} <= copied
