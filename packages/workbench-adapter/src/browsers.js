@@ -75,7 +75,10 @@ export class SandboxBrowser {
       if (line.length > 2 * 1024 * 1024) { this.dispose(); return }
       try {
         const frame = JSON.parse(line)
-        if (frame.type === 'result') {
+        if (frame.type === 'fatal' && typeof frame.error === 'string' && frame.error.length <= 256) {
+          this.dispose(httpError(502, frame.error))
+          return
+        } else if (frame.type === 'result') {
           const pending = this.pending.get(frame.id)
           if (frame.error) pending?.reject(httpError(502, frame.error))
           else pending?.resolve()
@@ -118,8 +121,10 @@ export class SandboxBrowser {
     for (const listener of this.listeners) listener()
   }
   async *follow(attachment, signal) {
-    if (this.closed) throw httpError(410, '浏览器已经关闭，请重新打开')
+    if (this.closed) throw this.failure
     signal.throwIfAborted()
+    const lease = Symbol('browser stream')
+    this.controllerLease = lease
     this.controller = attachment
     let wake, changed = true
     const update = () => { changed = true; wake?.(); wake = undefined }
@@ -133,13 +138,16 @@ export class SandboxBrowser {
         if (!changed) await new Promise(resolve => { wake = resolve })
         if (signal.aborted || this.closed) break
         changed = false
-        if (this.frame) yield { event: 'workbench_browser', value: { ...this.frame, writable: this.controller === attachment } }
+        if (this.frame) yield { event: 'workbench_browser', value: { ...this.frame, writable: this.controllerLease === lease } }
       }
-      if (this.closed && !signal.aborted) throw httpError(410, '浏览器已经关闭，请重新打开')
+      if (this.closed && !signal.aborted) throw this.failure
     } finally {
       signal.removeEventListener('abort', update)
       this.listeners.delete(update)
-      if (this.controller === attachment) this.controller = undefined
+      if (this.controllerLease === lease) {
+        this.controllerLease = undefined
+        this.controller = undefined
+      }
       this.publish()
       if (!this.listeners.size && !this.closed) void this.command({ action: 'watch', enabled: false }).catch(() => {})
       this.armIdle()
@@ -148,6 +156,7 @@ export class SandboxBrowser {
   dispose(error = httpError(410, '浏览器已经关闭，请重新打开')) {
     if (this.closed) return
     this.closed = true
+    this.failure = error
     clearTimeout(this.idleTimer)
     for (const pending of [...this.pending.values()]) pending.reject(error)
     this.buffer = ''

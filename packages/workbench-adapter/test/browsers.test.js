@@ -61,3 +61,33 @@ it('streams a bounded latest frame, reports takeover, and aborts its sandbox pro
   expect(subprocess.spawn.mock.calls[0][0].signal.aborted).toBe(true)
   finish({exitCode:0})
 })
+it('retains the replacement stream lease when an earlier stream with the same attachment exits', async () => {
+  const stdout = new PassThrough(), stdin = new PassThrough()
+  stdin.on('data', chunk => {
+    const request = JSON.parse(String(chunk))
+    stdout.write(JSON.stringify({type:'result',id:request.id})+'\n')
+  })
+  const browser = new SandboxBrowser({spawn:spec => ({stdin,stdout,done:new Promise(resolve => spec.signal.addEventListener('abort',resolve))})})
+  stdout.write(JSON.stringify({type:'frame',image:'aA==',width:1000,height:700})+'\n')
+  const old = browser.follow(id,signal()), replacement = browser.follow(id,signal())
+  await old.next()
+  expect((await replacement.next()).value.value.writable).toBe(true)
+  expect((await old.next()).value.value.writable).toBe(false)
+  await old.return()
+  expect(browser.controller).toBe(id)
+  expect((await replacement.next()).value.value.writable).toBe(true)
+  await browser.command({action:'text',text:'still writable'})
+  await replacement.return()
+  browser.dispose(); await browser.done
+})
+it('propagates a fatal worker error to the active stream and invalidates the browser', async () => {
+  const stdout = new PassThrough(), stdin = new PassThrough()
+  const browser = new SandboxBrowser({spawn:spec => ({stdin,stdout,done:new Promise(resolve => spec.signal.addEventListener('abort',resolve))})})
+  const stream = browser.follow(id,signal())
+  const next = stream.next()
+  stdout.write(JSON.stringify({type:'fatal',error:'网页进程已退出，请重新打开浏览器'})+'\n')
+  await expect(next).rejects.toMatchObject({status:502,message:'网页进程已退出，请重新打开浏览器'})
+  await expect(browser.command({action:'key',key:'Enter'})).rejects.toMatchObject({status:410})
+  expect(browser.closed).toBe(true)
+  await browser.done
+})
