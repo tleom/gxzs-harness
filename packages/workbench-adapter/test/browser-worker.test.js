@@ -8,7 +8,7 @@ it('reduces oversized images, reuses the successful quality, and resets it on na
   let url = 'https://example.com'
   const page = { url: () => url, viewportSize: () => ({width:1920,height:1080}),
     screenshot: vi.fn(async ({quality}) => Buffer.alloc(quality > 30 ? 1100000 : 700000)) }
-  const capture = createImageCapture()
+  const capture = createImageCapture({now:()=>0})
   expect((await capture(page)).length).toBe(700000)
   expect(page.screenshot.mock.calls.map(([args]) => args.quality)).toEqual([70,50,30])
   await capture(page)
@@ -16,6 +16,14 @@ it('reduces oversized images, reuses the successful quality, and resets it on na
   url = 'https://example.com/next'
   await capture(page)
   expect(page.screenshot.mock.calls.at(-3)[0].quality).toBe(70)
+})
+
+it('shares one bounded screenshot deadline across quality retries', async () => {
+  let elapsed = 0
+  const page = {url:()=> 'https://example.com', viewportSize:()=>({width:1000,height:700}),
+    screenshot:vi.fn(async()=> { elapsed+=2000; return Buffer.alloc(1100000) })}
+  await expect(createImageCapture({now:()=>elapsed})(page)).rejects.toThrow('capture_timeout')
+  expect(page.screenshot.mock.calls.map(([value])=>value.timeout)).toEqual([5000,3000,1000])
 })
 
 function worker() {
@@ -71,5 +79,42 @@ it('reports an uncompressible frame and exits without claiming initialization su
     expect(value.frames.find(frame=>frame.type==='fatal').error).toContain('图像过大')
     expect(value.frames.some(frame=>frame.type==='result' && frame.id===1)).toBe(false)
     expect(value.page.screenshot).toHaveBeenCalledTimes(4)
+  } finally { await value.runtime.shutdown() }
+})
+
+it('bounds untrusted titles before emitting a frame', async () => {
+  const value = worker()
+  value.page.title = async()=> '标题'.repeat(1000000)
+  try {
+    await value.command(1,'init',{width:1000,height:700})
+    expect(value.frames.find(frame=>frame.type==='frame').title.length).toBe(1024)
+    expect(Buffer.byteLength(JSON.stringify(value.frames.find(frame=>frame.type==='frame')),'utf8')).toBeLessThan(10000)
+  } finally { await value.runtime.shutdown() }
+})
+
+it('rejects initialization without a first frame rather than leaving the client connecting forever', async () => {
+  const value=worker()
+  value.page.screenshot.mockRejectedValue(new Error('screenshot unavailable'))
+  try {
+    await value.command(1,'init',{width:1000,height:700})
+    expect(value.frames.find(frame=>frame.type==='result' && frame.id===1).error).toContain('重新打开浏览器')
+    expect(value.frames.some(frame=>frame.type==='frame')).toBe(false)
+  } finally { await value.runtime.shutdown() }
+})
+
+it('discards a frame when the same Page navigates during capture and publishes the next consistent frame', async () => {
+  const value = worker()
+  let url='https://example.com/old'
+  value.page.url=()=>url
+  value.page.screenshot.mockImplementation(async()=>{url='https://example.com/new';return Buffer.from('new-page')})
+  try {
+    // Initialization must first establish a renderable blank page.
+    value.page.screenshot.mockResolvedValueOnce(Buffer.from('initial-page'))
+    await value.command(1,'init',{width:1000,height:700})
+    value.frames.length=0
+    await value.command(2,'watch',{enabled:true})
+    expect(value.frames.some(frame=>frame.type==='frame')).toBe(false)
+    await value.command(3,'watch',{enabled:true})
+    expect(value.frames.find(frame=>frame.type==='frame').url).toBe('https://example.com/new')
   } finally { await value.runtime.shutdown() }
 })

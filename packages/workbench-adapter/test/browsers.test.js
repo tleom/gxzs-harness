@@ -91,3 +91,23 @@ it('propagates a fatal worker error to the active stream and invalidates the bro
   expect(browser.closed).toBe(true)
   await browser.done
 })
+
+it('counts closing subprocesses until done before admitting replacement browsers', async () => {
+  const exits=[], workers=[]
+  const gateway=new WorkbenchBrowsers({create:()=> {
+    const value={closed:false,command:async()=>{},dispose(){this.closed=true},done:new Promise(resolve=>exits.push(resolve))}
+    workers.push(value)
+    return value
+  }})
+  for(let index=0;index<4;index++) {
+    const browserId=`12345678-1234-1234-1234-123456789ab${index}`
+    await gateway.create({ownerId:'owner'},{id:browserId},signal())
+    workers[index].dispose()
+  }
+  await expect(gateway.create({ownerId:'owner'},{id},signal())).rejects.toMatchObject({status:429})
+  expect(workers).toHaveLength(4)
+  exits[0](); await Promise.resolve()
+  await gateway.create({ownerId:'owner'},{id},signal())
+  expect(workers).toHaveLength(5)
+  gateway.dispose(); for(const exit of exits) exit()
+})

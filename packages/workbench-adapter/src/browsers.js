@@ -166,7 +166,7 @@ export class SandboxBrowser {
 }
 
 export class WorkbenchBrowsers {
-  constructor({ subprocess, create = () => new SandboxBrowser(subprocess) }) { this.items = new Map(); this.createBrowser = create }
+  constructor({ subprocess, create = () => new SandboxBrowser(subprocess) }) { this.items = new Map(); this.workers = new Set(); this.createBrowser = create }
   async create(owner, request, signal) {
     signal.throwIfAborted()
     if (!uuid.test(request.id)) throw httpError(400, '浏览器标识无效')
@@ -175,8 +175,12 @@ export class WorkbenchBrowsers {
     if (browser?.closed) { this.items.delete(key); browser = undefined }
     if (!browser) {
       for (const [id, item] of this.items) if (item.closed) this.items.delete(id)
-      if (this.items.size >= 4) throw httpError(429, '请先关闭不再使用的浏览器标签')
+      if (this.workers.size >= 4) throw httpError(429, '浏览器数量已达上限，请关闭其他标签或稍后重试')
       browser = this.createBrowser()
+      this.workers.add(browser)
+      const worker = browser
+      const settled = () => this.workers.delete(worker)
+      Promise.resolve(worker.done).then(settled, settled)
       this.items.set(key, browser)
       browser.ready = browser.command({ action: 'init', width: 1000, height: 700 }, signal)
     }

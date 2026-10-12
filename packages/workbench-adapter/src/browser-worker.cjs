@@ -1,15 +1,18 @@
 // Runs only in the owner sandbox. The Host transports pixels and validated input.
 const { createInterface } = require('node:readline')
 /** Reduce large photographic frames without losing the live stream; reuse the successful quality. */
-function createImageCapture() {
+function createImageCapture({ now = Date.now, budgetMs = 5000 } = {}) {
   const qualities = [70, 50, 30, 15]
   let key, start = 0
   return async page => {
     const viewport = page.viewportSize()
     const current = `${page.url()}|${viewport.width}:${viewport.height}`
     if (current !== key) { key = current; start = 0 }
+    const deadline = now() + budgetMs
     for (let index = start; index < qualities.length; index++) {
-      const image = await page.screenshot({ type: 'jpeg', quality: qualities[index], timeout: 5000 })
+      const remaining = deadline - now()
+      if (remaining <= 0) throw new Error('capture_timeout')
+      const image = await page.screenshot({ type: 'jpeg', quality: qualities[index], timeout: remaining })
       if (image.length <= 1024 * 1024) { start = index; return image }
     }
     throw new Error('frame_too_large')
@@ -17,7 +20,7 @@ function createImageCapture() {
 }
 function runWorker({ chromium, input = process.stdin, output = process.stdout, exit = code => process.exit(code) }) {
   let browser, context, page, session, watching = false, capturing = false, closed = false
-  let timer, notice = ''
+  let timer, notice = '', navigation = 0, hasFrame = false
   const send = value => new Promise(resolve => {
     if (output.write(JSON.stringify(value) + '\n')) resolve()
     else output.once('drain', resolve)
@@ -34,14 +37,16 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
     try {
       const target = page, cdp = session
       const url = target.url()
+      const epoch = navigation
       const viewport = target.viewportSize()
       const image = await capture(target)
       const history = await cdp.send('Page.getNavigationHistory')
-      const title = await target.title()
-      if (target !== page || closed) return
+      const title = (await target.title()).slice(0, 1024)
+      if (target !== page || target.url() !== url || navigation !== epoch || closed) return
       await send({ type: 'frame', url: url === 'about:blank' ? '' : url, title,
         ...viewport, image: image.toString('base64'), back: history.currentIndex > 0,
         forward: history.currentIndex < history.entries.length - 1, notice })
+      hasFrame = true
     } catch (error) {
       if (error.message === 'frame_too_large') fatal('网页图像过大，请重新打开浏览器')
       // Navigation can temporarily invalidate a screenshot; the next frame retries.
@@ -57,7 +62,9 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
     target.on('dialog', dialog => { notice = '网页弹窗已关闭'; void dialog.dismiss().catch(() => {}) })
     target.on('download', download => { notice = '请在系统浏览器中下载文件'; void download.cancel().catch(() => {}) })
     target.on('framenavigated', main => {
-      if (main !== target.mainFrame() || target !== page || main.url() === 'about:blank') return
+      if (main !== target.mainFrame() || target !== page) return
+      navigation++
+      if (main.url() === 'about:blank') return
       try {
         validUrl(main.url())
       } catch { notice = '浏览器仅支持 HTTP 和 HTTPS 页面'; void target.close().catch(() => {}) }
@@ -90,6 +97,7 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
       await bind(page)
       timer = setInterval(() => { if (watching) void frame() }, 400)
       await frame()
+      if (!hasFrame) throw new Error('initial_frame_unavailable')
       return
     }
     if (!page || page.isClosed()) throw new Error('browser_closed')
