@@ -20,11 +20,12 @@ import { streamWorkspaceEvents } from './workspace-events.js'
 import { WorkbenchSchedules } from './schedules.js'
 import { WorkbenchSubagents } from './subagents.js'
 import { WorkbenchTerminals } from './terminals.js'
+import { WorkbenchBrowsers } from './browsers.js'
 import { registerScheduledClaims } from './scheduled-claims.js'
 import { setTimeout as delay } from 'node:timers/promises'
 
 export const name = 'workbench-adapter'
-export const inject = ['webServer', 'sessionController', 'workspaceController', 'sessionReferenceResolver', 'fileReferences', 'workspaceChanges', 'agents', 'commands', 'skills', 'systemPrompt', 'tokenMeter', 'workbenchFileManager', 'workbenchPlatformClient', 'sessionQuery', 'sessionProjections', 'agentPresets', 'agentDefaultModel', 'settings', 'attachments', 'fileUploads', 'goals', 'terminalController', 'subagents']
+export const inject = ['webServer', 'sessionController', 'workspaceController', 'sessionReferenceResolver', 'fileReferences', 'workspaceChanges', 'agents', 'commands', 'skills', 'systemPrompt', 'tokenMeter', 'workbenchFileManager', 'workbenchPlatformClient', 'sessionQuery', 'sessionProjections', 'agentPresets', 'agentDefaultModel', 'settings', 'attachments', 'fileUploads', 'goals', 'terminalController', 'subagents', 'subprocess']
 
 export const Config = z.object({
   basePath: z.string().default('/ai/workbench'),
@@ -78,6 +79,7 @@ export function apply(ctx, config) {
   workspaces.schedules = schedules
   const subagents = new WorkbenchSubagents({ sessions: ctx.sessionController, service, native: ctx.subagents, attachments: ctx.attachments })
   const terminals = new WorkbenchTerminals({ native: ctx.terminalController, service, sessions: ctx.sessionController })
+  const browsers = new WorkbenchBrowsers({ subprocess: ctx.subprocess })
   service.closeTerminals = async sessionId => {
     const items = ctx.terminalController.list(sessionId)
     if (!items.length) return
@@ -195,7 +197,7 @@ export function apply(ctx, config) {
     })))
     return {
       resources_pending: modelsOnly,
-      dsh_version: '0.2.1-alpha.2', schedule_protocol: 1, subagent_protocol: 1, terminal_protocol: 1,
+      dsh_version: '0.2.1-alpha.2', schedule_protocol: 1, subagent_protocol: 1, terminal_protocol: 1, browser_protocol: 1,
       activity_protocol: 1, human_input_protocol: 1, followup_protocol: 1, history_protocol: 1, native_history_protocol: 1,
       control_protocol: 1, goal_events_protocol: 1, compact_events_protocol: 1, resources_protocol: 1, command_resources_protocol: 1, submission_control_protocol: 1,
       default_selection: { model: catalog.default ? `${catalog.default.provider}/${catalog.default.model}` : models[0]?.id ?? '', tools: [], skills: [], knowledge: [], model_parameters: {}, tool_parameters: {} },
@@ -287,6 +289,27 @@ export function apply(ctx, config) {
     }],
     ['GET', /^\/workspaces$/, async ({ owner }, res) => sendJson(res, 200, { data: await workspaces.baseline(owner) })],
     ['GET', /^\/schedules$/, async ({ owner }, res) => sendJson(res, 200, { data: await schedules.catalog(owner) })],
+    ['POST', /^\/browsers$/, async ({ owner, json }, res) => {
+      const abort = new AbortController()
+      const cancel = () => abort.abort()
+      res.on('close', cancel)
+      try { sendJson(res, 201, { data: await browsers.create(owner, json, abort.signal) }) }
+      finally { res.off('close', cancel) }
+    }],
+    ['GET', /^\/browsers\/([\w-]+)\/events$/, async ({ owner, url }, res, match) =>
+      streamNativeEvents({ res, follow: signal => browsers.follow(owner, match[1], url.searchParams.get('attachment'), signal) })],
+    ['POST', /^\/browsers\/([\w-]+)\/actions$/, async ({ owner, json }, res, match) => {
+      const abort = new AbortController()
+      const cancel = () => abort.abort()
+      res.on('close', cancel)
+      try {
+        await browsers.control(owner, match[1], json, AbortSignal.any([abort.signal, AbortSignal.timeout(35000)]))
+        if (!abort.signal.aborted) sendJson(res, 200, { data: {} })
+      } finally { res.off('close', cancel) }
+    }],
+    ['DELETE', /^\/browsers\/([\w-]+)$/, async ({ owner }, res, match) => {
+      await browsers.close(owner, match[1]); sendJson(res, 200, { data: {} })
+    }],
     ['GET', /^\/chats\/([\w-]+)\/terminals$/, async ({ owner }, res, match) => sendJson(res, 200, { data: terminals.list(owner, match[1]) })],
     ['POST', /^\/chats\/([\w-]+)\/terminals$/, async ({ owner, json }, res, match) => {
       const abort = new AbortController()
@@ -556,6 +579,7 @@ export function apply(ctx, config) {
     return () => {
       clearTimeout(recoveryTimer)
       scheduler.close()
+      browsers.dispose()
       disposeRoute?.()
       database.close()
     }

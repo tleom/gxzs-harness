@@ -1,0 +1,63 @@
+import { PassThrough } from 'node:stream'
+import { expect, it, vi } from 'vitest'
+import { browserAction, SandboxBrowser, WorkbenchBrowsers } from '../src/browsers.js'
+const id = '12345678-1234-1234-1234-123456789abc'
+const signal = () => new AbortController().signal
+it('bounds input and schemes without accepting command/config fields', () => {
+  expect(browserAction({ action: 'navigate', url: 'https://www.baidu.com', command: 'rm' })).toEqual({ action: 'navigate', url: 'https://www.baidu.com/' })
+  for (const url of ['file:///workspace/secrets', 'javascript:alert(1)', 'https://user:password@example.com'])
+    expect(() => browserAction({ action: 'navigate', url })).toThrow()
+  for (const request of [{action:'key',key:'evil()'}, {action:'resize',width:4000,height:800}, {action:'click',x:-1,y:0}, {action:'execute',script:'code'}])
+    expect(() => browserAction(request)).toThrow()
+})
+it('keeps browser actions inside the owner binding and explicit controller lease', async () => {
+  const browser = { command: vi.fn(async () => {}), dispose: vi.fn(), follow: vi.fn(), done: Promise.resolve() }
+  const gateway = new WorkbenchBrowsers({ create: () => browser })
+  await gateway.create({ownerId:'owner'}, {id}, signal())
+  expect(browser.command).toHaveBeenCalledWith({action:'init',width:1000,height:700}, expect.any(AbortSignal))
+  expect(() => gateway.require({ownerId:'foreign'}, id)).toThrow()
+  await expect(gateway.control({ownerId:'owner'}, id, {attachment_id:id, action:'key', key:'Enter'}, signal())).rejects.toMatchObject({status:409})
+  browser.controller = id
+  await gateway.control({ownerId:'owner'}, id, {attachment_id:id,action:'key',key:'Enter'}, signal())
+  expect(browser.command).toHaveBeenLastCalledWith({action:'key',key:'Enter'}, expect.any(AbortSignal))
+  await gateway.close({ownerId:'foreign'}, id)
+  expect(browser.dispose).not.toHaveBeenCalled()
+  await gateway.close({ownerId:'owner'}, id)
+  expect(browser.dispose).toHaveBeenCalledOnce()
+})
+it('does not remove a replacement browser when an earlier initialization fails', async () => {
+  let rejectFirst
+  const first = {closed:false,command:()=>new Promise((_,reject)=>{rejectFirst=reject}),dispose(){this.closed=true}}
+  const second = {closed:false,command:async()=>{},dispose:vi.fn()}
+  let count = 0
+  const gateway = new WorkbenchBrowsers({create:()=>count++ === 0 ? first : second})
+  const pending = gateway.create({ownerId:'owner'},{id},signal())
+  first.dispose()
+  await gateway.create({ownerId:'owner'},{id},signal())
+  rejectFirst(new Error('cancelled initialization'))
+  await expect(pending).rejects.toThrow('cancelled initialization')
+  expect(gateway.require({ownerId:'owner'},id)).toBe(second)
+  gateway.dispose()
+})
+it('streams a bounded latest frame, reports takeover, and aborts its sandbox process on close', async () => {
+  let finish
+  const stdout = new PassThrough(), stdin = new PassThrough()
+  stdin.on('data', chunk => {
+    const request = JSON.parse(String(chunk))
+    stdout.write(JSON.stringify({type:'result',id:request.id})+'\n')
+  })
+  const subprocess = {spawn:vi.fn(spec => ({stdin,stdout,done:new Promise(resolve => {finish=resolve;spec.signal.addEventListener('abort', () => resolve({exitCode:0}))})}))}
+  const browser = new SandboxBrowser(subprocess)
+  stdout.write(JSON.stringify({type:'frame',image:'aGVsbG8=',width:1000,height:700,url:'https://example.com',title:'test'})+'\n')
+  const firstAbort = new AbortController(), otherAbort = new AbortController()
+  const first = browser.follow(id, firstAbort.signal)[Symbol.asyncIterator]()
+  expect((await first.next()).value.value.writable).toBe(true)
+  const other = browser.follow('other', otherAbort.signal)[Symbol.asyncIterator]()
+  expect((await other.next()).value.value.writable).toBe(true)
+  expect((await first.next()).value.value.writable).toBe(false)
+  firstAbort.abort(); await first.return()
+  otherAbort.abort(); await other.return()
+  browser.dispose(); await browser.done
+  expect(subprocess.spawn.mock.calls[0][0].signal.aborted).toBe(true)
+  finish({exitCode:0})
+})

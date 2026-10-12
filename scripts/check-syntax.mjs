@@ -7,7 +7,7 @@ async function files(root) {
   for (const entry of await readdir(root, { withFileTypes: true })) {
     const target = path.join(root, entry.name)
     if (entry.isDirectory()) result.push(...await files(target))
-    else if (entry.isFile() && target.endsWith('.js')) result.push(target)
+    else if (entry.isFile() && /\.(?:js|cjs)$/.test(target)) result.push(target)
   }
   return result
 }
