@@ -107,7 +107,8 @@ describe('followup and control service', () => {
     database.bindRunMessage(chat.sessionId,run.id,1,'m1')
     database.transitionRun(owner.ownerId,run.id,'running')
     service.sessionQuery={observeSession:vi.fn(async()=>({events:[{seq:50}],[Symbol.dispose](){}}))}
-    sessionController.page=vi.fn(async()=>{
+    sessionController.page=vi.fn(async request=>{
+      if(request.maxMessages===1)return {records:[{event:{seq:39,type:'assistant/message'}}],hasMore:false}
       database.appendEvent(owner.ownerId,run.id,{event:'workbench_activity',data:{kind:'text',segment_id:'t1s1b0',text:'刚刚完成的输出'}})
       database.setRunSourceSeq(owner.ownerId,run.id,'source_end_seq',51)
       database.transitionRun(owner.ownerId,run.id,'completed')
@@ -164,6 +165,7 @@ describe('followup and control service', () => {
     const {run}=database.createRun({ownerId:owner.ownerId,chatId:chat.id,sessionId:chat.sessionId,query:'live',selection:{}})
     database.bindRunMessage(chat.sessionId,run.id,1,'message-1')
     const disposed=vi.fn(), allEvents=vi.spyOn(database,'allEvents')
+    sessionController.page=vi.fn(async()=>({records:[{event:{seq:89,type:'assistant/message'}}],hasMore:false}))
     sessionController.follow=vi.fn(async function* (request,signal) {
       expect(request).toEqual({address:{kind:'session',sessionId:chat.sessionId},maxMessages:500,
         turnWindow:{minMessages:50,minTurns:2},assistantStream:true})
@@ -514,10 +516,23 @@ describe('followup and control service', () => {
     const second = await service.createChat(owner, '/workspace', {})
     expect(first.id).not.toBe(second.id)
     for (const chat of [first, second]) {
-      expect(fileManager.operate).toHaveBeenCalledWith({ operation: 'mkdir', path: `conversations/${chat.id}` })
-      expect(sessionController.create).toHaveBeenCalledWith({ cwd: `/workspace/conversations/${chat.id}` })
+      expect(chat.directory).toMatch(new RegExp(`^conversations/\\d{4}-\\d{2}-\\d{2}/${chat.id}$`))
+      expect(fileManager.operate).toHaveBeenCalledWith({ operation: 'mkdir', path: chat.directory })
+      expect(sessionController.create).toHaveBeenCalledWith({ cwd: `/workspace/${chat.directory}` })
     }
     expect(fileManager.operate.mock.invocationCallOrder[0]).toBeLessThan(sessionController.create.mock.invocationCallOrder[0])
+  })
+
+  it('groups default task directories by the Shanghai calendar date at midnight', async () => {
+    const { service, owner, sessionController } = setup()
+    sessionController.create.mockImplementation(async ({ cwd }) => ({ sessionId: cwd }))
+    vi.useFakeTimers()
+    try {
+      vi.setSystemTime(new Date('2026-10-11T15:59:59Z'))
+      expect((await service.createChat(owner, '/workspace', {})).directory).toMatch(/^conversations\/2026-10-11\//)
+      vi.setSystemTime(new Date('2026-10-11T16:00:00Z'))
+      expect((await service.createChat(owner, '/workspace', {})).directory).toMatch(/^conversations\/2026-10-12\//)
+    } finally { vi.useRealTimers() }
   })
 
   it('rejects a mismatched session directory without migrating history', async () => {
@@ -880,6 +895,30 @@ describe('followup and control service', () => {
     agent.cancel.mockImplementation(() => { throw new Error('cancel failed') })
     await expect(service.deleteChat(owner, chat.id)).rejects.toThrow('cancel failed')
     expect(fileManager.operate).not.toHaveBeenCalled()
+    expect(service.listChats(owner)).toHaveLength(1)
+  })
+
+  it('stops native background activity and terminals before removing the chat directory', async () => {
+    const { owner, chat, service, fileManager } = setup()
+    const actions = []
+    service.workspaces = { controller: { archiveSession: vi.fn(async request => actions.push(['archive', request])) } }
+    service.closeTerminals = vi.fn(async sessionId => actions.push(['terminals', sessionId]))
+    fileManager.operate.mockImplementation(async request => {
+      actions.push([request.operation])
+      return request.operation === 'stat' ? { kind: 'directory', version: 'v1' } : { deleted: true }
+    })
+    await service.deleteChat(owner, chat.id)
+    expect(actions).toEqual([['archive', { sessionId: chat.sessionId, stopActivity: true }], ['terminals', chat.sessionId], ['stat'], ['delete']])
+    expect(service.listChats(owner)).toEqual([])
+  })
+
+  it('keeps files and the chat when the native background stop fails', async () => {
+    const { owner, chat, service, fileManager } = setup()
+    service.workspaces = { controller: { archiveSession: vi.fn(async () => { throw new Error('stop failed') }) } }
+    service.closeTerminals = vi.fn()
+    await expect(service.deleteChat(owner, chat.id)).rejects.toThrow('stop failed')
+    expect(fileManager.operate).not.toHaveBeenCalled()
+    expect(service.closeTerminals).not.toHaveBeenCalled()
     expect(service.listChats(owner)).toHaveLength(1)
   })
 

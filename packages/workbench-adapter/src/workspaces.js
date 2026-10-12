@@ -31,6 +31,7 @@ export class WorkbenchWorkspaces {
         projected.sessions = items.filter(item => projected.chatIds[item.sessionId])
           .map(({ cwd, ...item }) => item)
       }
+      if (this.schedules) projected.schedules = await this.schedules.catalog(owner)
       return projected
     } finally {
       signal?.removeEventListener('abort', cancel)

@@ -242,6 +242,11 @@ export class WorkbenchDatabase {
     return this.db.prepare('SELECT * FROM chats WHERE owner_id = ? AND deleted_at IS NULL ORDER BY pinned DESC, updated_at DESC, id')
       .all(ownerId).map(decodeChat)
   }
+  // Retained native tasks keep their original owner even after chat soft deletion.
+  chatBindings(ownerId) {
+    return this.db.prepare('SELECT id, session_id AS sessionId, title, deleted_at AS deletedAt FROM chats WHERE owner_id = ?')
+      .all(ownerId)
+  }
 
   updateChat(ownerId, chatId, patch, now = Date.now()) {
     const chat = this.getChat(ownerId, chatId)

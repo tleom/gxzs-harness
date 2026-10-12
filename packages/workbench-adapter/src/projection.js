@@ -7,6 +7,23 @@ const END_STATUS = {
   'max-tokens': 'failed', blocked: 'failed', interrupted: 'interrupted',
 }
 
+/** DSH FileMutationRow's preparation counter; raw arguments stay in the native stream. */
+export function fileToolPreparation(run, calls, chunk) {
+  if (chunk?.type !== 'tool-call-delta') return undefined
+  const previous = calls.get(chunk.index) ?? { id: '', name: '', characters: 0 }
+  previous.id ||= String(chunk.id ?? '')
+  previous.name = chunk.name ?? previous.name
+  previous.characters += chunk.argumentsDelta?.length ?? 0
+  calls.set(chunk.index, previous)
+  if (!previous.id || !['write', 'edit'].includes(previous.name)) return undefined
+  const kilobytes = Math.ceil(previous.characters / 1024)
+  if (previous.publishedKilobytes === kilobytes) return undefined
+  previous.publishedKilobytes = kilobytes
+  return { kind: 'tool', workbench_run_id: run.id, call_id: previous.id,
+    tool_call_id: previous.id, tool_name: previous.name, activity_id: previous.id,
+    stage: 'preparing', argument_chars: previous.characters }
+}
+
 export function createAssistantStreamProjector(database, expectedOwnerId) {
   const attempts = new Map()
   return ({ agent, frame }) => {
@@ -14,7 +31,7 @@ export function createAssistantStreamProjector(database, expectedOwnerId) {
     const chat = database.getChatBySession(sessionId)
     if (!chat || (expectedOwnerId && chat.ownerId !== expectedOwnerId)) return undefined
     if (frame.type === 'start') {
-      attempts.set(String(frame.attemptId), { sessionId, turn: frame.turn, step: frame.step })
+      attempts.set(String(frame.attemptId), { sessionId, turn: frame.turn, step: frame.step, tools: new Map() })
       return undefined
     }
     const attempt = attempts.get(String(frame.attemptId))
@@ -32,6 +49,16 @@ export function createAssistantStreamProjector(database, expectedOwnerId) {
       })
     }
     const chunk = frame.chunk
+    if (chunk?.type === 'tool-call-delta') {
+      const run = database.runForTurn(sessionId, attempt.turn)
+      if (!run) return undefined
+      const data = fileToolPreparation(run, attempt.tools, chunk)
+      if (!data) return undefined
+      return database.appendStreamEvent(chat.ownerId, run.id, {
+        event: 'workbench_activity', backend_run_id: run.id,
+        data: { ...data, segment_id: `t${attempt.turn}s${attempt.step}a${String(frame.attemptId)}:b${chunk.index}` },
+      }, attempt.turn, attempt.step)
+    }
     if (chunk?.type !== 'text-delta' && chunk?.type !== 'reasoning-delta') return undefined
     if (!chunk.text) return undefined
     const run = database.runForTurn(sessionId, attempt.turn)
@@ -61,11 +88,11 @@ function projectEvent(database, sessionId, event, expectedOwnerId, context) {
   if (!chat || (expectedOwnerId && chat.ownerId !== expectedOwnerId)) return undefined
 
   if (event.type === 'agent/inbox/spliced') {
-    for (const message of event.data?.inserted ?? []) adoptMessage(database, sessionId, message)
+    for (const message of event.data?.inserted ?? []) adoptMessage(database, sessionId, message, context)
     return undefined
   }
   if (event.type === 'user/message') {
-    adoptMessage(database, sessionId, event.data)
+    adoptMessage(database, sessionId, event.data, context)
     if (event.surfaceOp?.op === 'replace') {
       const run = database.activeRun(chat.ownerId, chat.id)
       if (run) return database.appendEvent(chat.ownerId, run.id, {
@@ -239,12 +266,26 @@ function toolPresentation(run, call) {
   return tool ? { provider_name: tool.provider_name ?? tool.server_id, display_name: tool.tool_name } : {}
 }
 
-export function projectInboxClaim(database, { agent, message, turn }, expectedOwnerId) {
+export function projectInboxClaim(database, { agent, message, turn }, expectedOwnerId, context) {
   const sessionId = agent?.session?.id ?? agent?.id
   if (!Number.isInteger(turn) || typeof message?.id !== 'string') return undefined
   const chat = database.getChatBySession(sessionId)
   if (!chat || (expectedOwnerId && chat.ownerId !== expectedOwnerId)) return undefined
   let run
+  if (message.source?.kind === 'schedule') {
+    const scheduled = adoptMessage(database, sessionId, message, context)
+    const current = database.runForTurn(sessionId, turn)
+    if (scheduled) {
+      run = database.bindRunMessage(sessionId, scheduled.id, turn, message.id)
+      if (current && current.id !== scheduled.id) {
+        database.transitionRun(chat.ownerId, scheduled.id, 'steered')
+        database.appendEvent(chat.ownerId, scheduled.id, { event: 'workbench_steered', steer_target_run_id: current.id })
+        database.appendEvent(chat.ownerId, current.id, { event: 'workbench_steering', steering_id: scheduled.id,
+          query: scheduled.query, attachments: [] })
+        return run
+      }
+    }
+  }
   if (runPromptId(message)) {
     const current = database.runForTurn(sessionId, turn)
     run = database.bindRunMessage(sessionId, message.source.rpcId, turn, message.id)
@@ -283,7 +324,17 @@ export function projectInboxClaim(database, { agent, message, turn }, expectedOw
   return run
 }
 
-function adoptMessage(database, sessionId, message) {
+function adoptMessage(database, sessionId, message, context) {
+  if (message?.source?.kind === 'schedule' && typeof message.id === 'string') {
+    const chat = database.getChatBySession(sessionId)
+    if (!chat) return
+    // A display/admission receipt for a message DSH already delivered. Never enqueue it again.
+    const { run } = database.createRun({ ownerId: chat.ownerId, chatId: chat.id, sessionId,
+      id: message.id, requestKey: `schedule:${message.id}`, query: contentText(message.content),
+      selection: { ...chat.selection, native_source: 'schedule' }, mcpTools: context?.mcpTools ?? [] })
+    database.adoptInboxMessage(sessionId, run.id, message.id)
+    return run
+  }
   if (runPromptId(message) && typeof message?.id === 'string')
     database.adoptInboxMessage(sessionId, message.source.rpcId, message.id)
   else if (message?.source?.kind === 'user' && typeof message.id === 'string') {
@@ -365,7 +416,9 @@ export async function reconcileNativeSessions(database, sessionQuery, ownerId) {
         if (event.type === 'turn/start') turn = event.data.turn
         if (event.type === 'user/message' && Number.isInteger(turn)) {
           const message = event.data
-          const admitted = database.listRuns(chat.ownerId, chat.id).find(item => item.messageId === message.id)
+          const admitted = message.source?.kind === 'schedule' ? adoptMessage(database, chat.sessionId, message)
+            : database.listRuns(chat.ownerId, chat.id).find(item => item.messageId === message.id)
+          if (message.source?.kind === 'schedule' && admitted) database.bindRunMessage(chat.sessionId, admitted.id, turn, message.id)
           if (runPromptId(message) || (message.source?.kind === 'user' && admitted))
             database.bindRunMessage(chat.sessionId, message.source.rpcId ?? admitted.id, turn, message.id)
           else if (message.source?.kind === 'goal' || (message.source?.kind === 'user' && !message.source.rpcId)) {

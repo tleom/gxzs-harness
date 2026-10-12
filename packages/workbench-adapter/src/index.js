@@ -4,7 +4,7 @@ import { RunEventBus } from './events.js'
 import { HumanInputBridge } from './human-input.js'
 import { httpError, parseJson, readBody, sendError, sendJson } from './http.js'
 import { streamRunEvents } from './sse.js'
-import { streamHistoryEvents } from './history-events.js'
+import { streamHistoryEvents, streamNativeEvents } from './history-events.js'
 import { WorkbenchDatabase } from './persistence.js'
 import { resolveWorkspacePath } from './paths.js'
 import { createAssistantStreamProjector, projectInboxClaim, projectSessionEvent, reconcileNativeSessions, settleNativeIdle } from './projection.js'
@@ -17,9 +17,12 @@ import { registerRunResourceContext } from './resource-mentions.js'
 import { prepareNativeFiles } from './attachments.js'
 import { WorkbenchWorkspaces } from './workspaces.js'
 import { streamWorkspaceEvents } from './workspace-events.js'
+import { WorkbenchSchedules } from './schedules.js'
+import { WorkbenchSubagents } from './subagents.js'
+import { WorkbenchTerminals } from './terminals.js'
 
 export const name = 'workbench-adapter'
-export const inject = ['webServer', 'sessionController', 'workspaceController', 'sessionReferenceResolver', 'fileReferences', 'workspaceChanges', 'agents', 'commands', 'skills', 'systemPrompt', 'tokenMeter', 'workbenchFileManager', 'workbenchPlatformClient', 'sessionQuery', 'sessionProjections', 'agentPresets', 'agentDefaultModel', 'settings', 'attachments', 'fileUploads', 'goals']
+export const inject = ['webServer', 'sessionController', 'workspaceController', 'sessionReferenceResolver', 'fileReferences', 'workspaceChanges', 'agents', 'commands', 'skills', 'systemPrompt', 'tokenMeter', 'workbenchFileManager', 'workbenchPlatformClient', 'sessionQuery', 'sessionProjections', 'agentPresets', 'agentDefaultModel', 'settings', 'attachments', 'fileUploads', 'goals', 'terminalController']
 
 export const Config = z.object({
   basePath: z.string().default('/ai/workbench'),
@@ -43,12 +46,26 @@ export function apply(ctx, config) {
   const scheduler = new TaskScheduler({ database, sessions: ctx.sessionController, platformClient: ctx.workbenchPlatformClient, ownerId: config.ownerId, agents: ctx.agents, modelSettings: ctx.settings, goals: ctx.goals,
     prepareContent: (sessionId, content) => prepareNativeFiles(ctx.fileUploads, sessionId, content) })
   runtime.scheduler = scheduler
+  scheduler.hasOwnedWork = sessionId => runtime.hasOwnedWork(sessionId)
+  scheduler.cancelOwned = sessionId => runtime.cancelOwned(sessionId)
   scheduler.executionRun = (sessionId) => runtime.executionRun(sessionId)
   const service = new WorkbenchService({ database, sessionController: ctx.sessionController, agents: ctx.agents, commands: ctx.commands, skills: ctx.skills, fileManager: ctx.workbenchFileManager, platformClient: ctx.workbenchPlatformClient, workspace: config.workspace, sessionQuery: ctx.sessionQuery, agentPresets: ctx.agentPresets, agentDefaultModel: ctx.agentDefaultModel, modelSettings: ctx.settings, scheduler, attachments: ctx.attachments, goals: ctx.goals, fileUploads: ctx.fileUploads, nativeFileAttachments: process.env.GXZS_NATIVE_FILE_ATTACHMENTS === '1' })
   service.workspaceChanges = ctx.workspaceChanges
   service.workspaces = workspaces
   service.sessionReferences = ctx.sessionReferenceResolver
   service.fileReferences = ctx.fileReferences
+  service.cancelOwned = sessionId => runtime.cancelOwned(sessionId)
+  const schedules = new WorkbenchSchedules({ native: () => ctx.schedule, database, service })
+  workspaces.schedules = schedules
+  const subagents = new WorkbenchSubagents({ sessions: ctx.sessionController, service })
+  const terminals = new WorkbenchTerminals({ native: ctx.terminalController, service, sessions: ctx.sessionController })
+  service.closeTerminals = async sessionId => {
+    const items = ctx.terminalController.list(sessionId)
+    if (!items.length) return
+    const resolved = await ctx.sessionController.resolveAgent(sessionId)
+    if ('error' in resolved) throw resolved.error
+    await Promise.all(items.map(item => ctx.terminalController.close(resolved.agent, item.id)))
+  }
   service.subscribeGoal = (sessionId, listener) => ctx.on('goal/activation-changed', event => {
     if (event.sessionId === sessionId) listener()
   }, { global: true })
@@ -86,7 +103,9 @@ export function apply(ctx, config) {
   const projectAssistantStream = createAssistantStreamProjector(database, config.ownerId)
   ctx.on('user-questions/request', humanInput.handleRequest, { global: true, prepend: true })
   ctx.on('agent/assistant-stream', projectAssistantStream, { global: true })
-  ctx.on('agent/inbox/claimed', (payload) => projectInboxClaim(database, payload, config.ownerId), { global: true })
+  ctx.on('agent/created', ({ agent }) => runtime.bindChild(agent), { global: true, prepend: true })
+  ctx.on('agent/inbox/claimed', (payload) => projectInboxClaim(database, payload, config.ownerId,
+    { mcpTools: runtime.mcpResources?.() ?? [] }), { global: true, prepend: true })
   ctx.on('agent/pre-step', async (payload, next) => {
     await recovery
     if (recoveryError) return { kind: 'reject' }
@@ -114,7 +133,8 @@ export function apply(ctx, config) {
       const agent = ctx.agents.get(session.id)
       context = { ...context, goal: agent ? ctx.goals?.get(agent) : undefined, nativeIdle: agent?.status === 'idle' }
     }
-    projectSessionEvent(database, session?.id ?? session?.header?.id, event, config.ownerId, context)
+    projectSessionEvent(database, session?.id ?? session?.header?.id, event, config.ownerId,
+      { ...context, mcpTools: runtime.mcpResources?.() ?? [] })
   }, { global: true })
 
   const buildCatalog = async (owner, modelsOnly = false) => {
@@ -127,6 +147,7 @@ export function apply(ctx, config) {
     })))
     return {
       resources_pending: modelsOnly,
+      dsh_version: '0.2.1-alpha.2', schedule_protocol: 1, subagent_protocol: 1, terminal_protocol: 1,
       activity_protocol: 1, human_input_protocol: 1, followup_protocol: 1, history_protocol: 1, native_history_protocol: 1,
       control_protocol: 1, goal_events_protocol: 1, compact_events_protocol: 1, resources_protocol: 1, command_resources_protocol: 1, submission_control_protocol: 1,
       default_selection: { model: catalog.default ? `${catalog.default.provider}/${catalog.default.model}` : models[0]?.id ?? '', tools: [], skills: [], knowledge: [], model_parameters: {}, tool_parameters: {} },
@@ -217,9 +238,30 @@ export function apply(ctx, config) {
       } finally { res.off('close', disconnected) }
     }],
     ['GET', /^\/workspaces$/, async ({ owner }, res) => sendJson(res, 200, { data: await workspaces.baseline(owner) })],
+    ['GET', /^\/schedules$/, async ({ owner }, res) => sendJson(res, 200, { data: await schedules.catalog(owner) })],
+    ['GET', /^\/chats\/([\w-]+)\/terminals$/, async ({ owner }, res, match) => sendJson(res, 200, { data: terminals.list(owner, match[1]) })],
+    ['POST', /^\/chats\/([\w-]+)\/terminals$/, async ({ owner, json }, res, match) => sendJson(res, 201, { data: await terminals.create(owner, match[1], json, new AbortController().signal) })],
+    ['GET', /^\/chats\/([\w-]+)\/terminals\/([\w-]+)\/events$/, async ({ owner, url }, res, match) => streamNativeEvents({ res, follow: signal => terminals.follow(owner, match[1], match[2], url.searchParams.get('attachment'), signal) })],
+    ['POST', /^\/chats\/([\w-]+)\/terminals\/([\w-]+)\/(write|resize)$/, async ({ owner, json }, res, match) => { await terminals.control(owner, match[1], match[2], match[3], json); sendJson(res, 200, { data: {} }) }],
+    ['DELETE', /^\/chats\/([\w-]+)\/terminals\/([\w-]+)$/, async ({ owner }, res, match) => { await terminals.control(owner, match[1], match[2], 'close', {}); sendJson(res, 200, { data: {} }) }],
+    ['GET', /^\/chats\/([\w-]+)\/subagents$/, async ({ owner }, res, match) => sendJson(res, 200, { data: await subagents.catalog(owner, match[1], new AbortController().signal) })],
+    ['GET', /^\/chats\/([\w-]+)\/subagents\/([\w-]+)\/history$/, async ({ owner, url }, res, match) => {
+      const abort = new AbortController()
+      const disconnected = () => abort.abort()
+      res.once('close', disconnected)
+      try {
+        const cursor = url.searchParams.has('cursor') ? parseJson(Buffer.from(url.searchParams.get('cursor'))) : undefined
+        const page = await subagents.history(owner, match[1], match[2], cursor, abort.signal)
+        if (!abort.signal.aborted) sendJson(res, 200, { data: page })
+      } finally { res.off('close', disconnected) }
+    }],
+    ['POST', /^\/chats\/([\w-]+)\/schedules$/, async ({ owner, json }, res, match) => sendJson(res, 201, { data: await schedules.create(owner, match[1], json) })],
+    ['GET', /^\/schedules\/([\w-]+)\/history$/, async ({ owner, url }, res, match) => sendJson(res, 200, { data: await schedules.history(owner, match[1], url.searchParams.get('before')) })],
+    ['PATCH', /^\/schedules\/([\w-]+)$/, async ({ owner, json }, res, match) => sendJson(res, 200, { data: await schedules.update(owner, match[1], json) })],
+    ['DELETE', /^\/schedules\/([\w-]+)$/, async ({ owner }, res, match) => sendJson(res, 200, { data: await schedules.delete(owner, match[1]) })],
     ['GET', /^\/workspaces\/events$/, async ({ owner }, res) => streamWorkspaceEvents({ workspaces, owner, res,
       subscribe: changed => {
-        const stops = ['api-session/added', 'api-session/removed', 'api-session/status', 'api-session/activity'].map(event => ctx.on(event, changed))
+        const stops = ['api-session/added', 'api-session/removed', 'api-session/status', 'api-session/activity', 'schedule/changed'].map(event => ctx.on(event, changed))
         return () => stops.forEach(stop => stop())
       },
     })],

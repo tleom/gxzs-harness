@@ -11,6 +11,7 @@ const MCP_CALL_TIMEOUT_MS = 350_000 - 5_000
 
 export async function apply(ctx) {
   const registrations = new Map()
+  ctx.workbenchRuntime.mcpResources = () => [...registrations.values()].map(({ tool }) => ({ ...tool }))
   const restrictions = new Map()
   let catalogLoaded = false
   let disposed = false

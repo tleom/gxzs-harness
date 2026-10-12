@@ -55,6 +55,9 @@ class FakeModel extends LlmAdapter {
 
 async function fixture(script) {
   const ctx = new Context()
+  // New native skill and terminal consumers share the working-directory owner.
+  ctx.provide('workingDirectory', { ensure: async agent => agent.session.header.cwd,
+    get: session => session.header.cwd })
   const db = new WorkbenchDatabase(':memory:')
   cleanups.push(() => db.close())
   cleanups.push(() => ctx.fiber.dispose())

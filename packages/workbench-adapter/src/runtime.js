@@ -7,6 +7,36 @@ export class WorkbenchRuntime extends Service {
     this.database = database
     this.ownerId = ownerId
     this.agents = ctx.agents
+    this.childRuns = new WeakMap()
+  }
+
+  rootOf(agent) {
+    const seen = new Set()
+    while (agent && !seen.has(agent.id)) {
+      seen.add(agent.id)
+      if (this.database.getChatBySession(agent.session?.id ?? agent.id)) return agent
+      agent = this.agents.list?.().find(parent => this.agents.isOwnedBy?.(agent.id, parent))
+    }
+  }
+
+  bindChild(agent) {
+    if (this.database.getChatBySession(agent.session?.id ?? agent.id)) return
+    const parent = this.agents.list?.().find(parent => this.agents.isOwnedBy?.(agent.id, parent))
+    const run = parent && this.executionRun(parent.session?.id ?? parent.id)
+    if (run?.ownerId === this.ownerId) this.childRuns.set(agent, run.id)
+  }
+
+  hasOwnedWork(sessionId, runId) {
+    const root = this.agents?.get(sessionId)
+    return Boolean(root && this.agents.list?.().some(child => child !== root && child.status === 'running'
+      && this.rootOf(child) === root && (runId === undefined || this.childRuns.get(child) === runId)))
+  }
+
+  cancelOwned(sessionId) {
+    const root = this.agents?.get(sessionId)
+    if (!root) return
+    for (const child of this.agents.list?.() ?? []) if (child !== root && this.rootOf(child) === root)
+      child.cancel({ kind: 'user' }, { keepInbox: true })
   }
 
   executionRun(sessionId) {
@@ -14,10 +44,18 @@ export class WorkbenchRuntime extends Service {
     let agent = this.agents?.get(sessionId)
     while (agent && !visited.has(agent.id)) {
       visited.add(agent.id)
+      const binding = this.childRuns.get(agent)
+      if (binding) {
+        const bound = this.database.getRun(this.ownerId, binding)
+        const root = this.rootOf(agent)
+        if (bound && root?.id === bound.sessionId) return bound.status === 'completed' && agent.status === 'running'
+          ? { ...bound, status: 'running', background: true } : bound
+      }
       const id = agent.session?.id ?? agent.id
       const turn = nativeTurn(agent)?.lastTurn
       const run = Number.isInteger(turn) ? this.database.runForTurn(id, turn) : this.database.activeRunBySession(id)
-      if (run) return run.ownerId === this.ownerId ? run : undefined
+      if (run) return run.ownerId !== this.ownerId ? undefined : run.status === 'completed' && this.hasOwnedWork(run.sessionId, run.id)
+        ? { ...run, status: 'running', background: true } : run
       // Durable parentSession alone is not authority: require live registry ownership.
       agent = this.agents.list?.().find(parent => this.agents.isOwnedBy?.(agent.id, parent))
     }
@@ -36,6 +74,10 @@ export class WorkbenchRuntime extends Service {
     if (ownerId !== this.ownerId) return false
     const run = this.database.getRun(ownerId, runId)
     if (!run) return false
+    if (run.status === 'completed' && this.hasOwnedWork(run.sessionId, run.id)) {
+      return (!this.scheduler || this.scheduler.hasAdmission(run.sessionId))
+        && run.mcpTools.some(resource => resource.id === resourceId && resource.version === version)
+    }
     return this.authorizeMcp(run.sessionId, resourceId, version)?.runId === runId
   }
 }

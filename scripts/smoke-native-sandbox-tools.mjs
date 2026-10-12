@@ -29,6 +29,7 @@ assert.ok(Number.isInteger(sustainedSeconds) && sustainedSeconds >= 10 && sustai
 assert.match(directory, /^\/tmp\/gxzs-native-tools-[0-9a-f-]{36}$/)
 assert.equal(fs.existsSync(directory), false)
 const ctx = new Context()
+ctx.provide('workingDirectory', { ensure: async () => directory, get: () => directory })
 let ssh
 let created = false
 let stage = 'bootstrap'
@@ -98,13 +99,17 @@ try {
     const callbacks=new Map(),effects=[],records=[],warnings=[]
     let service
     const session={id:`probe-${randomUUID()}`,header:{cwd:directory},append(type,data){const event={type,data,seq:records.length+1};records.push(event);return event}}
-    await recorder.apply({subprocess:ctx.subprocess,logger:{info(){},warn:message=>warnings.push(message)},on:(name,fn)=>callbacks.set(name,fn),provide:(_,value)=>service=value,effect:fn=>effects.push(fn())},
+    await recorder.apply({subprocess:ctx.subprocess,fs:ctx.fs,logger:{info(){},warn:message=>warnings.push(message)},on:(name,fn)=>callbacks.set(name,fn),provide:(_,value)=>service=value,effect:fn=>effects.push(fn())},
       {timeoutMs:30000,outputMaxBytes:8388608,maxFiles:500,maxFileBytes:2097152,diffTimeoutMs:100})
     try {
       const source=`${directory}/changes.txt`
       await execute('write',{file_path:source,content:'before\n'})
       callbacks.get('session/event')(session,{type:'turn/start',data:{turn:1}})
-      await callbacks.get('tools/pre-execute')({agent:{session},name:'write',arguments:{file_path:source,content:'after\n'}},()=>execute('write',{file_path:source,content:'after\n'}))
+      const actor={agent:{session},name:'write',arguments:{file_path:source,content:'after\n'}}
+      await callbacks.get('tools/pre-execute')(actor,async()=>{
+        await callbacks.get('fs/write-intent')(source,actor,()=>undefined)
+        return execute('write',{file_path:source,content:'after\n'})
+      })
       callbacks.get('session/event')(session,{type:'tool/result',seq:10,data:{turn:1}})
       await callbacks.get('agent/turn-stopping')({agent:{session},turn:1})
       stage='changes-summary'
@@ -116,7 +121,7 @@ try {
       const diff=await service.diff(session.id,records[0].seq,0,AbortSignal.timeout(30000))
       assert.deepEqual(diff.hunks[0].lines,['-before','+after'])
       assert.equal(fs.existsSync(directory),false)
-      changes={recorder_version:'0.1.7-rc.1',summary:true,historical_diff:true,host_files_absent:true}
+      changes={recorder_version:nativeVersion,summary:true,historical_diff:true,host_files_absent:true}
     } finally {for(const cleanup of effects)await cleanup()}
   }
   if (process.argv.includes('--long-check')) {

@@ -40,6 +40,14 @@
 - id: file-reference-local
   disabled: true
 
+# Start native reminder delivery after the Workbench admission fence is installed.
+- id: schedule
+  disabled: true
+
+- id: terminal-controller
+  config:
+    maxTerminals: !!js Number.MAX_SAFE_INTEGER
+
 - id: ptc-runtime
   config:
     nodeExecutable: !!js process.env.GXZS_SANDBOX_NODE ?? '/usr/local/bin/node'
@@ -120,3 +128,5 @@
         humanInputTimeoutSeconds: 60
     - id: gxzs-workbench-mcp-tools
       name: '@gxzs/dsh-workbench-mcp-tools'
+    - id: gxzs-native-schedule
+      name: '@deepseek-ai/dsh-schedule'

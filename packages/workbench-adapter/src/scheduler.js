@@ -162,6 +162,7 @@ export class TaskScheduler {
     const goal = agent && this.goals?.get(agent)
     if (goal?.phase === 'active') this.goals.pause(agent, { id: goal.id, revision: goal.revision })
     this.sessions.cancel({ sessionId: run.sessionId })
+    this.cancelOwned?.(run.sessionId)
     // The durable fence blocks this Session immediately. Remote confirmation
     // must not hold unrelated Sessions' short admission renewals behind it.
     if (!runIds.length) this.unfencedSessions.delete(run.sessionId)
@@ -202,7 +203,7 @@ export class TaskScheduler {
     const chat = this.database.getChatBySession(sessionId)
     if (!chat) {
       const inherited = this.executionRun?.(sessionId)
-      return inherited?.status === 'running' && this.hasAdmission(inherited.sessionId) ? next() : { kind: 'reject' }
+      return inherited?.status === 'running' ? this.admitRun(inherited, signal, next) : { kind: 'reject' }
     }
     if (chat.ownerId !== this.ownerId || this.closed || this.unfencedSessions.has(sessionId)) return { kind: 'reject' }
     const run = this.database.runForTurn(sessionId, turn)
@@ -221,7 +222,8 @@ export class TaskScheduler {
     while (!this.hasAdmission(sessionId)) {
       signal.throwIfAborted()
       if (this.closed || this.unfencedSessions.has(sessionId)
-        || TERMINAL.has(this.database.getRun(this.ownerId, run.id)?.status)) return { kind: 'reject' }
+        || (TERMINAL.has(this.database.getRun(this.ownerId, run.id)?.status)
+          && !(run.background && this.hasOwnedWork?.(sessionId)))) return { kind: 'reject' }
       if (this.hasPendingFence(sessionId)) {
         this.retryFences()
         await delay(250, undefined, { signal })
@@ -314,7 +316,7 @@ export class TaskScheduler {
           }
           const agent = this.agents?.get(run.sessionId)
           const goal = agent && this.goals?.get(agent)
-          if (agent?.status === 'running' || (goal?.phase === 'active' && goal.activation === 'armed')) {
+          if (agent?.status === 'running' || this.hasOwnedWork?.(run.sessionId) || (goal?.phase === 'active' && goal.activation === 'armed')) {
             if (this.nativeAdmissions.has(run.sessionId) || !this.leases.has(run.sessionId)) continue
             let lease
             try { lease = await this.request(run, 'renew') }
@@ -350,7 +352,7 @@ export class TaskScheduler {
         const leaseOwner = this.database.submissions(this.ownerId).find((candidate) =>
           candidate.dispatched && candidate.runId !== run.id &&
           this.database.getRun(this.ownerId, candidate.runId)?.sessionId === run.sessionId)
-        if (leaseOwner && agent?.status === 'running') {
+        if (leaseOwner && (agent?.status === 'running' || this.hasOwnedWork?.(run.sessionId))) {
           const holder = this.database.getRun(this.ownerId, leaseOwner.runId)
           let lease
           try { lease = await this.request(holder, 'renew') }

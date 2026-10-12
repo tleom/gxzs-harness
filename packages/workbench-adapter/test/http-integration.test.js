@@ -244,17 +244,19 @@ describe('authenticated workbench HTTP handler', () => {
     expect(context.workbenchFileManager.operate).not.toHaveBeenCalled()
   })
 
-  it('creates and repairs owner chat directories', async () => {
+  it('allocates a dated task directory and checks it when reopening the chat', async () => {
     const { handler, key, context } = setup()
     const created = await call(handler, key, 'POST', '/chats', {})
     const chatId = created.body.data.id
+    const directory = context.workbenchFileManager.operate.mock.calls.at(-1)[0].path
+    expect(directory).toMatch(new RegExp(`^conversations/\\d{4}-\\d{2}-\\d{2}/${chatId}$`))
     expect(context.workbenchFileManager.operate).toHaveBeenCalledWith({
-      operation: 'mkdir', path: `conversations/${chatId}`,
+      operation: 'mkdir', path: directory,
     })
     context.workbenchFileManager.operate.mockClear()
     await call(handler, key, 'GET', `/chats/${chatId}`)
     expect(context.workbenchFileManager.operate).toHaveBeenCalledWith({
-      operation: 'mkdir', path: `conversations/${chatId}`,
+      operation: 'list', path: directory,
     })
   })
 

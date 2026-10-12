@@ -13,7 +13,7 @@ import { toAnswer } from './human-input.js'
 import { requireDatabaseModel } from './database-models.js'
 import { currentExecutionRun, fenceMcpExecutions } from './scheduler.js'
 import { nativeTurn } from './native-turn.js'
-import { historyWindow, loadNativeHistoryPage } from './history-page.js'
+import { hasEarlierContent, historyWindow, loadNativeHistoryPage } from './history-page.js'
 import { nativePresentation } from './projection.js'
 import { HistoryPresentation } from './history-presentation.js'
 import { withGoalUpdates } from './goal-updates.js'
@@ -53,9 +53,12 @@ export class WorkbenchService {
       return this.database.createChat({ id, ownerId: owner.ownerId, sessionId: created.sessionId, selection,
         directory: target.path === '.' ? 'conversations' : `conversations/${target.path}` })
     }
-    await this.fileManager.operate({ operation: 'mkdir', path: `conversations/${id}` })
-    const created = await this.sessions.create({ cwd: this.chatDirectory(id) })
-    const chat = this.database.createChat({ id, ownerId: owner.ownerId, sessionId: created.sessionId, selection })
+    const date = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date())
+    const directory = `conversations/${date}/${id}`
+    await this.fileManager.operate({ operation: 'mkdir', path: `conversations/${date}` })
+    await this.fileManager.operate({ operation: 'mkdir', path: directory })
+    const created = await this.sessions.create({ cwd: this.chatDirectory(id, directory) })
+    const chat = this.database.createChat({ id, ownerId: owner.ownerId, sessionId: created.sessionId, selection, directory })
     return chat
   }
 
@@ -179,6 +182,9 @@ export class WorkbenchService {
         // Drain an in-flight admission before cancelling; otherwise its prompt
         // could arrive after cancellation and restart the deleted conversation.
         await this.scheduler?.pendingTick
+        // Native archive commits the wake-up fence before stopping schedules, jobs and children.
+        await this.workspaces?.controller?.archiveSession?.({ sessionId: chat.sessionId, stopActivity: true })
+        await this.closeTerminals?.(chat.sessionId)
         const agent = this.agents.get(chat.sessionId)
         const cancelling = this.database.listRuns(owner.ownerId, chatId)
           .filter(run => ['running', 'waiting_input', 'stopping'].includes(run.status) || this.database.submission(owner.ownerId, run.id)?.dispatched
@@ -201,10 +207,10 @@ export class WorkbenchService {
           }
         }
         const path = chat.directory ?? `conversations/${chat.id}`
-        // Explicit directories belong to a workspace (including native forks),
-        // so deleting a chat never deletes that workspace's files.
+        // Allocated task directories are private; selected workspaces and forks retain shared files.
         const shared = this.database.listChats(owner.ownerId).some((other) => other.id !== chat.id && (other.directory ?? `conversations/${other.id}`) === path)
-        if (shared || chat.directory || path === '.') { this.database.deleteChat(owner.ownerId, chatId); return }
+        const allocated = path === `conversations/${chat.id}` || /^conversations\/\d{4}-\d{2}-\d{2}\//.test(path) && path.split('/').at(-1) === chat.id
+        if (shared || !allocated || path === '.') { this.database.deleteChat(owner.ownerId, chatId); return }
         const entry = await this.fileManager.operate({ operation: 'stat', path })
         if (entry.kind !== 'missing')
           await this.fileManager.operate({ operation: 'delete', path, version: entry.version })
@@ -304,7 +310,8 @@ export class WorkbenchService {
       // configuration. Only the native display log/stream crosses this boundary.
       const value = frame.type === 'snapshot' ? {
         type: frame.type, cursor: frame.cursor, records: frame.records,
-        hasMore: frame.hasMore, assistantStream: frame.assistantStream,
+        hasMore: frame.hasMore && await hasEarlierContent(this.sessions, chat.sessionId,
+          frame.cursor, frame.records[0]?.event.seq, signal), assistantStream: frame.assistantStream,
       } : frame
       const updatesControl = frame.type === 'snapshot' || frame.type === 'goal-state'
         || (frame.type === 'event' && (['goal/change', 'plan/mode', 'command/run', 'command/done', 'turn/end', 'request/context', 'assistant/message', 'assistant/attempt', 'compaction/end'].includes(frame.event.type)
@@ -850,6 +857,7 @@ export class WorkbenchService {
     try {
       if (goal?.phase === 'active') this.goals.pause(agent, { id: goal.id, revision: goal.revision })
       this.sessions.cancel({ sessionId: run.sessionId })
+      this.cancelOwned?.(run.sessionId)
     }
     catch (error) { nativeError = error }
     const confirmation = await fenceMcpExecutions(this.platformClient, owner, runIds)
@@ -1100,6 +1108,7 @@ export function runDto(run, events = [], pending = null) {
     mentioned_resources: run.selection?.mentioned_resources ?? [],
     ...(run.selection?.command ? { command: run.selection.command } : {}),
     ...(run.selection?.silent_resume || run.selection?.is_continuation ? { is_continuation: true } : {}),
+    ...(run.selection?.native_source === 'schedule' ? { source: { kind: 'schedule' } } : {}),
     status: run.status, error: run.error ? runFailure({ message: run.error, code: run.errorCode }).message : run.error,
     feedback: run.feedback ?? null, events: events.map(presentRunEvent), events_cursor: `${run.seq}-0`,
     stop_confirmation: run.stopConfirmation ?? null,
