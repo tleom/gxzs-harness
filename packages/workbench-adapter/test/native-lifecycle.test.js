@@ -31,6 +31,26 @@ const { SessionCommandController } = await import(pathToFileURL(controllerPath).
 const cleanups = []
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup() })
 
+it('continues an owned background-child notice after the parent completed and replays it once', async () => {
+  const test = await fixture(['parent done', 'child result incorporated'])
+  const original = test.create('delegate')
+  test.db.updateRunResources(original, {subagent_ids:['owned-child']}, original.mcpTools)
+  await test.scheduler.enqueue(original,[{type:'text',text:'delegate'}])
+  await test.scheduler.tick()
+  await test.agent.whenIdle()
+  expect(test.db.getRun(test.owner.ownerId,original.id).status).toBe('completed')
+  const message = createUserMessage({content:[{type:'text',text:'child completed'}],source:{kind:'subagent-settled',senderSessionId:'owned-child',form:'notice',summary:'completed'}})
+  test.agent.followup(message)
+  await test.agent.whenIdle()
+  expect(test.model.requests).toHaveLength(2)
+  const continued = test.db.listRuns(test.owner.ownerId,test.chat.id).find(run => run.id !== original.id)
+  expect(continued).toMatchObject({status:'completed',parentRunId:original.id,selection:{is_continuation:true,native_notice:true},mcpTools:original.mcpTools})
+  const query = {observeSession:async () => ({events:test.agent.session.snapshotEvents(),[Symbol.dispose]() {}})}
+  await reconcileNativeSessions(test.db,query,test.owner.ownerId)
+  expect(test.db.listRuns(test.owner.ownerId,test.chat.id)).toHaveLength(2)
+  expect(test.model.requests).toHaveLength(2)
+})
+
 class FakeModel extends LlmAdapter {
   requests = []
   constructor(script) { super(); this.script = script }

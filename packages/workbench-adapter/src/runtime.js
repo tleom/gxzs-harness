@@ -23,20 +23,31 @@ export class WorkbenchRuntime extends Service {
     if (this.database.getChatBySession(agent.session?.id ?? agent.id)) return
     const parent = this.agents.list?.().find(parent => this.agents.isOwnedBy?.(agent.id, parent))
     const run = parent && this.executionRun(parent.session?.id ?? parent.id)
-    if (run?.ownerId === this.ownerId) this.childRuns.set(agent, run.id)
+    if (run?.ownerId === this.ownerId) {
+      this.childRuns.set(agent, run.id)
+      const current = this.database.getRun(this.ownerId, run.id)
+      const ids = [...new Set([...(current.selection?.subagent_ids ?? []), agent.id])]
+      this.database.updateRunResources(current, { ...current.selection, subagent_ids: ids }, current.mcpTools)
+    }
+  }
+
+  ownsRunBinding(binding, runId) {
+    if (runId === undefined || binding === runId) return true
+    const run = this.database.getRun(this.ownerId, runId)
+    return run?.selection?.native_notice === true && run.parentRunId === binding
   }
 
   hasOwnedWork(sessionId, runId) {
     const root = this.agents?.get(sessionId)
     return Boolean(root && this.agents.list?.().some(child => child !== root && child.status === 'running'
-      && this.rootOf(child) === root && (runId === undefined || this.childRuns.get(child) === runId)))
+      && this.rootOf(child) === root && this.ownsRunBinding(this.childRuns.get(child), runId)))
   }
 
   cancelOwned(sessionId, runId) {
     const root = this.agents?.get(sessionId)
     if (!root) return
     for (const child of this.agents.list?.() ?? []) if (child !== root && this.rootOf(child) === root
-      && (runId === undefined || this.childRuns.get(child) === runId))
+      && this.ownsRunBinding(this.childRuns.get(child), runId))
       child.cancel({ kind: 'user' }, { keepInbox: true })
   }
 

@@ -13,7 +13,9 @@ export async function hasEarlierContent(sessions, sessionId, throughSeq, beforeS
     signal.throwIfAborted()
     if (page.records.some(({ event }) =>
       ['assistant/message', 'tool/call', 'tool/result', 'compaction/summary', 'workspace/changes', 'deliverables/presented'].includes(event.type)
-      || (event.type === 'user/message' && ['user', 'goal', 'schedule'].includes(event.data?.source?.kind)))) return true
+      || (event.type === 'user/message' && (address.kind === 'subagent'
+        ? event.data?.source?.kind !== 'workbench-resume'
+        : ['user', 'goal', 'schedule'].includes(event.data?.source?.kind))))) return true
     if (!page.hasMore) return false
     const next = page.records[0]?.event.seq
     if (!Number.isSafeInteger(next) || next >= before) throw httpError(502, '历史消息分页未向前推进')

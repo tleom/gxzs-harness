@@ -63,6 +63,17 @@ it('adopts one native scheduled delivery for admission without re-enqueuing it o
   projectInboxClaim(db, { agent: { id: chat.sessionId }, message, turn: 1 }, owner.ownerId, context)
   expect(db.listRuns(owner.ownerId, chat.id)).toHaveLength(1)
 })
+it('rejects unknown or already-fenced native child notifications', () => {
+  const {db,chat,owner} = fixture()
+  const {run} = db.createRun({ownerId:owner.ownerId,chatId:chat.id,sessionId:chat.sessionId,query:'task',selection:{subagent_ids:['child']},mcpTools:[]})
+  db.transitionRun(owner.ownerId,run.id,'running')
+  const message = sender => ({id:`notice-${sender}`,source:{kind:'subagent-settled',senderSessionId:sender},content:[{type:'text',text:'done'}]})
+  expect(projectInboxClaim(db,{agent:{id:chat.sessionId},message:message('foreign'),turn:2},owner.ownerId)).toBeUndefined()
+  db.requireRunFence(owner.ownerId,run.id)
+  db.confirmRunFence(owner.ownerId,run.id,{fenced:true})
+  expect(projectInboxClaim(db,{agent:{id:chat.sessionId},message:message('child'),turn:2},owner.ownerId)).toBeUndefined()
+  expect(db.listRuns(owner.ownerId,chat.id)).toHaveLength(1)
+})
 it('replays an acknowledged scheduled turn after restart without generating another delivery', async () => {
   const { db, chat, owner } = fixture()
   const message = { id: 'restored-delivery', source: { kind: 'schedule' }, content: [{ type: 'text', text: 'reminder' }] }

@@ -69,6 +69,7 @@ const REMOTE_ERRORS = {
   'subagent/unauthorized': [404, '子智能体不属于此对话'],
   'subagent/delivery-unavailable': [409, '子智能体当前无法接收消息，请稍后重试'],
   'subagent/invalid-time-zone': [400, '时区参数无效'],
+  'subagent/attachment-invalid': [400, '图片无效或所选模型不支持图片'],
   'session/conflict': [409, '会话配置已改变，请刷新后重试'],
   'session/writer-held': [409, '会话正在被其他执行器使用，请稍后重试'],
   'session/agent-busy': [409, '会话正在执行其他任务，请刷新当前状态'],

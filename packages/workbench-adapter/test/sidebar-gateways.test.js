@@ -75,3 +75,29 @@ it('hides a child cursor when only its descriptor metadata precedes the visible 
   expect(result.history_cursor).toBeNull()
   expect(sessions.page.mock.calls[1][0].address).toMatchObject({ kind: 'subagent', childSessionId: child.id })
 })
+it('admits image-only continuation through the native image store and scopes binary reads to the owner', async () => {
+  const native = {prompt:vi.fn(async () => ({messageId:'accepted'}))}
+  const attachments = {readImage:vi.fn(async ref => ({ref,data:Buffer.from('image')}))}
+  const sessions = {list:async () => ({items:[{sessionId:'root',agentAvailable:true,projections:{values:{subagentCatalog:[child]}}}]})}
+  const gateway = new WorkbenchSubagents({native,sessions,service,attachments})
+  const signal = new AbortController().signal
+  const image = {mediaType:'image/png',data:'aW1hZ2U=',name:'调研.png'}
+  await gateway.prompt(owner,chat.id,child.id,{requestId:attachment,text:'',images:[image]},signal)
+  expect(native.prompt).toHaveBeenCalledWith(expect.objectContaining({content:[{type:'image',...image}]}),signal)
+  await expect(gateway.prompt(owner,chat.id,child.id,{requestId:attachment,text:'',images:[{...image,mediaType:'text/html'}]},signal)).rejects.toMatchObject({status:400})
+  const ref = {attachmentId:'image-id',mediaType:'image/png'}
+  await expect(gateway.image({ownerId:'foreign'},chat.id,child.id,ref,signal)).rejects.toMatchObject({status:404})
+  expect(attachments.readImage).not.toHaveBeenCalled()
+  await gateway.image(owner,chat.id,child.id,ref,signal)
+  expect(attachments.readImage).toHaveBeenCalledWith(ref,signal)
+})
+it('presents stored child image references through the shared attachment renderer', async () => {
+  const ref = {attachmentId:'image-id',mediaType:'image/png',name:'调查.png',bytes:12,width:1,height:1}
+  const sessions = {list:async () => ({items:[{sessionId:'root',projections:{values:{subagentCatalog:[child]}}}]}),page:async () => ({hasMore:false,records:[
+    {event:{seq:1,time:1000,type:'turn/start',data:{turn:1}}},
+    {event:{seq:2,time:1001,type:'user/message',data:{source:{kind:'user'},content:[{type:'image',attachment:ref}]}}},
+  ]})}
+  const gateway = new WorkbenchSubagents({sessions,service})
+  const result = await gateway.history(owner,chat.id,child.id,{sessionId:child.id,throughSeq:2,beforeSeq:3},new AbortController().signal)
+  expect(result.runs[0].attachments).toEqual([{name:'调查.png',path:'native-image:image-id',size:12,native_image:{parentChatId:chat.id,childId:child.id,ref}}])
+})

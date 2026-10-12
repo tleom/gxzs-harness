@@ -272,6 +272,10 @@ export function projectInboxClaim(database, { agent, message, turn }, expectedOw
   const chat = database.getChatBySession(sessionId)
   if (!chat || (expectedOwnerId && chat.ownerId !== expectedOwnerId)) return undefined
   let run
+  if (isNativeNotice(message)) {
+    run = database.runForTurn(sessionId, turn) ?? adoptNativeNotice(database, chat, message)
+    if (run) run = database.bindNativeTurn(run, turn)
+  }
   if (message.source?.kind === 'schedule') {
     const scheduled = adoptMessage(database, sessionId, message, context)
     const current = database.runForTurn(sessionId, turn)
@@ -321,6 +325,24 @@ export function projectInboxClaim(database, { agent, message, turn }, expectedOw
     database.transitionRun(run.ownerId, run.id, 'running')
     database.appendEvent(run.ownerId, run.id, { event: 'workbench_status', status: 'running' })
   }
+  return run
+}
+
+const isNativeNotice = message => ['agent-message', 'subagent-settled'].includes(message?.source?.kind)
+function adoptNativeNotice(database, chat, message) {
+  if (chat.deletedAt || !isNativeNotice(message) || typeof message.id !== 'string') return
+  const existing = database.listRuns(chat.ownerId, chat.id).find(run => run.id === message.id)
+  if (existing) return existing
+  const parent = database.listRuns(chat.ownerId, chat.id).find(run =>
+    run.selection?.subagent_ids?.includes(message.source.senderSessionId))
+  // Bind only notifications from a child previously registered by the native
+  // owner graph. A stopped or failed task cannot be woken by a late notice.
+  if (!parent || !['completed', 'running'].includes(parent.status) || parent.stopConfirmation?.fenced) return
+  const { run } = database.createRun({ ownerId: chat.ownerId, chatId: chat.id, sessionId: chat.sessionId,
+    id: message.id, requestKey: `native-notice:${message.id}`, query: contentText(message.content),
+    parentRunId: parent.id, selection: { ...parent.selection, subagent_ids: [], native_notice: true,
+      is_continuation: true, silent_resume: true }, mcpTools: parent.mcpTools })
+  database.adoptInboxMessage(chat.sessionId, run.id, message.id)
   return run
 }
 
@@ -417,7 +439,9 @@ export async function reconcileNativeSessions(database, sessionQuery, ownerId) {
         if (event.type === 'user/message' && Number.isInteger(turn)) {
           const message = event.data
           const admitted = message.source?.kind === 'schedule' ? adoptMessage(database, chat.sessionId, message)
+            : isNativeNotice(message) ? (database.runForTurn(chat.sessionId, turn) ?? adoptNativeNotice(database, chat, message))
             : database.listRuns(chat.ownerId, chat.id).find(item => item.messageId === message.id)
+          if (isNativeNotice(message) && admitted) database.bindNativeTurn(admitted, turn)
           if (message.source?.kind === 'schedule' && admitted) database.bindRunMessage(chat.sessionId, admitted.id, turn, message.id)
           if (runPromptId(message) || (message.source?.kind === 'user' && admitted))
             database.bindRunMessage(chat.sessionId, message.source.rpcId ?? admitted.id, turn, message.id)
@@ -448,6 +472,7 @@ export async function reconcileNativeSessions(database, sessionQuery, ownerId) {
       for (const message of [...inbox['next-turn'], ...inbox['next-step']]) {
         const requestId = runPromptId(message)
         const run = requestId ? database.getRun(ownerId, requestId)
+          : isNativeNotice(message) ? adoptNativeNotice(database, chat, message)
           : database.listRuns(chat.ownerId, chat.id).find(item => item.messageId === message.id)
         if (run && run.sessionId === chat.sessionId) {
           queued.push(run.id)

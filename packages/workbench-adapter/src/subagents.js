@@ -5,7 +5,7 @@ import { httpError } from './http.js'
 const terminal = { completed: 'completed', aborted: 'cancelled', interrupted: 'interrupted' }
 /** Read only native catalog descendants; never register another Workbench chat. */
 export class WorkbenchSubagents {
-  constructor({ sessions, service, native }) { this.sessions = sessions; this.service = service; this.native = native }
+  constructor({ sessions, service, native, attachments }) { this.sessions = sessions; this.service = service; this.native = native; this.attachments = attachments }
   async catalog(owner, chatId, signal) {
     const parent = this.service.requireChat(owner, chatId)
     const { items } = await this.sessions.list({}, signal)
@@ -23,10 +23,28 @@ export class WorkbenchSubagents {
     if (!child) throw httpError(404, '子智能体不属于此对话')
     if (child.mode !== 'continuable') throw httpError(409, '此子智能体不支持后续消息')
     if (!this.native) throw httpError(503, '子智能体服务尚未就绪')
-    if (typeof request.text !== 'string' || !request.text.trim() || typeof request.requestId !== 'string') throw httpError(400, '子智能体消息无效')
+    const images = request.images ?? []
+    if (typeof request.text !== 'string' || (!request.text.trim() && !images.length) || typeof request.requestId !== 'string'
+      || !Array.isArray(images) || images.length > 20) throw httpError(400, '子智能体消息无效')
+    let bytes = 0
+    for (const image of images) {
+      if (!image || !['image/png', 'image/jpeg', 'image/gif', 'image/webp'].includes(image.mediaType)
+        || typeof image.data !== 'string' || (image.name !== undefined && typeof image.name !== 'string')) throw httpError(400, '图片参数无效')
+      bytes += image.data.length * 0.75
+    }
+    if (bytes > 20 * 1024 * 1024) throw httpError(413, '图片总大小超过 20 MiB')
     return this.native.prompt({ parentSessionId: child.parentSessionId, childSessionId: child.id,
-      mode: 'continuable', requestId: request.requestId, delivery: 'queue', content: [{ type: 'text', text: request.text }],
+      mode: 'continuable', requestId: request.requestId, delivery: 'queue', content: [
+        ...(request.text.trim() ? [{ type: 'text', text: request.text }] : []),
+        ...images.map(({ data, mediaType, name }) => ({ type: 'image', data, mediaType, ...(name ? { name } : {}) }))],
       ...(request.clientTimeZone ? { clientTimeZone: request.clientTimeZone } : {}) }, signal)
+  }
+  async image(owner, chatId, childId, ref, signal) {
+    if (!(await this.catalog(owner, chatId, signal)).some(child => child.id === childId && child.mode !== 'external')) throw httpError(404, '子智能体不属于此对话')
+    if (!this.attachments || !ref || typeof ref.attachmentId !== 'string'
+      || !['image/png', 'image/jpeg', 'image/gif', 'image/webp'].includes(ref.mediaType)) throw httpError(400, '图片引用无效')
+    // This store is mounted on the signed owner's private Host home.
+    return this.attachments.readImage(ref, signal)
   }
   async history(owner, chatId, childId, cursor, signal) {
     const child = (await this.catalog(owner, chatId, signal)).find(item => item.id === childId)
@@ -75,8 +93,14 @@ export class WorkbenchSubagents {
       if (!run) continue
       if (!run.created_at) run.created_at = event.time / 1000
       if (event.type === 'turn/start') run.started_at = event.time / 1000
-      if (event.type === 'user/message' && !run.query && event.data?.source?.kind !== 'workbench-resume')
+      if (event.type === 'user/message' && !run.query && event.data?.source?.kind !== 'workbench-resume') {
         run.query = (event.data?.content ?? []).filter(block => block.type === 'text').map(block => block.text).join('\n')
+        run.attachments = (event.data?.content ?? []).filter(block => block.type === 'image' && block.attachment).map(block => ({
+          name: block.attachment.name || `图片.${block.attachment.mediaType.split('/').at(-1)}`,
+          path: `native-image:${block.attachment.attachmentId}`, size: block.attachment.bytes,
+          native_image: { parentChatId: chatId, childId, ref: block.attachment },
+        }))
+      }
       if (event.type === 'turn/end') {
         run.status = terminal[event.data.reason?.kind] ?? 'failed'
         run.completed_at = event.time / 1000

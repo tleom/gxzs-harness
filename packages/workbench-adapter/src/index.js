@@ -65,7 +65,7 @@ export function apply(ctx, config) {
   }
   const schedules = new WorkbenchSchedules({ native: () => ctx.schedule, database, service })
   workspaces.schedules = schedules
-  const subagents = new WorkbenchSubagents({ sessions: ctx.sessionController, service, native: ctx.subagents })
+  const subagents = new WorkbenchSubagents({ sessions: ctx.sessionController, service, native: ctx.subagents, attachments: ctx.attachments })
   const terminals = new WorkbenchTerminals({ native: ctx.terminalController, service, sessions: ctx.sessionController })
   service.closeTerminals = async sessionId => {
     const items = ctx.terminalController.list(sessionId)
@@ -112,6 +112,10 @@ export function apply(ctx, config) {
   ctx.on('user-questions/request', humanInput.handleRequest, { global: true, prepend: true })
   ctx.on('agent/assistant-stream', projectAssistantStream, { global: true })
   ctx.on('agent/created', ({ agent }) => runtime.bindChild(agent), { global: true, prepend: true })
+  ctx.on('subagent/start', ({ id }) => {
+    const child = ctx.agents.get(id)
+    if (child) runtime.bindChild(child)
+  }, { global: true, prepend: true })
   ctx.on('agent/inbox/claimed', (payload) => projectInboxClaim(database, payload, config.ownerId,
     { mcpTools: runtime.mcpResources?.() ?? [] }), { global: true, prepend: true })
   ctx.on('agent/pre-step', async (payload, next) => {
@@ -269,6 +273,18 @@ export function apply(ctx, config) {
       res.once('close', disconnected)
       try { const data = await subagents.prompt(owner, match[1], match[2], json, abort.signal)
         if (!abort.signal.aborted) sendJson(res, 201, { data })
+      } finally { res.off('close', disconnected) }
+    }],
+    ['POST', /^\/chats\/([\w-]+)\/subagents\/([\w-]+)\/images$/, async ({ owner, json }, res, match) => {
+      const abort = new AbortController()
+      const disconnected = () => abort.abort()
+      res.once('close', disconnected)
+      try {
+        const image = await subagents.image(owner, match[1], match[2], json.ref, abort.signal)
+        if (!abort.signal.aborted) {
+          res.writeHead(200, { 'content-type': image.ref.mediaType, 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' })
+          res.end(Buffer.from(image.data))
+        }
       } finally { res.off('close', disconnected) }
     }],
     ['GET', /^\/chats\/([\w-]+)\/subagents\/([\w-]+)\/history$/, async ({ owner, url }, res, match) => {

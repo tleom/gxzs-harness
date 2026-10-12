@@ -135,7 +135,7 @@ const manager = fixture((req, res) => {
   if (req.url === `${base}files`) {
     const value = req.fixtureBody
     if (nativeAttachments && ['upload', 'get'].includes(value?.operation)) {
-      assert.match(value.path, /^conversations\/[a-f0-9-]{36}\/native-evidence\.(txt|png)$/)
+      assert.match(value.path, /^conversations\/\d{4}-\d{2}-\d{2}\/[a-f0-9-]{36}\/native-evidence\.(txt|png)$/)
       if (value.operation === 'upload') {
         assert.equal(value.version, null)
         assert.ok(!fixtureFiles.has(value.path), 'Cold continuation must not upload the attachment again')
@@ -151,10 +151,12 @@ const manager = fixture((req, res) => {
       return
     }
     if (sessionCreate) {
-      assert.equal(req.fixtureBody?.operation, 'mkdir')
-      assert.match(req.fixtureBody.path, /^conversations\/[a-f0-9-]{36}$/)
-      if (realSsh) remote(`mkdir -p -- /workspace/${req.fixtureBody.path}`)
-      remoteDirectories.add(req.fixtureBody.path)
+      assert.ok(['mkdir', 'list'].includes(req.fixtureBody?.operation))
+      assert.match(req.fixtureBody.path, /^conversations\/\d{4}-\d{2}-\d{2}(?:\/[a-f0-9-]{36})?$/)
+      if (req.fixtureBody.operation === 'mkdir') {
+        if (realSsh) remote(`mkdir -p -- /workspace/${req.fixtureBody.path}`)
+        remoteDirectories.add(req.fixtureBody.path)
+      } else assert.ok(remoteDirectories.has(req.fixtureBody.path))
     }
     respond(res, 200, { path: '.', entries: [] }); return
   }
@@ -176,7 +178,7 @@ const model = fixture((req, res) => {
     res.end('data: [DONE]\n\n')
     return
   }
-  for (const name of ['bash', 'job_output', 'job_kill']) {
+  for (const name of ['bash', 'job_output', 'job_kill', 'schedule_create', 'schedule_list', 'schedule_update', 'schedule_delete', 'working_directory']) {
     assert.ok(tools.has(name), `Native standard preset must expose ${name} to the model; received: ${JSON.stringify([...tools.keys()])}`)
   }
   assert.ok(tools.get('bash').parameters?.properties?.run_in_background,
@@ -421,12 +423,14 @@ try {
     'registered catalog: HTTP 200, live=true, ready=true', 30_000)
   if (sessionCreate) {
     const response = await signedRequest('POST', '/chats')
+    if (fixtureFailure) throw fixtureFailure
     assert.equal(response.status, 201, 'Actual Workbench -> native sessionController.create must succeed')
     const chat = (await response.json()).data
     assert.match(chat.id, /^[a-f0-9-]{36}$/)
-    assert.ok(remoteDirectories.has(`conversations/${chat.id}`), 'Sandbox mkdir must run before native creation')
-    if (realSsh) remote(`printf restart-proof > /workspace/conversations/${chat.id}/restart-proof.txt`)
-    assert.deepEqual(await readdir(`/workspace/conversations/${chat.id}`), [], 'Host cwd remains an empty placeholder')
+    assert.match(chat.file_directory, /^conversations\/\d{4}-\d{2}-\d{2}\/[a-f0-9-]{36}$/)
+    assert.ok(remoteDirectories.has(chat.file_directory), 'Sandbox mkdir must run before native creation')
+    if (realSsh) remote(`printf restart-proof > /workspace/${chat.file_directory}/restart-proof.txt`)
+    assert.deepEqual(await readdir(`/workspace/${chat.file_directory}`), [], 'Host cwd remains an empty placeholder')
     const detail = await signedRequest('GET', `/chats/${chat.id}`)
     assert.equal(detail.status, 200)
     const nativeCommand = async (command) => {
@@ -510,9 +514,9 @@ try {
     }
     const resumed = await signedRequest('PATCH', `/chats/${chat.id}`, { title: 'Native resume smoke' })
     assert.equal(resumed.status, 200, 'Native cold-session resume must succeed after host restart')
-    if (realSsh) assert.equal(remote(`cat /workspace/conversations/${chat.id}/restart-proof.txt`), 'restart-proof',
+    if (realSsh) assert.equal(remote(`cat /workspace/${chat.file_directory}/restart-proof.txt`), 'restart-proof',
       'Sandbox file must survive host restart')
-    assert.deepEqual(await readdir(`/workspace/conversations/${chat.id}`), [], 'Native create and resume must leave cwd empty')
+    assert.deepEqual(await readdir(`/workspace/${chat.file_directory}`), [], 'Native create and resume must leave cwd empty')
     if (runningRestart) {
       const targetResponse = await signedRequest('POST', '/chats')
       assert.equal(targetResponse.status, 201)
@@ -584,7 +588,7 @@ try {
           ['txt', Buffer.from('durable-native-evidence').toString('base64')],
           ['png', 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII='],
         ]) {
-          const response = await signedRequest('POST', '/files', { path: `conversations/${target.id}/native-evidence.${extension}`, data, version: null })
+          const response = await signedRequest('POST', '/files', { path: `${target.file_directory}/native-evidence.${extension}`, data, version: null })
           assert.equal(response.status, 200, 'Actual file upload route must accept the fixture')
           uploads.push((await response.json()).data)
         }
