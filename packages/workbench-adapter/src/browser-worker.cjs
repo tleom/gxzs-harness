@@ -1,7 +1,7 @@
 // Runs only in the owner sandbox. The Host transports pixels and validated input.
 const { createInterface } = require('node:readline')
 /** Reduce large photographic frames without losing the live stream; reuse the successful quality. */
-function createImageCapture({ now = Date.now, budgetMs = 5000 } = {}) {
+function createImageCapture({ now = Date.now, budgetMs = 8000 } = {}) {
   const qualities = [70, 50, 30, 15]
   let key, start = 0
   return async page => {
@@ -20,7 +20,7 @@ function createImageCapture({ now = Date.now, budgetMs = 5000 } = {}) {
 }
 function runWorker({ chromium, input = process.stdin, output = process.stdout, exit = code => process.exit(code) }) {
   let browser, context, page, session, watching = false, capturing = false, closed = false
-  let timer, notice = '', navigation = 0, hasFrame = false
+  let timer, notice = '', navigation = 0, hasFrame = false, navigating = false
   let captureFinished = Promise.resolve(), finishCapture = () => {}
   const send = value => new Promise(resolve => {
     if (output.write(JSON.stringify(value) + '\n')) resolve()
@@ -33,14 +33,12 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
     return url.href
   }
   async function frame() {
-    if (!page || page.isClosed() || capturing || closed) return
+    if (!page || page.isClosed() || capturing || closed || navigating) return
     capturing = true
     captureFinished = new Promise(resolve => { finishCapture = resolve })
+    const target = page, cdp = session, epoch = navigation, url = target.url()
     try {
-      const target = page, cdp = session
-      const url = target.url()
       if (url !== 'about:blank') validUrl(url)
-      const epoch = navigation
       const viewport = target.viewportSize()
       const image = await capture(target)
       const history = await cdp.send('Page.getNavigationHistory')
@@ -51,6 +49,8 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
         forward: history.currentIndex < history.entries.length - 1, notice })
       hasFrame = true
     } catch (error) {
+      // A navigation invalidates old-page captures; it is not a stable-page timeout.
+      if (closed || target !== page || navigating || navigation !== epoch || target.url() !== url) return
       if (error.message === 'frame_too_large') fatal('网页图像过大，请重新打开浏览器')
       else if (error.message === 'capture_timeout' || error.name === 'TimeoutError') fatal('网页图像获取超时，请重新打开浏览器')
       else if (error.message === 'invalid_url') fatal('浏览器仅支持 HTTP 和 HTTPS 页面')
@@ -137,7 +137,9 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
     if (!page || page.isClosed()) throw new Error('browser_closed')
     if (action === 'watch') { watching = value.enabled === true; if (watching) await frame(); return }
     notice = ''
-    switch (action) {
+    const moves = ['navigate', 'reload', 'back', 'forward'].includes(action)
+    if (moves) { navigation++; navigating = true }
+    try { switch (action) {
       case 'navigate': await page.goto(validUrl(value.url), { waitUntil: 'domcontentloaded' }); break
       case 'reload': await page.reload({ waitUntil: 'domcontentloaded' }); break
       case 'back': await page.goBack({ waitUntil: 'domcontentloaded' }); break
@@ -154,7 +156,8 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
       case 'text': await page.keyboard.insertText(value.text); break
       case 'key': await page.keyboard.press(value.key); break
       default: throw new Error('invalid_action')
-    }
+    } } finally { if (moves) { navigation++; navigating = false } }
+    if (moves && capturing) await captureFinished
     if (!watching || !['move', 'wheel', 'text', 'key'].includes(action)) await frame()
   }
   function fatal(error) {

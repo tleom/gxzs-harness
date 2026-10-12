@@ -12,7 +12,7 @@ it('reduces oversized images, reuses the successful quality, and resets it on na
   expect((await capture(page)).length).toBe(700000)
   expect(page.screenshot.mock.calls.map(([args]) => args.quality)).toEqual([70,50,30])
   await capture(page)
-  expect(page.screenshot).toHaveBeenLastCalledWith({type:'jpeg',quality:30,timeout:5000})
+  expect(page.screenshot).toHaveBeenLastCalledWith({type:'jpeg',quality:30,timeout:8000})
   url = 'https://example.com/next'
   await capture(page)
   expect(page.screenshot.mock.calls.at(-3)[0].quality).toBe(70)
@@ -22,7 +22,7 @@ it('shares one bounded screenshot deadline across quality retries', async () => 
   let elapsed = 0
   const page = {url:()=> 'https://example.com', viewportSize:()=>({width:1000,height:700}),
     screenshot:vi.fn(async()=> { elapsed+=2000; return Buffer.alloc(1100000) })}
-  await expect(createImageCapture({now:()=>elapsed})(page)).rejects.toThrow('capture_timeout')
+  await expect(createImageCapture({now:()=>elapsed,budgetMs:5000})(page)).rejects.toThrow('capture_timeout')
   expect(page.screenshot.mock.calls.map(([value])=>value.timeout)).toEqual([5000,3000,1000])
 })
 
@@ -186,6 +186,28 @@ it('discards the pre-resize capture and emits matching dimensions before acknowl
     expect(frames.length).toBeGreaterThan(0)
     expect(frames.every(frame=>frame.width===800 && frame.height===600)).toBe(true)
     expect(value.frames.findIndex(frame=>frame.type==='frame')).toBeLessThan(value.frames.findIndex(frame=>frame.id===3))
+  } finally { await value.runtime.shutdown() }
+})
+
+it('retries after a superseded watcher capture times out during navigation instead of killing the new page', async () => {
+  const value=worker()
+  let finishNavigation,rejectImage,url='https://example.com'
+  value.page.url=()=>url
+  value.page.goto=async()=>new Promise(resolve=>{finishNavigation=resolve})
+  try {
+    await value.command(1,'init',{width:1000,height:700})
+    await value.command(2,'watch',{enabled:true})
+    value.page.screenshot.mockImplementationOnce(()=>new Promise((_resolve,reject)=>{rejectImage=reject}))
+    await vi.waitFor(()=>expect(rejectImage).toBeTypeOf('function'))
+    value.input.write(JSON.stringify({id:3,action:'navigate',url:'https://example.com/new'})+'\n')
+    await vi.waitFor(()=>expect(finishNavigation).toBeTypeOf('function'))
+    const timeout=new Error('old capture timeout');timeout.name='TimeoutError'
+    rejectImage(timeout)
+    await Promise.resolve()
+    url='https://example.com/new';finishNavigation()
+    await vi.waitFor(()=>expect(value.frames.some(frame=>frame.type==='result'&&frame.id===3)).toBe(true))
+    expect(value.frames.filter(frame=>frame.type==='frame').at(-1).url).toBe(url)
+    expect(value.frames.some(frame=>frame.type==='fatal')).toBe(false)
   } finally { await value.runtime.shutdown() }
 })
 
