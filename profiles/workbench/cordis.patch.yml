@@ -44,14 +44,12 @@
 - id: schedule
   disabled: true
 
-- id: terminal-controller
-  config:
-    maxTerminals: !!js Number.MAX_SAFE_INTEGER
-
 - id: ptc-runtime
   config:
-    nodeExecutable: !!js process.env.GXZS_SANDBOX_NODE ?? '/usr/local/bin/node'
-    bootstrapPath: !!js process.env.GXZS_SANDBOX_PTC_BOOTSTRAP ?? '/opt/dsh/node_modules/@deepseek-ai/dsh-ptc-runtime-node/lib/process.js'
+    launch:
+      kind: node-script
+      executable: !!js process.env.GXZS_SANDBOX_NODE ?? '/usr/local/bin/node'
+      bootstrapPath: !!js process.env.GXZS_SANDBOX_PTC_BOOTSTRAP ?? '/opt/dsh/node_modules/@deepseek-ai/dsh-ptc-runtime-node/lib/process.js'
 
 - id: sandbox-policy
   config:
@@ -65,7 +63,9 @@
       name: '@gxzs/dsh-workbench-sandbox-runtime/ssh'
       config:
         host: !!js process.env.GXZS_SANDBOX_SSH_HOST
-        node: !!js process.env.GXZS_SANDBOX_NODE ?? '/usr/local/bin/node'
+        launch:
+          kind: node-script
+          node: !!js process.env.GXZS_SANDBOX_NODE ?? '/usr/local/bin/node'
         helper: !!js process.env.GXZS_SANDBOX_HELPER ?? '/opt/dsh/node_modules/@deepseek-ai/dsh-ssh/lib/helper.js'
         helperHash: !!js process.env.GXZS_SANDBOX_HELPER_HASH
         workspace: !!js process.env.GXZS_SANDBOX_WORKSPACE ?? '/workspace'

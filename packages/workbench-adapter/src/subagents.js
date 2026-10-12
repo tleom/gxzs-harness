@@ -1,11 +1,11 @@
-import { historyWindow } from './history-page.js'
+import { hasEarlierContent, historyWindow } from './history-page.js'
 import { HistoryPresentation } from './history-presentation.js'
 import { httpError } from './http.js'
 
 const terminal = { completed: 'completed', aborted: 'cancelled', interrupted: 'interrupted' }
 /** Read only native catalog descendants; never register another Workbench chat. */
 export class WorkbenchSubagents {
-  constructor({ sessions, service }) { this.sessions = sessions; this.service = service }
+  constructor({ sessions, service, native }) { this.sessions = sessions; this.service = service; this.native = native }
   async catalog(owner, chatId, signal) {
     const parent = this.service.requireChat(owner, chatId)
     const { items } = await this.sessions.list({}, signal)
@@ -14,9 +14,19 @@ export class WorkbenchSubagents {
     return catalog.map(entry => {
       const item = items.find(item => item.sessionId === entry.id)
       const values = item?.projections?.values ?? {}
-      return { ...entry, title: values.title || entry.label || entry.id, running: item?.running === true,
+      return { ...entry, title: entry.label || entry.id, summary: values.title, running: item?.running === true, parentAvailable: root?.agentAvailable === true,
         timing: values.subagentTiming, usage: values.tokenUsage, parentSessionId: parent.sessionId }
     })
+  }
+  async prompt(owner, chatId, childId, request, signal) {
+    const child = (await this.catalog(owner, chatId, signal)).find(item => item.id === childId)
+    if (!child) throw httpError(404, '子智能体不属于此对话')
+    if (child.mode !== 'continuable') throw httpError(409, '此子智能体不支持后续消息')
+    if (!this.native) throw httpError(503, '子智能体服务尚未就绪')
+    if (typeof request.text !== 'string' || !request.text.trim() || typeof request.requestId !== 'string') throw httpError(400, '子智能体消息无效')
+    return this.native.prompt({ parentSessionId: child.parentSessionId, childSessionId: child.id,
+      mode: 'continuable', requestId: request.requestId, delivery: 'queue', content: [{ type: 'text', text: request.text }],
+      ...(request.clientTimeZone ? { clientTimeZone: request.clientTimeZone } : {}) }, signal)
   }
   async history(owner, chatId, childId, cursor, signal) {
     const child = (await this.catalog(owner, chatId, signal)).find(item => item.id === childId)
@@ -80,7 +90,8 @@ export class WorkbenchSubagents {
     const before = frame.records[0]?.event.seq
     if (frame.hasMore && (!Number.isSafeInteger(before) || before < 1 || before >= (cursor?.beforeSeq ?? frame.cursor + 1)))
       throw httpError(502, '子智能体历史分页未向前推进')
-    return { child, runs: [...runs.values()], through_seq: frame.cursor, history_cursor: frame.hasMore
+    const hasMore = frame.hasMore && await hasEarlierContent(this.sessions, childId, frame.cursor, before, signal, address)
+    return { child, runs: [...runs.values()], through_seq: frame.cursor, history_cursor: hasMore
       ? { sessionId: childId, throughSeq: frame.cursor, beforeSeq: before } : null }
   }
 }

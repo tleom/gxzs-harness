@@ -162,7 +162,7 @@ export class TaskScheduler {
     const goal = agent && this.goals?.get(agent)
     if (goal?.phase === 'active') this.goals.pause(agent, { id: goal.id, revision: goal.revision })
     this.sessions.cancel({ sessionId: run.sessionId })
-    this.cancelOwned?.(run.sessionId)
+    this.cancelOwned?.(run.sessionId, run.id)
     // The durable fence blocks this Session immediately. Remote confirmation
     // must not hold unrelated Sessions' short admission renewals behind it.
     if (!runIds.length) this.unfencedSessions.delete(run.sessionId)

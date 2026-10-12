@@ -19,6 +19,22 @@ export class WorkbenchSchedules {
       return chat ? [{ ...task, chat_id: chat.id, chat_title: chat.title, chat_deleted: chat.deletedAt != null }] : []
     })
   }
+  async rememberRun(run) {
+    if (Array.isArray(run.selection?.schedule_titles)) return
+    const ids = []
+    try {
+      const single = /^schedule_id_json: (.+)$/m.exec(run.query)?.[1]
+      const batch = /^reminders_json: (.+)$/m.exec(run.query)?.[1]
+      if (single) { const id = JSON.parse(single); if (typeof id === 'string') ids.push(id) }
+      if (batch) { const rows = JSON.parse(batch); if (Array.isArray(rows)) for (const row of rows)
+        if (typeof row?.schedule_id === 'string') ids.push(row.schedule_id) }
+    } catch { /* Older framing may not contain recoverable task identities. */ }
+    const catalog = await this.native.catalog()
+    const titles = ids.map(id => catalog.find(task => task.id === id && task.sessionId === run.sessionId)?.title).filter(title => typeof title === 'string')
+    // A delivery's display names are a receipt, not another task catalog.
+    this.database.updateRunResources(run, { ...run.selection, schedule_titles: titles }, run.mcpTools)
+    this.database.appendEvent(run.ownerId, run.id, { event: 'workbench_schedule', titles })
+  }
   async create(owner, chatId, request, signal) {
     const chat = this.service.requireChat(owner, chatId)
     // The signed owner/chat binding supplies the Session; the client cannot choose it.

@@ -21,6 +21,16 @@ it('scopes native tasks and their history/deletion to the signed chat owner', as
   for (const method of ['history', 'delete', 'update']) await expect(test.gateway[method](test.owner, 'foreign-task', {})).rejects.toMatchObject({ status: 404 })
   expect(test.native.history).not.toHaveBeenCalled(); expect(test.native.delete).not.toHaveBeenCalled(); expect(test.native.update).not.toHaveBeenCalled()
 })
+it('retains native delivery names without admitting another session task or overwriting later catalog edits', async () => {
+  const test = fixture()
+  const {run} = test.db.createRun({ownerId:test.owner.ownerId,chatId:test.chat.id,sessionId:test.chat.sessionId,query:'reminders_json: [{"schedule_id":"task"},{"schedule_id":"foreign-task"}]',selection:{native_source:'schedule'},mcpTools:[]})
+  await test.gateway.rememberRun(run)
+  expect(test.db.getRun(test.owner.ownerId,run.id).selection.schedule_titles).toEqual(['提醒'])
+  test.native.catalog.mockResolvedValue([])
+  await test.gateway.rememberRun(test.db.getRun(test.owner.ownerId,run.id))
+  expect(test.native.catalog).toHaveBeenCalledOnce()
+  expect(test.db.getRun(test.owner.ownerId,run.id).selection.schedule_titles).toEqual(['提醒'])
+})
 it('uses the owning native Session and preserves compare-and-update without accepting a body binding', async () => {
   const test = fixture(); const signal = new AbortController().signal
   await test.gateway.create(test.owner, test.chat.id, { title: '提醒', prompt: '内容', daily: { time: '08:00:00', time_zone: 'Asia/Shanghai' }, sessionId: test.foreign.sessionId }, signal)

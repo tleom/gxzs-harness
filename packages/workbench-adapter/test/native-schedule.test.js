@@ -13,6 +13,7 @@ const [{ Context }, { default: Sessions }, { default: Agents }, { default: Syste
   native('cordis'), native('dsh-session'), native('dsh-agent'), native('dsh-system-prompt'), native('dsh-tools'),
   native('dsh-storage'), native('dsh-storage-json'), native('dsh-storage-domain'), native('dsh-schedule'),
 ])
+const [{ createScope }, ToolSchedule] = await Promise.all([native('dsh-scope'), native('dsh-tool-schedule')])
 it('uses the published native JSON domain, delivers once and preserves rule/history across restart', async () => {
   const root = await mkdtemp(join(process.cwd(), '.native-schedule-'))
   const db = new WorkbenchDatabase(':memory:')
@@ -28,16 +29,26 @@ it('uses the published native JSON domain, delivers once and preserves rule/hist
     ctx.provide('storageDomain', facility)
     ctx.effect(() => async () => facility.closeAll())
     const session = ctx.sessions.create(chat.sessionId)
-    const agent = { id: session.id, session, ctx, followup: delivered, status: 'idle' }
+    const agent = { id: session.id, session, ctx, options: {}, followup: delivered, status: 'idle' }
     ctx.provide('sessionController', { resolveAgent: async () => ({ agent }) })
     ctx.provide('sessionPersistence', {})
     ctx.on('session/flush', () => {})
     await ctx.plugin(Schedule)
+    const scope = createScope(ctx, agent)
+    await scope.ctx.plugin(ToolSchedule)
     const service = { requireChat: () => chat }
-    return { ctx, gateway: new WorkbenchSchedules({ native: ctx.schedule, database: db, service }) }
+    return { ctx, agent, gateway: new WorkbenchSchedules({ native: ctx.schedule, database: db, service }) }
   }
   try {
     const first = await start()
+    for (const name of ['schedule_create', 'schedule_list', 'schedule_update', 'schedule_delete']) expect(first.ctx.tools.get(name, first.agent)).toBeDefined()
+    const tool = first.ctx.tools.get('schedule_create', first.agent)
+    const modelCreated = await tool.execute({ title: '对话创建', prompt: '由模型工具创建的提醒', after_seconds: 3600 }, {
+      agent: first.agent, signal: new AbortController().signal,
+    })
+    expect(modelCreated).toMatchObject({ title: '对话创建', prompt: '由模型工具创建的提醒', kind: 'after' })
+    expect((await first.gateway.catalog(owner)).some(task => task.id === modelCreated.id)).toBe(true)
+    await first.gateway.delete(owner, modelCreated.id)
     const daily = await first.gateway.create(owner, chat.id, { title: '每天提醒', prompt: '中文内容', daily: { time: '08:00:00', time_zone: 'Asia/Shanghai' } })
     const once = await first.gateway.create(owner, chat.id, { title: '立即验证', prompt: '只投递一次', after_seconds: 1 })
     await vi.waitFor(() => expect(delivered).toHaveBeenCalledOnce(), { timeout: 3500 })

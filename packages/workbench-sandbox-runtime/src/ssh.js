@@ -49,7 +49,7 @@ export default class WorkbenchSsh extends SshConnection {
     // but not its multiplexed transport. A killed mux client leaves its remote
     // channel owned by ControlMaster until the command exits, leaking one
     // sandbox bridge PID per interrupted stream.
-    const command = [this.bridgeConfig.node, '-e', BRIDGE, endpoint.path].map(quote).join(' ')
+    const command = [this.bridgeConfig.launch.node, '-e', BRIDGE, endpoint.path].map(quote).join(' ')
     const child = spawn('ssh', ['-T', '-S', 'none', '-o', 'BatchMode=yes',
       '-o', 'StrictHostKeyChecking=yes', '-o', 'ForwardAgent=no',
       '-o', 'ConnectTimeout=5', '-o', 'ServerAliveInterval=5',

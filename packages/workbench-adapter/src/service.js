@@ -197,6 +197,7 @@ export class WorkbenchService {
         }
         const confirmation = await fenceMcpExecutions(this.platformClient, owner, cancelling.map(run => run.id))
         if (agent) await agent.whenIdle()
+        await this.waitSessionActivity?.(chat.sessionId)
         for (const run of cancelling) this.database.confirmRunFence(owner.ownerId, run.id, confirmation)
         for (const run of this.database.listRuns(owner.ownerId, chatId)) {
           if (['queued', 'running', 'waiting_input', 'stopping'].includes(run.status))
@@ -848,6 +849,7 @@ export class WorkbenchService {
     const agent = this.agents.get(run.sessionId)
     const goal = agent && this.goals?.get(agent)
     const active = currentExecutionRun(this.database, this.agents, run.sessionId)
+      ?? (this.executionRun?.(run.sessionId)?.background ? this.executionRun(run.sessionId) : undefined)
       ?? (goal?.phase === 'active' ? this.database.goalRun(run.sessionId) : undefined)
     if ((active && active.id !== run.id) || (!active && (goal?.phase === 'active' || agent?.status === 'running')))
       throw httpError(409, '当前任务已改变，请刷新后重试', 'STALE_RUN')
@@ -857,7 +859,7 @@ export class WorkbenchService {
     try {
       if (goal?.phase === 'active') this.goals.pause(agent, { id: goal.id, revision: goal.revision })
       this.sessions.cancel({ sessionId: run.sessionId })
-      this.cancelOwned?.(run.sessionId)
+      this.cancelOwned?.(run.sessionId, run.id)
     }
     catch (error) { nativeError = error }
     const confirmation = await fenceMcpExecutions(this.platformClient, owner, runIds)
@@ -1108,7 +1110,7 @@ export function runDto(run, events = [], pending = null) {
     mentioned_resources: run.selection?.mentioned_resources ?? [],
     ...(run.selection?.command ? { command: run.selection.command } : {}),
     ...(run.selection?.silent_resume || run.selection?.is_continuation ? { is_continuation: true } : {}),
-    ...(run.selection?.native_source === 'schedule' ? { source: { kind: 'schedule' } } : {}),
+    ...(run.selection?.native_source === 'schedule' ? { source: { kind: 'schedule', titles: run.selection.schedule_titles ?? [] } } : {}),
     status: run.status, error: run.error ? runFailure({ message: run.error, code: run.errorCode }).message : run.error,
     feedback: run.feedback ?? null, events: events.map(presentRunEvent), events_cursor: `${run.seq}-0`,
     stop_confirmation: run.stopConfirmation ?? null,

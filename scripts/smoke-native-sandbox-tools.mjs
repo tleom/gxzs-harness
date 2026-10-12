@@ -63,7 +63,7 @@ try {
   stage = 'ssh-create'
   ssh = new WorkbenchSsh(ctx, {
     host: process.env.GXZS_SANDBOX_SSH_HOST,
-    node: process.env.GXZS_SANDBOX_NODE || '/usr/local/bin/node',
+    launch: { kind: 'node-script', node: process.env.GXZS_SANDBOX_NODE || '/usr/local/bin/node' },
     helper: process.env.GXZS_SANDBOX_HELPER || '/opt/dsh/node_modules/@deepseek-ai/dsh-ssh/lib/helper.js',
     helperHash: process.env.GXZS_SANDBOX_HELPER_HASH,
     workspace: '/workspace', requestTimeoutMs: 10_000,
@@ -83,6 +83,13 @@ try {
   await plugin('search-tools', SearchTools, { sampleOverCapGlobResults: false })
   await execute('bash', { command: `mkdir -m 700 -- '${directory}'`, description: 'Create isolated tool fixture', workdir: '/tmp', timeoutMs: 10_000 })
   created = true
+  const { default: NodeRuntime } = await native('dsh-ptc-runtime-node')
+  await plugin('ptc-runtime', NodeRuntime, { launch: { kind: 'node-script', executable: '/usr/local/bin/node',
+    bootstrapPath: '/opt/dsh/node_modules/@deepseek-ai/dsh-ptc-runtime-node/lib/process.js' } })
+  const ptc = await ctx.ptcRuntime.run(ctx.ptcRuntime.resolve({ program: 'return { value: 42, cwd: process.cwd() }', bindings: [], cwd: directory, signal: AbortSignal.timeout(20_000) }))
+  assert.equal(ptc.error, undefined)
+  assert.deepEqual(ptc.value, { value: 42, cwd: directory })
+  checked.push('ptc-runtime')
   if (process.argv.includes('--changes-check')) {
     stage = 'native-changes'
     let recorder

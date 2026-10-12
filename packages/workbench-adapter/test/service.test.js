@@ -390,6 +390,17 @@ describe('followup and control service', () => {
     expect(sessionController.cancel).toHaveBeenCalledOnce()
   })
 
+  it('rejects a stale stop while another completed root run still owns background work', async () => {
+    const { database, owner, chat, service, sessionController } = setup()
+    const first = database.createRun({ ownerId: owner.ownerId, chatId: chat.id, sessionId: chat.sessionId, query: 'old', selection: {} }).run
+    const second = database.createRun({ ownerId: owner.ownerId, chatId: chat.id, sessionId: chat.sessionId, query: 'new', selection: {} }).run
+    service.executionRun = () => ({ ...second, status: 'running', background: true })
+    service.cancelOwned = vi.fn()
+    await expect(service.stopRun(owner, first.id)).rejects.toMatchObject({ status: 409, code: 'STALE_RUN' })
+    expect(sessionController.cancel).not.toHaveBeenCalled()
+    expect(service.cancelOwned).not.toHaveBeenCalled()
+  })
+
   it.each(['queued', 'completed'])('rejects a delayed stop for a %s run while a different run is active', async (status) => {
     const test = setup()
     const { database, owner, chat, service, sessionController, agent } = test
@@ -903,12 +914,13 @@ describe('followup and control service', () => {
     const actions = []
     service.workspaces = { controller: { archiveSession: vi.fn(async request => actions.push(['archive', request])) } }
     service.closeTerminals = vi.fn(async sessionId => actions.push(['terminals', sessionId]))
+    service.waitSessionActivity = vi.fn(async sessionId => actions.push(['settled', sessionId]))
     fileManager.operate.mockImplementation(async request => {
       actions.push([request.operation])
       return request.operation === 'stat' ? { kind: 'directory', version: 'v1' } : { deleted: true }
     })
     await service.deleteChat(owner, chat.id)
-    expect(actions).toEqual([['archive', { sessionId: chat.sessionId, stopActivity: true }], ['terminals', chat.sessionId], ['stat'], ['delete']])
+    expect(actions).toEqual([['archive', { sessionId: chat.sessionId, stopActivity: true }], ['terminals', chat.sessionId], ['settled', chat.sessionId], ['stat'], ['delete']])
     expect(service.listChats(owner)).toEqual([])
   })
 

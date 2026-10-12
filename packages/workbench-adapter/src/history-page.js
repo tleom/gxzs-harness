@@ -5,10 +5,10 @@ import { httpError } from './http.js'
 export const historyWindow = { maxMessages: 500, turnWindow: { minMessages: 50, minTurns: 2 } }
 
 /** Native pagination counts log metadata too; the UI only offers earlier display content. */
-export async function hasEarlierContent(sessions, sessionId, throughSeq, beforeSeq, signal) {
+export async function hasEarlierContent(sessions, sessionId, throughSeq, beforeSeq, signal, address = { kind: 'session', sessionId }) {
   let before = beforeSeq
   while (before > 0) {
-    const page = await sessions.page({ address: { kind: 'session', sessionId },
+    const page = await sessions.page({ address,
       throughSeq, beforeSeq: before, maxMessages: 1 }, signal)
     signal.throwIfAborted()
     if (page.records.some(({ event }) =>

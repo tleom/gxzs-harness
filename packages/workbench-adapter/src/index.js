@@ -22,7 +22,7 @@ import { WorkbenchSubagents } from './subagents.js'
 import { WorkbenchTerminals } from './terminals.js'
 
 export const name = 'workbench-adapter'
-export const inject = ['webServer', 'sessionController', 'workspaceController', 'sessionReferenceResolver', 'fileReferences', 'workspaceChanges', 'agents', 'commands', 'skills', 'systemPrompt', 'tokenMeter', 'workbenchFileManager', 'workbenchPlatformClient', 'sessionQuery', 'sessionProjections', 'agentPresets', 'agentDefaultModel', 'settings', 'attachments', 'fileUploads', 'goals', 'terminalController']
+export const inject = ['webServer', 'sessionController', 'workspaceController', 'sessionReferenceResolver', 'fileReferences', 'workspaceChanges', 'agents', 'commands', 'skills', 'systemPrompt', 'tokenMeter', 'workbenchFileManager', 'workbenchPlatformClient', 'sessionQuery', 'sessionProjections', 'agentPresets', 'agentDefaultModel', 'settings', 'attachments', 'fileUploads', 'goals', 'terminalController', 'subagents']
 
 export const Config = z.object({
   basePath: z.string().default('/ai/workbench'),
@@ -47,17 +47,25 @@ export function apply(ctx, config) {
     prepareContent: (sessionId, content) => prepareNativeFiles(ctx.fileUploads, sessionId, content) })
   runtime.scheduler = scheduler
   scheduler.hasOwnedWork = sessionId => runtime.hasOwnedWork(sessionId)
-  scheduler.cancelOwned = sessionId => runtime.cancelOwned(sessionId)
+  scheduler.cancelOwned = (sessionId, runId) => runtime.cancelOwned(sessionId, runId)
   scheduler.executionRun = (sessionId) => runtime.executionRun(sessionId)
   const service = new WorkbenchService({ database, sessionController: ctx.sessionController, agents: ctx.agents, commands: ctx.commands, skills: ctx.skills, fileManager: ctx.workbenchFileManager, platformClient: ctx.workbenchPlatformClient, workspace: config.workspace, sessionQuery: ctx.sessionQuery, agentPresets: ctx.agentPresets, agentDefaultModel: ctx.agentDefaultModel, modelSettings: ctx.settings, scheduler, attachments: ctx.attachments, goals: ctx.goals, fileUploads: ctx.fileUploads, nativeFileAttachments: process.env.GXZS_NATIVE_FILE_ATTACHMENTS === '1' })
   service.workspaceChanges = ctx.workspaceChanges
   service.workspaces = workspaces
   service.sessionReferences = ctx.sessionReferenceResolver
   service.fileReferences = ctx.fileReferences
-  service.cancelOwned = sessionId => runtime.cancelOwned(sessionId)
+  service.cancelOwned = (sessionId, runId) => runtime.cancelOwned(sessionId, runId)
+  service.executionRun = sessionId => runtime.executionRun(sessionId)
+  service.waitSessionActivity = async sessionId => {
+    const signal = AbortSignal.timeout(30_000)
+    while ((await ctx.waterfall('workspace/session-activity', { sessionId }, () => Promise.resolve([]))).length) {
+      signal.throwIfAborted()
+      await new Promise(resolve => setTimeout(resolve, 50))
+    }
+  }
   const schedules = new WorkbenchSchedules({ native: () => ctx.schedule, database, service })
   workspaces.schedules = schedules
-  const subagents = new WorkbenchSubagents({ sessions: ctx.sessionController, service })
+  const subagents = new WorkbenchSubagents({ sessions: ctx.sessionController, service, native: ctx.subagents })
   const terminals = new WorkbenchTerminals({ native: ctx.terminalController, service, sessions: ctx.sessionController })
   service.closeTerminals = async sessionId => {
     const items = ctx.terminalController.list(sessionId)
@@ -109,6 +117,8 @@ export function apply(ctx, config) {
   ctx.on('agent/pre-step', async (payload, next) => {
     await recovery
     if (recoveryError) return { kind: 'reject' }
+    const run = runtime.executionRun(payload.agent.session?.id ?? payload.agent.id)
+    if (run?.selection?.native_source === 'schedule') await schedules.rememberRun(run)
     return scheduler.admitNativeStep(payload, next)
   }, { global: true, prepend: true })
   ctx.on('agent/status', ({ agent, status }) => {
@@ -240,11 +250,27 @@ export function apply(ctx, config) {
     ['GET', /^\/workspaces$/, async ({ owner }, res) => sendJson(res, 200, { data: await workspaces.baseline(owner) })],
     ['GET', /^\/schedules$/, async ({ owner }, res) => sendJson(res, 200, { data: await schedules.catalog(owner) })],
     ['GET', /^\/chats\/([\w-]+)\/terminals$/, async ({ owner }, res, match) => sendJson(res, 200, { data: terminals.list(owner, match[1]) })],
-    ['POST', /^\/chats\/([\w-]+)\/terminals$/, async ({ owner, json }, res, match) => sendJson(res, 201, { data: await terminals.create(owner, match[1], json, new AbortController().signal) })],
+    ['POST', /^\/chats\/([\w-]+)\/terminals$/, async ({ owner, json }, res, match) => {
+      const abort = new AbortController()
+      const disconnected = () => abort.abort()
+      res.once('close', disconnected)
+      try {
+        const data = await terminals.create(owner, match[1], json, abort.signal)
+        if (!abort.signal.aborted) sendJson(res, 201, { data })
+      } finally { res.off('close', disconnected) }
+    }],
     ['GET', /^\/chats\/([\w-]+)\/terminals\/([\w-]+)\/events$/, async ({ owner, url }, res, match) => streamNativeEvents({ res, follow: signal => terminals.follow(owner, match[1], match[2], url.searchParams.get('attachment'), signal) })],
     ['POST', /^\/chats\/([\w-]+)\/terminals\/([\w-]+)\/(write|resize)$/, async ({ owner, json }, res, match) => { await terminals.control(owner, match[1], match[2], match[3], json); sendJson(res, 200, { data: {} }) }],
     ['DELETE', /^\/chats\/([\w-]+)\/terminals\/([\w-]+)$/, async ({ owner }, res, match) => { await terminals.control(owner, match[1], match[2], 'close', {}); sendJson(res, 200, { data: {} }) }],
     ['GET', /^\/chats\/([\w-]+)\/subagents$/, async ({ owner }, res, match) => sendJson(res, 200, { data: await subagents.catalog(owner, match[1], new AbortController().signal) })],
+    ['POST', /^\/chats\/([\w-]+)\/subagents\/([\w-]+)\/messages$/, async ({ owner, json }, res, match) => {
+      const abort = new AbortController()
+      const disconnected = () => abort.abort()
+      res.once('close', disconnected)
+      try { const data = await subagents.prompt(owner, match[1], match[2], json, abort.signal)
+        if (!abort.signal.aborted) sendJson(res, 201, { data })
+      } finally { res.off('close', disconnected) }
+    }],
     ['GET', /^\/chats\/([\w-]+)\/subagents\/([\w-]+)\/history$/, async ({ owner, url }, res, match) => {
       const abort = new AbortController()
       const disconnected = () => abort.abort()

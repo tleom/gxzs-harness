@@ -37,7 +37,7 @@ it('authorizes native child history only through its parent catalog and rejects 
   ] })), page: vi.fn(async () => ({ records: [], hasMore: false })) }
   const gateway = new WorkbenchSubagents({ sessions, service })
   const signal = new AbortController().signal
-  expect((await gateway.catalog(owner, chat.id, signal))[0]).toMatchObject({ title: '原生标题', running: true })
+  expect((await gateway.catalog(owner, chat.id, signal))[0]).toMatchObject({ title: '调查', summary: '原生标题', running: true })
   await expect(gateway.history(owner, chat.id, 'foreign', {}, signal)).rejects.toMatchObject({ status: 404 })
   await expect(gateway.history(owner, chat.id, 'external', {}, signal)).rejects.toMatchObject({ status: 409 })
   await expect(gateway.history(owner, chat.id, child.id, { sessionId: 'foreign', throughSeq: 9, beforeSeq: 5 }, signal)).rejects.toMatchObject({ status: 400 })
@@ -53,4 +53,25 @@ it('returns stable input and terminal errors without publishing internal diagnos
   expect(res.end.mock.calls[0][0]).not.toContain('/private')
   sendError(res, { isDSHRemoteError: true, code: 'terminal/unavailable', message: '/host/path' })
   expect(res.writeHead.mock.calls[1][0]).toBe(404)
+})
+it('routes only an owned continuable child through native subagent delivery', async () => {
+  const native = { prompt: vi.fn(async () => ({ messageId: 'accepted' })) }
+  const sessions = { list: async () => ({ items: [{ sessionId: 'root', agentAvailable: true, projections: { values: { subagentCatalog: [child, { id:'once', mode:'one-shot' }] } } }] }) }
+  const gateway = new WorkbenchSubagents({ native, sessions, service })
+  const request = { requestId:attachment, text:'继续调研' }, signal = new AbortController().signal
+  await expect(gateway.prompt(owner,chat.id,'once',request,signal)).rejects.toMatchObject({status:409})
+  await expect(gateway.prompt(owner,chat.id,'foreign',request,signal)).rejects.toMatchObject({status:404})
+  expect(native.prompt).not.toHaveBeenCalled()
+  await expect(gateway.prompt(owner,chat.id,child.id,request,signal)).resolves.toEqual({messageId:'accepted'})
+  expect(native.prompt).toHaveBeenCalledWith({parentSessionId:'root',childSessionId:'child',mode:'continuable',delivery:'queue',requestId:attachment,content:[{type:'text',text:'继续调研'}]},signal)
+})
+it('hides a child cursor when only its descriptor metadata precedes the visible history', async () => {
+  const sessions = { list: async () => ({ items: [{ sessionId: 'root', projections: { values: { subagentCatalog: [child] } } }] }),
+    page: vi.fn(async request => request.maxMessages === 1
+      ? { records: [{ event: { seq: 0, type: 'subagent/descriptor', data: {} } }], hasMore: false }
+      : { records: [{ event: { seq: 1, time: 1000, type: 'turn/start', data: { turn: 1 } } }], hasMore: true }) }
+  const gateway = new WorkbenchSubagents({ sessions, service })
+  const result = await gateway.history(owner, chat.id, child.id, { sessionId: child.id, throughSeq: 9, beforeSeq: 5 }, new AbortController().signal)
+  expect(result.history_cursor).toBeNull()
+  expect(sessions.page.mock.calls[1][0].address).toMatchObject({ kind: 'subagent', childSessionId: child.id })
 })

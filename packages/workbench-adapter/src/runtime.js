@@ -32,10 +32,11 @@ export class WorkbenchRuntime extends Service {
       && this.rootOf(child) === root && (runId === undefined || this.childRuns.get(child) === runId)))
   }
 
-  cancelOwned(sessionId) {
+  cancelOwned(sessionId, runId) {
     const root = this.agents?.get(sessionId)
     if (!root) return
-    for (const child of this.agents.list?.() ?? []) if (child !== root && this.rootOf(child) === root)
+    for (const child of this.agents.list?.() ?? []) if (child !== root && this.rootOf(child) === root
+      && (runId === undefined || this.childRuns.get(child) === runId))
       child.cancel({ kind: 'user' }, { keepInbox: true })
   }
 
