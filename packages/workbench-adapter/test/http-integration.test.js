@@ -2,7 +2,7 @@ import { createHash, createHmac, randomUUID } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import { Readable } from 'node:stream'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { apply } from '../src/index.js'
+import { apply, waitSessionActivity } from '../src/index.js'
 import { publishedModels } from './model-fixture.js'
 
 const cleanups = []
@@ -14,6 +14,7 @@ function setup() {
   const sessions = new Map()
   let handler
   const context = {
+    get: name => context[name],
     webServer: { register: vi.fn((route) => { handler = route.handler; return () => {} }) },
     sessionController: {
       modelCatalog: async () => ({ default: { provider: 'p', model: 'm' }, groups: [{ id: 'p', models: [{ id: 'm' }] }] }),
@@ -92,6 +93,41 @@ async function call(handler, key, method, route, value, authenticated = true, us
 }
 
 describe('authenticated workbench HTTP handler', () => {
+  it('bounds a stalled native activity query without deleting private files', async () => {
+    const context = { waterfall: vi.fn(() => new Promise(() => {})) }
+    await expect(waitSessionActivity(context, 'session', { timeoutMs: 20 })).rejects.toThrow('did not settle')
+    expect(context.waterfall).toHaveBeenCalledOnce()
+  })
+  it('blocks file deletion while a completed parent still owns background children', async () => {
+    const { handler, key, context } = setup()
+    const chat = (await call(handler, key, 'POST', '/chats', {})).body.data
+    const runtime = context.reflect.provide.mock.calls.find(([name]) => name === 'workbenchRuntime')[1]
+    const sessionId = runtime.database.getChat('t:42', chat.id).sessionId
+    runtime.hasOwnedWork = vi.fn(id => id === sessionId)
+    const response = await call(handler, key, 'DELETE', '/files', { path: 'case/a.txt' })
+    expect(response.status).toBe(409)
+    expect(context.workbenchFileManager.operate.mock.calls.some(([request]) => request.operation === 'delete')).toBe(false)
+    runtime.hasOwnedWork = () => false
+    expect((await call(handler, key, 'DELETE', '/files', { path: 'case/a.txt' })).status).toBe(200)
+  })
+  it('defers a live scheduled receipt until the first verified MCP catalog', async () => {
+    const { handler, key, context } = setup()
+    const chat = (await call(handler, key, 'POST', '/chats', {})).body.data
+    const runtime = context.reflect.provide.mock.calls.find(([name]) => name === 'workbenchRuntime')[1]
+    runtime.mcpCatalogState = { ready: false }
+    const sessionId = runtime.database.getChat('t:42', chat.id).sessionId
+    const payload = { agent: { id: sessionId }, message: { id: 'live-schedule', source: { kind: 'schedule' }, content: [{ type: 'text', text: 'scheduled prompt' }] }, turn: 1 }
+    const claim = context.on.mock.calls.find(([name]) => name === 'agent/inbox/claimed')[1]
+    const onEvent = context.on.mock.calls.find(([name]) => name === 'session/event')[1]
+    onEvent({ id: sessionId }, { type: 'agent/inbox/spliced', seq: 0, data: { target: 'next-turn', start: 0, removedCount: 0, inserted: [payload.message] } })
+    onEvent({ id: sessionId }, { type: 'user/message', seq: 1, data: payload.message })
+    claim(payload)
+    expect(runtime.database.getRun('t:42', 'live-schedule')).toBeUndefined()
+    runtime.mcpCatalogState = { ready: true }
+    runtime.mcpResources = () => [{ id: 'verified', version: 'v1' }]
+    claim(payload)
+    expect(runtime.database.getRun('t:42', 'live-schedule').mcpTools).toEqual([{ id: 'verified', version: 'v1' }])
+  })
   it('cancels a pending native schedule creation when the response disconnects',async()=>{
     const {handler,key,context}=setup()
     const chat=(await call(handler,key,'POST','/chats',{})).body.data

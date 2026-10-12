@@ -37,6 +37,20 @@ export const Config = z.object({
 
 
 
+export async function waitSessionActivity(ctx, sessionId, { timeoutMs = 30_000, pollMs = 50 } = {}) {
+  let timer
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error('Session activity did not settle before deletion')), timeoutMs)
+  })
+  try {
+    while ((await Promise.race([
+      ctx.waterfall('workspace/session-activity', { sessionId }, () => Promise.resolve([])), timeout,
+    ])).length) {
+      await Promise.race([new Promise(resolve => setTimeout(resolve, pollMs)), timeout])
+    }
+  } finally { clearTimeout(timer) }
+}
+
 export function apply(ctx, config) {
   if (!config.ownerId || !config.assertionIssuer) throw new Error('workbench host owner and assertion issuer are required')
   const eventBus = new RunEventBus()
@@ -56,14 +70,8 @@ export function apply(ctx, config) {
   service.fileReferences = ctx.fileReferences
   service.cancelOwned = (sessionId, runId) => runtime.cancelOwned(sessionId, runId)
   service.executionRun = sessionId => runtime.executionRun(sessionId)
-  service.waitSessionActivity = async sessionId => {
-    const signal = AbortSignal.timeout(30_000)
-    while ((await ctx.waterfall('workspace/session-activity', { sessionId }, () => Promise.resolve([]))).length) {
-      signal.throwIfAborted()
-      await new Promise(resolve => setTimeout(resolve, 50))
-    }
-  }
-  const schedules = new WorkbenchSchedules({ native: () => ctx.schedule, database, service })
+  service.waitSessionActivity = sessionId => waitSessionActivity(ctx, sessionId)
+  const schedules = new WorkbenchSchedules({ native: () => ctx.get('schedule'), database, service })
   workspaces.schedules = schedules
   const subagents = new WorkbenchSubagents({ sessions: ctx.sessionController, service, native: ctx.subagents, attachments: ctx.attachments })
   const terminals = new WorkbenchTerminals({ native: ctx.terminalController, service, sessions: ctx.sessionController })
@@ -81,7 +89,12 @@ export function apply(ctx, config) {
   let recoveryError
   let recoveryTimer
   let recovery
+  let recovering = false
   const beginRecovery = () => {
+    if (recovering) return
+    clearTimeout(recoveryTimer)
+    recovering = true
+    recovered = false
     recovery = (async () => {
       await reconcileNativeSessions(database, ctx.sessionQuery, config.ownerId, () => {
         // Only a missing scheduled receipt needs a fresh frozen catalog. Retry
@@ -100,7 +113,7 @@ export function apply(ctx, config) {
         recoveryTimer = setTimeout(beginRecovery, 1000)
         recoveryTimer.unref?.()
       }
-    })
+    }).finally(() => { recovering = false })
   }
   beginRecovery()
   const humanInput = new HumanInputBridge({ database, timeoutSeconds: config.humanInputTimeoutSeconds,
@@ -121,8 +134,16 @@ export function apply(ctx, config) {
     const child = ctx.agents.get(id)
     if (child) runtime.bindChild(child)
   }, { global: true, prepend: true })
-  ctx.on('agent/inbox/claimed', (payload) => projectInboxClaim(database, payload, config.ownerId,
-    { mcpTools: runtime.mcpResources?.() ?? [] }), { global: true, prepend: true })
+  ctx.on('agent/inbox/claimed', (payload) => {
+    if (payload.message?.source?.kind === 'schedule' && !runtime.mcpCatalogState?.ready) {
+      // The durable native log is retried by recovery; never freeze an
+      // unverified empty catalog into a delivered schedule receipt.
+      beginRecovery()
+      return
+    }
+    return projectInboxClaim(database, payload, config.ownerId,
+      { mcpTools: runtime.mcpResources?.() ?? [] })
+  }, { global: true, prepend: true })
   ctx.on('agent/pre-step', async (payload, next) => {
     await recovery
     if (recoveryError) return { kind: 'reject' }
@@ -156,7 +177,10 @@ export function apply(ctx, config) {
       context = { ...context, goal: agent ? ctx.goals?.get(agent) : undefined, nativeIdle: agent?.status === 'idle' }
     }
     projectSessionEvent(database, session?.id ?? session?.header?.id, event, config.ownerId,
-      { ...context, mcpTools: runtime.mcpResources?.() ?? [] })
+      { ...context, mcpCatalogReady: runtime.mcpCatalogState?.ready === true, mcpTools: runtime.mcpResources?.() ?? [] })
+    if (!runtime.mcpCatalogState?.ready && (event.type === 'user/message' && event.data?.source?.kind === 'schedule'
+      || event.type === 'agent/inbox/spliced' && event.data?.inserted?.some(message => message.source?.kind === 'schedule')))
+      beginRecovery()
   }, { global: true })
 
   const buildCatalog = async (owner, modelsOnly = false) => {
@@ -431,7 +455,9 @@ export function apply(ctx, config) {
     }],
     ['DELETE', /^\/files$/, async ({ owner, json }, res) => {
       const requested = managerPath(json.path)
-      if (database.hasActiveRuns(owner.ownerId)) throw httpError(409, '工作台正在执行任务，请停止后再删除文件')
+      if (database.hasActiveRuns(owner.ownerId) || database.listChats(owner.ownerId)
+        .some(chat => runtime.hasOwnedWork(chat.sessionId)))
+        throw httpError(409, '工作台正在执行任务，请停止后再删除文件')
       const result = await ctx.workbenchFileManager.operate({ operation: 'delete', path: requested, version: json.version ?? null })
       sendJson(res, 200, { data: result })
     }],

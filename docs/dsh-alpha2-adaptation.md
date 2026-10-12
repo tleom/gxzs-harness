@@ -67,12 +67,18 @@ HTML 预览在父页面通过认证读取同目录资源，再装入没有同源
 ## 新对话与目录规则
 
 - 顶部新对话按原生 `UiWorkspaceService.startSession` 规则，优先当前 Workspace，否则选择最近 Workspace。分组内新建显式指定该组；未分组新建显式不选择 Workspace。
-- 新对话立即显示本地“新对话”占位行。未使用时切换或再次新建会移除占位；发送后才创建后台会话并以首条消息暂命名，随后接收原生标题。
+- 新对话立即显示本地“新对话”占位行。未输入文字、附件或资源选择的空占位在切换时移除；未发送的输入保留，发送后才创建后台会话并以首条消息暂命名，随后接收原生标题。
 - 默认新任务目录：`/workspace/conversations/YYYY-MM-DD/<chat UUID>`；历史会话保留已有目录。
 - 手选 Workspace 直接作为 cwd；所有成员会话共享该目录。文件树显示实际目录名称，不以成员会话标题替代 Workspace 文件夹。
 - Codex 公开 app-server 协议的 `Thread.cwd` 是绝对路径。日期目录由本项目按用户要求实现，未将 GitHub 用户问题中的桌面示例当成公开实现源码。
 
 ## 部署与恢复
+
+MCP 与技能的内部状态统一归入资源目录：旧根目录的 `.mcp-settings.json`、`.mcp-pins.json`、`.mcp-cache`、`.mcp-backups` 分别迁入 `mcp/.settings.json`、`.pins.json`、`.cache`、`.backups`；技能开关、置顶、备份迁入 `skills/.settings.json`、`.pins.json`、`.backups`。单一 `resource_directory` 入口通过 owner descriptor/no-follow 与目录锁执行同文件系统迁移，保留冲突原始数据，迁入后移除旧条目。已安装包路径及 revision 保持不变；两个资源根文件夹允许查看与 ZIP 下载，文件接口拒绝删除根目录。
+
+迁移前先 drain/fence 全部旧 Host 任务与 MCP 监督进程，确认旧 helper 已退出；随后备份持久化状态，替换 manager/Host，并在重新开放请求前以 UID 1000 调用同一个迁移入口，逐 owner 核对七个旧条目不存在、原始字节及权限保留。回滚必须恢复与旧 helper 配套的旧布局备份，只回滚镜像不能恢复设置权威。
+
+适配器使用 Cordis `ctx.get('schedule')` 读取后启动的原生服务，避免引入启动依赖环；内部 Workspace 校验和引用搜索不读取定时目录。原生沙箱终端与定时目录的完整 HTTP 操作纳入 `smoke-host-bootstrap.mjs`。原生定时投递的实时事件和恢复路径都等待首次确认的 MCP 目录，后台子任务延续原冻结权限；文件删除同时检查后台子任务，私有会话目录删除等待有时间上限的原生活动结束。
 
 数据库无新增字段或 SQL 迁移。部署顺序为后端受控路由、237 Host/Sandbox 成对升级并更新 SSH helper hash、235 前端。保持 owner、Workspace、home volume 与目录不变，通过现有 drain/fence/replace 流程升级，不强停正在运行的任务。
 

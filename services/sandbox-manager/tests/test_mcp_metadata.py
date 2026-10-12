@@ -91,8 +91,8 @@ def test_discovery_expires_and_authentication_edit_invalidates(ops, tmp_path, mo
 
 def test_corrupt_cache_does_not_disable_valid_plugin(ops, tmp_path):
     ops.personal_mcp({"operation": "mcp_save", "name": "demo", "content": config()}, str(tmp_path))
-    (tmp_path / ".mcp-cache").mkdir(exist_ok=True)
-    (tmp_path / ".mcp-cache" / "demo.json").write_text("not-json", encoding="utf-8")
+    (tmp_path / "mcp/.cache").mkdir(exist_ok=True)
+    (tmp_path / "mcp/.cache" / "demo.json").write_text("not-json", encoding="utf-8")
     item = ops.personal_mcp({"operation": "mcp_list"}, str(tmp_path))["mcp"][0]
     assert item["enabled"] is True
     assert item["status"] == "unverified"

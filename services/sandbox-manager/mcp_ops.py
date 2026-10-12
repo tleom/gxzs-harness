@@ -13,10 +13,8 @@ import uuid
 from urllib.parse import urlsplit
 
 from file_ops import read_file, version
-from resource_ops import atomic_write, directory
+from resource_ops import SETTINGS, PINS, atomic_write, directory, resource_directory
 
-SETTINGS = ".mcp-settings.json"
-PINS = ".mcp-pins.json"
 MAX_CONFIG = 65536
 MAX_MANIFEST = 1024 * 1024
 MAX_TOOLS = 200
@@ -178,76 +176,83 @@ def load(rootfd, name):
 
 
 def snapshot(rootfd, selected=None):
-    warnings = []
+    mcpfd = resource_directory(rootfd, "mcp")
     try:
-        settings = mapping(rootfd, SETTINGS)
-        settings_valid = True
-    except (ValueError, OSError):
-        settings, settings_valid = {}, False
-        warnings.append("MCP 开关文件无效，个人 MCP 暂时停用")
-    try:
-        pins = mapping(rootfd, PINS)
-    except (ValueError, OSError):
-        pins = {}
-        warnings.append("MCP 置顶文件无效")
-    mcpfd, cachefd = directory(rootfd, "mcp"), directory(rootfd, ".mcp-cache")
-    items = []
-    try:
-        for name in ([server_name(selected)] if selected is not None else sorted(os.listdir(mcpfd))):
-            item = {
-                "id": name,
-                "name": name,
-                "description": "",
-                "scope": "personal",
-                "readonly": False,
-                "path": "/workspace/mcp/" + name,
-                "enabled": settings_valid and settings.get(name, True),
-                "pinned": pins.get(name, False),
-                "version": None,
-                "tools": [],
-                "status": "unverified",
-            }
-            try:
-                raw = raw_configuration(rootfd, name)
-                revision = version(raw)
-                item["version"] = revision
-                config = configuration(raw)
-                item.update(
-                    name=config.get("display_name") or config.get("name") or name,
-                    call_name=name,
-                    description=config.get("description", ""),
-                    transport=config["transport"],
-                    version=revision,
-                )
-            except (ValueError, OSError, RecursionError):
-                item.update(enabled=False, status="invalid", error="配置无效，请编辑 mcp.json 后重新测试连接")
+        warnings = []
+        try:
+            settings = mapping(mcpfd, SETTINGS)
+            settings_valid = True
+        except (ValueError, OSError):
+            settings, settings_valid = {}, False
+            warnings.append("MCP 开关文件无效，个人 MCP 暂时停用")
+        try:
+            pins = mapping(mcpfd, PINS)
+        except (ValueError, OSError):
+            pins = {}
+            warnings.append("MCP 置顶文件无效")
+        cachefd = directory(mcpfd, ".cache")
+        items = []
+        try:
+            for name in ([server_name(selected)] if selected is not None else sorted(os.listdir(mcpfd))):
+                if name.startswith("."):
+                    continue
+                item = {
+                    "id": name,
+                    "name": name,
+                    "description": "",
+                    "scope": "personal",
+                    "readonly": False,
+                    "path": "/workspace/mcp/" + name,
+                    "enabled": settings_valid and settings.get(name, True),
+                    "pinned": pins.get(name, False),
+                    "version": None,
+                    "tools": [],
+                    "status": "unverified",
+                }
+                try:
+                    raw = raw_configuration(rootfd, name)
+                    revision = version(raw)
+                    item["version"] = revision
+                    config = configuration(raw)
+                    item.update(
+                        name=config.get("display_name") or config.get("name") or name,
+                        call_name=name,
+                        description=config.get("description", ""),
+                        transport=config["transport"],
+                        version=revision,
+                    )
+                except (ValueError, OSError, RecursionError):
+                    item.update(enabled=False, status="invalid", error="配置无效，请编辑 mcp.json 后重新测试连接")
+                    items.append(item)
+                    continue
+                try:
+                    cached = json.loads(read_file(cachefd, name + ".json") or b"{}")
+                    if (isinstance(cached, dict) and cached.get("version") == revision
+                            and cached.get("connection_fingerprint") == connection_fingerprint(config)
+                            and cached.get("authentication_version") == authentication_version(config)
+                            and isinstance(cached.get("discovered_at"), (int, float))
+                            and 0 <= time.time() - cached["discovered_at"] < DISCOVERY_TTL):
+                        tools = tool_manifest(cached.get("tools", []))
+                        fingerprint = manifest_version(tools)
+                        if fingerprint == cached.get("manifest_version"):
+                            item.update(tools=tools, manifest_version=fingerprint, status="ready",
+                                        discovered_at=cached["discovered_at"])
+                except (ValueError, OSError, RecursionError):
+                    warnings.append(f"个人 MCP {name} 的目录缓存无效，正在重新发现")
                 items.append(item)
-                continue
-            try:
-                cached = json.loads(read_file(cachefd, name + ".json") or b"{}")
-                if (isinstance(cached, dict) and cached.get("version") == revision
-                        and cached.get("connection_fingerprint") == connection_fingerprint(config)
-                        and cached.get("authentication_version") == authentication_version(config)
-                        and isinstance(cached.get("discovered_at"), (int, float))
-                        and 0 <= time.time() - cached["discovered_at"] < DISCOVERY_TTL):
-                    tools = tool_manifest(cached.get("tools", []))
-                    fingerprint = manifest_version(tools)
-                    if fingerprint == cached.get("manifest_version"):
-                        item.update(tools=tools, manifest_version=fingerprint, status="ready",
-                                    discovered_at=cached["discovered_at"])
-            except (ValueError, OSError, RecursionError):
-                warnings.append(f"个人 MCP {name} 的目录缓存无效，正在重新发现")
-            items.append(item)
-        return {"mcp": items, "warnings": warnings}
+            return {"mcp": items, "warnings": warnings}
+        finally:
+            os.close(cachefd)
     finally:
         os.close(mcpfd)
-        os.close(cachefd)
 
 
 def personal_mcp(payload, root="/workspace"):
     operation = payload["operation"]
     rootfd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    statefd = None
     try:
+        statefd = resource_directory(rootfd, "mcp")
         if operation == "mcp_list":
             return snapshot(rootfd, payload.get('name'))
         name = server_name(payload.get("name"))
@@ -262,16 +267,16 @@ def personal_mcp(payload, root="/workspace"):
                 "id": name,
                 "version": revision,
                 "timeout": config["timeout"],
-                "enabled": mapping(rootfd, SETTINGS).get(name, True),
+                "enabled": mapping(statefd, SETTINGS).get(name, True),
             }
         if operation in {"mcp_toggle", "mcp_pin"}:
             load(rootfd, name)
             field, filename = ("enabled", SETTINGS) if operation == "mcp_toggle" else ("pinned", PINS)
             if not isinstance(payload.get(field), bool):
                 raise ValueError("MCP 设置需为布尔值")
-            values = mapping(rootfd, filename)
+            values = mapping(statefd, filename)
             values[name] = payload[field]
-            atomic_write(rootfd, filename, json.dumps(values).encode())
+            atomic_write(statefd, filename, json.dumps(values).encode())
             return {"id": name, field: values[name]}
         mcpfd = directory(rootfd, "mcp")
         try:
@@ -299,7 +304,7 @@ def personal_mcp(payload, root="/workspace"):
                     if raw is not None:
                         try:
                             if connection_configuration(configuration(raw)) == connection_configuration(config):
-                                cachefd = directory(rootfd, ".mcp-cache")
+                                cachefd = directory(statefd, ".cache")
                                 try:
                                     cached = json.loads(read_file(cachefd, name + ".json") or b"{}")
                                     if (not isinstance(cached, dict) or cached.get("version") != revision
@@ -313,14 +318,14 @@ def personal_mcp(payload, root="/workspace"):
                         except (ValueError, OSError, RecursionError):
                             cached = None
                     if raw is not None:
-                        backups = directory(rootfd, ".mcp-backups")
+                        backups = directory(statefd, ".backups")
                         try:
                             atomic_write(backups, name + "-" + uuid.uuid4().hex + ".json", raw)
                         finally:
                             os.close(backups)
                     atomic_write(fd, "mcp.json", data)
                     if cached is not None:
-                        cachefd = directory(rootfd, ".mcp-cache")
+                        cachefd = directory(statefd, ".cache")
                         try:
                             atomic_write(cachefd, name + ".json", json.dumps({
                                 **cached, "version": version(data)
@@ -329,12 +334,12 @@ def personal_mcp(payload, root="/workspace"):
                             os.close(cachefd)
                     return {"id": name, "version": version(data)}
                 if operation == "mcp_delete":
-                    backups = directory(rootfd, ".mcp-backups")
+                    backups = directory(statefd, ".backups")
                     try:
                         os.rename(name, name + "-" + uuid.uuid4().hex, src_dir_fd=mcpfd, dst_dir_fd=backups)
                     finally:
                         os.close(backups)
-                    cachefd = directory(rootfd, ".mcp-cache")
+                    cachefd = directory(statefd, ".cache")
                     try:
                         try:
                             os.unlink(name + ".json", dir_fd=cachefd)
@@ -344,16 +349,16 @@ def personal_mcp(payload, root="/workspace"):
                         os.close(cachefd)
                     for setting in (SETTINGS, PINS):
                         try:
-                            values = mapping(rootfd, setting)
+                            values = mapping(statefd, setting)
                         except (ValueError, OSError):
                             continue
                         values.pop(name, None)
-                        atomic_write(rootfd, setting, json.dumps(values).encode())
+                        atomic_write(statefd, setting, json.dumps(values).encode())
                     return {"id": name, "removed": True}
                 if operation == "mcp_cache":
                     tools = tool_manifest(payload.get("tools"))
                     config = configuration(raw)
-                    cachefd = directory(rootfd, ".mcp-cache")
+                    cachefd = directory(statefd, ".cache")
                     try:
                         atomic_write(
                             cachefd, name + ".json", json.dumps({
@@ -372,6 +377,8 @@ def personal_mcp(payload, root="/workspace"):
         finally:
             os.close(mcpfd)
     finally:
+        if statefd is not None:
+            os.close(statefd)
         os.close(rootfd)
 
 

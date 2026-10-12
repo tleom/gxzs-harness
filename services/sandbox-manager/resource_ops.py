@@ -6,6 +6,7 @@ Global packages use a separate root-owned, content-addressed directory.
 """
 
 import base64
+import fcntl
 import hashlib
 import io
 import json
@@ -21,8 +22,15 @@ from file_ops import parent_fd, read_file, remove_contents, tree_version, versio
 MAX_PACKAGE = 20 * 1024 * 1024
 MAX_SKILL_TEXT = 64 * 1024
 MAX_FILES = 200
-SETTINGS = ".skills-settings.json"
-PINS = ".skills-pins.json"
+SETTINGS = ".settings.json"
+PINS = ".pins.json"
+
+RESOURCE_LAYOUT = {
+    "skills": ((".skills-settings.json", SETTINGS), (".skills-pins.json", PINS),
+               (".skill-backups", ".backups")),
+    "mcp": ((".mcp-settings.json", SETTINGS), (".mcp-pins.json", PINS),
+            (".mcp-backups", ".backups"), (".mcp-cache", ".cache")),
+}
 
 
 def safe_name(name):
@@ -99,6 +107,81 @@ def atomic_write(fd, name, data):
             pass
 
 
+def resource_directory(rootfd, kind):
+    """Relocate legacy owner state once; resource contents keep their paths.
+
+    Namespace directory locks also serialize migration by MCP worker processes.
+    Existing destination settings win conflicts, while old bytes are retained
+    in backups. Directory collisions retain both entries without following links.
+    """
+    entries = RESOURCE_LAYOUT[kind]
+    fd = directory(rootfd, kind)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        for old, current in entries:
+            try:
+                source = os.stat(old, dir_fd=rootfd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            try:
+                target = os.stat(current, dir_fd=fd, follow_symlinks=False)
+            except FileNotFoundError:
+                os.rename(old, current, src_dir_fd=rootfd, dst_dir_fd=fd)
+                os.fsync(fd)
+                os.fsync(rootfd)
+                continue
+            if stat.S_ISDIR(source.st_mode):
+                if not stat.S_ISDIR(target.st_mode):
+                    raise ValueError("资源状态目录无效，请保留数据并检查目录类型")
+                legacyfd = os.open(old, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=rootfd)
+                try:
+                    currentfd = os.open(current, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                    try:
+                        for name in os.listdir(legacyfd):
+                            try:
+                                os.stat(name, dir_fd=currentfd, follow_symlinks=False)
+                            except FileNotFoundError:
+                                destination = name
+                            else:
+                                destination = name + ".legacy-" + uuid.uuid4().hex
+                            os.rename(name, destination, src_dir_fd=legacyfd, dst_dir_fd=currentfd)
+                        os.fsync(currentfd)
+                        os.fsync(legacyfd)
+                    finally:
+                        os.close(currentfd)
+                finally:
+                    os.close(legacyfd)
+                os.rmdir(old, dir_fd=rootfd)
+            else:
+                if stat.S_ISREG(source.st_mode) and stat.S_ISREG(target.st_mode):
+                    try:
+                        previous = json.loads(read_file(rootfd, old))
+                        active = json.loads(read_file(fd, current))
+                    except (ValueError, OSError, TypeError):
+                        pass
+                    else:
+                        if (isinstance(previous, dict) and isinstance(active, dict)
+                                and all(isinstance(value, bool) for value in previous.values())
+                                and all(isinstance(value, bool) for value in active.values())):
+                            merged = {**previous, **active}
+                            if merged != active:
+                                atomic_write(fd, current, json.dumps(merged).encode())
+                backups = directory(fd, ".backups")
+                try:
+                    os.rename(old, old + ".legacy-" + uuid.uuid4().hex,
+                              src_dir_fd=rootfd, dst_dir_fd=backups)
+                    os.fsync(backups)
+                finally:
+                    os.close(backups)
+            os.fsync(fd)
+            os.fsync(rootfd)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
 def write_package(fd, files, *, readonly=False):
     for path, data in files.items():
         current = os.dup(fd)
@@ -131,14 +214,21 @@ def personal(payload, root="/workspace"):
     if operation not in {"list", "skill_inspect", "skill_import", "skill_update", "skill_uninstall", "skill_toggle", "skill_pin"}:
         raise ValueError("未知个人资源操作")
     rootfd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    skillsfd = None
     try:
         warnings = []
         if operation == "skill_inspect":
             files = members(payload)
             return {"content": files["SKILL.md"].decode("utf-8-sig")}
+        try:
+            skillsfd = resource_directory(rootfd, "skills")
+        except (ValueError, OSError) as error:
+            if operation != "list":
+                raise
+            return {"skills": [], "warnings": ["skills 目录无法读取：" + str(error)]}
         if operation in {"list", "skill_toggle"}:
             try:
-                raw_settings = read_file(rootfd, SETTINGS)
+                raw_settings = read_file(skillsfd, SETTINGS)
                 settings = json.loads(raw_settings or b"{}")
             except (ValueError, OSError) as error:
                 if operation != "list":
@@ -154,7 +244,7 @@ def personal(payload, root="/workspace"):
                 settings = {}
                 warnings.append("技能开关文件无效，个人技能暂时停用")
         try:
-            pins = json.loads(read_file(rootfd, PINS) or b"{}")
+            pins = json.loads(read_file(skillsfd, PINS) or b"{}")
             if not isinstance(pins, dict):
                 raise ValueError("置顶设置格式无效")
         except (ValueError, OSError) as error:
@@ -163,15 +253,11 @@ def personal(payload, root="/workspace"):
             pins = {}
             warnings.append("技能置顶设置无法读取：" + str(error))
         try:
-            skillsfd = directory(rootfd, "skills")
-        except OSError as error:
-            if operation != "list":
-                raise
-            return {"skills": [], "warnings": [*warnings, "skills 目录无法读取：" + str(error)]}
-        try:
             if operation == "list":
                 skills = []
                 for name in sorted(os.listdir(skillsfd)):
+                    if name.startswith("."):
+                        continue
                     info = os.stat(name, dir_fd=skillsfd, follow_symlinks=False)
                     if not stat.S_ISDIR(info.st_mode):
                         continue
@@ -198,7 +284,7 @@ def personal(payload, root="/workspace"):
                 if not isinstance(payload.get("pinned"), bool):
                     raise ValueError("技能置顶值无效")
                 pins[name] = payload["pinned"]
-                atomic_write(rootfd, PINS, json.dumps(pins).encode())
+                atomic_write(skillsfd, PINS, json.dumps(pins).encode())
                 return {"id": name, "pinned": pins[name]}
             if operation in {"skill_update", "skill_uninstall"}:
                 fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=skillsfd)
@@ -213,7 +299,7 @@ def personal(payload, root="/workspace"):
                         if len(text) > MAX_SKILL_TEXT:
                             raise ValueError("SKILL.md 不能超过 64 KiB")
                         target_name = safe_name(payload.get("new_name", name))
-                    backups = directory(rootfd, ".skill-backups")
+                    backups = directory(skillsfd, ".backups")
                     backup_name = name + "-" + uuid.uuid4().hex
                     try:
                         if operation == "skill_uninstall":
@@ -245,7 +331,7 @@ def personal(payload, root="/workspace"):
                             atomic_write(fd, "SKILL.md", text)
                             if renamed:
                                 for filename in (SETTINGS, PINS):
-                                    raw = read_file(rootfd, filename)
+                                    raw = read_file(skillsfd, filename)
                                     if raw is None:
                                         continue
                                     values = json.loads(raw)
@@ -254,7 +340,7 @@ def personal(payload, root="/workspace"):
                                     if name in values:
                                         values[target_name] = values.pop(name)
                                         changed_settings.append((filename, raw))
-                                        atomic_write(rootfd, filename, json.dumps(values).encode())
+                                        atomic_write(skillsfd, filename, json.dumps(values).encode())
                                 os.fsync(skillsfd)
                         except BaseException:
                             if renamed:
@@ -267,7 +353,7 @@ def personal(payload, root="/workspace"):
                                 except FileNotFoundError:
                                     pass
                             for filename, raw in changed_settings:
-                                atomic_write(rootfd, filename, raw)
+                                atomic_write(skillsfd, filename, raw)
                             raise
                         return {"id": target_name, "version": tree_version(fd)}
                     finally:
@@ -280,7 +366,7 @@ def personal(payload, root="/workspace"):
                 if not isinstance(payload["enabled"], bool):
                     raise ValueError("技能开关值无效")
                 settings[name] = payload["enabled"]
-                atomic_write(rootfd, SETTINGS, json.dumps(settings).encode())
+                atomic_write(skillsfd, SETTINGS, json.dumps(settings).encode())
                 return {"id": name, "enabled": settings[name]}
             if operation != "skill_import":
                 raise ValueError("未知个人资源操作")
@@ -306,7 +392,7 @@ def personal(payload, root="/workspace"):
                 os.close(staging)
             backups, backup_name = None, None
             if previous is not None:
-                backups = directory(rootfd, ".skill-backups")
+                backups = directory(skillsfd, ".backups")
                 backup_name = name + "-" + uuid.uuid4().hex
                 os.rename(name, backup_name, src_dir_fd=skillsfd, dst_dir_fd=backups)
             try:
@@ -322,7 +408,10 @@ def personal(payload, root="/workspace"):
             return {"id": name, "version": fingerprint, "path": "/workspace/skills/" + name}
         finally:
             os.close(skillsfd)
+            skillsfd = None
     finally:
+        if skillsfd is not None:
+            os.close(skillsfd)
         os.close(rootfd)
 
 

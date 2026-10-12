@@ -350,6 +350,7 @@ function adoptMessage(database, sessionId, message, context) {
   if (message?.source?.kind === 'schedule' && typeof message.id === 'string') {
     const chat = database.getChatBySession(sessionId)
     if (!chat) return
+    if (context?.mcpCatalogReady === false && !database.getRun(chat.ownerId, message.id)) return
     // A display/admission receipt for a message DSH already delivered. Never enqueue it again.
     const { run } = database.createRun({ ownerId: chat.ownerId, chatId: chat.id, sessionId,
       id: message.id, requestKey: `schedule:${message.id}`, query: contentText(message.content),

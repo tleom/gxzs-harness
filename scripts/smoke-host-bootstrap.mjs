@@ -504,6 +504,19 @@ try {
       console.log('PASS native file references: sandbox-only file discovered; host cwd not exposed')
       await terminalRoundtrip(chat)
     }
+    const scheduleResponse = await signedRequest('POST', `/chats/${chat.id}/schedules`, {
+      title: 'Fixture scheduled reminder', prompt: 'Synthetic future reminder', after_seconds: 3600,
+    })
+    assert.equal(scheduleResponse.status, 201, 'Full host must resolve the late native schedule service')
+    const task = (await scheduleResponse.json()).data
+    const tasks = (await (await signedRequest('GET', '/schedules')).json()).data
+    assert.ok(tasks.some(item => item.id === task.id && item.chat_id === chat.id))
+    const updatedTask = await signedRequest('PATCH', `/schedules/${task.id}`, { expected: task, title: 'Updated fixture reminder' })
+    assert.equal(updatedTask.status, 200)
+    assert.equal((await updatedTask.json()).data.record.title, 'Updated fixture reminder')
+    assert.equal((await signedRequest('DELETE', `/schedules/${task.id}`)).status, 200)
+    assert.equal(modelCalls, 0, 'Schedule management must not call the model')
+    console.log('PASS native schedule HTTP: create, catalog, update and delete through the full host')
     // Empty native sessions are lazy until their first event or explicit flush.
     const renamed = await signedRequest('PATCH', `/chats/${chat.id}`, { title: 'Native create smoke' })
     assert.equal(renamed.status, 200)

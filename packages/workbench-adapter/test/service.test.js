@@ -291,7 +291,7 @@ describe('followup and control service', () => {
     expect(await service.referenceCandidates(owner, chat.id, '', signal)).toEqual([
       { path: '证据.pdf', kind: 'file', group: 'files', label: '证据.pdf' },
     ])
-    expect(service.workspaces.baseline).toHaveBeenCalledWith(owner, signal)
+    expect(service.workspaces.baseline).toHaveBeenCalledWith(owner, signal, { includeSchedules: false })
     archivedSessionIds = []
     expect((await service.referenceCandidates(owner, chat.id)).at(-1)).toMatchObject({ chatId: source.id })
   })

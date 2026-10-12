@@ -28,6 +28,10 @@ import { WorkbenchRuntime } from '../src/runtime.js'
       database.bindRunMessage('root', next.id, 2, 'next-message'); database.transitionRun('t:1', next.id, 'running'); turn = 2
       expect(runtime.authorizeMcp('child', 'new', 'v2')).toBeUndefined()
       expect(runtime.authorizeMcp('child', 'old', 'v1')).toMatchObject({ runId: run.id })
+      runtime.childRuns.delete(child)
+      runtime.bindChild(child)
+      expect(runtime.authorizeMcp('child', 'old', 'v1')).toMatchObject({ runId: run.id })
+      expect(runtime.authorizeMcp('child', 'new', 'v2')).toBeUndefined()
       child.status = 'idle'
       expect(runtime.authorizeMcp('child', 'old', 'v1')).toBeUndefined()
       expect(runtime.authorizeRunMcp('t:1', run.id, 'old', 'v1')).toBe(false)

@@ -12,6 +12,10 @@ function fixture(page) {
   }
 }
 const signal = () => new AbortController().signal
+it.each(['agent-message', 'subagent-settled'])('retains a cursor for an earlier %s continuation with no assistant output', async kind => {
+  const sessions = { page: vi.fn(async () => ({ records: [{ event: { seq: 0, type: 'user/message', data: { source: { kind } } } }], hasMore: false })) }
+  expect(await hasEarlierContent(sessions, 'root', 100, 1, signal())).toBe(true)
+})
 it('hides older pagination when only initialization metadata precedes the first display message', async () => {
   const sessions = { page: vi.fn(async () => ({ records: [{ event: { seq: 0, type: 'session/title' } }], hasMore: false })) }
   expect(await hasEarlierContent(sessions, 's', 100, 1, signal())).toBe(false)

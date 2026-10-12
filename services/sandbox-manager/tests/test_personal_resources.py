@@ -60,7 +60,7 @@ def test_import_toggle_replace_and_recoverable_backup(resources, tmp_path):
     assert resources.personal({"operation": "skill_import", "name": "report", **package()}, str(tmp_path)) == {"conflict": True}
     resources.personal({"operation": "skill_import", "name": "report", "version": first["version"], **package("updated")}, str(tmp_path))
     assert (tmp_path / "skills/report/SKILL.md").read_text() == "updated"
-    assert next((tmp_path / ".skill-backups").iterdir()).joinpath("SKILL.md").read_text().startswith("---")
+    assert next((tmp_path / "skills/.backups").iterdir()).joinpath("SKILL.md").read_text().startswith("---")
 
 
 def test_unreadable_memory_does_not_block_independent_skill_operations(resources, tmp_path):
@@ -154,7 +154,7 @@ def test_edit_preserves_assets_and_keeps_source_backup_with_version_checks(resou
     assert result["version"] != first["version"]
     assert (tmp_path / "skills/report/SKILL.md").read_text() == "updated"
     assert (tmp_path / "skills/report/scripts/helper.py").read_text() == "original asset"
-    assert next((tmp_path / ".skill-backups").iterdir()).joinpath("SKILL.md").read_text().startswith("---")
+    assert next((tmp_path / "skills/.backups").iterdir()).joinpath("SKILL.md").read_text().startswith("---")
     assert resources.personal({"operation": "skill_update", "name": "report", "version": first["version"], "content": "stale"}, str(tmp_path)) == {"conflict": True}
     assert (tmp_path / "skills/report/SKILL.md").read_text() == "updated"
 
@@ -187,14 +187,14 @@ def test_uninstall_requires_version_and_moves_the_whole_package_to_backup(resour
     result = resources.personal({"operation": "skill_uninstall", "name": "report", "version": first["version"]}, str(tmp_path))
     assert result == {"id": "report", "uninstalled": True}
     assert resources.personal({"operation": "list"}, str(tmp_path))["skills"] == []
-    assert next((tmp_path / ".skill-backups").iterdir()).joinpath("SKILL.md").read_text().startswith("---")
+    assert next((tmp_path / "skills/.backups").iterdir()).joinpath("SKILL.md").read_text().startswith("---")
 
 
 @pytest.mark.parametrize("operation", ["skill_pin", "skill_update", "skill_uninstall"])
 @pytest.mark.parametrize("settings_state", ["malformed", "wrong_type", "symlink"])
 def test_skill_mutations_do_not_depend_on_toggle_settings(resources, tmp_path, operation, settings_state):
     first = resources.personal({"operation": "skill_import", "name": "report", **package()}, str(tmp_path))
-    settings = tmp_path / resources.SETTINGS
+    settings = tmp_path / "skills" / resources.SETTINGS
     if settings_state == "symlink":
         target = tmp_path / "unrelated.json"
         target.write_text('{"report": true}')
@@ -216,11 +216,11 @@ def test_skill_mutations_do_not_depend_on_toggle_settings(resources, tmp_path, o
     elif operation == "skill_update":
         assert result["version"] != first["version"]
         assert (tmp_path / "skills/report/SKILL.md").read_text() == "updated"
-        assert next((tmp_path / ".skill-backups").iterdir()).joinpath("SKILL.md").read_text().startswith("---")
+        assert next((tmp_path / "skills/.backups").iterdir()).joinpath("SKILL.md").read_text().startswith("---")
     else:
         assert result == {"id": "report", "uninstalled": True}
         assert not (tmp_path / "skills/report").exists()
-        assert next((tmp_path / ".skill-backups").iterdir()).joinpath("SKILL.md").read_text().startswith("---")
+        assert next((tmp_path / "skills/.backups").iterdir()).joinpath("SKILL.md").read_text().startswith("---")
     assert settings.read_bytes() == original_settings
     assert settings.is_symlink() == (settings_state == "symlink")
 

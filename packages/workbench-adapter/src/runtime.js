@@ -22,7 +22,11 @@ export class WorkbenchRuntime extends Service {
   bindChild(agent) {
     if (this.database.getChatBySession(agent.session?.id ?? agent.id)) return
     const parent = this.agents.list?.().find(parent => this.agents.isOwnedBy?.(agent.id, parent))
-    const run = parent && this.executionRun(parent.session?.id ?? parent.id)
+    const root = this.rootOf(agent)
+    const chat = root && this.database.getChatBySession(root.session?.id ?? root.id)
+    const existing = chat && this.database.listRuns(this.ownerId, chat.id)
+      .find(run => run.selection?.subagent_ids?.includes(agent.id))
+    const run = existing ?? (parent && this.executionRun(parent.session?.id ?? parent.id))
     if (run?.ownerId === this.ownerId) {
       this.childRuns.set(agent, run.id)
       const current = this.database.getRun(this.ownerId, run.id)

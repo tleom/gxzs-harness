@@ -14,7 +14,7 @@ export class WorkbenchWorkspaces {
     this.sessions = sessions
   }
 
-  async baseline(owner, signal) {
+  async baseline(owner, signal, { includeSchedules = true } = {}) {
     const abort = new AbortController()
     const cancel = () => abort.abort(signal.reason)
     signal?.throwIfAborted()
@@ -31,7 +31,7 @@ export class WorkbenchWorkspaces {
         projected.sessions = items.filter(item => projected.chatIds[item.sessionId])
           .map(({ cwd, ...item }) => item)
       }
-      if (this.schedules) projected.schedules = await this.schedules.catalog(owner)
+      if (includeSchedules && this.schedules) projected.schedules = await this.schedules.catalog(owner)
       return projected
     } finally {
       signal?.removeEventListener('abort', cancel)
@@ -59,7 +59,7 @@ export class WorkbenchWorkspaces {
 
   async requireWorkspace(owner, workspaceId, validateDirectory = false) {
     if (typeof workspaceId !== 'string' || !workspaceId) throw httpError(400, '工作区标识无效')
-    const item = (await this.baseline(owner)).items.find(item => item.workspaceId === workspaceId)
+    const item = (await this.baseline(owner, undefined, { includeSchedules: false })).items.find(item => item.workspaceId === workspaceId)
     if (!item) throw httpError(404, '工作区不存在')
     if (validateDirectory) await this.resolveDirectory(item.path)
     return item
@@ -122,6 +122,6 @@ export class WorkbenchWorkspaces {
       await this.controller[operation]({ sessionId: this.session(owner, request.chatId),
         ...(operation === 'archiveSession' ? { stopActivity: request.stopActivity === true } : {}) })
     } else throw httpError(400, '工作区操作无效')
-    return this.baseline(owner)
+    return this.baseline(owner, undefined, { includeSchedules: false })
   }
 }

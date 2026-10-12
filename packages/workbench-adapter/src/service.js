@@ -78,7 +78,7 @@ export class WorkbenchService {
     const [files, metadata, workspace] = await Promise.all([
       this.fileReferences && !byIdentity ? this.fileReferences.list(agent, query, signal) : [],
       this.sessionQuery.listSessions(signal),
-      this.workspaces?.baseline(owner, signal),
+      this.workspaces?.baseline(owner, signal, { includeSchedules: false }),
     ])
     // DSH owns matching and ranking. Apply its display limit after platform visibility.
     const candidates = await this.sessionReferences.listCandidates(agent, sessionQuery, Math.max(1, metadata.length), signal)
