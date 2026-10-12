@@ -37,6 +37,7 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
     try {
       const target = page, cdp = session
       const url = target.url()
+      if (url !== 'about:blank') validUrl(url)
       const epoch = navigation
       const viewport = target.viewportSize()
       const image = await capture(target)
@@ -50,12 +51,13 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
     } catch (error) {
       if (error.message === 'frame_too_large') fatal('网页图像过大，请重新打开浏览器')
       else if (error.message === 'capture_timeout' || error.name === 'TimeoutError') fatal('网页图像获取超时，请重新打开浏览器')
+      else if (error.message === 'invalid_url') fatal('浏览器仅支持 HTTP 和 HTTPS 页面')
       // Navigation can temporarily invalidate a screenshot; the next frame retries.
     }
     finally { capturing = false }
   }
   async function bind(target) {
-    session = await context.newCDPSession(target)
+    const cdp = await context.newCDPSession(target)
     target.on('crash', () => { if (target === page) fatal('网页进程已退出，请重新打开浏览器') })
     target.on('close', () => { if (target === page) fatal('网页已经关闭，请重新打开浏览器') })
     target.setDefaultTimeout(5000)
@@ -72,6 +74,8 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
     })
     target.on('popup', async popup => {
       // Keep the single tab's owner context; do not create an unowned external guest.
+      const previous = page
+      let popupSession
       try {
         try {
           if (popup.url() !== 'about:blank') validUrl(popup.url())
@@ -80,13 +84,33 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
           await popup.close().catch(() => {})
           return
         }
-        await bind(popup)
-        const previous = page
+        popupSession = await bind(popup)
+        // The initial blank popup can navigate while its CDP binding is awaited.
+        try { if (popup.url() !== 'about:blank') validUrl(popup.url()) }
+        catch {
+          notice = '浏览器仅支持 HTTP 和 HTTPS 页面'
+          await popupSession.detach().catch(() => {})
+          await popup.close().catch(() => {})
+          return
+        }
+        if (closed || page !== previous || popup.isClosed()) {
+          await popupSession.detach().catch(() => {})
+          await popup.close().catch(() => {})
+          return
+        }
         page = popup
+        session = popupSession
         await previous.close().catch(() => {})
         await frame()
-      } catch { fatal('网页连接中断，请重新打开浏览器') }
+      } catch {
+        if (page === previous) {
+          await popupSession?.detach().catch(() => {})
+          await popup.close().catch(() => {})
+          notice = '弹窗连接中断，请重新打开网页'
+        } else fatal('网页连接中断，请重新打开浏览器')
+      }
     })
+    return cdp
   }
   async function operation(value) {
     const action = value.action
@@ -102,7 +126,7 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
         return route.continue()
       })
       page = await context.newPage()
-      await bind(page)
+      session = await bind(page)
       timer = setInterval(() => { if (watching) void frame() }, 400)
       await frame()
       if (!hasFrame) throw new Error('initial_frame_unavailable')

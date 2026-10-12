@@ -43,7 +43,7 @@ function worker() {
     input.write(JSON.stringify({id,action,...extra})+'\n')
     await vi.waitFor(()=>expect(frames.some(frame=>frame.type==='result' && frame.id===id)).toBe(true))
   }
-  return {page,browser,runtime,frames,exit,command,input}
+  return {page,browser,runtime,frames,exit,command,input,context}
 }
 
 it('acknowledges rapid input without taking a screenshot for every action while streaming', async () => {
@@ -121,6 +121,46 @@ it('rejects an already-navigated non-HTTP popup without replacing the current pa
     const popup={url:()=> 'blob:https://example.com/document',close:vi.fn(async()=>{})}
     value.page.emit('popup',popup)
     await vi.waitFor(()=>expect(popup.close).toHaveBeenCalledOnce())
+    await value.command(2,'watch',{enabled:true})
+    expect(value.frames.filter(frame=>frame.type==='frame').at(-1).url).toBe('https://example.com')
+    expect(value.browser.close).not.toHaveBeenCalled()
+  } finally { await value.runtime.shutdown() }
+})
+
+it('revalidates a popup after async binding and retains the original CDP session when rejecting it', async () => {
+  const value=worker()
+  let url='about:blank', finishBind
+  const popup=Object.assign(new EventEmitter(), {url:()=>url,setDefaultTimeout:vi.fn(),setDefaultNavigationTimeout:vi.fn(),close:vi.fn(async()=>{})})
+  const mainHistory=vi.fn(async()=>({currentIndex:0,entries:[{}]}))
+  const popupHistory=vi.fn(async()=>{throw new Error('wrong page session')}),detach=vi.fn(async()=>{})
+  value.context.newCDPSession=async target=>target===popup ? new Promise(resolve=>{finishBind=resolve}) : {send:mainHistory}
+  try {
+    await value.command(1,'init',{width:1000,height:700})
+    value.page.emit('popup',popup)
+    url='blob:https://example.com/redirect'
+    finishBind({send:popupHistory,detach})
+    await vi.waitFor(()=>expect(popup.close).toHaveBeenCalledOnce())
+    expect(detach).toHaveBeenCalledOnce()
+    await value.command(2,'watch',{enabled:true})
+    expect(value.frames.filter(frame=>frame.type==='frame').at(-1).url).toBe('https://example.com')
+    expect(mainHistory.mock.calls.length).toBeGreaterThanOrEqual(2)
+    expect(popupHistory).not.toHaveBeenCalled()
+    expect(value.browser.close).not.toHaveBeenCalled()
+  } finally { await value.runtime.shutdown() }
+})
+
+it('does not adopt a popup that closes while binding', async () => {
+  const value=worker()
+  let finishBind
+  const detach=vi.fn(async()=>{})
+  const popup=Object.assign(new EventEmitter(), {url:()=> 'https://example.com/popup',isClosed:()=>true,setDefaultTimeout:vi.fn(),setDefaultNavigationTimeout:vi.fn(),close:vi.fn(async()=>{})})
+  const original=value.context.newCDPSession
+  value.context.newCDPSession=async target=>target===popup ? new Promise(resolve=>{finishBind=resolve}) : original(target)
+  try {
+    await value.command(1,'init',{width:1000,height:700})
+    value.page.emit('popup',popup)
+    finishBind({detach,send:async()=>{throw new Error('closed popup')}})
+    await vi.waitFor(()=>expect(detach).toHaveBeenCalledOnce())
     await value.command(2,'watch',{enabled:true})
     expect(value.frames.filter(frame=>frame.type==='frame').at(-1).url).toBe('https://example.com')
     expect(value.browser.close).not.toHaveBeenCalled()
