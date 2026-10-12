@@ -308,6 +308,9 @@ def operation(key, action, payload):
         from global_memory import statistics as memory_statistics
         return {"mcp": statistics(), "memory": memory_statistics(), "workspace_locks": len(LOCKS)}
     if action == 'schedule':
+        required = {'owner_id', 'generation', 'instance_id', 'run_id', 'chat_id', 'action'}
+        if not required.issubset(payload):
+            raise ValueError('Scheduling request missing host or task identity; operation was not started')
         return HOSTS.schedule(key, payload)
     if action == "runtime-epoch":
         return runtime_epoch()
@@ -527,11 +530,19 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             errors.append('docker_unavailable')
         data = json.dumps({'ok': not errors, 'errors': errors}).encode()
-        self.send_response(200 if not errors else 503)
-        self.send_header('Content-Type', 'application/json')
-        self.send_header('Content-Length', str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
+        self.write_json(200 if not errors else 503, data, action='healthz')
+
+    def write_json(self, code, data, request_id=None, action='unresolved'):
+        try:
+            self.send_response(code)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            # Only the final downstream socket write is handled here. Operation
+            # failures above retain their actual error status and diagnostics.
+            LOGGER.debug('Sandbox client response closed request_id=%s action=%s', request_id, action)
 
     def do_POST(self):
         code = 200
@@ -555,10 +566,15 @@ class Handler(BaseHTTPRequestHandler):
                     role = authorize_request(self.headers, TOKEN, HOSTS.root, key, parts[2])
             if role == 'owner':
                 REQUEST_CONTEXT.owner = (self.headers, key, parts[2])
+            if self.headers.get('Transfer-Encoding'):
+                raise ValueError('Transfer-Encoding is not supported; send a fixed Content-Length')
             size = int(self.headers.get("Content-Length", "0"))
             if not 0 <= size <= MAX_BODY:
                 raise ValueError("Request too large")
-            payload = json.loads(self.rfile.read(size) or "{}")
+            body = self.rfile.read(size)
+            if len(body) != size:
+                raise ValueError('Incomplete request body; operation was not started')
+            payload = json.loads(body or "{}")
             if not isinstance(payload, dict):
                 raise ValueError('Request must be an object')
             if parts[2] not in CONTROL_ACTIONS:
@@ -592,11 +608,7 @@ class Handler(BaseHTTPRequestHandler):
         if code >= 400:
             output.setdefault('request_id', request_id)
         data = json.dumps(output).encode()
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
+        self.write_json(code, data, request_id=request_id, action=action)
 
 
 class CapacityError(RuntimeError):
@@ -635,6 +647,8 @@ class BoundedHTTPServer(ThreadingHTTPServer):
             headers = ('HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: '
                        + str(len(body)) + '\r\nRetry-After: 1\r\nConnection: close\r\n\r\n').encode()
             request.sendall(headers + body)
+        except (BrokenPipeError, ConnectionResetError):
+            LOGGER.debug('Sandbox client response closed while rejecting request code=%s', code)
         finally:
             self.shutdown_request(request)
 

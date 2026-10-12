@@ -61,7 +61,7 @@ function setup() {
   return { handler, key, context }
 }
 
-async function call(handler, key, method, route, value, authenticated = true, userId = '42', extraHeaders = {}) {
+async function call(handler, key, method, route, value, authenticated = true, userId = '42', extraHeaders = {}, onResponse) {
   const body = value === undefined ? Buffer.alloc(0) : Buffer.from(JSON.stringify(value))
   const now = Math.floor(Date.now() / 1000)
   const header = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url')
@@ -86,11 +86,40 @@ async function call(handler, key, method, route, value, authenticated = true, us
       else { try { response.body = JSON.parse(text) } catch { response.body = Buffer.from(text) } }
     },
   })
+  onResponse?.(res)
   await handler(req, res)
   return response
 }
 
 describe('authenticated workbench HTTP handler', () => {
+  it('cancels a pending native schedule creation when the response disconnects',async()=>{
+    const {handler,key,context}=setup()
+    const chat=(await call(handler,key,'POST','/chats',{})).body.data
+    let response,signal
+    context.schedule={create:vi.fn(async(_session,_request,abort)=>{
+      signal=abort
+      await new Promise((resolve,reject)=>abort.addEventListener('abort',()=>reject(abort.reason),{once:true}))
+    })}
+    const pending=call(handler,key,'POST',`/chats/${chat.id}/schedules`,{title:'提醒',prompt:'remind',after_seconds:60},true,'42',{},value=>{response=value})
+    await vi.waitFor(()=>expect(context.schedule.create).toHaveBeenCalledOnce())
+    response.emit('close')
+    await pending
+    expect(signal.aborted).toBe(true)
+    expect(response.listenerCount('close')).toBe(0)
+  })
+
+  it('admits an already-delivered schedule even when display title enrichment fails',async()=>{
+    const {context}=setup()
+    const runtime=context.reflect.provide.mock.calls.find(([name])=>name==='workbenchRuntime')[1]
+    runtime.executionRun=()=>({id:'delivered',sessionId:'native',query:'schedule_id_json: "task"',selection:{native_source:'schedule'},mcpTools:[]})
+    runtime.scheduler.admitNativeStep=vi.fn(async()=>({kind:'accept'}))
+    context.schedule={catalog:vi.fn(async()=>{throw new Error('storage unavailable')})}
+    context.logger={warn:vi.fn()}
+    const gate=context.on.mock.calls.find(([name])=>name==='agent/pre-step')[1]
+    await expect(gate({agent:{id:'native'}},()=>{})).resolves.toEqual({kind:'accept'})
+    expect(runtime.scheduler.admitNativeStep).toHaveBeenCalledOnce()
+    expect(context.logger.warn).toHaveBeenCalledWith('Scheduled delivery title enrichment deferred')
+  })
   it('reports live but unready until native recovery and MCP bootstrap are complete', async () => {
     const { handler, key, context } = setup()
     await expect(call(handler, key, 'GET', '/health', undefined, false)).resolves.toMatchObject({ status: 503, body: { live: true, ready: false } })

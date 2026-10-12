@@ -67,6 +67,20 @@ function activateNative(test, runId, queued = []) {
 }
 
 describe('followup and control service', () => {
+  it('fences the parent MCP run when a native child notice is stopped', async () => {
+    const test=setup(),{database,owner,chat,service}=test
+    const parent=database.createRun({ownerId:owner.ownerId,chatId:chat.id,sessionId:chat.sessionId,query:'parent',selection:{}}).run
+    database.transitionRun(owner.ownerId,parent.id,'running')
+    database.transitionRun(owner.ownerId,parent.id,'completed')
+    const notice=database.createRun({ownerId:owner.ownerId,chatId:chat.id,sessionId:chat.sessionId,query:'notice',parentRunId:parent.id,selection:{native_notice:true,is_continuation:true}}).run
+    activateNative(test,notice.id)
+    service.cancelOwned=vi.fn()
+    service.platformClient={json:vi.fn(async()=>({data:{fenced:true}}))}
+    await service.stopRun(owner,notice.id)
+    expect(service.platformClient.json.mock.calls.map(([request])=>JSON.parse(request.body).run_id)).toEqual([notice.id,parent.id])
+    expect(database.getRun(owner.ownerId,parent.id).stopConfirmation?.fenced).toBe(true)
+    expect(service.cancelOwned).toHaveBeenCalledWith(chat.sessionId,notice.id)
+  })
   it('uses the persisted native error code in full history, state snapshots and goal reasons', () => {
     const { service, database, owner, chat } = setup()
     const { run } = database.createRun({ ownerId: owner.ownerId, chatId: chat.id, sessionId: chat.sessionId, query: 'evidence', selection: {} })
@@ -914,12 +928,17 @@ describe('followup and control service', () => {
     const actions = []
     service.workspaces = { controller: { archiveSession: vi.fn(async request => actions.push(['archive', request])) } }
     service.closeTerminals = vi.fn(async sessionId => actions.push(['terminals', sessionId]))
-    service.waitSessionActivity = vi.fn(async sessionId => actions.push(['settled', sessionId]))
+    let settled
+    const unwinding=new Promise(resolve=>{settled=resolve})
+    service.waitSessionActivity = vi.fn(async sessionId => {await unwinding;actions.push(['settled', sessionId])})
     fileManager.operate.mockImplementation(async request => {
       actions.push([request.operation])
       return request.operation === 'stat' ? { kind: 'directory', version: 'v1' } : { deleted: true }
     })
-    await service.deleteChat(owner, chat.id)
+    const deletion=service.deleteChat(owner, chat.id)
+    await vi.waitFor(()=>expect(service.waitSessionActivity).toHaveBeenCalledWith(chat.sessionId))
+    expect(fileManager.operate).not.toHaveBeenCalled()
+    settled();await deletion
     expect(actions).toEqual([['archive', { sessionId: chat.sessionId, stopActivity: true }], ['terminals', chat.sessionId], ['settled', chat.sessionId], ['stat'], ['delete']])
     expect(service.listChats(owner)).toEqual([])
   })

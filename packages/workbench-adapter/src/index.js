@@ -83,7 +83,12 @@ export function apply(ctx, config) {
   let recovery
   const beginRecovery = () => {
     recovery = (async () => {
-      await reconcileNativeSessions(database, ctx.sessionQuery, config.ownerId)
+      await reconcileNativeSessions(database, ctx.sessionQuery, config.ownerId, () => {
+        // Only a missing scheduled receipt needs a fresh frozen catalog. Retry
+        // recovery until its first verified sync; an unavailable read is not empty.
+        if (!runtime.mcpCatalogState?.ready) throw new Error('MCP catalog is not ready for schedule recovery')
+        return { mcpTools: runtime.mcpResources?.() ?? [] }
+      })
       await scheduler.flushFences()
       if (scheduler.closed) return
       recovered = true
@@ -122,7 +127,10 @@ export function apply(ctx, config) {
     await recovery
     if (recoveryError) return { kind: 'reject' }
     const run = runtime.executionRun(payload.agent.session?.id ?? payload.agent.id)
-    if (run?.selection?.native_source === 'schedule') await schedules.rememberRun(run)
+    if (run?.selection?.native_source === 'schedule') {
+      try { await schedules.rememberRun(run) }
+      catch { ctx.logger.warn('Scheduled delivery title enrichment deferred') }
+    }
     return scheduler.admitNativeStep(payload, next)
   }, { global: true, prepend: true })
   ctx.on('agent/status', ({ agent, status }) => {
@@ -297,7 +305,15 @@ export function apply(ctx, config) {
         if (!abort.signal.aborted) sendJson(res, 200, { data: page })
       } finally { res.off('close', disconnected) }
     }],
-    ['POST', /^\/chats\/([\w-]+)\/schedules$/, async ({ owner, json }, res, match) => sendJson(res, 201, { data: await schedules.create(owner, match[1], json) })],
+    ['POST', /^\/chats\/([\w-]+)\/schedules$/, async ({ owner, json }, res, match) => {
+      const abort = new AbortController()
+      const disconnected = () => abort.abort()
+      res.once('close', disconnected)
+      try {
+        const data = await schedules.create(owner, match[1], json, abort.signal)
+        if (!abort.signal.aborted) sendJson(res, 201, { data })
+      } finally { res.off('close', disconnected) }
+    }],
     ['GET', /^\/schedules\/([\w-]+)\/history$/, async ({ owner, url }, res, match) => sendJson(res, 200, { data: await schedules.history(owner, match[1], url.searchParams.get('before')) })],
     ['PATCH', /^\/schedules\/([\w-]+)$/, async ({ owner, json }, res, match) => sendJson(res, 200, { data: await schedules.update(owner, match[1], json) })],
     ['DELETE', /^\/schedules\/([\w-]+)$/, async ({ owner }, res, match) => sendJson(res, 200, { data: await schedules.delete(owner, match[1]) })],

@@ -415,8 +415,12 @@ export function settleNativeIdle(database, sessionId, goal) {
 }
 
 /** Replay native facts before declaring readiness; never wake a recovered agent. */
-export async function reconcileNativeSessions(database, sessionQuery, ownerId) {
+export async function reconcileNativeSessions(database, sessionQuery, ownerId, context) {
   const queued = []
+  const resources = message => {
+    if (message?.source?.kind !== 'schedule' || database.getRun(ownerId, message.id)) return undefined
+    return typeof context === 'function' ? context() : context
+  }
   for (const chat of database.listChats(ownerId)) {
     let observed
     try { observed = await sessionQuery.observeSession(chat.sessionId) }
@@ -438,7 +442,7 @@ export async function reconcileNativeSessions(database, sessionQuery, ownerId) {
         if (event.type === 'turn/start') turn = event.data.turn
         if (event.type === 'user/message' && Number.isInteger(turn)) {
           const message = event.data
-          const admitted = message.source?.kind === 'schedule' ? adoptMessage(database, chat.sessionId, message)
+          const admitted = message.source?.kind === 'schedule' ? adoptMessage(database, chat.sessionId, message, resources(message))
             : isNativeNotice(message) ? (database.runForTurn(chat.sessionId, turn) ?? adoptNativeNotice(database, chat, message))
             : database.listRuns(chat.ownerId, chat.id).find(item => item.messageId === message.id)
           if (isNativeNotice(message) && admitted) database.bindNativeTurn(admitted, turn)
@@ -467,11 +471,15 @@ export async function reconcileNativeSessions(database, sessionQuery, ownerId) {
             continue
           }
         }
+        if (event.type === 'agent/inbox/spliced')
+          for (const message of event.data?.inserted ?? [])
+            if (message.source?.kind === 'schedule') adoptMessage(database, chat.sessionId, message, resources(message))
         projectSessionEvent(database, chat.sessionId, event, ownerId)
       }
       for (const message of [...inbox['next-turn'], ...inbox['next-step']]) {
         const requestId = runPromptId(message)
         const run = requestId ? database.getRun(ownerId, requestId)
+          : message.source?.kind === 'schedule' ? adoptMessage(database, chat.sessionId, message, resources(message))
           : isNativeNotice(message) ? adoptNativeNotice(database, chat, message)
           : database.listRuns(chat.ownerId, chat.id).find(item => item.messageId === message.id)
         if (run && run.sessionId === chat.sessionId) {

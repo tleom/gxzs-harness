@@ -50,6 +50,7 @@ export class SandboxReferenceSearch {
       throw new Error('File reference workspace is outside the owner sandbox')
     if(!Number.isSafeInteger(idleMs)||idleMs<1)throw new Error('File reference idle timeout must be a positive integer')
     this.idleMs=idleMs
+    this.root=root
     this.pending=new Map()
     this.sequence=0
     this.buffer=''
@@ -142,7 +143,7 @@ export class SandboxReferenceSearch {
 // Inherit upstream prompt installation and identity. Mirror its agent/session
 // lifecycle for the sandbox-side cache instead of indexing the host cwd.
 export default class SandboxFileReferences extends LocalFileReferences {
-  static inject=['agents','subprocess']
+  static inject=['agents','subprocess','workingDirectory']
   constructor(ctx,config) {
     super(ctx,config)
     this.searchConfig=config
@@ -170,7 +171,11 @@ export default class SandboxFileReferences extends LocalFileReferences {
   async list(agent,query,signal) {
     signal.throwIfAborted()
     if(this.stopped||this.disposedAgents?.has(agent))return Promise.reject(new Error('Sandbox reference service disposed'))
+    const root=await this.ctx.workingDirectory.ensure(agent,signal)
+    signal.throwIfAborted()
+    if(this.stopped||this.disposedAgents?.has(agent))throw new Error('Sandbox reference service disposed')
     let search=this.remoteSearches.get(agent)
+    if(search && !search.closed && search.root!==root)search.dispose()
     // A replacement must not overlap a still-closing index and its SSH pipes.
     if(search?.closed) {
       let cancel
@@ -187,7 +192,7 @@ export default class SandboxFileReferences extends LocalFileReferences {
     }
     if(!search||search.closed) {
       search=new SandboxReferenceSearch(this.ctx.subprocess,{
-        root:agent.session.header.cwd,config:this.searchConfig,
+        root,config:this.searchConfig,
         node:process.env.GXZS_SANDBOX_NODE||'/usr/local/bin/node',
         workspace:process.env.GXZS_SANDBOX_WORKSPACE||'/workspace',
         idleMs:Number(process.env.GXZS_REFERENCE_IDLE_MS??60_000),

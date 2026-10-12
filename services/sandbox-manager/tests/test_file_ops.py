@@ -2,6 +2,8 @@ import base64
 import importlib.util
 from pathlib import Path
 import os
+import io
+import zipfile
 import pytest
 
 spec=importlib.util.spec_from_file_location('file_ops',Path(__file__).parents[1]/'file_ops.py')
@@ -14,6 +16,21 @@ def root(tmp_path):
     (tmp_path/'conversations').mkdir()
     (tmp_path/'conversations'/'test-chat').mkdir()
     return str(tmp_path)
+
+
+@pytest.mark.parametrize('name', ['mcp', 'skills'])
+def test_resource_roots_allow_browsing_and_zip_download_but_reject_deletion(root, name):
+    directory = Path(root) / name
+    directory.mkdir()
+    (directory / 'demo.txt').write_text('content')
+    assert module.operate({'operation': 'list', 'path': name}, root)['entries'][0]['name'] == 'demo.txt'
+    result = module.operate({'operation': 'get', 'path': name}, root)
+    with zipfile.ZipFile(io.BytesIO(base64.b64decode(result['data']))) as archive:
+        assert any(archive.read(path) == b'content' for path in archive.namelist())
+    current = module.operate({'operation': 'stat', 'path': name}, root)
+    with pytest.raises(ValueError, match='cannot be deleted'):
+        module.operate({'operation': 'delete', 'path': name, 'version': current['version']}, root)
+    assert (directory / 'demo.txt').read_text() == 'content'
 
 
 def test_workspace_manifest_contains_stable_hashes_and_counts(root):

@@ -86,3 +86,20 @@ it('replays an acknowledged scheduled turn after restart without generating anot
   expect(db.runForTurn(chat.sessionId, 1)).toMatchObject({ id: message.id, status: 'completed' })
   expect(db.submissions(owner.ownerId)).toEqual([])
 })
+
+it('waits for verified MCP resources before creating a recovered schedule receipt and freezes them once', async () => {
+  const {db,chat,owner}=fixture()
+  const message={id:'unclaimed-delivery',source:{kind:'schedule'},content:[{type:'text',text:'reminder'}]}
+  const sessionQuery={observeSession:async()=>({events:[
+    {type:'agent/inbox/spliced',seq:1,data:{target:'next-turn',start:0,removedCount:0,inserted:[message]}},
+  ],[Symbol.dispose]() {}})}
+  const unavailable=()=>{throw new Error('catalog unavailable')}
+  await expect(reconcileNativeSessions(db,sessionQuery,owner.ownerId,unavailable)).rejects.toThrow('catalog unavailable')
+  expect(db.listRuns(owner.ownerId,chat.id)).toHaveLength(0)
+  const mcpTools=[{id:'personal:tool',version:'v1',manifest_version:'m1'}]
+  await reconcileNativeSessions(db,sessionQuery,owner.ownerId,()=>({mcpTools}))
+  expect(db.getRun(owner.ownerId,message.id).mcpTools).toEqual(mcpTools)
+  await reconcileNativeSessions(db,sessionQuery,owner.ownerId,unavailable)
+  expect(db.getRun(owner.ownerId,message.id).mcpTools).toEqual(mcpTools)
+  expect(db.listRuns(owner.ownerId,chat.id)).toHaveLength(1)
+})

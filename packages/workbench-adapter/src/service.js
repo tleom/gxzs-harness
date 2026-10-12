@@ -854,6 +854,10 @@ export class WorkbenchService {
     if ((active && active.id !== run.id) || (!active && (goal?.phase === 'active' || agent?.status === 'running')))
       throw httpError(409, '当前任务已改变，请刷新后重试', 'STALE_RUN')
     const runIds = run.status !== 'queued' || active?.id === run.id ? [run.id] : []
+    if (run.selection?.native_notice === true && run.parentRunId && runIds.length) {
+      const parent = this.database.getRun(owner.ownerId, run.parentRunId)
+      if (parent?.sessionId === run.sessionId) runIds.push(parent.id)
+    }
     for (const id of runIds) this.database.requireRunFence(owner.ownerId, id)
     let nativeError
     try {
