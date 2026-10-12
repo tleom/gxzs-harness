@@ -190,11 +190,15 @@ def test_distinct_manager_processes_share_the_allocation_lock(tmp_path):
         writer.close()
 
 
-def test_legacy_unconfigured_pool_reports_default_docker_exhaustion(tmp_path):
+@pytest.mark.parametrize('message', [
+    'all predefined address pools have been fully subnetted',
+    'could not find an available, non-overlapping IPv4 address pool among the defaults to assign to the network',
+])
+def test_legacy_unconfigured_pool_reports_default_docker_exhaustion(tmp_path, message):
     docker = Docker()
     def response(*args, **kwargs):
         if args[:2] == ('network', 'create'):
-            return SimpleNamespace(returncode=1, stdout='', stderr='all predefined address pools have been fully subnetted')
+            return SimpleNamespace(returncode=1, stdout='', stderr=message)
         return docker(*args, **kwargs)
     with pytest.raises(ResourceUnavailable) as failure:
         allocator(tmp_path, response, pool=None).ensure(str(uuid4()))

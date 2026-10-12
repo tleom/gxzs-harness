@@ -6,12 +6,17 @@ from types import SimpleNamespace
 import pytest
 
 
-@pytest.fixture
-def retirement(monkeypatch):
+def load_retirement():
     path = Path(__file__).parents[3] / 'scripts/retire-test-networks.py'
     spec = importlib.util.spec_from_file_location('network_retirement', path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    return module
+
+
+@pytest.fixture
+def retirement(monkeypatch):
+    module = load_retirement()
     monkeypatch.setattr(module, 'protected', lambda _: (set(), set(), 'production'))
     return module
 
@@ -61,3 +66,22 @@ def test_registered_owner_and_replaced_network_id_are_protected(retirement, monk
 def test_production_network_names_cannot_be_selected(retirement):
     with pytest.raises(ValueError, match='legacy'):
         retirement.candidate('gxzs-ai-sandboxes-user', 'manager')
+
+
+def test_default_manager_prefix_protects_its_unattached_test_named_bridge(monkeypatch):
+    module = load_retirement()
+    name = 'wb-integration-fault-qa-20260916'
+    info = network(name)
+    info['Labels'] = {'workbench': 'dify-wb-dev'}
+    def docker(*args, **kwargs):
+        if args == ('inspect', 'manager'):
+            return SimpleNamespace(stdout=json.dumps([{'Config': {'Env': []}}]))
+        if args[:2] == ('exec', 'manager'):
+            return SimpleNamespace(stdout='[]')
+        if args[:2] == ('network', 'inspect'):
+            return SimpleNamespace(stdout=json.dumps([info]))
+        raise AssertionError(args)
+    monkeypatch.setattr(module, 'docker', docker)
+    assert module.protected('manager')[2] == 'dify-wb-dev'
+    with pytest.raises(ValueError, match='registered'):
+        module.candidate(name, 'manager')

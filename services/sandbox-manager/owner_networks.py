@@ -101,7 +101,8 @@ class OwnerNetworks:
         message = result.stderr.lower()
         if subnet and 'overlap' in message:
             return False
-        if 'address pools' in message and ('exhaust' in message or 'fully subnetted' in message):
+        if (('address pools' in message and ('exhaust' in message or 'fully subnetted' in message))
+                or ('could not find an available' in message and 'address pool among the defaults' in message)):
             raise self._exhausted()
         raise ResourceUnavailable('工作区网络创建失败，请稍后重试；数据已保留', code='NETWORK_BUSY')
 

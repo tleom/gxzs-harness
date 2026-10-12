@@ -20,7 +20,7 @@ def protected(manager):
     code = "import json,pathlib,sys; print(json.dumps([json.loads(p.read_text())['workspace_id'] for p in (pathlib.Path(sys.argv[1])/'hosts').glob('*/host.json')]))"
     workspaces = {str(UUID(value)) for value in json.loads(docker('exec', manager, 'python', '-c', code, root).stdout)}
     prefix = env.get('WORKBENCH_SANDBOX_NETWORK', 'dify-workbench-sandboxes')
-    return workspaces, {prefix + '-' + hashlib.sha256(value.encode()).hexdigest()[:16] for value in workspaces}, env.get('WORKBENCH_SANDBOX_PREFIX', 'dify-workbench')
+    return workspaces, {prefix + '-' + hashlib.sha256(value.encode()).hexdigest()[:16] for value in workspaces}, env.get('WORKBENCH_SANDBOX_PREFIX', 'dify-wb-dev')
 
 
 def candidate(name, manager, expected_id=None):
