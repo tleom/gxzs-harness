@@ -32,11 +32,12 @@ def test_owner_network_names_are_deterministic_and_separate(server, monkeypatch)
         if args[:2] == ('network', 'inspect'):
             value = created.get(args[2])
             return SimpleNamespace(returncode=0 if value else 1,
-                                   stdout=json.dumps([value]) if value else '')
+                                   stdout=json.dumps([value]) if value else '', stderr='No such network' if not value else '')
         if args[:2] == ('network', 'create'):
             name = args[-1]
             workspace = next(value.split('=', 1)[1] for value in args if value.startswith('gxzs.workspace='))
-            created[name] = {'Labels': {'workbench': server.PREFIX, 'gxzs.workspace': workspace}}
+            created[name] = {'Driver': 'bridge', 'Scope': 'local',
+                             'Labels': {'workbench': server.PREFIX, 'gxzs.workspace': workspace}}
             return SimpleNamespace(returncode=0, stdout=name)
         raise AssertionError(args)
 

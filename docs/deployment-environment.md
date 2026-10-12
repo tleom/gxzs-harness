@@ -51,6 +51,9 @@ openssl rand -hex 16     # GXZS_MCP_CREDENTIAL_KEY，正好32字符
 WORKBENCH_SANDBOX_MANAGER_TOKEN=<只与Java共享的管理主凭据>
 WORKBENCH_SANDBOX_IMAGE=<已验证的sandbox镜像digest>
 WORKBENCH_SANDBOX_NETWORK=gxzs-ai-sandboxes
+# 专用池示例；部署前核对宿主机路由、DNS/VPN 和 Docker 子网，避免冲突。
+WORKBENCH_SANDBOX_ADDRESS_POOL=10.249.0.0/16
+WORKBENCH_SANDBOX_SUBNET_PREFIX=27
 WORKBENCH_SANDBOX_PREFIX=gxzs-wb
 WORKBENCH_MANAGER_STATE=/state
 # Java根地址；manager会调用 /internal/ai/mcp/authorize。
