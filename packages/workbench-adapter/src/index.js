@@ -20,6 +20,7 @@ import { streamWorkspaceEvents } from './workspace-events.js'
 import { WorkbenchSchedules } from './schedules.js'
 import { WorkbenchSubagents } from './subagents.js'
 import { WorkbenchTerminals } from './terminals.js'
+import { registerScheduledClaims } from './scheduled-claims.js'
 import { setTimeout as delay } from 'node:timers/promises'
 
 export const name = 'workbench-adapter'
@@ -137,14 +138,7 @@ export function apply(ctx, config) {
     const child = ctx.agents.get(id)
     if (child) runtime.bindChild(child)
   }, { global: true, prepend: true })
-  ctx.on('agent/inbox/claimed', (payload) => {
-    if (payload.message?.source?.kind === 'schedule' && !runtime.mcpCatalogState?.ready) {
-      // The native pre-step retains its claimed messages and awaits readiness.
-      return
-    }
-    return projectInboxClaim(database, payload, config.ownerId,
-      { mcpTools: runtime.mcpResources?.() ?? [] })
-  }, { global: true, prepend: true })
+  registerScheduledClaims(ctx, { runtime, database, ownerId: config.ownerId })
   ctx.on('agent/pre-step', async (payload, next) => {
     const scheduled = payload.messages?.filter(message => message.source?.kind === 'schedule') ?? []
     if (scheduled.length) {

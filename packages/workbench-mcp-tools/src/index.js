@@ -51,6 +51,7 @@ export async function apply(ctx) {
     restrictions.delete(agent)
     if (deny.length) restrictions.set(agent, { stamp, dispose: agent.ctx.tools.restrict({ deny }) })
   }
+  ctx.workbenchRuntime.restrictMcpScope = restrictAgent
   state(false)
   const sync = async () => {
     let payload
@@ -157,6 +158,7 @@ export async function apply(ctx) {
   }, { global: true })
   ctx.effect(() => () => {
     disposed = true
+    if (ctx.workbenchRuntime.restrictMcpScope === restrictAgent) ctx.workbenchRuntime.restrictMcpScope = undefined
     lifetime.abort()
     clearTimeout(timer)
     clear()

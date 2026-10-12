@@ -12,6 +12,8 @@ import { apply as applyMcpTools } from '../../workbench-mcp-tools/src/index.js'
 import { registerRunResourceContext } from '../src/resource-mentions.js'
 import { prepareNativeFiles } from '../src/attachments.js'
 import { dispatchRunPrompt } from '../src/native-prompt.js'
+import { registerScheduledClaims } from '../src/scheduled-claims.js'
+import { registerDatabasePrompt } from '../src/database-prompt.js'
 import WorkbenchFileSystem from '../../workbench-sandbox-runtime/src/fs.js'
 
 // Exercise the exact published DSH version installed by the production profile.
@@ -73,7 +75,7 @@ class FakeModel extends LlmAdapter {
   }
 }
 
-async function fixture(script) {
+async function fixture(script, { scheduledClaims = false } = {}) {
   const ctx = new Context()
   // New native skill and terminal consumers share the working-directory owner.
   ctx.provide('workingDirectory', { ensure: async agent => agent.session.header.cwd,
@@ -112,10 +114,13 @@ async function fixture(script) {
   registerRunResourceContext(ctx)
   runtime.scheduler = scheduler
   scheduler.executionRun = id => runtime.executionRun(id)
-  ctx.on('agent/inbox/claimed', payload => projectInboxClaim(db, payload, owner.ownerId))
+  if (scheduledClaims) registerScheduledClaims(ctx, { runtime, database: db, ownerId: owner.ownerId })
+  else ctx.on('agent/inbox/claimed', payload => projectInboxClaim(db, payload, owner.ownerId))
   ctx.on('agent/assistant-stream', createAssistantStreamProjector(db, owner.ownerId))
   ctx.on('session/event', (session, event) => projectSessionEvent(db, session.id, event, owner.ownerId,
-    { goal: ctx.goals.get(agent), nativeIdle: agent.status === 'idle' }))
+    { goal: ctx.goals.get(agent), nativeIdle: agent.status === 'idle',
+      ...(scheduledClaims ? { mcpCatalogReady: runtime.mcpCatalogState?.ready === true,
+        mcpTools: runtime.mcpResources?.() ?? [] } : {}) }))
   ctx.on('agent/status', ({ agent: current, status }) => {
     if (status === 'idle') settleNativeIdle(db, current.id, ctx.goals.get(current))
   })
@@ -125,6 +130,69 @@ async function fixture(script) {
   return { ctx, db, agent, owner, chat, model, scheduler, runtime, sessions, controllerCtx, requests, create,
     permit: value => { permitted = value } }
 }
+
+async function delayedScheduledCatalog(test) {
+  let available = false
+  const configRequests = []
+  const tool = { id: 'personal:server:search', runtime_name: 'personal_mcp_search', version: 'v1',
+    manifest_version: 'm1', scope: 'personal', server_id: 'server', tool_name: 'search',
+    description: 'Search records', inputSchema: { type: 'object', properties: {} } }
+  test.ctx.provide('workbenchPlatformClient', { json: async request => {
+    if (request.route === 'workbench/config') {
+      configRequests.push(request)
+      return { data: { enabled: true, system_prompt: 'fixture database prompt' } }
+    }
+    if (request.route !== 'mcp/catalog') return { data: { result: { content: [] } } }
+    if (!available) throw Object.assign(new Error('bootstrap unavailable'), { status: 503 })
+    return { tools: [tool] }
+  } })
+  await applyMcpTools(test.ctx)
+  return { tool, configRequests, release() { available = true; test.ctx.emit('workbench/resources-changed') } }
+}
+
+it.each([false, true])('assembles the actual first scheduled native request with verified MCP tools and complete prompt=%s', async complete => {
+  const test = await fixture(['scheduled answer'], { scheduledClaims: true })
+  const catalog = await delayedScheduledCatalog(test)
+  registerDatabasePrompt(test.ctx, test.owner.ownerId)
+  if (complete) test.ctx.systemPrompt.section({ name: 'fixture:complete', order: 0, complete: true, text: 'complete fixture prompt' })
+  const claimed = vi.fn()
+  test.ctx.on('agent/inbox/claimed', claimed)
+  const message = createUserMessage({ content: [{ type: 'text', text: 'Use search to check records' }], source: { kind: 'schedule' } })
+  test.agent.followup(message)
+  await vi.waitFor(() => expect(claimed).toHaveBeenCalledOnce())
+  expect(test.model.requests).toHaveLength(0)
+  expect(test.db.getRun(test.owner.ownerId, message.id)).toBeUndefined()
+  catalog.release()
+  await vi.waitFor(() => expect(test.runtime.mcpCatalogState.ready).toBe(true))
+  await test.agent.whenIdle()
+  expect(claimed).toHaveBeenCalledOnce()
+  expect(test.model.requests).toHaveLength(1)
+  expect(test.model.requests[0].tools.map(tool => tool.name)).toContain('search')
+  if (complete) {
+    expect(JSON.stringify(test.model.requests[0])).toContain('complete fixture prompt')
+    expect(JSON.stringify(test.model.requests[0])).not.toContain('当前可用 MCP 插件')
+    expect(JSON.stringify(test.model.requests[0])).not.toContain('fixture database prompt')
+  } else expect(JSON.stringify(test.model.requests[0])).toContain('当前可用 MCP 插件')
+  expect(catalog.configRequests).toHaveLength(1)
+  expect(test.db.getRun(test.owner.ownerId, message.id)).toMatchObject({ status: 'completed',
+    mcpTools: [expect.objectContaining({ id: catalog.tool.id, version: 'v1', manifest_version: 'm1' })] })
+})
+
+it('cancels a delayed scheduled native assembly before creating a receipt or model request', async () => {
+  const test = await fixture(['must not request'], { scheduledClaims: true })
+  const catalog = await delayedScheduledCatalog(test)
+  const claimed = vi.fn()
+  test.ctx.on('agent/inbox/claimed', claimed)
+  const message = createUserMessage({ content: [{ type: 'text', text: 'scheduled' }], source: { kind: 'schedule' } })
+  test.agent.followup(message)
+  await vi.waitFor(() => expect(claimed).toHaveBeenCalledOnce())
+  test.agent.cancel({ kind: 'user' }, { keepInbox: true })
+  await test.agent.whenIdle()
+  catalog.release()
+  await vi.waitFor(() => expect(test.runtime.mcpCatalogState.ready).toBe(true))
+  expect(test.model.requests).toHaveLength(0)
+  expect(test.db.getRun(test.owner.ownerId, message.id)).toBeUndefined()
+})
 
 it('runs background resume through the native inbox without making it a title input, including replay', async () => {
   const test = await fixture(['continued answer', 'human answer'])

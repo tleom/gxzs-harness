@@ -80,6 +80,8 @@ MCP 与技能的内部状态统一归入资源目录：旧根目录的 `.mcp-set
 
 适配器使用 Cordis `ctx.get('schedule')` 读取后启动的原生服务，避免引入启动依赖环；内部 Workspace 校验和引用搜索不读取定时目录。原生沙箱终端与定时目录的完整 HTTP 操作纳入 `smoke-host-bootstrap.mjs`。原生定时投递的实时事件和恢复路径都等待首次确认的 MCP 目录，后台子任务延续原冻结权限；文件删除同时检查后台子任务，私有会话目录删除等待有时间上限的原生活动结束。
 
+原生 Agent 在 `agent/pre-step` 之前已执行 `SystemPrompt.assemble`。首次目录尚未确认的定时 claim 暂存在当前 Agent 的弱映射，原生 assembly waterfall 可取消地等候目录后绑定同一次已领取消息、刷新 MCP 范围限制，再由原生 `SystemPrompt.assemble` 重组一次；不重领消息、不复制 Native/PTC 工具模型。真实已发布 Agent 测试覆盖首轮工具和提供方目录、`complete:true` 提示词权威、平台提示词只读取一次以及等待期间取消。
+
 数据库无新增字段或 SQL 迁移。部署顺序为后端受控路由、237 Host/Sandbox 成对升级并更新 SSH helper hash、235 前端。保持 owner、Workspace、home volume 与目录不变，通过现有 drain/fence/replace 流程升级，不强停正在运行的任务。
 
 上线前备份 manager 状态、原生会话、Workbench SQLite、配置及 owner 持久卷；在新镜像中对历史会话副本做读写重开验证。回滚使用此前镜像、helper hash、部署配置和备份；新建定时任务数据须随原生 JSON domain 一起保留。
