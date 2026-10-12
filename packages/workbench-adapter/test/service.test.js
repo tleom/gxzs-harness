@@ -67,6 +67,20 @@ function activateNative(test, runId, queued = []) {
 }
 
 describe('followup and control service', () => {
+  it('fences a completed background parent captured before native archive stops its child', async () => {
+    const { database, owner, chat, service } = setup()
+    const run = database.createRun({ ownerId: owner.ownerId, chatId: chat.id, sessionId: chat.sessionId, query: 'background', selection: {}, mcpTools: [{ id: 'tool', version: 'v1' }] }).run
+    database.transitionRun(owner.ownerId, run.id, 'running')
+    database.transitionRun(owner.ownerId, run.id, 'completed')
+    let background = true
+    service.hasOwnedWork = (session, id) => session === chat.sessionId && id === run.id && background
+    service.workspaces = { controller: { archiveSession: vi.fn(async () => { background = false }) } }
+    service.platformClient = { json: vi.fn(async () => ({ fenced: true })) }
+    await service.deleteChat(owner, chat.id)
+    expect(service.platformClient.json).toHaveBeenCalledWith(expect.objectContaining({ route: 'mcp/cancel', body: expect.any(Buffer) }))
+    expect(JSON.parse(service.platformClient.json.mock.calls[0][0].body).run_id).toBe(run.id)
+    expect(database.pendingRunFences(owner.ownerId)).toEqual([])
+  })
   it('fences the parent MCP run when a native child notice is stopped', async () => {
     const test=setup(),{database,owner,chat,service}=test
     const parent=database.createRun({ownerId:owner.ownerId,chatId:chat.id,sessionId:chat.sessionId,query:'parent',selection:{}}).run

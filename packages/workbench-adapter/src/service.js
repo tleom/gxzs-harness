@@ -182,13 +182,15 @@ export class WorkbenchService {
         // Drain an in-flight admission before cancelling; otherwise its prompt
         // could arrive after cancellation and restart the deleted conversation.
         await this.scheduler?.pendingTick
+        // Capture background run authority before archive dispatches child stops.
+        const cancelling = this.database.listRuns(owner.ownerId, chatId)
+          .filter(run => ['running', 'waiting_input', 'stopping'].includes(run.status) || this.database.submission(owner.ownerId, run.id)?.dispatched
+            || this.hasOwnedWork?.(chat.sessionId, run.id)
+            || this.database.pendingRunFences(owner.ownerId).some(value => value.id === run.id))
         // Native archive commits the wake-up fence before stopping schedules, jobs and children.
         await this.workspaces?.controller?.archiveSession?.({ sessionId: chat.sessionId, stopActivity: true })
         await this.closeTerminals?.(chat.sessionId)
         const agent = this.agents.get(chat.sessionId)
-        const cancelling = this.database.listRuns(owner.ownerId, chatId)
-          .filter(run => ['running', 'waiting_input', 'stopping'].includes(run.status) || this.database.submission(owner.ownerId, run.id)?.dispatched
-            || this.database.pendingRunFences(owner.ownerId).some(value => value.id === run.id))
         for (const run of cancelling) this.database.requireRunFence(owner.ownerId, run.id)
         if (agent) {
           const goal = this.goals?.get(agent)

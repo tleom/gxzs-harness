@@ -20,6 +20,7 @@ import { streamWorkspaceEvents } from './workspace-events.js'
 import { WorkbenchSchedules } from './schedules.js'
 import { WorkbenchSubagents } from './subagents.js'
 import { WorkbenchTerminals } from './terminals.js'
+import { setTimeout as delay } from 'node:timers/promises'
 
 export const name = 'workbench-adapter'
 export const inject = ['webServer', 'sessionController', 'workspaceController', 'sessionReferenceResolver', 'fileReferences', 'workspaceChanges', 'agents', 'commands', 'skills', 'systemPrompt', 'tokenMeter', 'workbenchFileManager', 'workbenchPlatformClient', 'sessionQuery', 'sessionProjections', 'agentPresets', 'agentDefaultModel', 'settings', 'attachments', 'fileUploads', 'goals', 'terminalController', 'subagents']
@@ -69,6 +70,7 @@ export function apply(ctx, config) {
   service.sessionReferences = ctx.sessionReferenceResolver
   service.fileReferences = ctx.fileReferences
   service.cancelOwned = (sessionId, runId) => runtime.cancelOwned(sessionId, runId)
+  service.hasOwnedWork = (sessionId, runId) => runtime.hasOwnedWork(sessionId, runId)
   service.executionRun = sessionId => runtime.executionRun(sessionId)
   service.waitSessionActivity = sessionId => waitSessionActivity(ctx, sessionId)
   const schedules = new WorkbenchSchedules({ native: () => ctx.get('schedule'), database, service })
@@ -91,7 +93,7 @@ export function apply(ctx, config) {
   let recovery
   let recovering = false
   const beginRecovery = () => {
-    if (recovering) return
+    if (recovering) return recovery
     clearTimeout(recoveryTimer)
     recovering = true
     recovered = false
@@ -114,6 +116,7 @@ export function apply(ctx, config) {
         recoveryTimer.unref?.()
       }
     }).finally(() => { recovering = false })
+    return recovery
   }
   beginRecovery()
   const humanInput = new HumanInputBridge({ database, timeoutSeconds: config.humanInputTimeoutSeconds,
@@ -136,16 +139,24 @@ export function apply(ctx, config) {
   }, { global: true, prepend: true })
   ctx.on('agent/inbox/claimed', (payload) => {
     if (payload.message?.source?.kind === 'schedule' && !runtime.mcpCatalogState?.ready) {
-      // The durable native log is retried by recovery; never freeze an
-      // unverified empty catalog into a delivered schedule receipt.
-      beginRecovery()
+      // The native pre-step retains its claimed messages and awaits readiness.
       return
     }
     return projectInboxClaim(database, payload, config.ownerId,
       { mcpTools: runtime.mcpResources?.() ?? [] })
   }, { global: true, prepend: true })
   ctx.on('agent/pre-step', async (payload, next) => {
+    const scheduled = payload.messages?.filter(message => message.source?.kind === 'schedule') ?? []
+    if (scheduled.length) {
+      while (!runtime.mcpCatalogState?.ready) {
+        await delay(100, undefined, { signal: payload.signal })
+      }
+      payload.signal?.throwIfAborted()
+      for (const message of scheduled) projectInboxClaim(database, { agent: payload.agent, message, turn: payload.turn }, config.ownerId,
+        { mcpTools: runtime.mcpResources?.() ?? [] })
+    }
     await recovery
+    if (scheduled.length && recoveryError) await beginRecovery()
     if (recoveryError) return { kind: 'reject' }
     const run = runtime.executionRun(payload.agent.session?.id ?? payload.agent.id)
     if (run?.selection?.native_source === 'schedule') {
@@ -178,9 +189,6 @@ export function apply(ctx, config) {
     }
     projectSessionEvent(database, session?.id ?? session?.header?.id, event, config.ownerId,
       { ...context, mcpCatalogReady: runtime.mcpCatalogState?.ready === true, mcpTools: runtime.mcpResources?.() ?? [] })
-    if (!runtime.mcpCatalogState?.ready && (event.type === 'user/message' && event.data?.source?.kind === 'schedule'
-      || event.type === 'agent/inbox/spliced' && event.data?.inserted?.some(message => message.source?.kind === 'schedule')))
-      beginRecovery()
   }, { global: true })
 
   const buildCatalog = async (owner, modelsOnly = false) => {
@@ -339,8 +347,24 @@ export function apply(ctx, config) {
       } finally { res.off('close', disconnected) }
     }],
     ['GET', /^\/schedules\/([\w-]+)\/history$/, async ({ owner, url }, res, match) => sendJson(res, 200, { data: await schedules.history(owner, match[1], url.searchParams.get('before')) })],
-    ['PATCH', /^\/schedules\/([\w-]+)$/, async ({ owner, json }, res, match) => sendJson(res, 200, { data: await schedules.update(owner, match[1], json) })],
-    ['DELETE', /^\/schedules\/([\w-]+)$/, async ({ owner }, res, match) => sendJson(res, 200, { data: await schedules.delete(owner, match[1]) })],
+    ['PATCH', /^\/schedules\/([\w-]+)$/, async ({ owner, json }, res, match) => {
+      const abort = new AbortController()
+      const disconnected = () => abort.abort()
+      res.once('close', disconnected)
+      try {
+        const data = await schedules.update(owner, match[1], json, abort.signal)
+        if (!abort.signal.aborted) sendJson(res, 200, { data })
+      } finally { res.off('close', disconnected) }
+    }],
+    ['DELETE', /^\/schedules\/([\w-]+)$/, async ({ owner }, res, match) => {
+      const abort = new AbortController()
+      const disconnected = () => abort.abort()
+      res.once('close', disconnected)
+      try {
+        const data = await schedules.delete(owner, match[1], abort.signal)
+        if (!abort.signal.aborted) sendJson(res, 200, { data })
+      } finally { res.off('close', disconnected) }
+    }],
     ['GET', /^\/workspaces\/events$/, async ({ owner }, res) => streamWorkspaceEvents({ workspaces, owner, res,
       subscribe: changed => {
         const stops = ['api-session/added', 'api-session/removed', 'api-session/status', 'api-session/activity', 'schedule/changed'].map(event => ctx.on(event, changed))
