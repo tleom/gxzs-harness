@@ -19,6 +19,7 @@ from urllib.request import ProxyHandler, Request, build_opener
 
 from admission import Admission
 from resource_limits import cgroup_args, owner_cgroup, ResourceUnavailable
+from owner_networks import OwnerNetworks
 from owner_auth import authorize as authorize_request
 
 
@@ -112,24 +113,17 @@ def tick(worker):
         HEALTH[worker] = time.monotonic()
 
 
+OWNER_NETWORKS = OwnerNetworks(STATE, NETWORK, PREFIX, lambda *args, **kwargs: docker(*args, **kwargs),
+                               os.environ.get('WORKBENCH_SANDBOX_ADDRESS_POOL'),
+                               os.environ.get('WORKBENCH_SANDBOX_SUBNET_PREFIX', '27'))
+
+
 def network_name(key):
-    return NETWORK + '-' + hashlib.sha256(key.encode()).hexdigest()[:16]
+    return OWNER_NETWORKS.name(key)
 
 
 def ensure_network(key):
-    """Create one owner bridge; never attach the manager or another owner."""
-    key = str(uuid.UUID(key))
-    name = network_name(key)
-    result = docker('network', 'inspect', name, check=False)
-    if result.returncode:
-        docker('network', 'create', '--driver', 'bridge', '--label', 'workbench=' + PREFIX,
-               '--label', 'gxzs.workspace=' + key, name)
-        result = docker('network', 'inspect', name)
-    info = json.loads(result.stdout)[0]
-    labels = info.get('Labels') or {}
-    if labels.get('workbench') != PREFIX or labels.get('gxzs.workspace') != key:
-        raise ValueError('Owner network identity mismatch')
-    return name
+    return OWNER_NETWORKS.ensure(key)
 
 
 @contextmanager

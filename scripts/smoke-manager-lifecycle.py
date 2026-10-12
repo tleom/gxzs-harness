@@ -5,6 +5,7 @@ import ipaddress
 import json
 import os
 import secrets
+import signal
 import subprocess
 import sys
 import tempfile
@@ -22,6 +23,13 @@ host_probe = prefix + '-host'
 host_home = prefix + '-host-home'
 token = secrets.token_hex(32)
 workspaces = [str(uuid.uuid4()), str(uuid.uuid4())]
+
+
+def interrupted(signum, frame):
+    raise InterruptedError('Disposable manager smoke interrupted')
+
+
+signal.signal(signal.SIGTERM, interrupted)
 
 
 def docker(*args, stdin=None, check=True):
@@ -79,6 +87,8 @@ try:
            '-e', 'WORKBENCH_SANDBOX_MANAGER_TOKEN=' + token,
            '-e', 'WORKBENCH_SANDBOX_PREFIX=' + prefix,
            '-e', 'WORKBENCH_SANDBOX_NETWORK=' + prefix,
+           '-e', 'WORKBENCH_SANDBOX_ADDRESS_POOL=' + os.environ.get('GXZS_SMOKE_ADDRESS_POOL', '10.249.253.0/24'),
+           '-e', 'WORKBENCH_SANDBOX_SUBNET_PREFIX=27',
            '-e', 'WORKBENCH_SANDBOX_IMAGE=' + sandbox_image, manager_image)
     healthy()
     # Optional explicit test ranges avoid consuming the daemon's production pool.
@@ -180,6 +190,14 @@ HOSTS._create_container(value['item'], folder, value['image'], 'none', [], PureP
         info = json.loads(docker('inspect', prefix + '-' + workspace).stdout)[0]
         networks.append(set(info['NetworkSettings']['Networks']))
     assert all(len(value) == 1 for value in networks) and networks[0].isdisjoint(networks[1])
+    network_before = {name: json.loads(docker('network', 'inspect', name).stdout)[0]
+                      for names in networks for name in names}
+    if not os.environ.get('GXZS_SMOKE_SUBNETS'):
+        address_pool = ipaddress.ip_network(os.environ.get('GXZS_SMOKE_ADDRESS_POOL', '10.249.253.0/24'))
+        for info in network_before.values():
+            subnet = ipaddress.ip_network(info['IPAM']['Config'][0]['Subnet'])
+            assert subnet.prefixlen == 27 and subnet.subnet_of(address_pool), info['IPAM']
+        print('PASS dedicated pool: distinct /27 bridges created through the real manager', flush=True)
     # A running process in B must outlive manager restart and A's restart.
     docker('exec', '-d', prefix + '-' + workspaces[1], '/usr/local/bin/python', '-I', '-S', '-c',
            "import pathlib,time; p=pathlib.Path('/workspace/probe'); "
@@ -194,6 +212,9 @@ HOSTS._create_container(value['item'], folder, value['image'], 'none', [], PureP
     healthy()
     for workspace, (_, data) in zip(workspaces, results):
         assert files(workspace, 'get', path='probe/data.bin')['data'] == data
+    for name, previous in network_before.items():
+        current = json.loads(docker('network', 'inspect', name).stdout)[0]
+        assert current['Id'] == previous['Id'] and current['IPAM'] == previous['IPAM']
     print('PASS manager restart: both owner files preserved', flush=True)
     docker('restart', prefix + '-' + workspaces[0])
     assert files(workspaces[0], 'get', path='probe/data.bin')['data'] == results[0][1]
