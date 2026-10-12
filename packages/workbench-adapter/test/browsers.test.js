@@ -9,6 +9,8 @@ it('bounds input and schemes without accepting command/config fields', () => {
     expect(() => browserAction({ action: 'navigate', url })).toThrow()
   for (const request of [{action:'key',key:'evil()'}, {action:'resize',width:4000,height:800}, {action:'click',x:-1,y:0}, {action:'execute',script:'code'}])
     expect(() => browserAction(request)).toThrow()
+  for(const count of [0,null,false,'']) expect(()=>browserAction({action:'click',x:0,y:0,count})).toThrow()
+  expect(browserAction({action:'click',x:0,y:0})).toMatchObject({count:1,button:'left'})
 })
 it('keeps browser actions inside the owner binding and explicit controller lease', async () => {
   const browser = { command: vi.fn(async () => {}), dispose: vi.fn(), follow: vi.fn(), done: Promise.resolve() }
@@ -135,4 +137,14 @@ it('reconciles watch state after a queued disable overlaps a replacement stream 
   await vi.waitFor(()=>expect(browser.watchEnabled).toBe(true))
   await replacement.return()
   browser.dispose(); await browser.done
+})
+
+it('reports a nonzero subprocess exit as a connection failure even when done resolves', async () => {
+  let finish
+  const browser=new SandboxBrowser({spawn:()=>({stdin:new PassThrough(),stdout:new PassThrough(),done:new Promise(resolve=>{finish=resolve})})})
+  const pending=browser.command({action:'init'})
+  finish({exitCode:2,signal:null})
+  await expect(pending).rejects.toMatchObject({status:502})
+  await browser.done
+  await expect(browser.follow(id,signal()).next()).rejects.toMatchObject({status:502})
 })

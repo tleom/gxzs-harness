@@ -20,8 +20,8 @@ export function browserAction(request) {
     case 'click': case 'move':
       if (!integer(request.x, 0, 1919) || !integer(request.y, 0, 1079)) break
       if (action === 'move') return { action, x: request.x, y: request.y }
-      if (!['left', 'middle', 'right'].includes(request.button || 'left') || !integer(request.count || 1, 1, 2)) break
-      return { action, x: request.x, y: request.y, button: request.button || 'left', count: request.count || 1 }
+      if (!['left', 'middle', 'right'].includes(request.button === undefined ? 'left' : request.button) || !integer(request.count === undefined ? 1 : request.count, 1, 2)) break
+      return { action, x: request.x, y: request.y, button: request.button === undefined ? 'left' : request.button, count: request.count === undefined ? 1 : request.count }
     case 'wheel':
       if (integer(request.x, -3000, 3000) && integer(request.y, -3000, 3000)) return { action, x: request.x, y: request.y }
       break
@@ -51,7 +51,8 @@ export class SandboxBrowser {
       signal: this.lifetime.signal, graceMs: 1500,
       stdio: { stdin: 'pipe', stdout: 'pipe', stderr: { maxBytes: 4096 } } })
     this.done = this.handle.done.then(
-      () => this.dispose(httpError(410, '浏览器已经关闭，请重新打开')),
+      outcome => this.dispose(outcome.exitCode === 0 && !outcome.signal
+        ? httpError(410, '浏览器已经关闭，请重新打开') : httpError(502, '沙盒浏览器连接中断')),
       () => this.dispose(httpError(502, '沙盒浏览器连接中断')),
     )
     if (!this.handle.stdin || !this.handle.stdout) { this.dispose(); throw httpError(502, '沙盒浏览器连接不可用') }

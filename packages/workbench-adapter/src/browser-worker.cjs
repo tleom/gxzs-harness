@@ -21,6 +21,7 @@ function createImageCapture({ now = Date.now, budgetMs = 5000 } = {}) {
 function runWorker({ chromium, input = process.stdin, output = process.stdout, exit = code => process.exit(code) }) {
   let browser, context, page, session, watching = false, capturing = false, closed = false
   let timer, notice = '', navigation = 0, hasFrame = false
+  let captureFinished = Promise.resolve(), finishCapture = () => {}
   const send = value => new Promise(resolve => {
     if (output.write(JSON.stringify(value) + '\n')) resolve()
     else output.once('drain', resolve)
@@ -34,6 +35,7 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
   async function frame() {
     if (!page || page.isClosed() || capturing || closed) return
     capturing = true
+    captureFinished = new Promise(resolve => { finishCapture = resolve })
     try {
       const target = page, cdp = session
       const url = target.url()
@@ -54,7 +56,7 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
       else if (error.message === 'invalid_url') fatal('浏览器仅支持 HTTP 和 HTTPS 页面')
       // Navigation can temporarily invalidate a screenshot; the next frame retries.
     }
-    finally { capturing = false }
+    finally { capturing = false; finishCapture() }
   }
   async function bind(target) {
     const cdp = await context.newCDPSession(target)
@@ -140,7 +142,12 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
       case 'reload': await page.reload({ waitUntil: 'domcontentloaded' }); break
       case 'back': await page.goBack({ waitUntil: 'domcontentloaded' }); break
       case 'forward': await page.goForward({ waitUntil: 'domcontentloaded' }); break
-      case 'resize': await page.setViewportSize({ width: value.width, height: value.height }); break
+      case 'resize':
+        navigation++
+        await page.setViewportSize({ width: value.width, height: value.height })
+        navigation++
+        if (capturing) await captureFinished
+        break
       case 'click': await page.mouse.click(value.x, value.y, { button: value.button || 'left', clickCount: value.count || 1 }); break
       case 'move': await page.mouse.move(value.x, value.y); break
       case 'wheel': await page.mouse.wheel(value.x, value.y); break

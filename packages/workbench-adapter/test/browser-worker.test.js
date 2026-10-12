@@ -167,6 +167,28 @@ it('does not adopt a popup that closes while binding', async () => {
   } finally { await value.runtime.shutdown() }
 })
 
+it('discards the pre-resize capture and emits matching dimensions before acknowledging resize', async () => {
+  const value=worker()
+  let size={width:1000,height:700}, finishImage
+  value.page.viewportSize=()=>size
+  value.page.setViewportSize=async value=>{size=value}
+  try {
+    await value.command(1,'init',{width:1000,height:700})
+    await value.command(2,'watch',{enabled:true})
+    value.page.screenshot.mockImplementationOnce(()=>new Promise(resolve=>{finishImage=resolve}))
+    await vi.waitFor(()=>expect(finishImage).toBeTypeOf('function'))
+    value.frames.length=0
+    value.input.write(JSON.stringify({id:3,action:'resize',width:800,height:600})+'\n')
+    await vi.waitFor(()=>expect(size).toEqual({width:800,height:600}))
+    finishImage(Buffer.from('stale-image'))
+    await vi.waitFor(()=>expect(value.frames.some(frame=>frame.type==='result' && frame.id===3)).toBe(true))
+    const frames=value.frames.filter(frame=>frame.type==='frame')
+    expect(frames.length).toBeGreaterThan(0)
+    expect(frames.every(frame=>frame.width===800 && frame.height===600)).toBe(true)
+    expect(value.frames.findIndex(frame=>frame.type==='frame')).toBeLessThan(value.frames.findIndex(frame=>frame.id===3))
+  } finally { await value.runtime.shutdown() }
+})
+
 it('discards a frame when the same Page navigates during capture and publishes the next consistent frame', async () => {
   const value = worker()
   let url='https://example.com/old'
