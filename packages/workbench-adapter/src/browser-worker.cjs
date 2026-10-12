@@ -49,6 +49,7 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
       hasFrame = true
     } catch (error) {
       if (error.message === 'frame_too_large') fatal('网页图像过大，请重新打开浏览器')
+      else if (error.message === 'capture_timeout' || error.name === 'TimeoutError') fatal('网页图像获取超时，请重新打开浏览器')
       // Navigation can temporarily invalidate a screenshot; the next frame retries.
     }
     finally { capturing = false }
@@ -72,6 +73,13 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
     target.on('popup', async popup => {
       // Keep the single tab's owner context; do not create an unowned external guest.
       try {
+        try {
+          if (popup.url() !== 'about:blank') validUrl(popup.url())
+        } catch {
+          notice = '浏览器仅支持 HTTP 和 HTTPS 页面'
+          await popup.close().catch(() => {})
+          return
+        }
         await bind(popup)
         const previous = page
         page = popup

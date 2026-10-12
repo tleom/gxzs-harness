@@ -111,3 +111,28 @@ it('counts closing subprocesses until done before admitting replacement browsers
   expect(workers).toHaveLength(5)
   gateway.dispose(); for(const exit of exits) exit()
 })
+
+it('reconciles watch state after a queued disable overlaps a replacement stream and a full action queue', async () => {
+  const stdout=new PassThrough(),stdin=new PassThrough(),requests=[]
+  stdin.on('data',chunk=>requests.push(JSON.parse(String(chunk))))
+  const browser=new SandboxBrowser({spawn:spec=>({stdin,stdout,done:new Promise(resolve=>spec.signal.addEventListener('abort',resolve))})})
+  const reply=id=>stdout.write(JSON.stringify({type:'result',id})+'\n')
+  stdout.write(JSON.stringify({type:'frame',image:'aA==',width:1000,height:700})+'\n')
+  const old=browser.follow(id,signal())
+  await old.next(); reply(requests[0].id)
+  await vi.waitFor(()=>expect(browser.watchEnabled).toBe(true))
+  const actions=Array.from({length:31},()=>browser.command({action:'key',key:'Enter'}))
+  await old.return()
+  const disable=requests.at(-1)
+  expect(disable).toMatchObject({action:'watch',enabled:false})
+  const replacement=browser.follow(id,signal())
+  await replacement.next()
+  for(const request of requests.filter(request=>request.action==='key')) reply(request.id)
+  await Promise.all(actions)
+  reply(disable.id)
+  await vi.waitFor(()=>expect(requests.at(-1)).toMatchObject({action:'watch',enabled:true}))
+  reply(requests.at(-1).id)
+  await vi.waitFor(()=>expect(browser.watchEnabled).toBe(true))
+  await replacement.return()
+  browser.dispose(); await browser.done
+})

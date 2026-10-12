@@ -102,6 +102,31 @@ it('rejects initialization without a first frame rather than leaving the client 
   } finally { await value.runtime.shutdown() }
 })
 
+it('invalidates the live stream when screenshot timeouts would otherwise leave stale pixels', async () => {
+  const value=worker()
+  try {
+    await value.command(1,'init',{width:1000,height:700})
+    const timeout=new Error('screenshot timeout'); timeout.name='TimeoutError'
+    value.page.screenshot.mockRejectedValue(timeout)
+    value.input.write(JSON.stringify({id:2,action:'watch',enabled:true})+'\n')
+    await vi.waitFor(()=>expect(value.exit).toHaveBeenCalledWith(2))
+    expect(value.frames.find(frame=>frame.type==='fatal').error).toContain('超时')
+  } finally { await value.runtime.shutdown() }
+})
+
+it('rejects an already-navigated non-HTTP popup without replacing the current page', async () => {
+  const value=worker()
+  try {
+    await value.command(1,'init',{width:1000,height:700})
+    const popup={url:()=> 'blob:https://example.com/document',close:vi.fn(async()=>{})}
+    value.page.emit('popup',popup)
+    await vi.waitFor(()=>expect(popup.close).toHaveBeenCalledOnce())
+    await value.command(2,'watch',{enabled:true})
+    expect(value.frames.filter(frame=>frame.type==='frame').at(-1).url).toBe('https://example.com')
+    expect(value.browser.close).not.toHaveBeenCalled()
+  } finally { await value.runtime.shutdown() }
+})
+
 it('discards a frame when the same Page navigates during capture and publishes the next consistent frame', async () => {
   const value = worker()
   let url='https://example.com/old'

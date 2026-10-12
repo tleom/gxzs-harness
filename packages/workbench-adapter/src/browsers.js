@@ -43,6 +43,8 @@ export class SandboxBrowser {
     this.buffer = ''
     this.sequence = 0
     this.closed = false
+    this.watchEnabled = false
+    this.watchBusy = false
     this.idleMs = idleMs
     this.lifetime = new AbortController()
     this.handle = subprocess.spawn({ argv: ['/usr/local/bin/node', worker], cwd: '/workspace',
@@ -104,6 +106,7 @@ export class SandboxBrowser {
         signal.removeEventListener('abort', cancel)
         this.pending.delete(id)
         this.armIdle()
+        this.syncWatch()
         callback(result)
       }
       const cancel = () => {
@@ -120,6 +123,16 @@ export class SandboxBrowser {
   publish() {
     for (const listener of this.listeners) listener()
   }
+  syncWatch() {
+    if (this.closed || this.watchBusy || this.pending.size >= 32) return
+    const enabled = this.listeners.size > 0
+    if (enabled === this.watchEnabled) return
+    this.watchBusy = true
+    this.command({ action: 'watch', enabled }).then(
+      () => { this.watchEnabled = enabled },
+      error => this.dispose(error),
+    ).finally(() => { this.watchBusy = false; this.syncWatch() })
+  }
   async *follow(attachment, signal) {
     if (this.closed) throw this.failure
     signal.throwIfAborted()
@@ -132,7 +145,7 @@ export class SandboxBrowser {
     signal.addEventListener('abort', update, { once: true })
     clearTimeout(this.idleTimer)
     this.publish()
-    void this.command({ action: 'watch', enabled: true }).catch(() => {})
+    this.syncWatch()
     try {
       while (!signal.aborted && !this.closed) {
         if (!changed) await new Promise(resolve => { wake = resolve })
@@ -149,7 +162,7 @@ export class SandboxBrowser {
         this.controller = undefined
       }
       this.publish()
-      if (!this.listeners.size && !this.closed) void this.command({ action: 'watch', enabled: false }).catch(() => {})
+      this.syncWatch()
       this.armIdle()
     }
   }
