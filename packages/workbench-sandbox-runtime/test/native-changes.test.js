@@ -22,12 +22,16 @@ it.each([false,true])('preserves native events and historical comparison with gi
   const io=createChangesIo(subprocess,{node:process.execPath,cwd,home:cwd,tempRoot})
   const native=createWorkspaceChanges(io)
   const session={id:'session',header:{cwd},append(type,data){const event={type,data,seq:events.length+1};events.push(event);return event}}
-  const ctx={subprocess,logger:{info(){},warn:message=>warnings.push(message)},on:(name,fn)=>handlers.set(name,fn),provide:(_,value)=>service=value,effect:fn=>effects.push(fn())}
+  const ctx={subprocess,fs:{processPath:target=>target},logger:{info(){},warn:message=>warnings.push(message)},on:(name,fn)=>handlers.set(name,fn),provide:(_,value)=>service=value,effect:fn=>effects.push(fn())}
   try{
     native.apply(ctx,{timeoutMs:30000,outputMaxBytes:8388608,maxFiles:500,maxFileBytes:2097152,diffTimeoutMs:100})
     await writeFile(join(cwd,'file.txt'),'before\n')
     handlers.get('session/event')(session,{type:'turn/start',data:{turn:1}})
-    await handlers.get('tools/pre-execute')({agent:{session},name:'write',arguments:{file_path:'file.txt',content:'after\n'}},()=>writeFile(join(cwd,'file.txt'),'after\n'))
+    const execution={agent:{session},name:'write',arguments:{file_path:'file.txt',content:'after\n'}}
+    await handlers.get('tools/pre-execute')(execution,async()=>{
+      await handlers.get('fs/write-intent')(join(cwd,'file.txt'),execution,()=>undefined)
+      await writeFile(join(cwd,'file.txt'),'after\n')
+    })
     handlers.get('session/event')(session,{type:'tool/result',seq:10,data:{turn:1}})
     await handlers.get('agent/turn-stopping')({agent:{session},turn:1})
     expect(warnings).toEqual([])
@@ -43,4 +47,4 @@ it.each([false,true])('preserves native events and historical comparison with gi
     for(const cleanup of effects)await cleanup()
     await rm(cwd,{recursive:true,force:true})
   }
-})
+}, 15000)

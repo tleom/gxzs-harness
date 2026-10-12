@@ -1,7 +1,7 @@
 # DSH assistant presentation
 
 `client-assistant-stream.js` is the published JavaScript from
-`@deepseek-ai/dsh-api-session-controller@0.1.7-rc.1`,
+`@deepseek-ai/dsh-api-session-controller@0.2.1-alpha.2`,
 `lib/types/client/sessions/assistant-stream.js` (MIT; see LICENSE).
 Only the unavailable source-map reference is removed; executable code is unchanged.
 

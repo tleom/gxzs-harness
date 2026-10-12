@@ -1,5 +1,5 @@
 import { ClientAssistantStream } from './dsh/client-assistant-stream.js'
-import { nativePresentation } from './projection.js'
+import { fileToolPreparation, nativePresentation } from './projection.js'
 import { compactionSummary } from './native-command.js'
 
 /** Map native publication decisions to existing Workbench display records. */
@@ -12,6 +12,7 @@ export class HistoryPresentation {
     this.stream = new ClientAssistantStream()
     this.attempts = new Map()
     this.tools = new Map()
+    this.preparations = new Map()
     this.compactions = new Map()
     this.revision = 0
   }
@@ -33,6 +34,16 @@ export class HistoryPresentation {
       }
       if (event.type === 'assistant/live-chunk') {
         const { chunk, attemptId, turn, step } = event.data
+        if (chunk.type === 'tool-call-delta') {
+          let calls = this.preparations.get(attemptId)
+          if (!calls) this.preparations.set(attemptId, calls = new Map())
+          const data = fileToolPreparation(run, calls, chunk)
+          if (data) display.events.push({ run_id: run.id, event: {
+            event: 'workbench_activity', _id: `stream:${this.sessionId}:${attemptId}:${event.seq}`,
+            data: { ...data, native_attempt: attemptId, segment_id: `t${turn}s${step}a${attemptId}:b${chunk.index}` },
+          } })
+          return
+        }
         if (!['text-delta', 'reasoning-delta'].includes(chunk.type) || !chunk.text) return
         display.events.push({ run_id: run.id, event: {
           event: 'workbench_activity', _id: `stream:${this.sessionId}:${attemptId}:${event.seq}`,
@@ -55,6 +66,7 @@ export class HistoryPresentation {
     if (frame.type === 'snapshot') {
       this.turn = undefined
       this.attempts.clear(); this.tools.clear()
+      this.preparations.clear()
       this.compactions.clear()
       this.revision = frame.assistantStream?.revision ?? 0
       const opening = frame.assistantStream?.activeAttempt
@@ -75,6 +87,7 @@ export class HistoryPresentation {
     if (result?.entry) project(result.entry)
     if (result?.type === 'abandonment' || result?.type === 'settlement') display.retire_attempts.push(result.attemptId)
     if (result?.retireAttemptId) display.retire_attempts.push(result.retireAttemptId)
+    for (const attemptId of display.retire_attempts) this.preparations.delete(attemptId)
     return display
   }
 }

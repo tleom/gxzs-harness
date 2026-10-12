@@ -11,7 +11,7 @@ const { default: WorkbenchSubprocess } = await import('/opt/workbench/packages/w
 const { z } = await import(require.resolve('zod'))
 const source = fs.readFileSync('/opt/workbench/packages/workbench-sandbox-runtime/src/ssh.js', 'utf8').replace("'@deepseek-ai/dsh-ssh'", JSON.stringify(pathToFileURL(require.resolve('@deepseek-ai/dsh-ssh')).href))
 const {default: WorkbenchSsh} = await import('data:text/javascript;base64,' + Buffer.from(source).toString('base64'))
-const config = {host:process.env.GXZS_SANDBOX_SSH_HOST,node:'/usr/local/bin/node',helper:'/opt/dsh/node_modules/@deepseek-ai/dsh-ssh/lib/helper.js',helperHash:process.env.GXZS_SANDBOX_HELPER_HASH,workspace:'/workspace',requestTimeoutMs:3000,maxFrameBytes:67108864,maxPending:128,leaseMs:30000}
+const config = {host:process.env.GXZS_SANDBOX_SSH_HOST,launch:{kind:'node-script',node:'/usr/local/bin/node'},helper:'/opt/dsh/node_modules/@deepseek-ai/dsh-ssh/lib/helper.js',helperHash:process.env.GXZS_SANDBOX_HELPER_HASH,workspace:'/workspace',requestTimeoutMs:3000,maxFrameBytes:67108864,maxPending:128,leaseMs:30000}
 const ctx = new Context(); const ssh = new WorkbenchSsh(ctx,config)
 const execFileAsync=promisify(execFile)
 const checks=[]

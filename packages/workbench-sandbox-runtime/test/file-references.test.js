@@ -102,13 +102,13 @@ it('keeps in-flight searches alive and starts the idle deadline after their last
 it('waits for the old index to exit and shares a single lazy replacement',async()=>{
  const provider=runtime(),agent={session:{header:{cwd:options().root}}}
  let finish
- const old={closed:true,done:new Promise(resolve=>{finish=resolve})}
+ const old={root:options().root,closed:true,done:new Promise(resolve=>{finish=resolve})}
  const service=Object.assign(Object.create(SandboxFileReferences.prototype),{
-  ctx:{subprocess:provider},searchConfig:options().config,remoteSearches:new Map([[agent,old]]),stopped:false,
+  ctx:{subprocess:provider,workingDirectory:{ensure:async()=>options().root}},searchConfig:options().config,remoteSearches:new Map([[agent,old]]),stopped:false,
  })
  const first=service.list(agent,'a',new AbortController().signal)
  const second=service.list(agent,'b',new AbortController().signal)
- expect(provider.spawn).not.toHaveBeenCalled();finish();await Promise.resolve();await Promise.resolve()
+ expect(provider.spawn).not.toHaveBeenCalled();finish();await vi.waitFor(()=>expect(provider.spawn).toHaveBeenCalledTimes(1))
  expect(provider.spawn).toHaveBeenCalledTimes(1)
  provider.reply(1,[]);provider.reply(2,[]);await Promise.all([first,second])
  const search=service.remoteSearches.get(agent);search.dispose();await search.done
@@ -117,12 +117,35 @@ it('waits for the old index to exit and shares a single lazy replacement',async(
 it('does not rebuild an index when the agent is disposed while the old process exits',async()=>{
  const provider=runtime(),agent={session:{header:{cwd:options().root}}}
  let finish
- const old={closed:true,done:new Promise(resolve=>{finish=resolve})}
+ const old={root:options().root,closed:true,done:new Promise(resolve=>{finish=resolve})}
  const disposedAgents=new WeakSet()
  const service=Object.assign(Object.create(SandboxFileReferences.prototype),{
-  ctx:{subprocess:provider},searchConfig:options().config,remoteSearches:new Map([[agent,old]]),disposedAgents,stopped:false,
+  ctx:{subprocess:provider,workingDirectory:{ensure:async()=>options().root}},searchConfig:options().config,remoteSearches:new Map([[agent,old]]),disposedAgents,stopped:false,
  })
  const rejected=expect(service.list(agent,'a',new AbortController().signal)).rejects.toThrow('disposed')
  disposedAgents.add(agent);finish();await rejected
  expect(provider.spawn).not.toHaveBeenCalled()
+})
+
+it('uses the live native working directory and retires the previous sandbox index before switching',async()=>{
+ const instances=[]
+ const provider={spawn:vi.fn(spec=>{const next=runtime();instances.push(next);return next.spawn(spec)})}
+ const agent={session:{header:{cwd:'/workspace/old-header'}}}
+ let cwd=options().root
+ const ensure=vi.fn(async()=>cwd)
+ const service=Object.assign(Object.create(SandboxFileReferences.prototype),{
+  ctx:{subprocess:provider,workingDirectory:{ensure}},searchConfig:options().config,remoteSearches:new Map(),stopped:false,
+ })
+ const first=service.list(agent,'a',new AbortController().signal)
+ await vi.waitFor(()=>expect(provider.spawn).toHaveBeenCalledTimes(1))
+ expect(provider.spawn.mock.calls[0][0].cwd).toBe(cwd)
+ instances[0].reply(1,[]);await first
+ const previous=service.remoteSearches.get(agent)
+ cwd='/workspace/another-project'
+ const second=service.list(agent,'b',new AbortController().signal)
+ await vi.waitFor(()=>expect(provider.spawn).toHaveBeenCalledTimes(2))
+ expect(previous.closed).toBe(true)
+ expect(provider.spawn.mock.calls[1][0].cwd).toBe(cwd)
+ instances[1].reply(1,[]);await second
+ const search=service.remoteSearches.get(agent);search.dispose();await search.done
 })

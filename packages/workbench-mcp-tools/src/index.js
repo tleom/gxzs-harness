@@ -11,6 +11,7 @@ const MCP_CALL_TIMEOUT_MS = 350_000 - 5_000
 
 export async function apply(ctx) {
   const registrations = new Map()
+  ctx.workbenchRuntime.mcpResources = () => [...registrations.values()].map(({ tool }) => ({ ...tool }))
   const restrictions = new Map()
   let catalogLoaded = false
   let disposed = false
@@ -50,6 +51,7 @@ export async function apply(ctx) {
     restrictions.delete(agent)
     if (deny.length) restrictions.set(agent, { stamp, dispose: agent.ctx.tools.restrict({ deny }) })
   }
+  ctx.workbenchRuntime.restrictMcpScope = restrictAgent
   state(false)
   const sync = async () => {
     let payload
@@ -156,6 +158,7 @@ export async function apply(ctx) {
   }, { global: true })
   ctx.effect(() => () => {
     disposed = true
+    if (ctx.workbenchRuntime.restrictMcpScope === restrictAgent) ctx.workbenchRuntime.restrictMcpScope = undefined
     lifetime.abort()
     clearTimeout(timer)
     clear()

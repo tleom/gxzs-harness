@@ -135,7 +135,7 @@ const manager = fixture((req, res) => {
   if (req.url === `${base}files`) {
     const value = req.fixtureBody
     if (nativeAttachments && ['upload', 'get'].includes(value?.operation)) {
-      assert.match(value.path, /^conversations\/[a-f0-9-]{36}\/native-evidence\.(txt|png)$/)
+      assert.match(value.path, /^conversations\/\d{4}-\d{2}-\d{2}\/[a-f0-9-]{36}\/native-evidence\.(txt|png)$/)
       if (value.operation === 'upload') {
         assert.equal(value.version, null)
         assert.ok(!fixtureFiles.has(value.path), 'Cold continuation must not upload the attachment again')
@@ -151,10 +151,12 @@ const manager = fixture((req, res) => {
       return
     }
     if (sessionCreate) {
-      assert.equal(req.fixtureBody?.operation, 'mkdir')
-      assert.match(req.fixtureBody.path, /^conversations\/[a-f0-9-]{36}$/)
-      if (realSsh) remote(`mkdir -p -- /workspace/${req.fixtureBody.path}`)
-      remoteDirectories.add(req.fixtureBody.path)
+      assert.ok(['mkdir', 'list'].includes(req.fixtureBody?.operation))
+      assert.match(req.fixtureBody.path, /^conversations\/\d{4}-\d{2}-\d{2}(?:\/[a-f0-9-]{36})?$/)
+      if (req.fixtureBody.operation === 'mkdir') {
+        if (realSsh) remote(`mkdir -p -- /workspace/${req.fixtureBody.path}`)
+        remoteDirectories.add(req.fixtureBody.path)
+      } else assert.ok(remoteDirectories.has(req.fixtureBody.path))
     }
     respond(res, 200, { path: '.', entries: [] }); return
   }
@@ -176,7 +178,7 @@ const model = fixture((req, res) => {
     res.end('data: [DONE]\n\n')
     return
   }
-  for (const name of ['bash', 'job_output', 'job_kill']) {
+  for (const name of ['bash', 'job_output', 'job_kill', 'schedule_create', 'schedule_list', 'schedule_update', 'schedule_delete', 'working_directory']) {
     assert.ok(tools.has(name), `Native standard preset must expose ${name} to the model; received: ${JSON.stringify([...tools.keys()])}`)
   }
   assert.ok(tools.get('bash').parameters?.properties?.run_in_background,
@@ -353,6 +355,50 @@ async function historySnapshot(chatId) {
   } finally { await reader.cancel(); reader.releaseLock() }
 }
 
+async function terminalRoundtrip(chat) {
+  const id=randomUUID(),attachment=randomUUID()
+  const created=await signedRequest('POST',`/chats/${chat.id}/terminals`,{id,cols:80,rows:24})
+  const result=await created.json()
+  assert.equal(created.status,201,`Native terminal creation failed: ${sanitize(JSON.stringify(result))}`)
+  assert.equal(result.data.cwd,`/workspace/${chat.file_directory}`)
+  const response=await signedRequest('GET',`/chats/${chat.id}/terminals/${id}/events?attachment=${attachment}`)
+  assert.equal(response.status,200)
+  const reader=response.body.getReader(),decoder=new TextDecoder()
+  let pending='',output='',sent=false
+  try {
+    while(true) {
+      const chunk=await reader.read()
+      assert.equal(chunk.done,false,'Native terminal disconnected before its sandbox proof')
+      pending+=decoder.decode(chunk.value,{stream:true})
+      let boundary
+      while((boundary=pending.indexOf('\n\n'))>=0) {
+        const lines=pending.slice(0,boundary).split('\n');pending=pending.slice(boundary+2)
+        const data=lines.filter(line=>line.startsWith('data:')).map(line=>line.slice(5).trimStart()).join('\n')
+        if(!data)continue
+        const frame=JSON.parse(data)
+        assert.equal(frame.event,'workbench_terminal')
+        if(frame.value.type==='snapshot') {
+          assert.equal(frame.value.info.controllerId,attachment)
+          assert.equal(frame.value.info.cwd,`/workspace/${chat.file_directory}`)
+          output+=frame.value.screen
+          if(!sent) {
+            const written=await signedRequest('POST',`/chats/${chat.id}/terminals/${id}/write`,{
+              attachment_id:attachment,data:`printf '\\n__TERM_CWD__%s\\n__TERM_UID__%s\\n' "$PWD" "$(id -u)"\r`,
+            })
+            assert.equal(written.status,200);sent=true
+          }
+        } else if(frame.value.type==='output')output+=frame.value.data
+      }
+      if(output.includes(`__TERM_CWD__/workspace/${chat.file_directory}`)&&output.includes('__TERM_UID__1000'))break
+    }
+  } finally {
+    await reader.cancel().catch(()=>{});reader.releaseLock()
+    assert.equal((await signedRequest('DELETE',`/chats/${chat.id}/terminals/${id}`)).status,200)
+  }
+  assert.equal(modelCalls,0,'The real terminal must not submit a model turn')
+  console.log('PASS native TerminalController: signed create/follow/write/close; current session cwd; owner Sandbox UID=1000; no model call')
+}
+
 try {
   if (runningRestart) modelPort = await listen(model)
   const platformPort = await listen(platform)
@@ -421,12 +467,14 @@ try {
     'registered catalog: HTTP 200, live=true, ready=true', 30_000)
   if (sessionCreate) {
     const response = await signedRequest('POST', '/chats')
+    if (fixtureFailure) throw fixtureFailure
     assert.equal(response.status, 201, 'Actual Workbench -> native sessionController.create must succeed')
     const chat = (await response.json()).data
     assert.match(chat.id, /^[a-f0-9-]{36}$/)
-    assert.ok(remoteDirectories.has(`conversations/${chat.id}`), 'Sandbox mkdir must run before native creation')
-    if (realSsh) remote(`printf restart-proof > /workspace/conversations/${chat.id}/restart-proof.txt`)
-    assert.deepEqual(await readdir(`/workspace/conversations/${chat.id}`), [], 'Host cwd remains an empty placeholder')
+    assert.match(chat.file_directory, /^conversations\/\d{4}-\d{2}-\d{2}\/[a-f0-9-]{36}$/)
+    assert.ok(remoteDirectories.has(chat.file_directory), 'Sandbox mkdir must run before native creation')
+    if (realSsh) remote(`printf restart-proof > /workspace/${chat.file_directory}/restart-proof.txt`)
+    assert.deepEqual(await readdir(`/workspace/${chat.file_directory}`), [], 'Host cwd remains an empty placeholder')
     const detail = await signedRequest('GET', `/chats/${chat.id}`)
     assert.equal(detail.status, 200)
     const nativeCommand = async (command) => {
@@ -447,13 +495,28 @@ try {
     console.log('PASS native commands: plan on/off projections; goal status without submission; compact argument validation')
     if (realSsh) {
       const references = await signedRequest('GET', `/chats/${chat.id}/references?query=restart-proof`)
-      assert.equal(references.status, 200, 'Native reference search must work through the full host')
-      const candidates = (await references.json()).data
+      const referenceResponse = await references.json()
+      assert.equal(references.status, 200, `Native reference search must work through the full host: ${sanitize(JSON.stringify(referenceResponse))}`)
+      const candidates = referenceResponse.data
       assert.ok(candidates.some(item => item.group === 'files' && item.kind === 'file' && item.path === 'restart-proof.txt'),
         `Reference search must find the sandbox file relative to the native session cwd: ${JSON.stringify(candidates)}`)
       assert.ok(candidates.every(item => !item.cwd), 'Reference candidates must not expose host cwd')
       console.log('PASS native file references: sandbox-only file discovered; host cwd not exposed')
+      await terminalRoundtrip(chat)
     }
+    const scheduleResponse = await signedRequest('POST', `/chats/${chat.id}/schedules`, {
+      title: 'Fixture scheduled reminder', prompt: 'Synthetic future reminder', after_seconds: 3600,
+    })
+    assert.equal(scheduleResponse.status, 201, 'Full host must resolve the late native schedule service')
+    const task = (await scheduleResponse.json()).data
+    const tasks = (await (await signedRequest('GET', '/schedules')).json()).data
+    assert.ok(tasks.some(item => item.id === task.id && item.chat_id === chat.id))
+    const updatedTask = await signedRequest('PATCH', `/schedules/${task.id}`, { expected: task, title: 'Updated fixture reminder' })
+    assert.equal(updatedTask.status, 200)
+    assert.equal((await updatedTask.json()).data.record.title, 'Updated fixture reminder')
+    assert.equal((await signedRequest('DELETE', `/schedules/${task.id}`)).status, 200)
+    assert.equal(modelCalls, 0, 'Schedule management must not call the model')
+    console.log('PASS native schedule HTTP: create, catalog, update and delete through the full host')
     // Empty native sessions are lazy until their first event or explicit flush.
     const renamed = await signedRequest('PATCH', `/chats/${chat.id}`, { title: 'Native create smoke' })
     assert.equal(renamed.status, 200)
@@ -510,9 +573,9 @@ try {
     }
     const resumed = await signedRequest('PATCH', `/chats/${chat.id}`, { title: 'Native resume smoke' })
     assert.equal(resumed.status, 200, 'Native cold-session resume must succeed after host restart')
-    if (realSsh) assert.equal(remote(`cat /workspace/conversations/${chat.id}/restart-proof.txt`), 'restart-proof',
+    if (realSsh) assert.equal(remote(`cat /workspace/${chat.file_directory}/restart-proof.txt`), 'restart-proof',
       'Sandbox file must survive host restart')
-    assert.deepEqual(await readdir(`/workspace/conversations/${chat.id}`), [], 'Native create and resume must leave cwd empty')
+    assert.deepEqual(await readdir(`/workspace/${chat.file_directory}`), [], 'Native create and resume must leave cwd empty')
     if (runningRestart) {
       const targetResponse = await signedRequest('POST', '/chats')
       assert.equal(targetResponse.status, 201)
@@ -584,7 +647,7 @@ try {
           ['txt', Buffer.from('durable-native-evidence').toString('base64')],
           ['png', 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII='],
         ]) {
-          const response = await signedRequest('POST', '/files', { path: `conversations/${target.id}/native-evidence.${extension}`, data, version: null })
+          const response = await signedRequest('POST', '/files', { path: `${target.file_directory}/native-evidence.${extension}`, data, version: null })
           assert.equal(response.status, 200, 'Actual file upload route must accept the fixture')
           uploads.push((await response.json()).data)
         }

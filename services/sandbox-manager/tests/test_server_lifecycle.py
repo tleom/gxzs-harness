@@ -240,3 +240,132 @@ def test_http_resource_failure_returns_correlated_json_without_leaking_capacity(
     assert value['retry_after'] == 1 and len(value['request_id']) == 12
     assert not instance.capacity.acquire(blocking=False) if reason == 'capacity' else instance.capacity.acquire(blocking=False)
     instance.shutdown_request.assert_called_once_with(request)
+
+
+def post_handler(server, body, declared_size, **headers):
+    handler = object.__new__(server.Handler)
+    handler.path = '/sandboxes/' + str(uuid4()) + '/schedule'
+    handler.headers = {'Authorization': 'Bearer ' + server.TOKEN,
+                       'Content-Length': str(declared_size), **headers}
+    handler.rfile, handler.wfile = BytesIO(body), BytesIO()
+    handler.send_response, handler.send_header, handler.end_headers = Mock(), Mock(), Mock()
+    return handler
+
+
+@pytest.mark.parametrize('body', [b'', b'{"action":"acq'])
+def test_truncated_body_cannot_start_a_manager_operation(server, monkeypatch, body):
+    operation = Mock(return_value={'ok': True})
+    monkeypatch.setattr(server, 'operation', operation)
+    handler = post_handler(server, body, len(body) + 5)
+    handler.do_POST()
+    operation.assert_not_called()
+    assert handler.send_response.call_args.args[0] == 400
+    value = json.loads(handler.wfile.getvalue())
+    assert 'Incomplete request body' in value['error']
+    assert len(value['request_id']) == 12
+    assert server.REQUEST_CONTEXT.owner is None
+
+
+def test_chunked_body_is_rejected_before_manager_admission(server, monkeypatch):
+    operation = Mock(return_value={'ok': True})
+    monkeypatch.setattr(server, 'operation', operation)
+    handler = post_handler(server, b'2\r\n{}\r\n0\r\n\r\n', 0, **{'Transfer-Encoding': 'chunked'})
+    handler.do_POST()
+    operation.assert_not_called()
+    assert handler.send_response.call_args.args[0] == 400
+
+
+def test_complete_body_is_dispatched_once_and_unknown_operation_errors_still_log(server, monkeypatch, caplog):
+    body = b'{"action":"acquire"}'
+    operation = Mock(return_value={'ok': True})
+    monkeypatch.setattr(server, 'operation', operation)
+    handler = post_handler(server, body, len(body))
+    handler.do_POST()
+    assert operation.call_count == 1 and operation.call_args.args[2] == {'action': 'acquire'}
+    assert handler.send_response.call_args.args[0] == 200
+    operation.side_effect = RuntimeError('operation failed')
+    failed = post_handler(server, body, len(body))
+    failed.do_POST()
+    assert failed.send_response.call_args.args[0] == 503
+    assert any(record.levelname == 'ERROR' and 'Sandbox request failed' in record.message for record in caplog.records)
+
+
+@pytest.mark.parametrize('failure', [BrokenPipeError('closed'), ConnectionResetError('closed')])
+def test_downstream_socket_cancellation_preserves_status_without_error_stacks(server, monkeypatch, caplog, failure):
+    operation = Mock(return_value={'ok': True})
+    monkeypatch.setattr(server, 'operation', operation)
+    body = b'{}'
+    handler = post_handler(server, body, len(body))
+    handler.wfile = Mock(write=Mock(side_effect=failure))
+    handler.do_POST()
+    assert operation.call_count == 1
+    assert handler.send_response.call_args.args[0] == 200
+    assert not any(record.levelname == 'ERROR' for record in caplog.records)
+
+
+def test_unclassified_socket_write_failure_remains_visible(server):
+    handler = object.__new__(server.Handler)
+    handler.wfile = Mock(write=Mock(side_effect=OSError('unexpected socket failure')))
+    handler.send_response, handler.send_header, handler.end_headers = Mock(), Mock(), Mock()
+    with pytest.raises(OSError, match='unexpected socket failure'):
+        handler.write_json(200, b'{}')
+
+
+@pytest.mark.parametrize('framing', ['complete', 'truncated', 'chunked'])
+def test_http_body_framing_is_enforced_before_dispatch_on_a_real_socket(server, monkeypatch, framing):
+    import http.client
+    import socket
+    import threading
+
+    operation = Mock(return_value={'ok': True})
+    monkeypatch.setattr(server, 'operation', operation)
+    listener = server.BoundedHTTPServer(('127.0.0.1', 0), server.Handler)
+    worker = threading.Thread(target=listener.serve_forever, daemon=True)
+    worker.start()
+    body = b'{"action":"acquire"}'
+    length = len(body) + (5 if framing == 'truncated' else 0)
+    fields = 'Transfer-Encoding: chunked\r\n' if framing == 'chunked' else f'Content-Length: {length}\r\n'
+    if framing == 'chunked':
+        body = b'2\r\n{}\r\n0\r\n\r\n'
+    packet = (f'POST /sandboxes/{uuid4()}/schedule HTTP/1.1\r\n'
+              f'Host: localhost\r\nAuthorization: Bearer {server.TOKEN}\r\n'
+              'Content-Type: application/json\r\nConnection: close\r\n' + fields + '\r\n').encode() + body
+    try:
+        with socket.create_connection(listener.server_address, timeout=3) as client:
+            client.sendall(packet)
+            client.shutdown(socket.SHUT_WR)
+            response = http.client.HTTPResponse(client)
+            response.begin()
+            value = json.loads(response.read())
+            assert response.status == (200 if framing == 'complete' else 400)
+            assert value['ok'] is True if framing == 'complete' else len(value['request_id']) == 12
+        assert operation.call_count == (1 if framing == 'complete' else 0)
+    finally:
+        listener.shutdown()
+        listener.server_close()
+        worker.join(timeout=3)
+
+
+@pytest.mark.parametrize('body', [b'', b'{}', b'{"action":"acquire"}'])
+def test_empty_or_partial_schedule_identity_never_enters_host_admission(server, monkeypatch, body):
+    schedule = Mock(return_value={'ok': True})
+    monkeypatch.setattr(server.HOSTS, 'schedule', schedule)
+    handler = post_handler(server, body, len(body))
+    handler.do_POST()
+    schedule.assert_not_called()
+    assert handler.send_response.call_args.args[0] == 400
+    value = json.loads(handler.wfile.getvalue())
+    assert 'missing host or task identity' in value['error']
+    assert len(value['request_id']) == 12
+
+
+def test_complete_schedule_identity_reaches_the_existing_host_validator(server, monkeypatch):
+    schedule = Mock(return_value={'ok': True})
+    monkeypatch.setattr(server.HOSTS, 'schedule', schedule)
+    payload = {'owner_id': 'tenant:7', 'generation': 1, 'instance_id': 'host-1',
+               'run_id': str(uuid4()), 'chat_id': str(uuid4()), 'action': 'acquire'}
+    body = json.dumps(payload).encode()
+    handler = post_handler(server, body, len(body))
+    handler.do_POST()
+    schedule.assert_called_once_with(handler.path.split('/')[2], payload)
+    assert handler.send_response.call_args.args[0] == 200

@@ -4,6 +4,26 @@ import { httpError } from './http.js'
 // source-message grouping, surface replacement records and cold-session reads.
 export const historyWindow = { maxMessages: 500, turnWindow: { minMessages: 50, minTurns: 2 } }
 
+/** Native pagination counts log metadata too; the UI only offers earlier display content. */
+export async function hasEarlierContent(sessions, sessionId, throughSeq, beforeSeq, signal, address = { kind: 'session', sessionId }) {
+  let before = beforeSeq
+  while (before > 0) {
+    const page = await sessions.page({ address,
+      throughSeq, beforeSeq: before, maxMessages: 1 }, signal)
+    signal.throwIfAborted()
+    if (page.records.some(({ event }) =>
+      ['assistant/message', 'tool/call', 'tool/result', 'compaction/summary', 'workspace/changes', 'deliverables/presented'].includes(event.type)
+      || (event.type === 'user/message' && (address.kind === 'subagent'
+        ? event.data?.source?.kind !== 'workbench-resume'
+        : ['user', 'goal', 'schedule', 'agent-message', 'subagent-settled'].includes(event.data?.source?.kind))))) return true
+    if (!page.hasMore) return false
+    const next = page.records[0]?.event.seq
+    if (!Number.isSafeInteger(next) || next >= before) throw httpError(502, '历史消息分页未向前推进')
+    before = next
+  }
+  return false
+}
+
 /** Read one native history window after the caller has authorized the chat. */
 export async function loadNativeHistoryPage({ sessions, sessionQuery }, sessionId, cursor, signal) {
   signal.throwIfAborted()
@@ -35,9 +55,10 @@ export async function loadNativeHistoryPage({ sessions, sessionQuery }, sessionI
     || beforeSeq >= (cursor?.beforeSeq ?? throughSeq + 1))) {
     throw httpError(502, '历史消息分页未向前推进')
   }
+  const more = page.hasMore && await hasEarlierContent(sessions, sessionId, throughSeq, beforeSeq, signal)
   return {
     through_seq: throughSeq,
     records: page.records,
-    cursor: page.hasMore ? { sessionId, throughSeq, beforeSeq } : null,
+    cursor: more ? { sessionId, throughSeq, beforeSeq } : null,
   }
 }

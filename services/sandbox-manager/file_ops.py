@@ -172,6 +172,8 @@ def remove_contents(fd):
 def operate(payload, root="/workspace"):
     operation = payload["operation"]
     path = payload.get("path", ".")
+    if operation == "delete" and path in {"mcp", "skills"}:
+        raise ValueError("Resource directories cannot be deleted from file management")
     if path in {".", "conversations"} and operation not in {"list", "manifest"}:
         raise ValueError("The workspace root can only be listed")
     if path == ".":

@@ -23,6 +23,12 @@ export function sendJson(res, status, value) {
 }
 
 export function sendError(res, error) {
+  if (error?.name === 'ScheduleInputError') {
+    const message = { invalid_prompt: '请填写有效的任务名称和内容', not_future: '运行时间必须在未来',
+      invalid_time_zone: '请选择有效的时区', invalid_rule: '定时规则无效', invalid_selector: '请选择一种运行规则',
+      frequency_too_high: '重复间隔至少为一分钟', time_out_of_range: '运行时间超出支持范围', subagent_session: '请在主对话中创建定时任务' }[error.code]
+    if (message) return sendJson(res, 400, { code: error.code, message })
+  }
   if (Object.hasOwn(GOAL_ERRORS, error?.code ?? '')) {
     const [status, message] = GOAL_ERRORS[error.code]
     return sendJson(res, status, { code: error.code, message })
@@ -51,10 +57,19 @@ const GOAL_ERRORS = {
 
 const STATUS_CODES = { 400: 'INVALID_REQUEST', 401: 'UNAUTHORIZED', 403: 'FORBIDDEN', 404: 'NOT_FOUND', 409: 'STATE_CONFLICT', 413: 'PAYLOAD_TOO_LARGE', 429: 'RATE_LIMITED', 500: 'INTERNAL_ERROR', 502: 'UPSTREAM_ERROR', 503: 'UNAVAILABLE', 504: 'DEADLINE_EXCEEDED' }
 const REMOTE_ERRORS = {
+  'terminal/unavailable': [404, '终端已关闭或当前不可用'],
+  'terminal/control-unavailable': [409, '当前终端不能接受输入，请重新连接'],
+  'terminal/limit-reached': [409, '当前会话无法继续创建终端'],
   'gateway/bad-request': [400, '请求参数无效'],
   'gateway/cancelled': [409, '请求已取消，请刷新当前状态'],
   'session/not-found': [404, '会话不存在或已被删除'],
   'subagent/not-found': [404, '子任务不存在'],
+  'subagent/parent-unavailable': [409, '父会话当前不可用，无法发送后续消息'],
+  'subagent/not-resumable': [409, '此子智能体不支持后续消息'],
+  'subagent/unauthorized': [404, '子智能体不属于此对话'],
+  'subagent/delivery-unavailable': [409, '子智能体当前无法接收消息，请稍后重试'],
+  'subagent/invalid-time-zone': [400, '时区参数无效'],
+  'subagent/attachment-invalid': [400, '图片无效或所选模型不支持图片'],
   'session/conflict': [409, '会话配置已改变，请刷新后重试'],
   'session/writer-held': [409, '会话正在被其他执行器使用，请稍后重试'],
   'session/agent-busy': [409, '会话正在执行其他任务，请刷新当前状态'],

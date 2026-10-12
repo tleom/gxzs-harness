@@ -21,6 +21,15 @@ function fixture() {
 }
 
 describe('native workspace boundary', () => {
+  it('validates workspace membership independently of an unavailable schedule store', async () => {
+    const { bridge, owner, controller } = fixture()
+    bridge.schedules = { catalog: vi.fn(async () => { throw new Error('schedule store unavailable') }) }
+    await expect(bridge.requireWorkspace(owner, 'workspace-a')).resolves.toMatchObject({ workspaceId: 'workspace-a' })
+    await bridge.mutate(owner, { operation: 'rename', workspaceId: 'workspace-a', title: 'New title' })
+    expect(controller.rename).toHaveBeenCalled()
+    expect(bridge.schedules.catalog).not.toHaveBeenCalled()
+    await expect(bridge.baseline(owner)).rejects.toThrow('schedule store unavailable')
+  })
   it('preserves native session timestamps and projection watermarks while filtering owners and host cwd', async () => {
     const { bridge, owner } = fixture()
     const record = { sessionId: 'session-a', updatedAt: 12345, blank: true, running: false, agentAvailable: false,

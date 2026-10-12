@@ -40,10 +40,16 @@
 - id: file-reference-local
   disabled: true
 
+# Start native reminder delivery after the Workbench admission fence is installed.
+- id: schedule
+  disabled: true
+
 - id: ptc-runtime
   config:
-    nodeExecutable: !!js process.env.GXZS_SANDBOX_NODE ?? '/usr/local/bin/node'
-    bootstrapPath: !!js process.env.GXZS_SANDBOX_PTC_BOOTSTRAP ?? '/opt/dsh/node_modules/@deepseek-ai/dsh-ptc-runtime-node/lib/process.js'
+    launch:
+      kind: node-script
+      executable: !!js process.env.GXZS_SANDBOX_NODE ?? '/usr/local/bin/node'
+      bootstrapPath: !!js process.env.GXZS_SANDBOX_PTC_BOOTSTRAP ?? '/opt/dsh/node_modules/@deepseek-ai/dsh-ptc-runtime-node/lib/process.js'
 
 - id: sandbox-policy
   config:
@@ -57,7 +63,9 @@
       name: '@gxzs/dsh-workbench-sandbox-runtime/ssh'
       config:
         host: !!js process.env.GXZS_SANDBOX_SSH_HOST
-        node: !!js process.env.GXZS_SANDBOX_NODE ?? '/usr/local/bin/node'
+        launch:
+          kind: node-script
+          node: !!js process.env.GXZS_SANDBOX_NODE ?? '/usr/local/bin/node'
         helper: !!js process.env.GXZS_SANDBOX_HELPER ?? '/opt/dsh/node_modules/@deepseek-ai/dsh-ssh/lib/helper.js'
         helperHash: !!js process.env.GXZS_SANDBOX_HELPER_HASH
         workspace: !!js process.env.GXZS_SANDBOX_WORKSPACE ?? '/workspace'
@@ -120,3 +128,5 @@
         humanInputTimeoutSeconds: 60
     - id: gxzs-workbench-mcp-tools
       name: '@gxzs/dsh-workbench-mcp-tools'
+    - id: gxzs-native-schedule
+      name: '@deepseek-ai/dsh-schedule'

@@ -1,15 +1,26 @@
 import { expect, it, vi } from 'vitest'
-import { loadNativeHistoryPage } from '../src/history-page.js'
+import { hasEarlierContent, loadNativeHistoryPage } from '../src/history-page.js'
 
 function fixture(page) {
   const dispose = vi.fn()
   return {
     dispose,
     sessionQuery: { observeSession: vi.fn(async () => ({ events: [{ seq: 99 }], [Symbol.dispose]: dispose })) },
-    sessions: { page: vi.fn(async () => page) },
+    sessions: { page: vi.fn(async request => request.maxMessages === 1
+      ? { records: [{ event: { seq: request.beforeSeq - 1, type: 'user/message', data: { source: { kind: 'user' } } } }], hasMore: false }
+      : page) },
   }
 }
 const signal = () => new AbortController().signal
+it.each(['agent-message', 'subagent-settled'])('retains a cursor for an earlier %s continuation with no assistant output', async kind => {
+  const sessions = { page: vi.fn(async () => ({ records: [{ event: { seq: 0, type: 'user/message', data: { source: { kind } } } }], hasMore: false })) }
+  expect(await hasEarlierContent(sessions, 'root', 100, 1, signal())).toBe(true)
+})
+it('hides older pagination when only initialization metadata precedes the first display message', async () => {
+  const sessions = { page: vi.fn(async () => ({ records: [{ event: { seq: 0, type: 'session/title' } }], hasMore: false })) }
+  expect(await hasEarlierContent(sessions, 's', 100, 1, signal())).toBe(false)
+  expect(sessions.page).toHaveBeenCalledWith({ address: { kind: 'session', sessionId: 's' }, throughSeq: 100, beforeSeq: 1, maxMessages: 1 }, expect.any(AbortSignal))
+})
 it('delegates the exact native window and keeps replacement records intact', async () => {
   const records = [{ type: 'event', event: { seq: 40, type: 'turn/start' } },
     { type: 'event', event: { seq: 41, surfaceOp: { op: 'replace', startSeq: 1, endSeq: 10 } } }]

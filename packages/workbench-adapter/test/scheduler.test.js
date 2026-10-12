@@ -21,6 +21,23 @@ function setup() {
   return { db, sessions, scheduler, platform, create, agent, diagnostics, permit: () => { permitted = true } }
 }
 
+it('holds one root ticket for native background children until the last owned execution ends', async () => {
+  const { db, scheduler, platform, sessions, agent, create, permit } = setup()
+  permit(); const run = create('spawn child')
+  await scheduler.enqueue(run, [{ type: 'text', text: run.query }]); await scheduler.tick()
+  let children = true
+  scheduler.hasOwnedWork = () => children
+  db.transitionRun('t:1', run.id, 'completed'); agent.status = 'idle'
+  await scheduler.tick()
+  expect(scheduler.hasAdmission('s')).toBe(true)
+  expect(sessions.prompt).toHaveBeenCalledOnce()
+  expect(platform.json.mock.calls.map(([request]) => JSON.parse(request.body).action)).not.toContain('release')
+  children = false; await scheduler.tick()
+  expect(scheduler.hasAdmission('s')).toBe(false)
+  expect(db.submission('t:1', run.id)).toBeUndefined()
+  expect(sessions.prompt).toHaveBeenCalledOnce()
+})
+
 it.each(['prepare', 'prompt'])('preserves reviewed native attachment rejection during queued %s admission', async stage => {
   const { db, scheduler, sessions, create, permit } = setup()
   const error = Object.assign(new Error('/host/private/config secret'), {

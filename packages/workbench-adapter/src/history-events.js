@@ -1,13 +1,17 @@
 import { encodeSse } from './http.js'
 
 /** Carry DSH's snapshot/follow protocol without another event log or replay cursor. */
-export async function streamHistoryEvents({ service, owner, chatId, res, heartbeatMs = 15000, drainTimeoutMs = 30000 }) {
+export function streamHistoryEvents(options) {
+  return streamNativeEvents({ ...options, follow: signal => options.service.followHistory(options.owner, options.chatId, signal) })
+}
+
+export async function streamNativeEvents({ follow, res, heartbeatMs = 15000, drainTimeoutMs = 30000 }) {
   const abort = new AbortController()
   let heartbeat, drainTimeout, releaseDrain
   const close = () => { abort.abort(); releaseDrain?.() }
   res.on('close', close)
   res.on('error', close)
-  const source = service.followHistory(owner, chatId, abort.signal)
+  const source = follow(abort.signal)
   const write = async value => {
     if (abort.signal.aborted) return
     if (res.write(value) !== false) return
