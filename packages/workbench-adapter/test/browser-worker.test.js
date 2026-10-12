@@ -211,6 +211,48 @@ it('retries after a superseded watcher capture times out during navigation inste
   } finally { await value.runtime.shutdown() }
 })
 
+it('retries a resized frame discarded by navigation and publishes matching dimensions before acknowledging', async () => {
+  const value=worker()
+  let size={width:1000,height:700},url='https://example.com'
+  value.page.viewportSize=()=>size
+  value.page.setViewportSize=async next=>{size=next}
+  value.page.url=()=>url
+  try {
+    await value.command(1,'init',{width:1000,height:700})
+    value.frames.length=0
+    value.page.screenshot.mockImplementationOnce(async()=>{url='https://example.com/next';return Buffer.from('stale')})
+    await value.command(2,'resize',{width:800,height:600})
+    const position=value.frames.findIndex(frame=>frame.type==='result'&&frame.id===2)
+    const matching=value.frames.findIndex(frame=>frame.type==='frame'&&frame.url===url&&frame.width===800&&frame.height===600)
+    expect(matching).toBeGreaterThanOrEqual(0)
+    expect(matching).toBeLessThan(position)
+    expect(value.frames[position].error).toBeUndefined()
+    expect(value.page.screenshot).toHaveBeenCalledTimes(3)
+  } finally { await value.runtime.shutdown() }
+})
+
+it('keeps discarded-frame retries within one shared deadline and never acknowledges stale dimensions', async () => {
+  let elapsed=0
+  const clock=vi.spyOn(Date,'now').mockImplementation(()=>100000+elapsed)
+  const value=worker()
+  let size={width:1000,height:700},url='https://example.com'
+  value.page.viewportSize=()=>size
+  value.page.setViewportSize=async next=>{size=next}
+  value.page.url=()=>url
+  try {
+    await value.command(1,'init',{width:1000,height:700})
+    value.page.screenshot.mockClear()
+    value.page.screenshot.mockImplementation(async({timeout})=>{
+      if(timeout<4500){const error=new Error('capture timed out');error.name='TimeoutError';throw error}
+      elapsed+=4500;url+='x';return Buffer.from('stale')
+    })
+    value.input.write(JSON.stringify({id:2,action:'resize',width:800,height:600})+'\n')
+    await vi.waitFor(()=>expect(value.frames.some(frame=>frame.type==='fatal')).toBe(true))
+    expect(value.page.screenshot.mock.calls.map(([arg])=>arg.timeout)).toEqual([8000,3500])
+    expect(value.frames.some(frame=>frame.type==='result'&&frame.id===2&&!frame.error)).toBe(false)
+  } finally { await value.runtime.shutdown();clock.mockRestore() }
+})
+
 it('discards a frame when the same Page navigates during capture and publishes the next consistent frame', async () => {
   const value = worker()
   let url='https://example.com/old'

@@ -4,11 +4,11 @@ const { createInterface } = require('node:readline')
 function createImageCapture({ now = Date.now, budgetMs = 8000 } = {}) {
   const qualities = [70, 50, 30, 15]
   let key, start = 0
-  return async page => {
+  return async (page, captureBudgetMs = budgetMs) => {
     const viewport = page.viewportSize()
     const current = `${page.url()}|${viewport.width}:${viewport.height}`
     if (current !== key) { key = current; start = 0 }
-    const deadline = now() + budgetMs
+    const deadline = now() + Math.min(budgetMs, captureBudgetMs)
     for (let index = start; index < qualities.length; index++) {
       const remaining = deadline - now()
       if (remaining <= 0) throw new Error('capture_timeout')
@@ -32,31 +32,44 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
     if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || value.length > 4096) throw new Error('invalid_url')
     return url.href
   }
-  async function frame() {
-    if (!page || page.isClosed() || capturing || closed || navigating) return
+  async function frame(deadline) {
+    if (!page || page.isClosed() || capturing || closed || navigating) return false
     capturing = true
     captureFinished = new Promise(resolve => { finishCapture = resolve })
     const target = page, cdp = session, epoch = navigation, url = target.url()
     try {
       if (url !== 'about:blank') validUrl(url)
       const viewport = target.viewportSize()
-      const image = await capture(target)
+      const image = await capture(target, deadline === undefined ? undefined : deadline - Date.now())
       const history = await cdp.send('Page.getNavigationHistory')
       const title = (await target.title()).slice(0, 1024)
-      if (target !== page || target.url() !== url || navigation !== epoch || closed) return
+      if (target !== page || target.url() !== url || navigation !== epoch || closed) return false
       await send({ type: 'frame', url: url === 'about:blank' ? '' : url, title,
         ...viewport, image: image.toString('base64'), back: history.currentIndex > 0,
         forward: history.currentIndex < history.entries.length - 1, notice })
       hasFrame = true
+      return true
     } catch (error) {
       // A navigation invalidates old-page captures; it is not a stable-page timeout.
-      if (closed || target !== page || navigating || navigation !== epoch || target.url() !== url) return
+      if (closed || target !== page || navigating || navigation !== epoch || target.url() !== url) return false
       if (error.message === 'frame_too_large') fatal('网页图像过大，请重新打开浏览器')
       else if (error.message === 'capture_timeout' || error.name === 'TimeoutError') fatal('网页图像获取超时，请重新打开浏览器')
       else if (error.message === 'invalid_url') fatal('浏览器仅支持 HTTP 和 HTTPS 页面')
       // Navigation can temporarily invalidate a screenshot; the next frame retries.
     }
     finally { capturing = false; finishCapture() }
+    return false
+  }
+  async function freshFrame() {
+    if (capturing) await captureFinished
+    const deadline = Date.now() + 8000
+    // A redirect can invalidate the first encode; up to three frames share one budget.
+    for (let attempt = 0; attempt < 3 && !closed && Date.now() < deadline; attempt++) {
+      if (capturing) await captureFinished
+      if (await frame(deadline)) return
+    }
+    if (!closed) fatal(Date.now() >= deadline ? '网页图像获取超时，请重新打开浏览器' : '网页图像获取失败，请重新打开浏览器')
+    throw new Error('frame_unavailable')
   }
   async function bind(target) {
     const cdp = await context.newCDPSession(target)
@@ -158,7 +171,7 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
       default: throw new Error('invalid_action')
     } } finally { if (moves) { navigation++; navigating = false } }
     if (moves && capturing) await captureFinished
-    if (!watching || !['move', 'wheel', 'text', 'key'].includes(action)) await frame()
+    if (!watching || !['move', 'wheel', 'text', 'key'].includes(action)) await freshFrame()
   }
   function fatal(error) {
     if (closed) return
