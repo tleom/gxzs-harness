@@ -53,8 +53,9 @@ export class WorkbenchRuntime extends Service {
     if (!previous) throw Object.assign(new Error('子智能体运行归属尚未恢复，请稍后重试'), { status: 409 })
     const agent = this.agents.get(child.id)
     const pending = this.childPrompts.get(child.id) && this.database.getRun(this.ownerId, this.childPrompts.get(child.id))
-    if ((pending?.status === 'running' || agent?.status === 'running') && ['running','completed'].includes(previous.status) && !previous.stopConfirmation?.fenced) {
-      const receipt = pending ?? previous
+    const authority = pending ?? previous
+    if ((pending?.status === 'running' || agent?.status === 'running') && ['running','completed'].includes(authority.status) && !authority.stopConfirmation?.fenced) {
+      const receipt = authority
       this.database.saveCommandReceipt(this.ownerId, chat.id, requestKey, { runId: receipt.id })
       return receipt
     }
