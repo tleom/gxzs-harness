@@ -27,30 +27,33 @@ it('keeps browser actions inside the owner binding and explicit controller lease
   await gateway.close({ownerId:'owner'}, id)
   expect(browser.dispose).toHaveBeenCalledOnce()
 })
-it('counts independent tabs and native popups together and closes only the selected native page', async () => {
+it('allows one browser per chat and independent browsers in other chats', async () => {
   const worker={closed:false,closedPages:new Set(),command:vi.fn(async()=>{}),publish:vi.fn(),dispose:vi.fn(),done:new Promise(()=>{})}
-  const gateway=new WorkbenchBrowsers({create:()=>worker,service:{requireChat:vi.fn()}})
+  let created=0
+  const gateway=new WorkbenchBrowsers({create:()=>created++ ? {...worker,command:vi.fn(async()=>{}),dispose:vi.fn()} : worker,service:{requireChat:vi.fn()}})
   const root='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',child='bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb',third='cccccccc-cccc-cccc-cccc-cccccccccccc'
   await gateway.create({ownerId:'owner'},{id:root,chat_id:id},signal())
-  worker.onPageOpen(child);worker.onPageOpen(third)
-  expect(worker.onPageOpen('dddddddd-dddd-dddd-dddd-dddddddddddd')).toBe(false)
-  await expect(gateway.create({ownerId:'owner'},{id:'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee',chat_id:id},signal())).rejects.toMatchObject({status:429})
-  expect(gateway.currentId({ownerId:'owner'},id)).toBe(third)
-  await gateway.close({ownerId:'owner'},child)
-  expect(worker.command).toHaveBeenLastCalledWith({action:'close-page',page_id:child},undefined)
-  expect(worker.dispose).not.toHaveBeenCalled()
+  expect(worker.onPageOpen(child)).toBe(false)
+  await expect(gateway.create({ownerId:'owner'},{id:third,chat_id:id},signal())).rejects.toMatchObject({status:409})
+  await gateway.create({ownerId:'owner'},{id:child,chat_id:child},signal())
+  expect(gateway.currentId({ownerId:'owner'},id)).toBe(root)
   expect(gateway.require({ownerId:'owner'},root)).toBe(worker)
-  expect(()=>gateway.require({ownerId:'owner'},child)).toThrow()
-  expect(gateway.count('owner',id)).toBe(2)
+  expect(gateway.count('owner',id)).toBe(1)
+  expect(gateway.count('owner',child)).toBe(1)
+  for (const chatId of [third, 'dddddddd-dddd-dddd-dddd-dddddddddddd'])
+    await gateway.create({ownerId:'owner'},{id:chatId,chat_id:chatId},signal())
+  expect(created).toBe(4)
 })
 it('does not remove a replacement browser when an earlier initialization fails', async () => {
-  let rejectFirst
-  const first = {closed:false,command:()=>new Promise((_,reject)=>{rejectFirst=reject}),dispose(){this.closed=true}}
+  let rejectFirst, finishFirst
+  const first = {closed:false,command:()=>new Promise((_,reject)=>{rejectFirst=reject}),
+    done:new Promise(resolve=>{finishFirst=resolve}),dispose(){this.closed=true;finishFirst()}}
   const second = {closed:false,command:async()=>{},dispose:vi.fn()}
   let count = 0
   const gateway = new WorkbenchBrowsers({create:()=>count++ === 0 ? first : second})
   const pending = gateway.create({ownerId:'owner'},{id},signal())
   first.dispose()
+  await first.done
   await gateway.create({ownerId:'owner'},{id},signal())
   rejectFirst(new Error('cancelled initialization'))
   await expect(pending).rejects.toThrow('cancelled initialization')
@@ -117,16 +120,16 @@ it('counts closing subprocesses until done before admitting replacement browsers
     workers.push(value)
     return value
   }})
-  for(let index=0;index<3;index++) {
+  for(let index=0;index<1;index++) {
     const browserId=`12345678-1234-1234-1234-123456789ab${index}`
     await gateway.create({ownerId:'owner'},{id:browserId},signal())
     workers[index].dispose()
   }
-  await expect(gateway.create({ownerId:'owner'},{id},signal())).rejects.toMatchObject({status:429})
-  expect(workers).toHaveLength(3)
+  await expect(gateway.create({ownerId:'owner'},{id},signal())).rejects.toMatchObject({status:409})
+  expect(workers).toHaveLength(1)
   exits[0](); await Promise.resolve()
   await gateway.create({ownerId:'owner'},{id},signal())
-  expect(workers).toHaveLength(4)
+  expect(workers).toHaveLength(2)
   gateway.dispose(); for(const exit of exits) exit()
 })
 

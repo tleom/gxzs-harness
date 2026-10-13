@@ -89,14 +89,14 @@ it('keeps the native UI attachment writable while the Agent observes and writes 
   finish({exitCode:0})
   abort.abort();await ui.return();await terminal.close()
   const owner=()=>({terminals:new Map(),pending:new Map(),allocations:new Map(),closedIds:new Set(),lifetime:new AbortController()})
-  const a=owner(),b=owner();a.terminals.set('one',{});a.terminals.set('two',{});b.terminals.set('three',{})
+  const a=owner(),b=owner();a.terminals.set('one',{});b.terminals.set('other',{})
   const allocation={info:{id:'new'},monitor:vi.fn()}
-  const controller={lifetime:new AbortController(),config:{maxTerminals:3},owners:new Map([['a',a],['b',b]]),
+  const controller={lifetime:new AbortController(),config:{maxTerminals:1},owners:new Map([['a',a],['b',b]]),
     owner:()=>b,dimensions:()=>{},requireOpen:()=>{},spawn:vi.fn(async()=>allocation)}
   const signal=new AbortController().signal
   await expect(TerminalController.prototype.create.call(controller,{}, {id:'new',cols:80,rows:24},signal)).rejects.toMatchObject({code:'terminal/limit-reached'})
   expect(controller.spawn).not.toHaveBeenCalled()
-  a.terminals.delete('two')
+  b.terminals.delete('other')
   await TerminalController.prototype.create.call(controller,{}, {id:'new',cols:80,rows:24},signal)
   expect(controller.spawn).toHaveBeenCalledOnce()
 })

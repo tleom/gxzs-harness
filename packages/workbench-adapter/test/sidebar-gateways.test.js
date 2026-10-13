@@ -10,6 +10,32 @@ const service = { requireChat: (who, id) => {
   if (who.ownerId !== owner.ownerId || id !== chat.id) throw Object.assign(new Error('missing'), { status: 404 })
   return chat
 } }
+it('shares a terminal allocation within one chat while other chats remain independent', async () => {
+  const terminalId = '22345678-1234-1234-1234-123456789abc'
+  const retained = new Map()
+  let settle
+  const native = {
+    list: sessionId => retained.get(sessionId) || [],
+    create: vi.fn((agent, request) => agent.session.id === 'chat'
+      ? new Promise(resolve => { settle = () => { const terminal = { id: request.id }; retained.set('chat', [terminal]); resolve(terminal) } })
+      : Promise.resolve({ id: request.id })),
+  }
+  const gateway = new WorkbenchTerminals({ native,
+    service: { requireChat: (who, id) => { if (who.ownerId !== owner.ownerId) throw Object.assign(new Error('missing'), {status:404}); return {sessionId:id} } },
+    sessions: { resolveAgent: async id => ({agent:{session:{id}}}) },
+  })
+  const signal = new AbortController().signal
+  const first = gateway.create(owner, 'chat', {id:attachment}, signal)
+  const second = gateway.create(owner, 'chat', {id:terminalId}, signal)
+  await vi.waitFor(() => expect(native.create).toHaveBeenCalledOnce())
+  settle()
+  expect(await first).toEqual({id:attachment})
+  expect(await second).toEqual({id:attachment})
+  expect(await gateway.create(owner, 'chat', {id:terminalId}, signal)).toEqual({id:attachment})
+  expect(native.create).toHaveBeenCalledOnce()
+  for (const id of ['chat2','chat3','chat4']) await gateway.create(owner,id,{id:terminalId},signal)
+  expect(native.create).toHaveBeenCalledTimes(4)
+})
 it('binds terminals to the signed Session and holds the native process until stream cancellation', async () => {
   const agent = { session: { id: chat.sessionId } }
   const released = vi.fn()

@@ -29,6 +29,13 @@ it('returns the current snapshot URL and title when an SPA changed without an ac
   expect(value).toMatchObject({ url: 'https://example.com/new', title: 'Current page' })
   expect(JSON.parse(value.content)).toMatchObject({ text: 'Current content' })
 })
+it('reuses the chat browser for a new-page action', async () => {
+  const test=fixture()
+  test.browsers.currentId=()=>test.chat.id
+  await test.definition.execute({action:'new_tab',url:'https://example.com/next'},test.exec)
+  expect(test.browsers.create).toHaveBeenCalledWith({ownerId:'owner'},{id:test.chat.id,chat_id:test.chat.id},test.exec.signal)
+  expect(test.browser.command).toHaveBeenCalledWith({action:'navigate',url:'https://example.com/next'},test.exec.signal)
+})
 
 it('validates action-dependent input before starting a worker or opening a tab', async () => {
   for (const args of [{action:'navigate'}, {action:'navigate',url:'file:///private'}, {action:'click',selector:''}]) {

@@ -151,7 +151,7 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
     const cdp = await context.newCDPSession(target)
     target.on('crash', () => { if (target === page) fatal('网页进程已退出，请重新打开浏览器') })
     target.on('close', () => {
-      if (!pages.has(id)) return
+      if (pages.get(id)?.page !== target) return
       pages.delete(id)
       void send({ type: 'page-close', page_id: id })
       if (target === page) {
@@ -174,15 +174,10 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
     })
     target.on('popup', popup => {
       pendingPopup = (async () => {
-      const popupId = randomUUID()
+      const popupId = id
       let popupSession
+      let adopted = false
       try {
-        if (pages.size >= 3) {
-          popupLimited = true
-          notice = '最多打开3个浏览器标签，请先关闭一个'
-          await popup.close().catch(() => {})
-          return
-        }
         try {
           if (popup.url() !== 'about:blank') validUrl(popup.url())
         } catch {
@@ -204,12 +199,15 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
           await popup.close().catch(() => {})
           return
         }
+        const previous = pages.get(id)
         pages.set(popupId, { page: popup, session: popupSession })
+        adopted = true
         selectPage(popupId)
-        await send({ type: 'page-open', page_id: popupId, opener_id: id })
+        await previous?.page.close().catch(() => {})
+        await previous?.session.detach?.().catch(() => {})
         await frame()
       } catch {
-        if (!pages.has(popupId)) {
+        if (!adopted) {
           await popupSession?.detach().catch(() => {})
           await popup.close().catch(() => {})
           notice = '弹窗连接中断，请重新打开网页'
@@ -310,7 +308,7 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
       } catch {
         if (closed) return
         const error = ['navigate', 'reload', 'back', 'forward'].includes(value?.action)
-          ? '网页加载失败，请检查地址或稍后刷新' : '浏览器操作失败，请重新打开浏览器'
+          ? '网页加载失败，请检查地址或稍后刷新' : '浏览器操作失败'
         notice = error
         await send({ type: 'result', id: value?.id, error })
         await frame()

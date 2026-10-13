@@ -46,9 +46,9 @@ function worker() {
   return {page,browser,runtime,frames,exit,command,input,context}
 }
 
-it('opens native popups as independent pages, retains the opener and closes only the selected page', async () => {
+it('replaces the displayed page with a native popup, preserving the browser identity', async () => {
   const value=worker()
-  value.page.close=vi.fn(async()=>{})
+  value.page.close=vi.fn(async()=>value.page.emit('close'))
   const popup=Object.assign(new EventEmitter(),{url:()=> 'https://example.com/child',viewportSize:()=>({width:1000,height:700}),isClosed:()=>false,
     screenshot:vi.fn(async()=>Buffer.from('popup')),title:async()=> 'Child',setDefaultTimeout:vi.fn(),setDefaultNavigationTimeout:vi.fn(),
     close:vi.fn(async()=>{}),keyboard:{insertText:vi.fn(async()=>{})}})
@@ -56,16 +56,14 @@ it('opens native popups as independent pages, retains the opener and closes only
     const root='12345678-1234-1234-1234-123456789abc'
     await value.command(1,'init',{width:1000,height:700,browser_id:root})
     value.page.emit('popup',popup)
-    await vi.waitFor(()=>expect(value.frames.some(frame=>frame.type==='page-open')).toBe(true))
-    const id=value.frames.find(frame=>frame.type==='page-open').page_id
-    expect(value.page.close).not.toHaveBeenCalled()
-    await value.command(2,'text',{page_id:root,text:'parent'})
-    await value.command(3,'text',{page_id:id,text:'child'})
-    expect(value.page.keyboard.insertText).toHaveBeenCalledWith('parent')
+    await vi.waitFor(()=>expect(value.page.close).toHaveBeenCalledOnce())
+    expect(value.frames.some(frame=>frame.type==='page-open')).toBe(false)
+    await value.command(2,'text',{page_id:root,text:'child'})
+    expect(value.page.keyboard.insertText).not.toHaveBeenCalled()
     expect(popup.keyboard.insertText).toHaveBeenCalledWith('child')
-    await value.command(4,'close-page',{page_id:id})
+    await value.command(3,'close-page',{page_id:root})
     expect(popup.close).toHaveBeenCalledOnce()
-    expect(value.page.close).not.toHaveBeenCalled()
+    expect(value.page.close).toHaveBeenCalledOnce()
     expect(value.browser.close).not.toHaveBeenCalled()
   } finally { await value.runtime.shutdown() }
 })
@@ -121,7 +119,7 @@ it('rejects initialization without a first frame rather than leaving the client 
   value.page.screenshot.mockRejectedValue(new Error('screenshot unavailable'))
   try {
     await value.command(1,'init',{width:1000,height:700})
-    expect(value.frames.find(frame=>frame.type==='result' && frame.id===1).error).toContain('重新打开浏览器')
+    expect(value.frames.find(frame=>frame.type==='result' && frame.id===1).error).toBe('浏览器操作失败')
     expect(value.frames.some(frame=>frame.type==='frame')).toBe(false)
   } finally { await value.runtime.shutdown() }
 })

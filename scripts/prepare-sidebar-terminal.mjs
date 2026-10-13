@@ -5,10 +5,11 @@ import { fileURLToPath } from 'node:url'
 
 /** Internal Agent operations share the native screen/PTY without replacing its UI attachment. */
 export function sidebarTerminalSource(source) {
+  source = source.replace('maxTerminals: z.number().step(1).min(1).default(3),', 'maxTerminals: z.number().step(1).min(1).default(8),')
+    .replace('if ([...this.owners.values()].reduce((count, item) => count + new Set([...item.terminals.keys(), ...item.pending.keys(), ...item.allocations.keys()]).size, 0) >= this.config.maxTerminals)',
+      'if (new Set([\n\t\t\t\t...owner.terminals.keys(),\n\t\t\t\t...owner.pending.keys(),\n\t\t\t\t...owner.allocations.keys()\n\t\t\t]).size >= this.config.maxTerminals)')
   const additions = [
-    ['maxTerminals: z.number().step(1).min(1).default(8),', 'maxTerminals: z.number().step(1).min(1).default(3),'],
-    ['if (new Set([\n\t\t\t\t...owner.terminals.keys(),\n\t\t\t\t...owner.pending.keys(),\n\t\t\t\t...owner.allocations.keys()\n\t\t\t]).size >= this.config.maxTerminals)',
-      'if ([...this.owners.values()].reduce((count, item) => count + new Set([...item.terminals.keys(), ...item.pending.keys(), ...item.allocations.keys()]).size, 0) >= this.config.maxTerminals)'],
+    ['maxTerminals: z.number().step(1).min(1).default(8),', 'maxTerminals: z.number().step(1).min(1).default(1),'],
     ['\twrite(id, data) {', `\t// GXZS internal Agent input; the controller remains owned by the UI follower.
 \twriteFromAgent(data, signal) {
 \t\tthis.retention?.invalidate();
