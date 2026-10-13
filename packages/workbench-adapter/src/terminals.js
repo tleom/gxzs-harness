@@ -11,22 +11,46 @@ export class WorkbenchTerminals {
   }
   list(owner, chatId) { return this.native.list(this.service.requireChat(owner, chatId).sessionId) }
   async create(owner, chatId, request, signal) {
+    signal.throwIfAborted()
     if (!uuid.test(request.id)) throw httpError(400, '终端标识无效')
     const agent = await this.agent(owner, chatId)
-    const existing = this.native.list(agent.session.id).at(-1)
-    if (existing) return existing
+    signal.throwIfAborted()
     const key = `${owner.ownerId}/${chatId}`
-    if (this.creating.has(key)) return this.creating.get(key)
-    const pending = this.native.create(agent, { id: request.id, cols: request.cols, rows: request.rows,
-      ...(request.shellPath ? { shellPath: request.shellPath } : {}) }, signal)
-    this.creating.set(key, pending)
+    let allocation = this.creating.get(key)
+    if (!allocation) {
+      const retained = this.native.list(agent.session.id)
+      const running = retained.findLast(info => info.state === 'running')
+      if (running) return running
+      allocation = { controller: new AbortController(), waiters: 0, settled: false }
+      const current = allocation
+      current.promise = (async () => {
+        for (const info of retained) await this.native.close(agent, info.id)
+        current.controller.signal.throwIfAborted()
+        try {
+          return await this.native.create(agent, { id: request.id, cols: request.cols, rows: request.rows,
+            ...(request.shellPath ? { shellPath: request.shellPath } : {}) }, current.controller.signal)
+        } catch (error) {
+          if (error?.code === 'terminal/limit-reached') throw httpError(409, '当前对话已有终端，请打开已有标签')
+          throw error
+        }
+      })().finally(() => {
+        current.settled = true
+        if (this.creating.get(key) === current) this.creating.delete(key)
+      })
+      this.creating.set(key, current)
+    }
+    allocation.waiters++
+    let abort
+    const cancelled = new Promise((_, reject) => {
+      abort = () => reject(signal.reason || new Error('Terminal request cancelled'))
+      signal.addEventListener('abort', abort, { once: true })
+      if (signal.aborted) abort()
+    })
     try {
-      return await pending
-    } catch (error) {
-      if (error?.code === 'terminal/limit-reached') throw httpError(409, '当前对话已有终端，请打开已有标签')
-      throw error
+      return await Promise.race([allocation.promise, cancelled])
     } finally {
-      if (this.creating.get(key) === pending) this.creating.delete(key)
+      signal.removeEventListener('abort', abort)
+      if (--allocation.waiters === 0 && !allocation.settled) allocation.controller.abort()
     }
   }
   async *follow(owner, chatId, id, attachment, signal) {

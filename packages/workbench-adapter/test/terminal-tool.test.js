@@ -34,6 +34,14 @@ it('creates one bounded native PTY when no terminal exists and returns its actua
   expect(result.terminal_id).toMatch(/^[a-f\d-]{36}$/)
   expect(test.native.writeFromAgent).not.toHaveBeenCalled()
 })
+it('reopens an exited terminal as a usable shell for the model', async()=>{
+  const test=fixture();test.native.list.mockReturnValue([{id,title:'bash',state:'exited'}])
+  const result=await test.definition.execute({action:'open',wait_ms:0},test.exec)
+  expect(test.native.close).toHaveBeenCalledWith(test.agent,id)
+  expect(test.native.create).toHaveBeenCalledOnce()
+  expect(result.terminal_id).not.toBe(id)
+  expect(result.state).toBe('running')
+})
 it('rejects foreign terminal IDs and invalid input before allocating, writing or opening a tab', async () => {
   for (const args of [{action:'write'}, {action:'key',key:'__proto__'}, {action:'read',wait_ms:2001}, {action:'read',terminal_id:'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'}]) {
     const test=fixture()

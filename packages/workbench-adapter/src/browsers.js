@@ -256,6 +256,7 @@ export class WorkbenchBrowsers {
       }
       Promise.resolve(worker.done).then(settled, settled)
       this.items.set(key, browser)
+      this.current.set(`${owner.ownerId}/${request.chat_id}`, request.id)
       browser.ready = browser.command({ action: 'init', browser_id: request.id, width: 1000, height: 700 }, signal)
     }
     try { await browser.ready }

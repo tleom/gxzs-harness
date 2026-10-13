@@ -44,6 +44,21 @@ it('allows one browser per chat and independent browsers in other chats', async 
     await gateway.create({ownerId:'owner'},{id:chatId,chat_id:chatId},signal())
   expect(created).toBe(4)
 })
+it('joins the initializing browser when the agent opens the same chat', async()=>{
+  let ready
+  const browser={closed:false,done:new Promise(()=>{}),dispose:vi.fn(),command:vi.fn(()=>new Promise(resolve=>{ready=resolve}))}
+  const create=vi.fn(()=>browser),gateway=new WorkbenchBrowsers({create,service:{requireChat:vi.fn()}})
+  const chatId='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
+  const first=gateway.create({ownerId:'owner'},{id,chat_id:chatId},signal())
+  const current=gateway.currentId({ownerId:'owner'},chatId)
+  expect(current).toBe(id)
+  const second=gateway.create({ownerId:'owner'},{id:current,chat_id:chatId},signal())
+  ready()
+  await expect(first).resolves.toEqual({id})
+  await expect(second).resolves.toEqual({id})
+  expect(create).toHaveBeenCalledOnce()
+  expect(browser.command).toHaveBeenCalledOnce()
+})
 it('does not remove a replacement browser when an earlier initialization fails', async () => {
   let rejectFirst, finishFirst
   const first = {closed:false,command:()=>new Promise((_,reject)=>{rejectFirst=reject}),
