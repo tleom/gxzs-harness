@@ -21,7 +21,7 @@ export function adaptInputSchema(source) {
         throw Object.assign(new Error('MCP _req annotation must match the parent required list'), { code: 'UNSUPPORTED_SCHEMA' })
       delete result._req
     }
-    const bounds = ['minimum', 'maximum', 'minLength', 'maxLength', 'minItems', 'maxItems', 'minProperties', 'maxProperties', 'format']
+    const bounds = ['minimum', 'maximum', 'minLength', 'maxLength', 'pattern', 'minItems', 'maxItems', 'minProperties', 'maxProperties', 'format']
     const limits = bounds
       .filter((key) => key in result).map((key) => `${key}: ${JSON.stringify(result[key])}`)
     for (const key of bounds) delete result[key]

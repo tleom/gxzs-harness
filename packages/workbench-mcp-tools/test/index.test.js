@@ -83,6 +83,7 @@ describe('platform MCP proxy tools', () => {
     const { ctx, definitions, platform } = setup()
     const inputSchema = { type: 'object', properties: {
       title: { type: 'string', minLength: 1, maxLength: 100 },
+      idempotencyKey: { type: 'string', pattern: '^[A-Za-z0-9_-]{1,64}$' },
       references: { type: 'object', properties: { values: { type: 'array', items: { type: 'string' }, minItems: 1, maxItems: 2 } } },
       max_results: { type: 'integer', minimum: 1, maximum: 20 },
       start_date: { type: 'string', format: 'date' },
@@ -97,6 +98,7 @@ describe('platform MCP proxy tools', () => {
     await expect(tool.execute({ references: { values: [] } }, exec)).rejects.toThrow('fewer than 1')
     await expect(tool.execute({ title: '' }, exec)).rejects.toThrow('fewer than 1 characters')
     await expect(tool.execute({ title: 'x'.repeat(101) }, exec)).rejects.toThrow('more than 100 characters')
+    await expect(tool.execute({ idempotencyKey: 'invalid key' }, exec)).rejects.toThrow('match pattern')
     expect(platform.json.mock.calls.filter(([request]) => request.route === 'mcp/call')).toHaveLength(0)
     await expect(tool.execute({ title: '合法标题', max_results: 5, references: { values: ['one'] } }, exec)).resolves.toBeDefined()
   })
