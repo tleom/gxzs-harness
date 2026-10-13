@@ -48,7 +48,11 @@ export class WorkbenchRuntime extends Service {
     const requestKey = `subagent-prompt:${child.id}:${requestId}`
     const saved = this.database.getCommandReceipt(this.ownerId, chat.id, requestKey)
     const replay = saved ? this.database.getRun(this.ownerId, saved.runId) : candidates.find(run => run.requestKey === requestKey)
-    if (replay) return replay
+    if (replay) {
+      if (['failed','discarded','cancelled','interrupted'].includes(replay.status))
+        throw Object.assign(new Error('该消息已结束，请重新发送'), { status: 409, code: 'SUBAGENT_MESSAGE_FINISHED' })
+      return replay
+    }
     const previous = candidates.find(run => run.selection?.subagent_ids?.includes(child.id))
     if (!previous) throw Object.assign(new Error('子智能体运行归属尚未恢复，请稍后重试'), { status: 409 })
     const agent = this.agents.get(child.id)
@@ -81,13 +85,19 @@ export class WorkbenchRuntime extends Service {
   settleChild(agent) {
     const binding = this.childRuns.get(agent)
     const run = binding && this.database.getRun(this.ownerId, binding)
-    if (run?.selection?.native_child === agent.id && run.status === 'running')
-      this.database.transitionRun(this.ownerId, run.id, 'completed')
+    if (run?.selection?.native_child === agent.id && run.status === 'running') {
+      const end = agent.session?.snapshotEvents?.().findLast(event => event.type === 'turn/end')
+      const kind = end?.data?.reason?.kind ?? (run.stopConfirmation?.fenced ? 'aborted' : 'completed')
+      const status = { completed: 'completed', aborted: 'cancelled', interrupted: 'interrupted' }[kind] ?? 'failed'
+      const error = status === 'failed' ? String(end?.data?.reason?.error?.message ?? '子智能体执行失败') : undefined
+      this.database.transitionRun(this.ownerId, run.id, status, error)
+    }
     if (this.childPrompts.get(agent.id) === binding) this.childPrompts.delete(agent.id)
   }
 
   rejectChildPrompt(run) {
-    this.database.transitionRun(this.ownerId, run.id, 'failed', '子智能体消息未确认')
+    // A deterministic pre-delivery rejection has no execution to fence.
+    this.database.transitionRun(this.ownerId, run.id, 'discarded', '子智能体消息未被接收')
     const childId = run.selection.native_child
     if (this.childPrompts.get(childId) === run.id) this.childPrompts.delete(childId)
     const agent = this.agents.get(childId)

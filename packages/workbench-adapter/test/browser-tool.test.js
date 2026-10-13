@@ -30,6 +30,19 @@ it('returns the current snapshot URL and title when an SPA changed without an ac
   expect(JSON.parse(value.content)).toMatchObject({ text: 'Current content' })
 })
 
+it('validates action-dependent input before starting a worker or opening a tab', async () => {
+  for (const args of [{action:'navigate'}, {action:'navigate',url:'file:///private'}, {action:'click',selector:''}]) {
+    const test = fixture()
+    await expect(test.definition.execute(args,test.exec)).rejects.toMatchObject({status:400})
+    expect(test.browsers.create).not.toHaveBeenCalled()
+    expect(test.database.appendEvent).not.toHaveBeenCalled()
+  }
+  const test = fixture()
+  test.browsers.create.mockRejectedValue(new Error('worker unavailable'))
+  await expect(test.definition.execute({action:'snapshot'},test.exec)).rejects.toThrow('worker unavailable')
+  expect(test.database.appendEvent).not.toHaveBeenCalled()
+})
+
 it('rejects fenced, unadmitted and foreign activations before browser creation', async () => {
   for (const run of [{ id: 'run', ownerId: 'foreign', status: 'running' }, { id: 'run', ownerId: 'owner', status: 'completed' }, { id: 'run', ownerId: 'owner', status: 'running', stopConfirmation: { fenced: true } }]) {
     const test = fixture()

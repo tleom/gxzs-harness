@@ -41,9 +41,6 @@ export function registerBrowserTool(ctx, { browsers, runtime, database, ownerId 
         || run.stopConfirmation?.fenced || !runtime.scheduler.hasAdmission(chat.sessionId))
         throw httpError(403, '当前智能体没有此浏览器的执行权限')
       const owner = { ownerId }
-      database.appendEvent(ownerId, run.id, { event: 'workbench_browser_open', chat_id: chat.id })
-      await browsers.create(owner, { id: chat.id, chat_id: chat.id }, exec.signal)
-      const browser = browsers.require(owner, chat.id)
       let action
       if (args.action === 'snapshot') action = { action: 'snapshot' }
       else if (['click', 'text'].includes(args.action) && args.selector !== undefined) {
@@ -54,6 +51,9 @@ export function registerBrowserTool(ctx, { browsers, runtime, database, ownerId 
         action = { action: args.action === 'click' ? 'element-click' : 'element-text', selector: args.selector,
           ...(args.action === 'text' ? { text: args.text } : {}) }
       } else action = browserAction(args)
+      await browsers.create(owner, { id: chat.id, chat_id: chat.id }, exec.signal)
+      const browser = browsers.require(owner, chat.id)
+      database.appendEvent(ownerId, run.id, { event: 'workbench_browser_open', chat_id: chat.id })
       const observed = await browser.command(action, exec.signal)
       const content = args.action === 'snapshot' ? observed : await browser.command({ action: 'snapshot' }, exec.signal)
       return { browser_id: chat.id, url: content.url, title: content.title, content: JSON.stringify(content) }

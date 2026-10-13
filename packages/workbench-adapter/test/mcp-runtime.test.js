@@ -17,7 +17,9 @@ describe('frozen run MCP authorization', () => {
       runtime.agents = { get: id => id === 'root' ? root : child, list: () => [root, child], isOwnedBy: (id, parent) => id === 'child' && parent === root }
       const rejected = runtime.prepareChildPrompt(chat, { id: 'child', title: '调查员' }, 'rejected')
       runtime.rejectChildPrompt(rejected)
-      expect(database.getRun('t:1', rejected.id).status).toBe('failed')
+      expect(database.getRun('t:1', rejected.id).status).toBe('discarded')
+      expect(database.pendingRunFences('t:1')).toEqual([])
+      expect(() => runtime.prepareChildPrompt(chat, { id: 'child', title: '调查员' }, 'rejected')).toThrow('该消息已结束')
       expect(runtime.childPrompts.has('child')).toBe(false)
       expect(runtime.childRuns.has(child)).toBe(false)
       const accepted = runtime.prepareChildPrompt(chat, { id: 'child', title: '调查员' }, 'accepted')

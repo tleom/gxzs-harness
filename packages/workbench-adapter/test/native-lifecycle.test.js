@@ -168,6 +168,39 @@ it('registers the sidebar browser with the real native prompt and tool services'
   expect(test.db.getRun(test.owner.ownerId, run.id).status).toBe('completed')
 })
 
+it.each(['failed','cancelled'])('keeps a resumed native child %s outcome and exposes its cancellable control receipt', async status => {
+  const test = await fixture(['parent done', status === 'failed' ? new Error('child model failure') : 'hang'])
+  const original = test.create('delegate')
+  test.db.updateRunResources(original, {subagent_ids:['outcome-child']}, original.mcpTools)
+  await test.scheduler.enqueue(original,[{type:'text',text:'delegate'}])
+  await test.scheduler.tick(); await test.agent.whenIdle(); await test.scheduler.tick()
+  const handle = await test.ctx.agents.create({sessionId:'outcome-child',parentAgent:test.agent,
+    agentOptions:{provider:'mock',model:'mock'},meta:{cwd:'/workspace/conversations/native-chat',origin:'subagent'}})
+  const child = handle.agent
+  test.runtime.bindChild(child)
+  const receipt = test.runtime.prepareChildPrompt(test.chat,{id:child.id,title:'验收助手'},'outcome')
+  test.ctx.on('agent/status',({agent,status}) => { if (agent===child && status==='idle') test.runtime.settleChild(child) })
+  const service = new WorkbenchService({database:test.db,sessionController:test.sessions,agents:test.ctx.agents,
+    scheduler:test.scheduler,platformClient:{json:async()=>({data:{fenced:true}})},workspace:'/workspace'})
+  service.cancelOwned = (id,runId) => test.runtime.cancelOwned(id,runId)
+  child.followup(createUserMessage({content:[{type:'text',text:'continue'}],source:{kind:'user'}}))
+  if (status==='cancelled') {
+    await vi.waitFor(()=>expect(test.model.requests).toHaveLength(2))
+    const view = service.getChat(test.owner,test.chat.id)
+    expect(view.control_run).toMatchObject({id:receipt.id,status:'running',events:[]})
+    expect(view.runs.some(run=>run.id===receipt.id)).toBe(false)
+    await service.stopRun(test.owner,view.control_run.id)
+  }
+  await child.whenIdle()
+  expect(test.db.getRun(test.owner.ownerId,receipt.id).status).toBe(status)
+  expect(service.getChat(test.owner,test.chat.id).control_run).toBeNull()
+  if (status==='failed') expect(test.db.pendingRunFences(test.owner.ownerId).some(run=>run.id===receipt.id)).toBe(true)
+  await test.scheduler.flushFences()
+  expect(test.db.getRun(test.owner.ownerId,receipt.id).stopConfirmation?.fenced).toBe(true)
+  expect(() => test.runtime.prepareChildPrompt(test.chat,{id:child.id,title:'验收助手'},'outcome')).toThrow('该消息已结束')
+  await handle.dispose()
+})
+
 it('reacquires real native admission before a later sidebar child step uses its frozen MCP scope', async () => {
   const test = await fixture(['parent done', 'child continued'])
   const original = test.create('delegate')
