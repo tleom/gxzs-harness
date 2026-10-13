@@ -82,6 +82,7 @@ describe('platform MCP proxy tools', () => {
   it('registers bounded external schemas while validating bounds before proxy I/O', async () => {
     const { ctx, definitions, platform } = setup()
     const inputSchema = { type: 'object', properties: {
+      title: { type: 'string', minLength: 1, maxLength: 100 },
       references: { type: 'object', properties: { values: { type: 'array', items: { type: 'string' }, minItems: 1, maxItems: 2 } } },
       max_results: { type: 'integer', minimum: 1, maximum: 20 },
       start_date: { type: 'string', format: 'date' },
@@ -94,8 +95,10 @@ describe('platform MCP proxy tools', () => {
     const exec = { callId: 'call-1', agent: { id: 's1' }, signal: new AbortController().signal }
     await expect(tool.execute({ max_results: 21 }, exec)).rejects.toThrow('<= 20')
     await expect(tool.execute({ references: { values: [] } }, exec)).rejects.toThrow('fewer than 1')
+    await expect(tool.execute({ title: '' }, exec)).rejects.toThrow('fewer than 1 characters')
+    await expect(tool.execute({ title: 'x'.repeat(101) }, exec)).rejects.toThrow('more than 100 characters')
     expect(platform.json.mock.calls.filter(([request]) => request.route === 'mcp/call')).toHaveLength(0)
-    await expect(tool.execute({ max_results: 5, references: { values: ['one'] } }, exec)).resolves.toBeDefined()
+    await expect(tool.execute({ title: '合法标题', max_results: 5, references: { values: ['one'] } }, exec)).resolves.toBeDefined()
   })
   it('registers catalog tools and proxies only frozen authorized calls', async () => {
     const { ctx, definitions, platform } = setup()
