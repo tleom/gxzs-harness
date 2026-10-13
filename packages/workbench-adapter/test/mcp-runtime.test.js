@@ -40,6 +40,8 @@ describe('frozen run MCP authorization', () => {
       const receipt=runtime.prepareChildPrompt(chat,{id:'child',title:'调查员'},'request')
       expect(receipt.id).not.toBe(original.id)
       expect(runtime.prepareChildPrompt(chat,{id:'child',title:'调查员'},'request').id).toBe(receipt.id)
+      expect(runtime.prepareChildPrompt(chat,{id:'child',title:'调查员'},'second-message').id).toBe(receipt.id)
+      expect(database.listRuns('t:1',chat.id)).toHaveLength(2)
       child.status='running';runtime.bindChild(child)
       expect(runtime.authorizeMcp('child','search','v1')).toMatchObject({runId:receipt.id})
       expect(runtime.authorizeRunMcp('t:1',receipt.id,'search','v1')).toBe(true)
@@ -48,11 +50,13 @@ describe('frozen run MCP authorization', () => {
       runtime.cancelOwned('root',original.id)
       child.status='idle';runtime.settleChild(child)
       expect(database.getRun('t:1',receipt.id).status).toBe('completed')
+      expect(runtime.prepareChildPrompt(chat,{id:'child',title:'调查员'},'second-message').id).toBe(receipt.id)
       expect(database.getRun('t:1',original.id).stopConfirmation.fenced).toBe(true)
       const message={id:'report',source:{kind:'agent-message',senderSessionId:'child'},content:[{type:'text',text:'Agent child sent a message: '},{type:'text',text:'调查结果'}]}
       const parent=projectInboxClaim(database,{agent:root,message,turn:2},'t:1')
       expect(parent).toMatchObject({parentRunId:receipt.id,selection:{native_notice:true,native_child:false}})
       expect(nativePresentation(parent,{type:'user/message',time:1000,data:message})).toMatchObject([{event:'workbench_agent_message',sender_name:'调查员',query:'调查结果'}])
+      expect(nativePresentation(parent,{type:'user/message',time:1000,data:{id:'settled',source:{kind:'subagent-settled',senderSessionId:'child',summary:'completed'},content:[{type:'text',text:'child completed'}]}})).toMatchObject([{query:'child completed'}])
     } finally {database.close()}
   })
   it('retains the exact spawning run for a live native child after its parent completes or accepts another prompt', () => {

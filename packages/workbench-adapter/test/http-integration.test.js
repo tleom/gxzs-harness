@@ -51,6 +51,7 @@ function setup() {
     skills: { list: vi.fn(async () => []), get: async () => undefined },
     tokenMeter: { measure: vi.fn(() => ({ totalTokens: 0, baseline: { kind: 'none' } })) },
     systemPrompt: { section: vi.fn(() => () => {}) },
+    tools: { register: vi.fn(() => () => {}) },
     on: vi.fn(), emit: vi.fn(), reflect: { provide: vi.fn() },
     effect: (factory) => cleanups.push(factory()),
   }
@@ -235,7 +236,7 @@ describe('authenticated workbench HTTP handler', () => {
         { id: 'global-skill', scope: 'global' },
       ] } },
     })
-    expect(context.systemPrompt.section).not.toHaveBeenCalled()
+    expect(context.systemPrompt.section.mock.calls.map(([section]) => section.name)).toEqual(['gxzs:sidebar-browser'])
     const assemble = context.on.mock.calls.find(([event]) => event === 'system-prompt/assemble')[1]
     context.workbenchPlatformClient.json.mockResolvedValueOnce({ data: { enabled: true, system_prompt: '数据库规则' } })
     const original = { sections: [{ name: 'deployment:persona-prefix', text: '原生身份' }], contexts: [], tools: [], variables: {} }

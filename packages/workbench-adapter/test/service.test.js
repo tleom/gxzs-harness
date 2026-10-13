@@ -1512,7 +1512,8 @@ describe('forked conversations', () => {
     expect(child.id).not.toBe(chat.id)
     expect(child.runs.map(run => run.query)).toEqual(['first', 'second'])
     expect(child.runs[1].parent_run_id).toBe(child.runs[0].id)
-    expect(child.runs[1].events).toEqual(expect.arrayContaining([expect.objectContaining({ answer: 'answer second' })]))
+    expect(child.runs[1].events).toEqual([])
+    expect(service.getRun(owner, child.runs[1].id).events).toEqual(expect.arrayContaining([expect.objectContaining({ answer: 'answer second' })]))
     expect(service.getChat(owner, chat.id)).toEqual(original)
     expect(database.getChat(owner.ownerId, chat.id).sessionId).toBe('session-1')
     const followup = await service.submitRun(owner, child.id, { query: 'followup' })
@@ -1536,6 +1537,16 @@ describe('forked conversations', () => {
     expect(child.title).toBe(expected)
     expect(sessionController.rename).toHaveBeenCalledWith({ sessionId: 'session-fork', title: expected })
     expect(service.getChat(owner, chat.id).title).toBe(title)
+  })
+
+  it('returns a small fork receipt while preserving large historical tool output for paged reads', async () => {
+    const { service, owner, database, second } = history()
+    database.appendEvent(owner.ownerId, second.id, { event: 'workbench_activity', data: { kind: 'tool', output: 'x'.repeat(4 * 1024 * 1024) } })
+    const child = await service.fork(owner, second.id, { request_key: 'large-history' })
+    expect(Buffer.byteLength(JSON.stringify(child))).toBeLessThan(64 * 1024)
+    expect(child.runs.every(run => run.events.length === 0 && run.history_complete === false)).toBe(true)
+    expect(service.getRun(owner, child.runs[1].id).events.some(event => event.data?.output?.length === 4 * 1024 * 1024)).toBe(true)
+    expect(await service.fork(owner, second.id, { request_key: 'large-history' })).toEqual(child)
   })
 
   it('uses native fork even with sessionQuery and inherits the source directory', async () => {

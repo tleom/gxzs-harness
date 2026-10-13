@@ -1,26 +1,26 @@
 // Runs only in the owner sandbox. The Host transports pixels and validated input.
 const { createInterface } = require('node:readline')
-/** Reduce large photographic frames without losing the live stream; reuse the successful quality. */
+/** Prefer lossless text at 2x scale; bound photographic frames without low-quality encoding. */
 function createImageCapture({ now = Date.now, budgetMs = 8000 } = {}) {
-  const qualities = [70, 50, 30, 15]
+  const formats = [{type:'png'}, ...[95,90,85].map(quality => ({type:'jpeg',quality}))]
   let key, start = 0
   return async (page, captureBudgetMs = budgetMs) => {
     const viewport = page.viewportSize()
     const current = `${page.url()}|${viewport.width}:${viewport.height}`
     if (current !== key) { key = current; start = 0 }
     const deadline = now() + Math.min(budgetMs, captureBudgetMs)
-    for (let index = start; index < qualities.length; index++) {
+    for (let index = start; index < formats.length; index++) {
       const remaining = deadline - now()
       if (remaining <= 0) throw new Error('capture_timeout')
-      const image = await page.screenshot({ type: 'jpeg', quality: qualities[index], timeout: remaining })
-      if (image.length <= 1024 * 1024) { start = index; return image }
+      const image = await page.screenshot({ ...formats[index], caret: 'initial', timeout: remaining })
+      if (image.length <= 4 * 1024 * 1024) { start = index; image.mediaType = `image/${formats[index].type}`; return image }
     }
     throw new Error('frame_too_large')
   }
 }
 function runWorker({ chromium, input = process.stdin, output = process.stdout, exit = code => process.exit(code) }) {
   let browser, context, page, session, watching = false, capturing = false, closed = false
-  let timer, notice = '', navigation = 0, hasFrame = false, navigating = false
+  let timer, notice = '', navigation = 0, hasFrame = false, navigating = false, lastFrame
   let captureFinished = Promise.resolve(), finishCapture = () => {}
   const send = value => new Promise(resolve => {
     if (output.write(JSON.stringify(value) + '\n')) resolve()
@@ -44,9 +44,14 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
       const history = await cdp.send('Page.getNavigationHistory')
       const title = (await target.title()).slice(0, 1024)
       if (target !== page || target.url() !== url || navigation !== epoch || closed) return false
-      await send({ type: 'frame', url: url === 'about:blank' ? '' : url, title,
-        ...viewport, image: image.toString('base64'), back: history.currentIndex > 0,
-        forward: history.currentIndex < history.entries.length - 1, notice })
+      const meta = { type: 'frame', url: url === 'about:blank' ? '' : url, title,
+        ...viewport, mediaType: image.mediaType, back: history.currentIndex > 0,
+        forward: history.currentIndex < history.entries.length - 1, notice }
+      const stamp = JSON.stringify(meta)
+      if (!lastFrame || lastFrame.stamp !== stamp || !lastFrame.image.equals(image)) {
+        await send({ ...meta, image: image.toString('base64') })
+        lastFrame = { stamp, image }
+      }
       hasFrame = true
       return true
     } catch (error) {
@@ -134,7 +139,7 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
         args: ['--no-sandbox', '--disable-dev-shm-usage'], timeout: 20000 })
       browser.on('disconnected', () => fatal('沙盒浏览器已退出，请重新打开浏览器'))
       context = await browser.newContext({ viewport: { width: value.width, height: value.height },
-        locale: 'zh-CN', acceptDownloads: false, serviceWorkers: 'block' })
+        deviceScaleFactor: 2, locale: 'zh-CN', acceptDownloads: false, serviceWorkers: 'block' })
       await context.route('**/*', route => {
         const request = route.request()
         if (request.isNavigationRequest() && !/^https?:\/\//i.test(request.url())) return route.abort()
@@ -149,6 +154,31 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
     }
     if (!page || page.isClosed()) throw new Error('browser_closed')
     if (action === 'watch') { watching = value.enabled === true; if (watching) await frame(); return }
+    if (action === 'snapshot') return page.evaluate(() => {
+      const elements = []
+      for (const element of document.querySelectorAll('a,button,input,textarea,select,[role="button"],[contenteditable="true"]')) {
+        if (elements.length >= 120) break
+        const box = element.getBoundingClientRect()
+        if (!box.width || !box.height || getComputedStyle(element).visibility === 'hidden') continue
+        let selector = element.id ? '#' + CSS.escape(element.id) : ''
+        if (!selector || document.querySelectorAll(selector).length !== 1) {
+          const path = []
+          let node = element
+          while (node && node !== document.body && path.length < 10) {
+            const siblings = [...node.parentElement.children].filter(sibling => sibling.tagName === node.tagName)
+            path.unshift(`${node.tagName.toLowerCase()}:nth-of-type(${siblings.indexOf(node)+1})`)
+            node = node.parentElement
+          }
+          selector = 'body > ' + path.join(' > ')
+        }
+        if (selector.length > 512 || document.querySelectorAll(selector).length !== 1) continue
+        elements.push({ selector, tag: element.tagName.toLowerCase(), role: element.getAttribute('role'),
+          focused: element === document.activeElement,
+          label: (element.getAttribute('aria-label') || element.getAttribute('placeholder') || element.innerText || '').slice(0,200),
+          ...(element.tagName === 'INPUT' && element.type !== 'password' ? { value: element.value.slice(0,200) } : {}) })
+      }
+      return JSON.stringify({ text: document.body?.innerText.slice(0,20000) || '', elements })
+    })
     notice = ''
     const moves = ['navigate', 'reload', 'back', 'forward'].includes(action)
     if (moves) { navigation++; navigating = true }
@@ -164,6 +194,8 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
         if (capturing) await captureFinished
         break
       case 'click': await page.mouse.click(value.x, value.y, { button: value.button || 'left', clickCount: value.count || 1 }); break
+      case 'element-click': await page.locator(value.selector).click(); break
+      case 'element-text': await page.locator(value.selector).fill(value.text); break
       case 'move': await page.mouse.move(value.x, value.y); break
       case 'wheel': await page.mouse.wheel(value.x, value.y); break
       case 'text': await page.keyboard.insertText(value.text); break
@@ -193,8 +225,8 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
       let value
       try {
         value = JSON.parse(line)
-        await operation(value)
-        if (!closed) await send({ type: 'result', id: value.id })
+        const result = await operation(value)
+        if (!closed) await send({ type: 'result', id: value.id, ...(result === undefined ? {} : { value: result }) })
       } catch {
         if (closed) return
         const error = ['navigate', 'reload', 'back', 'forward'].includes(value?.action)

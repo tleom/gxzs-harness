@@ -33,6 +33,8 @@ export class WorkbenchSubagents {
       bytes += image.data.length * 0.75
     }
     if (bytes > 20 * 1024 * 1024) throw httpError(413, '图片总大小超过 20 MiB')
+    const deliver = async () => {
+    signal.throwIfAborted()
     const receipt = this.runtime?.prepareChildPrompt(this.service.requireChat(owner, chatId), child, request.requestId)
     try { return await this.native.prompt({ parentSessionId: child.parentSessionId, childSessionId: child.id,
       mode: 'continuable', requestId: request.requestId, delivery: 'queue', content: [
@@ -45,6 +47,8 @@ export class WorkbenchSubagents {
         this.runtime.rejectChildPrompt(receipt)
       throw error
     }
+    }
+    return this.runtime?.withChildPrompt ? this.runtime.withChildPrompt(child.id, deliver) : deliver()
   }
   async image(owner, chatId, childId, ref, signal) {
     if (!(await this.catalog(owner, chatId, signal)).some(child => child.id === childId && child.mode !== 'external')) throw httpError(404, '子智能体不属于此对话')

@@ -236,9 +236,9 @@ export class WorkbenchService {
     return this.database.listChats(owner.ownerId).map((chat) => this.chatSummary(owner, chat))
   }
 
-  getChat(owner, chatId) {
+  getChat(owner, chatId, includeEvents = true) {
     const chat = this.requireChat(owner, chatId)
-    return { ...this.chatSummary(owner, chat), selection: chat.selection, runs: this.database.listRuns(owner.ownerId, chat.id).filter(run => !run.selection?.native_child).map((run) => this.getRun(owner, run.id)) }
+    return { ...this.chatSummary(owner, chat), selection: chat.selection, runs: this.database.listRuns(owner.ownerId, chat.id).filter(run => !run.selection?.native_child).map((run) => this.getRun(owner, run.id, includeEvents)) }
   }
 
   async historyPage(owner, chatId, cursor, signal, nativeLive = false) {

@@ -119,7 +119,11 @@ export class WorkbenchWorkspaces {
           beforeSessionId: request.beforeChatId == null ? undefined : this.session(owner, request.beforeChatId) })
       }
     } else if (['archiveSession', 'unarchiveSession', 'pinSession', 'unpinSession'].includes(operation)) {
-      await this.controller[operation]({ sessionId: this.session(owner, request.chatId),
+      const sessionId = this.session(owner, request.chatId)
+      if (operation === 'archiveSession' && this.schedules &&
+        (await this.schedules.catalog(owner)).some(task => task.chat_id === request.chatId))
+        throw httpError(409, '该对话关联了定时任务，请先删除定时任务', 'WORKSPACE_SCHEDULE_ATTACHED')
+      await this.controller[operation]({ sessionId,
         ...(operation === 'archiveSession' ? { stopActivity: request.stopActivity === true } : {}) })
     } else throw httpError(400, '工作区操作无效')
     return this.baseline(owner, undefined, { includeSchedules: false })

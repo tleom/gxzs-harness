@@ -215,7 +215,9 @@ export function nativePresentation(run, event, { streamed = false, toolName = ''
         const blocks = event.data.content ?? []
         const prefix = `Agent ${source.senderSessionId} sent a message: `
         const content = source.kind === 'agent-message' && blocks[0]?.text === prefix ? blocks.slice(1)
-          : source.kind === 'subagent-settled' ? blocks.slice(blocks[1]?.text === 'Its closing message:' ? 2 : 1) : blocks
+          : source.kind === 'subagent-settled' && blocks[0]?.text === source.summary &&
+            ['Its closing message:', 'It left no closing message.'].includes(blocks[1]?.text)
+            ? blocks.slice(blocks[1].text === 'Its closing message:' ? 2 : 1) : blocks
         return [{ event: 'workbench_agent_message', message_id: event.data.id, created_at: event.time / 1000,
           sender_session_id: source.senderSessionId, sender_name: run.selection?.subagent_names?.[source.senderSessionId] ?? source.senderSessionId,
           sender_type: source.senderSessionId === run.selection?.parent_session_id ? 'parent' : 'child',

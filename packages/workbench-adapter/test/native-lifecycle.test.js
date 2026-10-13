@@ -154,6 +154,35 @@ async function delayedScheduledCatalog(test) {
   return { tool, configRequests, release() { available = true; test.ctx.emit('workbench/resources-changed') } }
 }
 
+it('reacquires real native admission before a later sidebar child step uses its frozen MCP scope', async () => {
+  const test = await fixture(['parent done', 'child continued'])
+  const original = test.create('delegate')
+  test.db.updateRunResources(original, { subagent_ids: ['idle-child'] }, original.mcpTools)
+  await test.scheduler.enqueue(original, [{ type: 'text', text: 'delegate' }])
+  await test.scheduler.tick()
+  await test.agent.whenIdle()
+  await test.scheduler.tick()
+  expect(test.scheduler.hasAdmission(test.agent.id)).toBe(false)
+  const handle = await test.ctx.agents.create({ sessionId: 'idle-child', parentAgent: test.agent,
+    agentOptions: { provider: 'mock', model: 'mock' }, meta: { cwd: '/workspace/conversations/native-chat', origin: 'subagent' } })
+  const child = handle.agent
+  test.runtime.bindChild(child)
+  const receipt = test.runtime.prepareChildPrompt(test.chat, { id: child.id, title: '调查员' }, 'later-sidebar-message')
+  let authorization
+  test.ctx.on('agent/pre-step', (payload, next) => {
+    if (payload.agent === child) authorization = test.runtime.authorizeMcp(child.id, 'personal:server:tool', 'v1')
+    return next()
+  }, { global: true })
+  child.followup(createUserMessage({ content: [{ type: 'text', text: 'continue' }], source: { kind: 'user' } }))
+  await child.whenIdle()
+  expect(test.model.requests).toHaveLength(2)
+  expect(test.requests).toContainEqual(expect.objectContaining({ action: 'acquire', run_id: receipt.id }))
+  expect(authorization).toMatchObject({ runId: receipt.id, ownerId: test.owner.ownerId })
+  test.runtime.settleChild(child)
+  expect(test.db.getRun(test.owner.ownerId, receipt.id).status).toBe('completed')
+  await handle.dispose()
+})
+
 it.each([false, true])('assembles the actual first scheduled native request with verified MCP tools and complete prompt=%s', async complete => {
   const test = await fixture(['scheduled answer'], { scheduledClaims: true })
   const catalog = await delayedScheduledCatalog(test)

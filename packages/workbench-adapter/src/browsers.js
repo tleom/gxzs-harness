@@ -75,7 +75,7 @@ export class SandboxBrowser {
     while ((boundary = this.buffer.indexOf('\n')) >= 0) {
       const line = this.buffer.slice(0, boundary)
       this.buffer = this.buffer.slice(boundary + 1)
-      if (line.length > 2 * 1024 * 1024) { this.dispose(); return }
+      if (line.length > 8 * 1024 * 1024) { this.dispose(); return }
       try {
         const frame = JSON.parse(line)
         if (frame.type === 'fatal' && typeof frame.error === 'string' && frame.error.length <= 256) {
@@ -84,15 +84,15 @@ export class SandboxBrowser {
         } else if (frame.type === 'result') {
           const pending = this.pending.get(frame.id)
           if (frame.error) pending?.reject(httpError(502, frame.error))
-          else pending?.resolve()
-        } else if (frame.type === 'frame' && typeof frame.image === 'string' && frame.image.length <= 1400000
+          else pending?.resolve(frame.value)
+        } else if (frame.type === 'frame' && typeof frame.image === 'string' && frame.image.length <= 6 * 1024 * 1024
           && integer(frame.width, 320, 1920) && integer(frame.height, 240, 1080)) {
           this.frame = frame
           this.publish()
         } else throw new Error('Invalid frame')
       } catch { this.dispose(httpError(502, '沙盒浏览器数据无效')); return }
     }
-    if (this.buffer.length > 2 * 1024 * 1024) this.dispose()
+    if (this.buffer.length > 8 * 1024 * 1024) this.dispose()
   }
   command(value, signal = new AbortController().signal) {
     signal.throwIfAborted()
@@ -114,7 +114,7 @@ export class SandboxBrowser {
         // Never leave a timed-out navigation queued ahead of later input.
         this.dispose(httpError(504, '浏览器操作超时，请重新打开'))
       }
-      this.pending.set(id, { resolve: () => finish(resolve), reject: error => finish(reject, error) })
+      this.pending.set(id, { resolve: value => finish(resolve, value), reject: error => finish(reject, error) })
       signal.addEventListener('abort', cancel, { once: true })
       timer = setTimeout(cancel, 35000)
       try { this.handle.stdin.write(JSON.stringify({ ...value, id }) + '\n') }
@@ -180,10 +180,14 @@ export class SandboxBrowser {
 }
 
 export class WorkbenchBrowsers {
-  constructor({ subprocess, create = () => new SandboxBrowser(subprocess) }) { this.items = new Map(); this.workers = new Set(); this.createBrowser = create }
+  constructor({ subprocess, service, create = () => new SandboxBrowser(subprocess) }) { this.items = new Map(); this.workers = new Set(); this.createBrowser = create; this.service = service }
   async create(owner, request, signal) {
     signal.throwIfAborted()
     if (!uuid.test(request.id)) throw httpError(400, '浏览器标识无效')
+    if (request.chat_id !== undefined) {
+      if (request.chat_id !== request.id) throw httpError(400, '浏览器与对话标识不一致')
+      this.service?.requireChat(owner, request.chat_id)
+    }
     const key = `${owner.ownerId}/${request.id}`
     let browser = this.items.get(key)
     if (browser?.closed) { this.items.delete(key); browser = undefined }

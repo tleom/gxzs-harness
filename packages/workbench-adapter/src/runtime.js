@@ -10,6 +10,7 @@ export class WorkbenchRuntime extends Service {
     this.projections = ctx.sessionProjections
     this.childRuns = new WeakMap()
     this.childPrompts = new Map()
+    this.childPromptMutations = new Map()
   }
 
   rootOf(agent) {
@@ -45,20 +46,35 @@ export class WorkbenchRuntime extends Service {
   prepareChildPrompt(chat, child, requestId) {
     const candidates = this.database.listRuns(this.ownerId, chat.id).reverse()
     const requestKey = `subagent-prompt:${child.id}:${requestId}`
-    const replay = candidates.find(run => run.requestKey === requestKey)
+    const saved = this.database.getCommandReceipt(this.ownerId, chat.id, requestKey)
+    const replay = saved ? this.database.getRun(this.ownerId, saved.runId) : candidates.find(run => run.requestKey === requestKey)
     if (replay) return replay
     const previous = candidates.find(run => run.selection?.subagent_ids?.includes(child.id))
     if (!previous) throw Object.assign(new Error('子智能体运行归属尚未恢复，请稍后重试'), { status: 409 })
     const agent = this.agents.get(child.id)
-    if (agent?.status === 'running' && ['running','completed'].includes(previous.status) && !previous.stopConfirmation?.fenced) return previous
+    const pending = this.childPrompts.get(child.id) && this.database.getRun(this.ownerId, this.childPrompts.get(child.id))
+    if ((pending?.status === 'running' || agent?.status === 'running') && ['running','completed'].includes(previous.status) && !previous.stopConfirmation?.fenced) {
+      const receipt = pending ?? previous
+      this.database.saveCommandReceipt(this.ownerId, chat.id, requestKey, { runId: receipt.id })
+      return receipt
+    }
     const { run } = this.database.createRun({ ownerId: this.ownerId, chatId: chat.id, sessionId: chat.sessionId,
       requestKey, query: '', parentRunId: previous.id,
       selection: { ...previous.selection, subagent_ids: [child.id], subagent_names: { [child.id]: child.title },
         native_notice: false, native_child: child.id, silent_resume: true, is_continuation: true }, mcpTools: previous.mcpTools })
     this.database.transitionRun(this.ownerId, run.id, 'running')
+    this.database.saveCommandReceipt(this.ownerId, chat.id, requestKey, { runId: run.id })
     this.childPrompts.set(child.id, run.id)
     if (agent) this.bindChild(agent)
     return this.database.getRun(this.ownerId, run.id)
+  }
+
+  async withChildPrompt(childId, operation) {
+    const previous = this.childPromptMutations.get(childId) ?? Promise.resolve()
+    const pending = previous.catch(() => {}).then(operation)
+    this.childPromptMutations.set(childId, pending)
+    try { return await pending }
+    finally { if (this.childPromptMutations.get(childId) === pending) this.childPromptMutations.delete(childId) }
   }
 
   settleChild(agent) {

@@ -21,12 +21,13 @@ import { WorkbenchSchedules } from './schedules.js'
 import { WorkbenchSubagents } from './subagents.js'
 import { WorkbenchTerminals } from './terminals.js'
 import { WorkbenchBrowsers } from './browsers.js'
+import { registerBrowserTool } from './browser-tool.js'
 import { WorkbenchJobs } from './jobs.js'
 import { registerScheduledClaims } from './scheduled-claims.js'
 import { setTimeout as delay } from 'node:timers/promises'
 
 export const name = 'workbench-adapter'
-export const inject = ['webServer', 'sessionController', 'workspaceController', 'sessionReferenceResolver', 'fileReferences', 'workspaceChanges', 'agents', 'commands', 'skills', 'systemPrompt', 'tokenMeter', 'workbenchFileManager', 'workbenchPlatformClient', 'sessionQuery', 'sessionProjections', 'agentPresets', 'agentDefaultModel', 'settings', 'attachments', 'fileUploads', 'goals', 'terminalController', 'subagents', 'subprocess', 'jobs', 'jobController']
+export const inject = ['webServer', 'sessionController', 'workspaceController', 'sessionReferenceResolver', 'fileReferences', 'workspaceChanges', 'agents', 'commands', 'skills', 'systemPrompt', 'tokenMeter', 'workbenchFileManager', 'workbenchPlatformClient', 'sessionQuery', 'sessionProjections', 'agentPresets', 'agentDefaultModel', 'settings', 'attachments', 'fileUploads', 'goals', 'terminalController', 'subagents', 'subprocess', 'jobs', 'jobController', 'tools']
 
 export const Config = z.object({
   basePath: z.string().default('/ai/workbench'),
@@ -80,7 +81,8 @@ export function apply(ctx, config) {
   workspaces.schedules = schedules
   const subagents = new WorkbenchSubagents({ sessions: ctx.sessionController, service, native: ctx.subagents, attachments: ctx.attachments, runtime })
   const terminals = new WorkbenchTerminals({ native: ctx.terminalController, service, sessions: ctx.sessionController })
-  const browsers = new WorkbenchBrowsers({ subprocess: ctx.subprocess })
+  const browsers = new WorkbenchBrowsers({ subprocess: ctx.subprocess, service })
+  registerBrowserTool(ctx, { browsers, runtime, database, ownerId: config.ownerId })
   const jobs = new WorkbenchJobs({ native: ctx.jobController, registry: ctx.jobs, service })
   service.closeTerminals = async sessionId => {
     const items = ctx.terminalController.list(sessionId)
