@@ -13,12 +13,14 @@ WORKDIR /opt/workbench
 COPY packages ./packages
 COPY profiles/workbench ./profiles/workbench
 COPY scripts/prepare-workspace-changes.mjs /opt/workbench/scripts/prepare-workspace-changes.mjs
+COPY scripts/prepare-sidebar-terminal.mjs /opt/workbench/scripts/prepare-sidebar-terminal.mjs
 COPY scripts/check-runtime-imports.mjs ./check-runtime-imports.mjs
 COPY scripts/patch-dsh-skill-catalog.mjs /opt/workbench/scripts/patch-dsh-skill-catalog.mjs
 COPY scripts/check-dsh-skill-catalog.mjs /opt/workbench/scripts/check-dsh-skill-catalog.mjs
 RUN ln -s profiles/workbench/node_modules /opt/workbench/node_modules \
     && cd profiles/workbench && npm ci --no-audit --no-fund \
     && node /opt/workbench/scripts/patch-dsh-skill-catalog.mjs \
+    && node /opt/workbench/scripts/prepare-sidebar-terminal.mjs \
     && node /opt/workbench/scripts/check-dsh-skill-catalog.mjs \
     && node /opt/workbench/check-runtime-imports.mjs
 COPY services/dsh-host/start.sh /usr/local/bin/start-workbench

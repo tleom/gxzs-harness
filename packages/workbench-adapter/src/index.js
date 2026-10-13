@@ -22,6 +22,7 @@ import { WorkbenchSubagents } from './subagents.js'
 import { WorkbenchTerminals } from './terminals.js'
 import { WorkbenchBrowsers } from './browsers.js'
 import { registerBrowserTool } from './browser-tool.js'
+import { registerTerminalTool } from './terminal-tool.js'
 import { WorkbenchJobs } from './jobs.js'
 import { registerScheduledClaims } from './scheduled-claims.js'
 import { setTimeout as delay } from 'node:timers/promises'
@@ -83,6 +84,7 @@ export function apply(ctx, config) {
   const terminals = new WorkbenchTerminals({ native: ctx.terminalController, service, sessions: ctx.sessionController })
   const browsers = new WorkbenchBrowsers({ subprocess: ctx.subprocess, service })
   registerBrowserTool(ctx, { browsers, runtime, database, ownerId: config.ownerId })
+  registerTerminalTool(ctx, { native: ctx.terminalController, runtime, database, ownerId: config.ownerId })
   const jobs = new WorkbenchJobs({ native: ctx.jobController, registry: ctx.jobs, service })
   service.closeTerminals = async sessionId => {
     const items = ctx.terminalController.list(sessionId)
