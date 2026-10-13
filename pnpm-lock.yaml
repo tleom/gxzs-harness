@@ -26,6 +26,9 @@ importers:
       '@deepseek-ai/dsh-session-reference':
         specifier: 0.2.1-alpha.2
         version: 0.2.1-alpha.2(5a9225699006e3ce397043b495290d04)
+      '@deepseek-ai/dsh-tools':
+        specifier: 0.2.1-alpha.2
+        version: 0.2.1-alpha.2(779d50c05c1b267da637c41eaebe4618)
       '@deepseek-ai/schemastery':
         specifier: 3.18.2
         version: 3.18.2

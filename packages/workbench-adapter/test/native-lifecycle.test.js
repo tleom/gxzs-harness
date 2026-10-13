@@ -15,6 +15,7 @@ import { dispatchRunPrompt } from '../src/native-prompt.js'
 import { registerScheduledClaims } from '../src/scheduled-claims.js'
 import { registerDatabasePrompt } from '../src/database-prompt.js'
 import WorkbenchFileSystem from '../../workbench-sandbox-runtime/src/fs.js'
+import { registerBrowserTool } from '../src/browser-tool.js'
 
 // Exercise the exact published DSH version installed by the production profile.
 // CI must install profiles/workbench before running this contract suite.
@@ -41,10 +42,14 @@ it('continues an owned background-child notice after the parent completed and re
   await test.scheduler.tick()
   await test.agent.whenIdle()
   expect(test.db.getRun(test.owner.ownerId,original.id).status).toBe('completed')
+  await test.scheduler.flushFences()
+  expect(test.db.pendingRunFences(test.owner.ownerId)).toEqual([])
+  expect(test.requests.some(request => request.run_id === original.id && request.action === 'cancel')).toBe(false)
   const message = createUserMessage({content:[{type:'text',text:'child completed'}],source:{kind:'subagent-settled',senderSessionId:'owned-child',form:'notice',summary:'completed'}})
   test.agent.followup(message)
   await test.agent.whenIdle()
   expect(test.model.requests).toHaveLength(2)
+  expect(JSON.stringify(test.model.requests[1].messages)).toContain('child completed')
   const continued = test.db.listRuns(test.owner.ownerId,test.chat.id).find(run => run.id !== original.id)
   expect(continued).toMatchObject({status:'completed',parentRunId:original.id,selection:{is_continuation:true,native_notice:true},mcpTools:original.mcpTools})
   const query = {observeSession:async () => ({events:test.agent.session.snapshotEvents(),[Symbol.dispose]() {}})}
@@ -149,6 +154,81 @@ async function delayedScheduledCatalog(test) {
   await applyMcpTools(test.ctx)
   return { tool, configRequests, release() { available = true; test.ctx.emit('workbench/resources-changed') } }
 }
+
+it('registers the sidebar browser with the real native prompt and tool services', async () => {
+  const test = await fixture(['browser ready'])
+  registerBrowserTool(test.ctx, { browsers: {}, runtime: test.runtime, database: test.db, ownerId: test.owner.ownerId })
+  const run = test.create('Open the sidebar browser')
+  await test.scheduler.enqueue(run, [{ type: 'text', text: run.query }])
+  await test.scheduler.tick()
+  await test.agent.whenIdle()
+  expect(test.model.requests).toHaveLength(1)
+  expect(JSON.stringify(test.model.requests[0])).toContain('The browser tool operates the real browser shown in the current chat sidebar')
+  expect(test.model.requests[0].tools).toContainEqual(expect.objectContaining({ name: 'browser' }))
+  expect(test.db.getRun(test.owner.ownerId, run.id).status).toBe('completed')
+})
+
+it.each(['failed','cancelled'])('keeps a resumed native child %s outcome and exposes its cancellable control receipt', async status => {
+  const test = await fixture(['parent done', status === 'failed' ? new Error('child model failure') : 'hang'])
+  const original = test.create('delegate')
+  test.db.updateRunResources(original, {subagent_ids:['outcome-child']}, original.mcpTools)
+  await test.scheduler.enqueue(original,[{type:'text',text:'delegate'}])
+  await test.scheduler.tick(); await test.agent.whenIdle(); await test.scheduler.tick()
+  const handle = await test.ctx.agents.create({sessionId:'outcome-child',parentAgent:test.agent,
+    agentOptions:{provider:'mock',model:'mock'},meta:{cwd:'/workspace/conversations/native-chat',origin:'subagent'}})
+  const child = handle.agent
+  test.runtime.bindChild(child)
+  const receipt = test.runtime.prepareChildPrompt(test.chat,{id:child.id,title:'验收助手'},'outcome')
+  test.ctx.on('agent/status',({agent,status}) => { if (agent===child && status==='idle') test.runtime.settleChild(child) })
+  const service = new WorkbenchService({database:test.db,sessionController:test.sessions,agents:test.ctx.agents,
+    scheduler:test.scheduler,platformClient:{json:async()=>({data:{fenced:true}})},workspace:'/workspace'})
+  service.cancelOwned = (id,runId) => test.runtime.cancelOwned(id,runId)
+  child.followup(createUserMessage({content:[{type:'text',text:'continue'}],source:{kind:'user'}}))
+  if (status==='cancelled') {
+    await vi.waitFor(()=>expect(test.model.requests).toHaveLength(2))
+    const view = service.getChat(test.owner,test.chat.id)
+    expect(view.control_run).toMatchObject({id:receipt.id,status:'running',events:[]})
+    expect(view.runs.some(run=>run.id===receipt.id)).toBe(false)
+    await service.stopRun(test.owner,view.control_run.id)
+  }
+  await child.whenIdle()
+  expect(test.db.getRun(test.owner.ownerId,receipt.id).status).toBe(status)
+  expect(service.getChat(test.owner,test.chat.id).control_run).toBeNull()
+  if (status==='failed') expect(test.db.pendingRunFences(test.owner.ownerId).some(run=>run.id===receipt.id)).toBe(true)
+  await test.scheduler.flushFences()
+  expect(test.db.getRun(test.owner.ownerId,receipt.id).stopConfirmation?.fenced).toBe(true)
+  expect(() => test.runtime.prepareChildPrompt(test.chat,{id:child.id,title:'验收助手'},'outcome')).toThrow('该消息已结束')
+  await handle.dispose()
+})
+
+it('reacquires real native admission before a later sidebar child step uses its frozen MCP scope', async () => {
+  const test = await fixture(['parent done', 'child continued'])
+  const original = test.create('delegate')
+  test.db.updateRunResources(original, { subagent_ids: ['idle-child'] }, original.mcpTools)
+  await test.scheduler.enqueue(original, [{ type: 'text', text: 'delegate' }])
+  await test.scheduler.tick()
+  await test.agent.whenIdle()
+  await test.scheduler.tick()
+  expect(test.scheduler.hasAdmission(test.agent.id)).toBe(false)
+  const handle = await test.ctx.agents.create({ sessionId: 'idle-child', parentAgent: test.agent,
+    agentOptions: { provider: 'mock', model: 'mock' }, meta: { cwd: '/workspace/conversations/native-chat', origin: 'subagent' } })
+  const child = handle.agent
+  test.runtime.bindChild(child)
+  const receipt = test.runtime.prepareChildPrompt(test.chat, { id: child.id, title: '调查员' }, 'later-sidebar-message')
+  let authorization
+  test.ctx.on('agent/pre-step', (payload, next) => {
+    if (payload.agent === child) authorization = test.runtime.authorizeMcp(child.id, 'personal:server:tool', 'v1')
+    return next()
+  }, { global: true })
+  child.followup(createUserMessage({ content: [{ type: 'text', text: 'continue' }], source: { kind: 'user' } }))
+  await child.whenIdle()
+  expect(test.model.requests).toHaveLength(2)
+  expect(test.requests).toContainEqual(expect.objectContaining({ action: 'acquire', run_id: receipt.id }))
+  expect(authorization).toMatchObject({ runId: receipt.id, ownerId: test.owner.ownerId })
+  test.runtime.settleChild(child)
+  expect(test.db.getRun(test.owner.ownerId, receipt.id).status).toBe('completed')
+  await handle.dispose()
+})
 
 it.each([false, true])('assembles the actual first scheduled native request with verified MCP tools and complete prompt=%s', async complete => {
   const test = await fixture(['scheduled answer'], { scheduledClaims: true })

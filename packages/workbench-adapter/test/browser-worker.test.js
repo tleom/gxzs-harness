@@ -4,24 +4,24 @@ import { PassThrough } from 'node:stream'
 import { expect, it, vi } from 'vitest'
 const { createImageCapture, runWorker } = createRequire(import.meta.url)('../src/browser-worker.cjs')
 
-it('reduces oversized images, reuses the successful quality, and resets it on navigation', async () => {
+it('prefers lossless images, bounds oversized photographs at high quality and resets on navigation', async () => {
   let url = 'https://example.com'
   const page = { url: () => url, viewportSize: () => ({width:1920,height:1080}),
-    screenshot: vi.fn(async ({quality}) => Buffer.alloc(quality > 30 ? 1100000 : 700000)) }
+    screenshot: vi.fn(async ({type,quality}) => Buffer.alloc(type === 'png' || quality > 90 ? 4500000 : 700000)) }
   const capture = createImageCapture({now:()=>0})
   expect((await capture(page)).length).toBe(700000)
-  expect(page.screenshot.mock.calls.map(([args]) => args.quality)).toEqual([70,50,30])
+  expect(page.screenshot.mock.calls.map(([args]) => args.quality)).toEqual([undefined,95,90])
   await capture(page)
-  expect(page.screenshot).toHaveBeenLastCalledWith({type:'jpeg',quality:30,timeout:8000})
+  expect(page.screenshot).toHaveBeenLastCalledWith({type:'jpeg',quality:90,caret:'initial',timeout:8000})
   url = 'https://example.com/next'
   await capture(page)
-  expect(page.screenshot.mock.calls.at(-3)[0].quality).toBe(70)
+  expect(page.screenshot.mock.calls.at(-3)[0].type).toBe('png')
 })
 
 it('shares one bounded screenshot deadline across quality retries', async () => {
   let elapsed = 0
   const page = {url:()=> 'https://example.com', viewportSize:()=>({width:1000,height:700}),
-    screenshot:vi.fn(async()=> { elapsed+=2000; return Buffer.alloc(1100000) })}
+    screenshot:vi.fn(async()=> { elapsed+=2000; return Buffer.alloc(4500000) })}
   await expect(createImageCapture({now:()=>elapsed,budgetMs:5000})(page)).rejects.toThrow('capture_timeout')
   expect(page.screenshot.mock.calls.map(([value])=>value.timeout)).toEqual([5000,3000,1000])
 })
@@ -72,7 +72,7 @@ it.each(['disconnected','crash','close'])('terminates on %s and reports a fatal 
 
 it('reports an uncompressible frame and exits without claiming initialization succeeded', async () => {
   const value = worker()
-  value.page.screenshot.mockImplementation(async()=>Buffer.alloc(1100000))
+  value.page.screenshot.mockImplementation(async()=>Buffer.alloc(4500000))
   try {
     value.input.write(JSON.stringify({id:1,action:'init',width:1000,height:700})+'\n')
     await vi.waitFor(()=>expect(value.exit).toHaveBeenCalledWith(2))

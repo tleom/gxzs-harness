@@ -25,7 +25,7 @@ export async function forkChat(service, owner, sourceRunId, body) {
     const chat = service.requireChat(owner, source.chatId)
     const key = `fork:${source.id}:${body.request_key}`
     const receipt = db.getCommandReceipt(owner.ownerId, chat.id, key)
-    if (receipt) return service.getChat(owner, receipt.chatId)
+    if (receipt) return service.getChat(owner, receipt.chatId, false)
     const runs = db.listRuns(owner.ownerId, chat.id)
     const chain = []
     const seen = new Set()
@@ -102,6 +102,7 @@ export async function forkChat(service, owner, sourceRunId, body) {
       }
       db.saveCommandReceipt(owner.ownerId, chat.id, key, { chatId: id })
     })()
-    return service.getChat(owner, id)
+    // Preserve the entire durable history, but load its display through bounded native pages.
+    return service.getChat(owner, id, false)
   })
 }

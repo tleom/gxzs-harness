@@ -768,7 +768,7 @@ export class WorkbenchDatabase {
     const result = this.db.prepare('UPDATE runs SET status = ?, error = ?, updated_at = ? WHERE id = ? AND owner_id = ?')
       .run(status, error ?? null, now, runId, ownerId)
     if (result.changes !== 1) throw notFound('任务不存在')
-    if (TERMINAL.has(status) && !['discarded', 'steered'].includes(status)
+    if (TERMINAL.has(status) && !['completed', 'discarded', 'steered'].includes(status)
       && (before.turnNumber !== undefined || ['running', 'waiting_input', 'stopping'].includes(before.status)))
       this.requireRunFence(ownerId, runId)
     if (status === 'discarded' || status === 'steered') {

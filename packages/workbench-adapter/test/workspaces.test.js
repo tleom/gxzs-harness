@@ -21,6 +21,16 @@ function fixture() {
 }
 
 describe('native workspace boundary', () => {
+  it('identifies an associated schedule before archive while retaining the native activity error for other chats', async () => {
+    const { bridge, owner, controller } = fixture()
+    bridge.schedules = { catalog: vi.fn(async () => [{ chat_id: 'chat-a', id: 'schedule' }]) }
+    await expect(bridge.mutate(owner, { operation: 'archiveSession', chatId: 'chat-a' }))
+      .rejects.toMatchObject({ status: 409, code: 'WORKSPACE_SCHEDULE_ATTACHED', message: '该对话关联了定时任务，请先删除定时任务' })
+    expect(controller.archiveSession).not.toHaveBeenCalled()
+    const error = { isDSHRemoteError: true, code: 'workspace/session-active' }
+    controller.archiveSession.mockRejectedValue(error)
+    await expect(bridge.mutate(owner, { operation: 'archiveSession', chatId: 'chat-b' })).rejects.toBe(error)
+  })
   it('validates workspace membership independently of an unavailable schedule store', async () => {
     const { bridge, owner, controller } = fixture()
     bridge.schedules = { catalog: vi.fn(async () => { throw new Error('schedule store unavailable') }) }

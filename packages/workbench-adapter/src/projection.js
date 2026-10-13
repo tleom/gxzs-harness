@@ -93,6 +93,10 @@ function projectEvent(database, sessionId, event, expectedOwnerId, context) {
   }
   if (event.type === 'user/message') {
     adoptMessage(database, sessionId, event.data, context)
+    if (isNativeNotice(event.data)) {
+      const run = database.runForMessage(sessionId, event.data.id) ?? database.activeRunBySession(sessionId)
+      if (run) for (const item of nativePresentation(run, event)) database.appendEvent(chat.ownerId, run.id, item)
+    }
     if (event.surfaceOp?.op === 'replace') {
       const run = database.activeRun(chat.ownerId, chat.id)
       if (run) return database.appendEvent(chat.ownerId, run.id, {
@@ -206,6 +210,19 @@ function projectEvent(database, sessionId, event, expectedOwnerId, context) {
 export function nativePresentation(run, event, { streamed = false, toolName = '', messageRun } = {}) {
   switch (event.type) {
     case 'user/message': {
+      const source = event.data?.source
+      if (isNativeNotice(event.data)) {
+        const blocks = event.data.content ?? []
+        const prefix = `Agent ${source.senderSessionId} sent a message: `
+        const content = source.kind === 'agent-message' && blocks[0]?.text === prefix ? blocks.slice(1)
+          : source.kind === 'subagent-settled' && blocks[0]?.text === source.summary &&
+            ['Its closing message:', 'It left no closing message.'].includes(blocks[1]?.text)
+            ? blocks.slice(blocks[1].text === 'Its closing message:' ? 2 : 1) : blocks
+        return [{ event: 'workbench_agent_message', message_id: event.data.id, created_at: event.time / 1000,
+          sender_session_id: source.senderSessionId, sender_name: run.selection?.subagent_names?.[source.senderSessionId] ?? source.senderSessionId,
+          sender_type: source.senderSessionId === run.selection?.parent_session_id ? 'parent' : 'child',
+          query: contentText(content), native: event }]
+      }
       const id = messageRun?.id ?? event.data?.source?.rpcId
       if (typeof id !== 'string' || id === run.id || (run.messageId && run.messageId === event.data?.id)) return []
       return [{ event: 'workbench_steering', steering_id: id,
@@ -333,14 +350,15 @@ function adoptNativeNotice(database, chat, message) {
   if (chat.deletedAt || !isNativeNotice(message) || typeof message.id !== 'string') return
   const existing = database.listRuns(chat.ownerId, chat.id).find(run => run.id === message.id)
   if (existing) return existing
-  const parent = database.listRuns(chat.ownerId, chat.id).find(run =>
+  const parent = database.listRuns(chat.ownerId, chat.id).reverse().find(run =>
     run.selection?.subagent_ids?.includes(message.source.senderSessionId))
   // Bind only notifications from a child previously registered by the native
   // owner graph. A stopped or failed task cannot be woken by a late notice.
-  if (!parent || !['completed', 'running'].includes(parent.status) || parent.stopConfirmation?.fenced) return
+  if (!parent || !['completed', 'running'].includes(parent.status) || parent.stopConfirmation?.fenced
+    || database.pendingRunFences(chat.ownerId).some(run => run.id === parent.id)) return
   const { run } = database.createRun({ ownerId: chat.ownerId, chatId: chat.id, sessionId: chat.sessionId,
     id: message.id, requestKey: `native-notice:${message.id}`, query: contentText(message.content),
-    parentRunId: parent.id, selection: { ...parent.selection, subagent_ids: [], native_notice: true,
+    parentRunId: parent.id, selection: { ...parent.selection, native_child: false, subagent_ids: [], native_notice: true,
       is_continuation: true, silent_resume: true }, mcpTools: parent.mcpTools })
   database.adoptInboxMessage(chat.sessionId, run.id, message.id)
   return run

@@ -75,6 +75,16 @@ it('hides a child cursor when only its descriptor metadata precedes the visible 
   expect(result.history_cursor).toBeNull()
   expect(sessions.page.mock.calls[1][0].address).toMatchObject({ kind: 'subagent', childSessionId: child.id })
 })
+
+it.each(['subagent/invalid-time-zone','subagent/parent-unavailable'])('settles a new rejected child receipt for native %s without an HTTP status', async code => {
+  const error = { isDSHRemoteError: true, code }
+  const receipt = { requestKey: `subagent-prompt:${child.id}:${attachment}`, status: 'running' }
+  const runtime = { prepareChildPrompt: () => receipt, rejectChildPrompt: vi.fn() }
+  const sessions = { list: async () => ({ items: [{ sessionId: 'root', projections: { values: { subagentCatalog: [child] } } }] }) }
+  const gateway = new WorkbenchSubagents({ sessions, service, runtime, native: { prompt: async () => { throw error } } })
+  await expect(gateway.prompt(owner,chat.id,child.id,{requestId:attachment,text:'continue'},new AbortController().signal)).rejects.toBe(error)
+  expect(runtime.rejectChildPrompt).toHaveBeenCalledWith(receipt)
+})
 it('admits image-only continuation through the native image store and scopes binary reads to the owner', async () => {
   const native = {prompt:vi.fn(async () => ({messageId:'accepted'}))}
   const attachments = {readImage:vi.fn(async ref => ({ref,data:Buffer.from('image')}))}
@@ -100,4 +110,15 @@ it('presents stored child image references through the shared attachment rendere
   const gateway = new WorkbenchSubagents({sessions,service})
   const result = await gateway.history(owner,chat.id,child.id,{sessionId:child.id,throughSeq:2,beforeSeq:3},new AbortController().signal)
   expect(result.runs[0].attachments).toEqual([{name:'调查.png',path:'native-image:image-id',size:12,native_image:{parentChatId:chat.id,childId:child.id,ref}}])
+})
+
+it('renders the first child user message once and retains later steering messages', async () => {
+  const event = (seq,id,rpcId,text) => ({event:{seq,time:1000+seq,type:'user/message',data:{id,source:{kind:'user',rpcId},content:[{type:'text',text}]}}})
+  const sessions={list:async()=>({items:[{sessionId:'root',projections:{values:{subagentCatalog:[child]}}}]}),page:async()=>({hasMore:false,records:[
+    {event:{seq:1,time:1000,type:'turn/start',data:{turn:1}}},event(2,'first','request-first','首条'),event(3,'second','request-second','追加'),
+  ]})}
+  const gateway=new WorkbenchSubagents({sessions,service})
+  const result=await gateway.history(owner,chat.id,child.id,{sessionId:child.id,throughSeq:3,beforeSeq:4},new AbortController().signal)
+  expect(result.runs[0]).toMatchObject({query:'首条',message_id:'first'})
+  expect(result.runs[0].events.filter(e=>e.event==='workbench_steering').map(e=>e.query)).toEqual(['追加'])
 })

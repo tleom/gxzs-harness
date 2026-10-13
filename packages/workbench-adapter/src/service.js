@@ -236,9 +236,9 @@ export class WorkbenchService {
     return this.database.listChats(owner.ownerId).map((chat) => this.chatSummary(owner, chat))
   }
 
-  getChat(owner, chatId) {
+  getChat(owner, chatId, includeEvents = true) {
     const chat = this.requireChat(owner, chatId)
-    return { ...this.chatSummary(owner, chat), selection: chat.selection, runs: this.database.listRuns(owner.ownerId, chat.id).map((run) => this.getRun(owner, run.id)) }
+    return { ...this.chatSummary(owner, chat), selection: chat.selection, runs: this.database.listRuns(owner.ownerId, chat.id).filter(run => !run.selection?.native_child).map((run) => this.getRun(owner, run.id, includeEvents)) }
   }
 
   async historyPage(owner, chatId, cursor, signal, nativeLive = false) {
@@ -270,6 +270,7 @@ export class WorkbenchService {
     // The live run uses its existing SSE snapshot/cursor as one atomic pair.
     // Older windows are read-only; they must never replace a newer live view.
     if (cursor === undefined) for (const run of this.database.listRuns(owner.ownerId, chat.id)) {
+      if (run.selection?.native_child) continue
       if (['queued', 'running', 'waiting_input', 'stopping'].includes(run.status)
         || (run.sourceStartSeq == null && run.sourceEndSeq == null)
         || run.sourceEndSeq > page.through_seq || run.sourceStartSeq > page.through_seq) {
@@ -358,6 +359,7 @@ export class WorkbenchService {
       file_directory: chat.directory ?? `conversations/${chat.id}`,
       created_at: Math.floor(chat.createdAt / 1000), updated_at: Math.floor(chat.updatedAt / 1000),
       has_active_run: Boolean(active), is_running: ['queued', 'running', 'stopping'].includes(active?.status), needs_input: active?.status === 'waiting_input',
+      control_run: active?.selection?.native_child ? this.getRun(owner, active.id, false) : null,
       pending_interaction: waiting?.status === 'pending' ? pendingInteraction : null,
       has_error: !active && this.database.latestRunStatus(owner.ownerId, chat.id) === 'failed',
     }

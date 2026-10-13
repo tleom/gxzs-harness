@@ -1,26 +1,88 @@
 // Runs only in the owner sandbox. The Host transports pixels and validated input.
 const { createInterface } = require('node:readline')
-/** Reduce large photographic frames without losing the live stream; reuse the successful quality. */
+/** Prefer lossless text at 2x scale; bound photographic frames without low-quality encoding. */
 function createImageCapture({ now = Date.now, budgetMs = 8000 } = {}) {
-  const qualities = [70, 50, 30, 15]
+  const formats = [{type:'png'}, ...[95,90,85].map(quality => ({type:'jpeg',quality}))]
   let key, start = 0
   return async (page, captureBudgetMs = budgetMs) => {
     const viewport = page.viewportSize()
     const current = `${page.url()}|${viewport.width}:${viewport.height}`
     if (current !== key) { key = current; start = 0 }
     const deadline = now() + Math.min(budgetMs, captureBudgetMs)
-    for (let index = start; index < qualities.length; index++) {
+    for (let index = start; index < formats.length; index++) {
       const remaining = deadline - now()
       if (remaining <= 0) throw new Error('capture_timeout')
-      const image = await page.screenshot({ type: 'jpeg', quality: qualities[index], timeout: remaining })
-      if (image.length <= 1024 * 1024) { start = index; return image }
+      const image = await page.screenshot({ ...formats[index], caret: 'initial', timeout: remaining })
+      if (image.length <= 4 * 1024 * 1024) { start = index; image.mediaType = `image/${formats[index].type}`; return image }
     }
     throw new Error('frame_too_large')
   }
 }
+// Self-contained page-context observation; never evaluates model-provided code.
+function observePage() {
+  const visible = box => box.width > 0 && box.height > 0 && box.bottom > 0 && box.right > 0
+    && box.top < innerHeight && box.left < innerWidth
+  const elements = []
+  for (const element of document.querySelectorAll('a,button,input,textarea,select,[role="button"],[contenteditable="true"]')) {
+    if (elements.length >= 120) break
+    if (!visible(element.getBoundingClientRect()) || getComputedStyle(element).visibility === 'hidden') continue
+    let selector = element.id ? '#' + CSS.escape(element.id) : ''
+    if (!selector || document.querySelectorAll(selector).length !== 1) {
+      const path = []
+      let node = element, anchor = ''
+      while (node && node !== document.body) {
+        const parent = node.parentElement
+        if (!parent) break
+        const siblings = [...parent.children].filter(sibling => sibling.tagName === node.tagName)
+        path.unshift(`${node.tagName.toLowerCase()}:nth-of-type(${siblings.indexOf(node)+1})`)
+        node = parent
+        if (node.id && document.querySelectorAll('#'+CSS.escape(node.id)).length === 1) { anchor = '#'+CSS.escape(node.id); break }
+        if (path.join(' > ').length > 470) break
+      }
+      selector = (anchor ? anchor+' > ' : node === document.body ? 'body > ' : '')+path.join(' > ')
+    }
+    const matches = selector.length <= 512 && document.querySelectorAll(selector)
+    if (!matches || matches.length !== 1 || matches[0] !== element) continue
+    elements.push({ selector, tag: element.tagName.toLowerCase(), role: element.getAttribute('role'),
+      focused: element === document.activeElement,
+      label: (element.getAttribute('aria-label') || element.getAttribute('placeholder') || element.innerText || '').slice(0,200),
+      ...(element.tagName === 'INPUT' && element.type !== 'password' ? { value: element.value.slice(0,200) } : {}) })
+  }
+  const parts = [], walker = document.body && document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT)
+  const range = document.createRange()
+  let node, length = 0, visited = 0
+  while (walker && (node = walker.nextNode()) && length < 20000 && visited++ < 10000) {
+    if (!node.textContent.trim() || ['SCRIPT','STYLE','NOSCRIPT'].includes(node.parentElement?.tagName)) continue
+    if (getComputedStyle(node.parentElement).visibility === 'hidden') continue
+    range.selectNodeContents(node)
+    if (![...range.getClientRects()].some(visible)) continue
+    let start = 0, end = node.textContent.length
+    // A long paragraph may be a single text node. Locate the visible characters
+    // rather than repeatedly returning its off-screen prefix after scrolling.
+    if (end > 2000 && range.getBoundingClientRect().height > innerHeight) {
+      const offset = bottom => {
+        let low = 0, high = node.textContent.length
+        while (low < high) {
+          const middle = (low+high) >>> 1
+          range.setStart(node,middle); range.setEnd(node,middle+1)
+          const box = range.getBoundingClientRect()
+          if (bottom ? box.top >= innerHeight : box.bottom > 0) high = middle
+          else low = middle+1
+        }
+        return low
+      }
+      start = offset(false); end = offset(true)
+    }
+    const text = node.textContent.slice(start, Math.min(end,start+20000-length)).trim()
+    if (text) { parts.push(text); length += text.length+1 }
+  }
+  return { url: location.href.slice(0,4096), title: document.title.slice(0,1024),
+    viewport: { x: scrollX, y: scrollY, width: innerWidth, height: innerHeight }, text: parts.join('\n').slice(0,20000), elements }
+}
+
 function runWorker({ chromium, input = process.stdin, output = process.stdout, exit = code => process.exit(code) }) {
   let browser, context, page, session, watching = false, capturing = false, closed = false
-  let timer, notice = '', navigation = 0, hasFrame = false, navigating = false
+  let timer, notice = '', navigation = 0, hasFrame = false, navigating = false, lastFrame
   let captureFinished = Promise.resolve(), finishCapture = () => {}
   const send = value => new Promise(resolve => {
     if (output.write(JSON.stringify(value) + '\n')) resolve()
@@ -44,9 +106,14 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
       const history = await cdp.send('Page.getNavigationHistory')
       const title = (await target.title()).slice(0, 1024)
       if (target !== page || target.url() !== url || navigation !== epoch || closed) return false
-      await send({ type: 'frame', url: url === 'about:blank' ? '' : url, title,
-        ...viewport, image: image.toString('base64'), back: history.currentIndex > 0,
-        forward: history.currentIndex < history.entries.length - 1, notice })
+      const meta = { type: 'frame', url: url === 'about:blank' ? '' : url, title,
+        ...viewport, mediaType: image.mediaType, back: history.currentIndex > 0,
+        forward: history.currentIndex < history.entries.length - 1, notice }
+      const stamp = JSON.stringify(meta)
+      if (!lastFrame || lastFrame.stamp !== stamp || !lastFrame.image.equals(image)) {
+        await send({ ...meta, image: image.toString('base64') })
+        lastFrame = { stamp, image }
+      }
       hasFrame = true
       return true
     } catch (error) {
@@ -134,7 +201,7 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
         args: ['--no-sandbox', '--disable-dev-shm-usage'], timeout: 20000 })
       browser.on('disconnected', () => fatal('沙盒浏览器已退出，请重新打开浏览器'))
       context = await browser.newContext({ viewport: { width: value.width, height: value.height },
-        locale: 'zh-CN', acceptDownloads: false, serviceWorkers: 'block' })
+        deviceScaleFactor: 2, locale: 'zh-CN', acceptDownloads: false, serviceWorkers: 'block' })
       await context.route('**/*', route => {
         const request = route.request()
         if (request.isNavigationRequest() && !/^https?:\/\//i.test(request.url())) return route.abort()
@@ -149,6 +216,7 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
     }
     if (!page || page.isClosed()) throw new Error('browser_closed')
     if (action === 'watch') { watching = value.enabled === true; if (watching) await frame(); return }
+    if (action === 'snapshot') return page.evaluate(observePage)
     notice = ''
     const moves = ['navigate', 'reload', 'back', 'forward'].includes(action)
     if (moves) { navigation++; navigating = true }
@@ -164,6 +232,8 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
         if (capturing) await captureFinished
         break
       case 'click': await page.mouse.click(value.x, value.y, { button: value.button || 'left', clickCount: value.count || 1 }); break
+      case 'element-click': await page.locator(value.selector).click(); break
+      case 'element-text': await page.locator(value.selector).fill(value.text); break
       case 'move': await page.mouse.move(value.x, value.y); break
       case 'wheel': await page.mouse.wheel(value.x, value.y); break
       case 'text': await page.keyboard.insertText(value.text); break
@@ -193,8 +263,8 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
       let value
       try {
         value = JSON.parse(line)
-        await operation(value)
-        if (!closed) await send({ type: 'result', id: value.id })
+        const result = await operation(value)
+        if (!closed) await send({ type: 'result', id: value.id, ...(result === undefined ? {} : { value: result }) })
       } catch {
         if (closed) return
         const error = ['navigate', 'reload', 'back', 'forward'].includes(value?.action)
@@ -212,5 +282,5 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
   return { shutdown: async () => { lines.close(); await shutdown(); process.off('SIGTERM', terminate); process.off('SIGINT', terminate) } }
 }
 
-module.exports = { createImageCapture, runWorker }
+module.exports = { createImageCapture, runWorker, observePage }
 if (require.main === module) runWorker({ chromium: require('/opt/office/node/node_modules/playwright').chromium })

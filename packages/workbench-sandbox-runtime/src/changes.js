@@ -6,7 +6,7 @@ import {createChangesIo} from './changes-io.js'
 
 export {Config}
 export const name='workbench-workspace-changes'
-export const inject=['subprocess']
+export const inject=['subprocess','fs']
 
 export async function apply(ctx,config) {
   const require=createRequire(import.meta.url)

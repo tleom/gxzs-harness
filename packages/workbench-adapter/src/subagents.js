@@ -1,11 +1,11 @@
 import { hasEarlierContent, historyWindow } from './history-page.js'
 import { HistoryPresentation } from './history-presentation.js'
-import { httpError } from './http.js'
+import { httpError, nativeError } from './http.js'
 
 const terminal = { completed: 'completed', aborted: 'cancelled', interrupted: 'interrupted' }
 /** Read only native catalog descendants; never register another Workbench chat. */
 export class WorkbenchSubagents {
-  constructor({ sessions, service, native, attachments }) { this.sessions = sessions; this.service = service; this.native = native; this.attachments = attachments }
+  constructor({ sessions, service, native, attachments, runtime }) { this.sessions = sessions; this.service = service; this.native = native; this.attachments = attachments; this.runtime = runtime }
   async catalog(owner, chatId, signal) {
     const parent = this.service.requireChat(owner, chatId)
     const { items } = await this.sessions.list({}, signal)
@@ -33,11 +33,23 @@ export class WorkbenchSubagents {
       bytes += image.data.length * 0.75
     }
     if (bytes > 20 * 1024 * 1024) throw httpError(413, '图片总大小超过 20 MiB')
-    return this.native.prompt({ parentSessionId: child.parentSessionId, childSessionId: child.id,
+    const deliver = async () => {
+    signal.throwIfAborted()
+    const receipt = this.runtime?.prepareChildPrompt(this.service.requireChat(owner, chatId), child, request.requestId)
+    try { return await this.native.prompt({ parentSessionId: child.parentSessionId, childSessionId: child.id,
       mode: 'continuable', requestId: request.requestId, delivery: 'queue', content: [
         ...(request.text.trim() ? [{ type: 'text', text: request.text }] : []),
         ...images.map(({ data, mediaType, name }) => ({ type: 'image', data, mediaType, ...(name ? { name } : {}) }))],
       ...(request.clientTimeZone ? { clientTimeZone: request.clientTimeZone } : {}) }, signal)
+    } catch (error) {
+      const status = nativeError(error)?.status ?? error.status
+      if (receipt?.requestKey === `subagent-prompt:${child.id}:${request.requestId}` && receipt.status === 'running'
+        && !signal.aborted && status >= 400 && status < 500 && status !== 408)
+        this.runtime.rejectChildPrompt(receipt)
+      throw error
+    }
+    }
+    return this.runtime?.withChildPrompt ? this.runtime.withChildPrompt(child.id, deliver) : deliver()
   }
   async image(owner, chatId, childId, ref, signal) {
     if (!(await this.catalog(owner, chatId, signal)).some(child => child.id === childId && child.mode !== 'external')) throw httpError(404, '子智能体不属于此对话')
@@ -93,8 +105,12 @@ export class WorkbenchSubagents {
       if (!run) continue
       if (!run.created_at) run.created_at = event.time / 1000
       if (event.type === 'turn/start') run.started_at = event.time / 1000
-      if (event.type === 'user/message' && !run.query && event.data?.source?.kind !== 'workbench-resume') {
-        run.query = (event.data?.content ?? []).filter(block => block.type === 'text').map(block => block.text).join('\n')
+      if (event.type === 'user/message' && !run.messageId && ['user','agent-message','subagent-settled'].includes(event.data?.source?.kind)) {
+        run.messageId = event.data.id
+        run.message_id = event.data.id
+        run.query = event.data.source.kind === 'user' ? (event.data?.content ?? []).filter(block => block.type === 'text').map(block => block.text).join('\n') : ''
+        run.is_continuation = event.data.source.kind !== 'user'
+        run.selection = { parent_session_id: child.parentSessionId }
         run.attachments = (event.data?.content ?? []).filter(block => block.type === 'image' && block.attachment).map(block => ({
           name: block.attachment.name || `图片.${block.attachment.mediaType.split('/').at(-1)}`,
           path: `native-image:${block.attachment.attachmentId}`, size: block.attachment.bytes,
