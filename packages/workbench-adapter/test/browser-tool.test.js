@@ -9,7 +9,7 @@ function fixture() {
   const browsers = { create: vi.fn(async () => {}), require: vi.fn(() => browser) }
   const runtime = { rootOf: () => agent, executionRun: () => ({ id: 'run', status: 'running', ownerId: 'owner' }), scheduler: { hasAdmission: () => true } }
   const database = { getChatBySession: () => chat, appendEvent: vi.fn() }
-  const definition = registerBrowserTool({ tools: { register: vi.fn() }, systemPrompt: { section: vi.fn() } }, { browsers, runtime, database, ownerId: 'owner' })
+  const definition = registerBrowserTool({ tools: { register: vi.fn() }, systemPrompt: { section: vi.fn(), getSectionOrder: () => 3000 } }, { browsers, runtime, database, ownerId: 'owner' })
   return { definition, browser, browsers, runtime, database, chat, exec: { agent, signal: new AbortController().signal } }
 }
 

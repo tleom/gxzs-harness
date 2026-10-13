@@ -15,6 +15,7 @@ import { dispatchRunPrompt } from '../src/native-prompt.js'
 import { registerScheduledClaims } from '../src/scheduled-claims.js'
 import { registerDatabasePrompt } from '../src/database-prompt.js'
 import WorkbenchFileSystem from '../../workbench-sandbox-runtime/src/fs.js'
+import { registerBrowserTool } from '../src/browser-tool.js'
 
 // Exercise the exact published DSH version installed by the production profile.
 // CI must install profiles/workbench before running this contract suite.
@@ -153,6 +154,19 @@ async function delayedScheduledCatalog(test) {
   await applyMcpTools(test.ctx)
   return { tool, configRequests, release() { available = true; test.ctx.emit('workbench/resources-changed') } }
 }
+
+it('registers the sidebar browser with the real native prompt and tool services', async () => {
+  const test = await fixture(['browser ready'])
+  registerBrowserTool(test.ctx, { browsers: {}, runtime: test.runtime, database: test.db, ownerId: test.owner.ownerId })
+  const run = test.create('Open the sidebar browser')
+  await test.scheduler.enqueue(run, [{ type: 'text', text: run.query }])
+  await test.scheduler.tick()
+  await test.agent.whenIdle()
+  expect(test.model.requests).toHaveLength(1)
+  expect(JSON.stringify(test.model.requests[0])).toContain('The browser tool operates the real browser shown in the current chat sidebar')
+  expect(test.model.requests[0].tools).toContainEqual(expect.objectContaining({ name: 'browser' }))
+  expect(test.db.getRun(test.owner.ownerId, run.id).status).toBe('completed')
+})
 
 it('reacquires real native admission before a later sidebar child step uses its frozen MCP scope', async () => {
   const test = await fixture(['parent done', 'child continued'])
