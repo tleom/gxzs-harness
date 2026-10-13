@@ -21,11 +21,12 @@ import { WorkbenchSchedules } from './schedules.js'
 import { WorkbenchSubagents } from './subagents.js'
 import { WorkbenchTerminals } from './terminals.js'
 import { WorkbenchBrowsers } from './browsers.js'
+import { WorkbenchJobs } from './jobs.js'
 import { registerScheduledClaims } from './scheduled-claims.js'
 import { setTimeout as delay } from 'node:timers/promises'
 
 export const name = 'workbench-adapter'
-export const inject = ['webServer', 'sessionController', 'workspaceController', 'sessionReferenceResolver', 'fileReferences', 'workspaceChanges', 'agents', 'commands', 'skills', 'systemPrompt', 'tokenMeter', 'workbenchFileManager', 'workbenchPlatformClient', 'sessionQuery', 'sessionProjections', 'agentPresets', 'agentDefaultModel', 'settings', 'attachments', 'fileUploads', 'goals', 'terminalController', 'subagents', 'subprocess']
+export const inject = ['webServer', 'sessionController', 'workspaceController', 'sessionReferenceResolver', 'fileReferences', 'workspaceChanges', 'agents', 'commands', 'skills', 'systemPrompt', 'tokenMeter', 'workbenchFileManager', 'workbenchPlatformClient', 'sessionQuery', 'sessionProjections', 'agentPresets', 'agentDefaultModel', 'settings', 'attachments', 'fileUploads', 'goals', 'terminalController', 'subagents', 'subprocess', 'jobs', 'jobController']
 
 export const Config = z.object({
   basePath: z.string().default('/ai/workbench'),
@@ -77,9 +78,10 @@ export function apply(ctx, config) {
   service.waitSessionActivity = sessionId => waitSessionActivity(ctx, sessionId)
   const schedules = new WorkbenchSchedules({ native: () => ctx.get('schedule'), database, service })
   workspaces.schedules = schedules
-  const subagents = new WorkbenchSubagents({ sessions: ctx.sessionController, service, native: ctx.subagents, attachments: ctx.attachments })
+  const subagents = new WorkbenchSubagents({ sessions: ctx.sessionController, service, native: ctx.subagents, attachments: ctx.attachments, runtime })
   const terminals = new WorkbenchTerminals({ native: ctx.terminalController, service, sessions: ctx.sessionController })
   const browsers = new WorkbenchBrowsers({ subprocess: ctx.subprocess })
+  const jobs = new WorkbenchJobs({ native: ctx.jobController, registry: ctx.jobs, service })
   service.closeTerminals = async sessionId => {
     const items = ctx.terminalController.list(sessionId)
     if (!items.length) return
@@ -138,7 +140,7 @@ export function apply(ctx, config) {
   ctx.on('agent/created', ({ agent }) => runtime.bindChild(agent), { global: true, prepend: true })
   ctx.on('subagent/start', ({ id }) => {
     const child = ctx.agents.get(id)
-    if (child) runtime.bindChild(child)
+    if (child) runtime.bindChild(child, { activation: true })
   }, { global: true, prepend: true })
   registerScheduledClaims(ctx, { runtime, database, ownerId: config.ownerId })
   ctx.on('agent/pre-step', async (payload, next) => {
@@ -162,7 +164,10 @@ export function apply(ctx, config) {
     return scheduler.admitNativeStep(payload, next)
   }, { global: true, prepend: true })
   ctx.on('agent/status', ({ agent, status }) => {
-    if (status === 'idle') settleNativeIdle(database, agent.session?.id ?? agent.id, ctx.goals?.get(agent))
+    if (status === 'idle') {
+      runtime.settleChild(agent)
+      settleNativeIdle(database, agent.session?.id ?? agent.id, ctx.goals?.get(agent))
+    }
   }, { global: true })
 
   ctx.on('session/event', (session, event) => {
@@ -197,7 +202,7 @@ export function apply(ctx, config) {
     })))
     return {
       resources_pending: modelsOnly,
-      dsh_version: '0.2.1-alpha.2', schedule_protocol: 1, subagent_protocol: 1, terminal_protocol: 1, browser_protocol: 1,
+      dsh_version: '0.2.1-alpha.2', schedule_protocol: 1, subagent_protocol: 1, terminal_protocol: 1, browser_protocol: 1, job_protocol: 1,
       activity_protocol: 1, human_input_protocol: 1, followup_protocol: 1, history_protocol: 1, native_history_protocol: 1,
       control_protocol: 1, goal_events_protocol: 1, compact_events_protocol: 1, resources_protocol: 1, command_resources_protocol: 1, submission_control_protocol: 1,
       default_selection: { model: catalog.default ? `${catalog.default.provider}/${catalog.default.model}` : models[0]?.id ?? '', tools: [], skills: [], knowledge: [], model_parameters: {}, tool_parameters: {} },
@@ -323,6 +328,12 @@ export function apply(ctx, config) {
     ['GET', /^\/chats\/([\w-]+)\/terminals\/([\w-]+)\/events$/, async ({ owner, url }, res, match) => streamNativeEvents({ res, follow: signal => terminals.follow(owner, match[1], match[2], url.searchParams.get('attachment'), signal) })],
     ['POST', /^\/chats\/([\w-]+)\/terminals\/([\w-]+)\/(write|resize)$/, async ({ owner, json }, res, match) => { await terminals.control(owner, match[1], match[2], match[3], json); sendJson(res, 200, { data: {} }) }],
     ['DELETE', /^\/chats\/([\w-]+)\/terminals\/([\w-]+)$/, async ({ owner }, res, match) => { await terminals.control(owner, match[1], match[2], 'close', {}); sendJson(res, 200, { data: {} }) }],
+    ['GET', /^\/chats\/([\w-]+)\/jobs\/events$/, async ({ owner }, res, match) =>
+      streamNativeEvents({ res, follow: signal => jobs.list(owner, match[1], signal) })],
+    ['GET', /^\/chats\/([\w-]+)\/jobs\/([\w-]{1,128})\/events$/, async ({ owner, url }, res, match) =>
+      streamNativeEvents({ res, follow: signal => jobs.follow(owner, match[1], match[2], url.searchParams.get('from'), signal) })],
+    ['POST', /^\/chats\/([\w-]+)\/jobs\/([\w-]{1,128})\/stop$/, async ({ owner }, res, match) =>
+      sendJson(res, 200, { data: await jobs.stop(owner, match[1], match[2]) })],
     ['GET', /^\/chats\/([\w-]+)\/subagents$/, async ({ owner }, res, match) => sendJson(res, 200, { data: await subagents.catalog(owner, match[1], new AbortController().signal) })],
     ['POST', /^\/chats\/([\w-]+)\/subagents\/([\w-]+)\/messages$/, async ({ owner, json }, res, match) => {
       const abort = new AbortController()

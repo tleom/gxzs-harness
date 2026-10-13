@@ -101,3 +101,14 @@ it('presents stored child image references through the shared attachment rendere
   const result = await gateway.history(owner,chat.id,child.id,{sessionId:child.id,throughSeq:2,beforeSeq:3},new AbortController().signal)
   expect(result.runs[0].attachments).toEqual([{name:'调查.png',path:'native-image:image-id',size:12,native_image:{parentChatId:chat.id,childId:child.id,ref}}])
 })
+
+it('renders the first child user message once and retains later steering messages', async () => {
+  const event = (seq,id,rpcId,text) => ({event:{seq,time:1000+seq,type:'user/message',data:{id,source:{kind:'user',rpcId},content:[{type:'text',text}]}}})
+  const sessions={list:async()=>({items:[{sessionId:'root',projections:{values:{subagentCatalog:[child]}}}]}),page:async()=>({hasMore:false,records:[
+    {event:{seq:1,time:1000,type:'turn/start',data:{turn:1}}},event(2,'first','request-first','首条'),event(3,'second','request-second','追加'),
+  ]})}
+  const gateway=new WorkbenchSubagents({sessions,service})
+  const result=await gateway.history(owner,chat.id,child.id,{sessionId:child.id,throughSeq:3,beforeSeq:4},new AbortController().signal)
+  expect(result.runs[0]).toMatchObject({query:'首条',message_id:'first'})
+  expect(result.runs[0].events.filter(e=>e.event==='workbench_steering').map(e=>e.query)).toEqual(['追加'])
+})

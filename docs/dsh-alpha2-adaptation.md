@@ -10,6 +10,7 @@
 | 定时投递 | 原生消息 `source.kind=schedule` 映射为一次业务运行，保留冻结资源和原生消息身份；恢复历史不重新投递，不更改会话标题 | `schedules.test.js`、native lifecycle 测试 |
 | 子智能体 | 目录与历史来自原生 SessionController，按父会话目录校验归属；外部运行子智能体不开放本地历史 | `sidebar-gateways.test.js` |
 | 后台子智能体 | 运行权限依赖实时 AgentRegistry ownership；父轮完成后仅其仍在运行的子智能体继续使用该轮冻结 MCP 资源及 admission，全部退出后释放 | `mcp-runtime.test.js`、`scheduler.test.js` |
+| 后台任务列表 | 原生 JobController 的列表、非消费式输出与停止接口经 owner、Session 和 job ownership 校验；前端入口紧随子智能体，有记录时显示，清空仅隐藏已结束记录 | `jobs.test.js`、前端 Job 菜单及流生命周期测试 |
 | 终端 | 复用原生 TerminalController 的 PTY、屏幕快照、写权限、resize、retain/follow 和 close；浏览器断线不创建新 Shell | `sidebar-gateways.test.js`，部署时 SSH/PTY 冒烟 |
 | 删除会话 | 先原生 archive/stopActivity 提交唤醒围栏，停止定时任务、后台活动与终端，再取消运行并按目录版本删除私有任务目录 | `service.test.js`、真实 Schedule 停止测试 |
 | 工作目录 | 原生 WorkingDirectory 依赖接入测试及 recorder；默认目录按上海日期分层，手选 Workspace 直接作为所有成员会话的 cwd | `service.test.js`、HTTP 集成测试 |
@@ -44,6 +45,10 @@ Java manager 客户端固定 HTTP/1.1，完整 MCP 同步读取失败返回 503�
 可继续子智能体输入支持图片粘贴、拖放及选择，通过原生 Attachment Store 和 SubagentRuntime.prompt 处理。历史图片按父会话归属校验后认证读取。原生子任务完成及 Agent Team Inbox 通知可以唤醒父 Agent，投影成关联的自动续轮；停止围栏、历史恢复和请求幂等仍由已有运行及原生 Inbox 协作。
 
 ## 升级记录逐项适配边界
+
+正常完成仅结束当前父轮，不触发 MCP 取消围栏；用户停止、执行失败及中断仍保留围栏。侧栏向历史子智能体发送新消息时，新执行凭据沿用已授权的冻结插件范围，不解除旧运行的停止保护；该凭据不作为父聊天的用户消息展示。原生首条消息通过 message ID 识别，追加消息不会重复显示为首条。子智能体回复在父会话中显示为带名称的用户消息气泡。
+
+终端沿用原生 OSC 主题与按单元格计算对比度的光标实现，明暗切换不覆盖程序调色板；xterm 6 自有滚动条复用系统颜色、宽度和圆角。内边距放到实际终端元素，确保 FitAddon 在计算可见行列时扣除边距；获取写权限后重新适配并聚焦，终端控制键不触发工作台快捷键。
 
 | 上游变更 | 本项目处理 |
 | --- | --- |
