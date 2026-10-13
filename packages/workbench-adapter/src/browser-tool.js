@@ -56,7 +56,7 @@ export function registerBrowserTool(ctx, { browsers, runtime, database, ownerId 
       } else action = browserAction(args)
       const observed = await browser.command(action, exec.signal)
       const content = args.action === 'snapshot' ? observed : await browser.command({ action: 'snapshot' }, exec.signal)
-      return { browser_id: chat.id, url: browser.frame?.url || '', title: browser.frame?.title || '', content: String(content || '') }
+      return { browser_id: chat.id, url: content.url, title: content.title, content: JSON.stringify(content) }
     },
     presentCall: args => ({ card: 'generic', title: args.url || args.selector || args.action, kind: 'browser' }),
   })

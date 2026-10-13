@@ -18,6 +18,68 @@ function createImageCapture({ now = Date.now, budgetMs = 8000 } = {}) {
     throw new Error('frame_too_large')
   }
 }
+// Self-contained page-context observation; never evaluates model-provided code.
+function observePage() {
+  const visible = box => box.width > 0 && box.height > 0 && box.bottom > 0 && box.right > 0
+    && box.top < innerHeight && box.left < innerWidth
+  const elements = []
+  for (const element of document.querySelectorAll('a,button,input,textarea,select,[role="button"],[contenteditable="true"]')) {
+    if (elements.length >= 120) break
+    if (!visible(element.getBoundingClientRect()) || getComputedStyle(element).visibility === 'hidden') continue
+    let selector = element.id ? '#' + CSS.escape(element.id) : ''
+    if (!selector || document.querySelectorAll(selector).length !== 1) {
+      const path = []
+      let node = element, anchor = ''
+      while (node && node !== document.body) {
+        const parent = node.parentElement
+        if (!parent) break
+        const siblings = [...parent.children].filter(sibling => sibling.tagName === node.tagName)
+        path.unshift(`${node.tagName.toLowerCase()}:nth-of-type(${siblings.indexOf(node)+1})`)
+        node = parent
+        if (node.id && document.querySelectorAll('#'+CSS.escape(node.id)).length === 1) { anchor = '#'+CSS.escape(node.id); break }
+        if (path.join(' > ').length > 470) break
+      }
+      selector = (anchor ? anchor+' > ' : node === document.body ? 'body > ' : '')+path.join(' > ')
+    }
+    const matches = selector.length <= 512 && document.querySelectorAll(selector)
+    if (!matches || matches.length !== 1 || matches[0] !== element) continue
+    elements.push({ selector, tag: element.tagName.toLowerCase(), role: element.getAttribute('role'),
+      focused: element === document.activeElement,
+      label: (element.getAttribute('aria-label') || element.getAttribute('placeholder') || element.innerText || '').slice(0,200),
+      ...(element.tagName === 'INPUT' && element.type !== 'password' ? { value: element.value.slice(0,200) } : {}) })
+  }
+  const parts = [], walker = document.body && document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT)
+  const range = document.createRange()
+  let node, length = 0, visited = 0
+  while (walker && (node = walker.nextNode()) && length < 20000 && visited++ < 10000) {
+    if (!node.textContent.trim() || ['SCRIPT','STYLE','NOSCRIPT'].includes(node.parentElement?.tagName)) continue
+    if (getComputedStyle(node.parentElement).visibility === 'hidden') continue
+    range.selectNodeContents(node)
+    if (![...range.getClientRects()].some(visible)) continue
+    let start = 0, end = node.textContent.length
+    // A long paragraph may be a single text node. Locate the visible characters
+    // rather than repeatedly returning its off-screen prefix after scrolling.
+    if (end > 2000 && range.getBoundingClientRect().height > innerHeight) {
+      const offset = bottom => {
+        let low = 0, high = node.textContent.length
+        while (low < high) {
+          const middle = (low+high) >>> 1
+          range.setStart(node,middle); range.setEnd(node,middle+1)
+          const box = range.getBoundingClientRect()
+          if (bottom ? box.top >= innerHeight : box.bottom > 0) high = middle
+          else low = middle+1
+        }
+        return low
+      }
+      start = offset(false); end = offset(true)
+    }
+    const text = node.textContent.slice(start, Math.min(end,start+20000-length)).trim()
+    if (text) { parts.push(text); length += text.length+1 }
+  }
+  return { url: location.href.slice(0,4096), title: document.title.slice(0,1024),
+    viewport: { x: scrollX, y: scrollY, width: innerWidth, height: innerHeight }, text: parts.join('\n').slice(0,20000), elements }
+}
+
 function runWorker({ chromium, input = process.stdin, output = process.stdout, exit = code => process.exit(code) }) {
   let browser, context, page, session, watching = false, capturing = false, closed = false
   let timer, notice = '', navigation = 0, hasFrame = false, navigating = false, lastFrame
@@ -154,31 +216,7 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
     }
     if (!page || page.isClosed()) throw new Error('browser_closed')
     if (action === 'watch') { watching = value.enabled === true; if (watching) await frame(); return }
-    if (action === 'snapshot') return page.evaluate(() => {
-      const elements = []
-      for (const element of document.querySelectorAll('a,button,input,textarea,select,[role="button"],[contenteditable="true"]')) {
-        if (elements.length >= 120) break
-        const box = element.getBoundingClientRect()
-        if (!box.width || !box.height || getComputedStyle(element).visibility === 'hidden') continue
-        let selector = element.id ? '#' + CSS.escape(element.id) : ''
-        if (!selector || document.querySelectorAll(selector).length !== 1) {
-          const path = []
-          let node = element
-          while (node && node !== document.body && path.length < 10) {
-            const siblings = [...node.parentElement.children].filter(sibling => sibling.tagName === node.tagName)
-            path.unshift(`${node.tagName.toLowerCase()}:nth-of-type(${siblings.indexOf(node)+1})`)
-            node = node.parentElement
-          }
-          selector = 'body > ' + path.join(' > ')
-        }
-        if (selector.length > 512 || document.querySelectorAll(selector).length !== 1) continue
-        elements.push({ selector, tag: element.tagName.toLowerCase(), role: element.getAttribute('role'),
-          focused: element === document.activeElement,
-          label: (element.getAttribute('aria-label') || element.getAttribute('placeholder') || element.innerText || '').slice(0,200),
-          ...(element.tagName === 'INPUT' && element.type !== 'password' ? { value: element.value.slice(0,200) } : {}) })
-      }
-      return JSON.stringify({ text: document.body?.innerText.slice(0,20000) || '', elements })
-    })
+    if (action === 'snapshot') return page.evaluate(observePage)
     notice = ''
     const moves = ['navigate', 'reload', 'back', 'forward'].includes(action)
     if (moves) { navigation++; navigating = true }
@@ -244,5 +282,5 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
   return { shutdown: async () => { lines.close(); await shutdown(); process.off('SIGTERM', terminate); process.off('SIGINT', terminate) } }
 }
 
-module.exports = { createImageCapture, runWorker }
+module.exports = { createImageCapture, runWorker, observePage }
 if (require.main === module) runWorker({ chromium: require('/opt/office/node/node_modules/playwright').chromium })

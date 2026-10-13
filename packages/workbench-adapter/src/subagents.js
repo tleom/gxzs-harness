@@ -1,6 +1,6 @@
 import { hasEarlierContent, historyWindow } from './history-page.js'
 import { HistoryPresentation } from './history-presentation.js'
-import { httpError } from './http.js'
+import { httpError, nativeError } from './http.js'
 
 const terminal = { completed: 'completed', aborted: 'cancelled', interrupted: 'interrupted' }
 /** Read only native catalog descendants; never register another Workbench chat. */
@@ -42,8 +42,9 @@ export class WorkbenchSubagents {
         ...images.map(({ data, mediaType, name }) => ({ type: 'image', data, mediaType, ...(name ? { name } : {}) }))],
       ...(request.clientTimeZone ? { clientTimeZone: request.clientTimeZone } : {}) }, signal)
     } catch (error) {
+      const status = nativeError(error)?.status ?? error.status
       if (receipt?.requestKey === `subagent-prompt:${child.id}:${request.requestId}` && receipt.status === 'running'
-        && !signal.aborted && error.status >= 400 && error.status < 500 && error.status !== 408)
+        && !signal.aborted && status >= 400 && status < 500 && status !== 408)
         this.runtime.rejectChildPrompt(receipt)
       throw error
     }
