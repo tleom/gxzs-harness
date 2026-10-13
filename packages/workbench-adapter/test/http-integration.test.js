@@ -236,7 +236,7 @@ describe('authenticated workbench HTTP handler', () => {
         { id: 'global-skill', scope: 'global' },
       ] } },
     })
-    expect(context.systemPrompt.section.mock.calls.map(([section]) => section.name)).toEqual(['gxzs:sidebar-browser'])
+    expect(context.systemPrompt.section.mock.calls.map(([section]) => section.name)).toEqual(['gxzs:sidebar-browser', 'gxzs:sidebar-terminal'])
     const assemble = context.on.mock.calls.find(([event]) => event === 'system-prompt/assemble')[1]
     context.workbenchPlatformClient.json.mockResolvedValueOnce({ data: { enabled: true, system_prompt: '数据库规则' } })
     const original = { sections: [{ name: 'deployment:persona-prefix', text: '原生身份' }], contexts: [], tools: [], variables: {} }

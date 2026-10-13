@@ -1,5 +1,6 @@
 // Runs only in the owner sandbox. The Host transports pixels and validated input.
 const { createInterface } = require('node:readline')
+const { randomUUID } = require('node:crypto')
 /** Prefer lossless text at 2x scale; bound photographic frames without low-quality encoding. */
 function createImageCapture({ now = Date.now, budgetMs = 8000 } = {}) {
   const formats = [{type:'png'}, ...[95,90,85].map(quality => ({type:'jpeg',quality}))]
@@ -46,7 +47,7 @@ function observePage() {
     elements.push({ selector, tag: element.tagName.toLowerCase(), role: element.getAttribute('role'),
       focused: element === document.activeElement,
       label: (element.getAttribute('aria-label') || element.getAttribute('placeholder') || element.innerText || '').slice(0,200),
-      ...(element.tagName === 'INPUT' && element.type !== 'password' ? { value: element.value.slice(0,200) } : {}) })
+      ...(['INPUT','TEXTAREA','SELECT'].includes(element.tagName) && element.type !== 'password' ? { value: element.value.slice(0,200) } : {}) })
   }
   const parts = [], walker = document.body && document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT)
   const range = document.createRange()
@@ -84,6 +85,14 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
   let browser, context, page, session, watching = false, capturing = false, closed = false
   let timer, notice = '', navigation = 0, hasFrame = false, navigating = false, lastFrame
   let captureFinished = Promise.resolve(), finishCapture = () => {}
+  const pages = new Map()
+  let pageId, pendingPopup, popupLimited = false
+  function selectPage(id) {
+    const selected = pages.get(id)
+    if (!selected || selected.page.isClosed()) throw new Error('browser_closed')
+    if (page !== selected.page) { navigation++; lastFrame = undefined; hasFrame = false }
+    pageId = id; page = selected.page; session = selected.session
+  }
   const send = value => new Promise(resolve => {
     if (output.write(JSON.stringify(value) + '\n')) resolve()
     else output.once('drain', resolve)
@@ -106,7 +115,7 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
       const history = await cdp.send('Page.getNavigationHistory')
       const title = (await target.title()).slice(0, 1024)
       if (target !== page || target.url() !== url || navigation !== epoch || closed) return false
-      const meta = { type: 'frame', url: url === 'about:blank' ? '' : url, title,
+      const meta = { type: 'frame', page_id: pageId, url: url === 'about:blank' ? '' : url, title,
         ...viewport, mediaType: image.mediaType, back: history.currentIndex > 0,
         forward: history.currentIndex < history.entries.length - 1, notice }
       const stamp = JSON.stringify(meta)
@@ -138,10 +147,19 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
     if (!closed) fatal(Date.now() >= deadline ? '网页图像获取超时，请重新打开浏览器' : '网页图像获取失败，请重新打开浏览器')
     throw new Error('frame_unavailable')
   }
-  async function bind(target) {
+  async function bind(target, id) {
     const cdp = await context.newCDPSession(target)
     target.on('crash', () => { if (target === page) fatal('网页进程已退出，请重新打开浏览器') })
-    target.on('close', () => { if (target === page) fatal('网页已经关闭，请重新打开浏览器') })
+    target.on('close', () => {
+      if (!pages.has(id)) return
+      pages.delete(id)
+      void send({ type: 'page-close', page_id: id })
+      if (target === page) {
+        const next = pages.keys().next().value
+        if (next) { selectPage(next); void frame() }
+        else fatal('网页已经关闭，请重新打开浏览器')
+      }
+    })
     target.setDefaultTimeout(5000)
     target.setDefaultNavigationTimeout(20000)
     target.on('dialog', dialog => { notice = '网页弹窗已关闭'; void dialog.dismiss().catch(() => {}) })
@@ -154,11 +172,17 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
         validUrl(main.url())
       } catch { notice = '浏览器仅支持 HTTP 和 HTTPS 页面'; void target.close().catch(() => {}) }
     })
-    target.on('popup', async popup => {
-      // Keep the single tab's owner context; do not create an unowned external guest.
-      const previous = page
+    target.on('popup', popup => {
+      pendingPopup = (async () => {
+      const popupId = randomUUID()
       let popupSession
       try {
+        if (pages.size >= 3) {
+          popupLimited = true
+          notice = '最多打开3个浏览器标签，请先关闭一个'
+          await popup.close().catch(() => {})
+          return
+        }
         try {
           if (popup.url() !== 'about:blank') validUrl(popup.url())
         } catch {
@@ -166,7 +190,7 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
           await popup.close().catch(() => {})
           return
         }
-        popupSession = await bind(popup)
+        popupSession = await bind(popup, popupId)
         // The initial blank popup can navigate while its CDP binding is awaited.
         try { if (popup.url() !== 'about:blank') validUrl(popup.url()) }
         catch {
@@ -175,22 +199,23 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
           await popup.close().catch(() => {})
           return
         }
-        if (closed || page !== previous || popup.isClosed()) {
+        if (closed || popup.isClosed()) {
           await popupSession.detach().catch(() => {})
           await popup.close().catch(() => {})
           return
         }
-        page = popup
-        session = popupSession
-        await previous.close().catch(() => {})
+        pages.set(popupId, { page: popup, session: popupSession })
+        selectPage(popupId)
+        await send({ type: 'page-open', page_id: popupId, opener_id: id })
         await frame()
       } catch {
-        if (page === previous) {
+        if (!pages.has(popupId)) {
           await popupSession?.detach().catch(() => {})
           await popup.close().catch(() => {})
           notice = '弹窗连接中断，请重新打开网页'
         } else fatal('网页连接中断，请重新打开浏览器')
       }
+      })()
     })
     return cdp
   }
@@ -208,15 +233,28 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
         return route.continue()
       })
       page = await context.newPage()
-      session = await bind(page)
+      pageId = value.browser_id || randomUUID()
+      session = await bind(page, pageId)
+      pages.set(pageId, { page, session })
       timer = setInterval(() => { if (watching) void frame() }, 400)
       await frame()
       if (!hasFrame) throw new Error('initial_frame_unavailable')
       return
     }
+    if (action === 'watch' && value.enabled !== true) { watching = false; return }
+    if (value.page_id) selectPage(value.page_id)
     if (!page || page.isClosed()) throw new Error('browser_closed')
     if (action === 'watch') { watching = value.enabled === true; if (watching) await frame(); return }
-    if (action === 'snapshot') return page.evaluate(observePage)
+    if (action === 'snapshot') return { ...await page.evaluate(observePage), page_id: pageId }
+    if (action === 'close-page') {
+      const previous = page
+      pages.delete(pageId)
+      const next = pages.keys().next().value
+      if (next) selectPage(next)
+      await previous.close()
+      if (next) await frame()
+      return
+    }
     notice = ''
     const moves = ['navigate', 'reload', 'back', 'forward'].includes(action)
     if (moves) { navigation++; navigating = true }
@@ -240,8 +278,12 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
       case 'key': await page.keyboard.press(value.key); break
       default: throw new Error('invalid_action')
     } } finally { if (moves) { navigation++; navigating = false } }
+    if (pendingPopup) { const pending = pendingPopup; await pending; if (pendingPopup === pending) pendingPopup = undefined }
     if (moves && capturing) await captureFinished
     if (!watching || !['move', 'wheel', 'text', 'key'].includes(action)) await freshFrame()
+    const result = { page_id: pageId, ...(popupLimited ? { page_limit: true } : {}) }
+    popupLimited = false
+    return result
   }
   function fatal(error) {
     if (closed) return

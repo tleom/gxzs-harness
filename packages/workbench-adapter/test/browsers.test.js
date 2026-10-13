@@ -16,7 +16,7 @@ it('keeps browser actions inside the owner binding and explicit controller lease
   const browser = { command: vi.fn(async () => {}), dispose: vi.fn(), follow: vi.fn(), done: Promise.resolve() }
   const gateway = new WorkbenchBrowsers({ create: () => browser })
   await gateway.create({ownerId:'owner'}, {id}, signal())
-  expect(browser.command).toHaveBeenCalledWith({action:'init',width:1000,height:700}, expect.any(AbortSignal))
+  expect(browser.command).toHaveBeenCalledWith({action:'init',browser_id:id,width:1000,height:700}, expect.any(AbortSignal))
   expect(() => gateway.require({ownerId:'foreign'}, id)).toThrow()
   await expect(gateway.control({ownerId:'owner'}, id, {attachment_id:id, action:'key', key:'Enter'}, signal())).rejects.toMatchObject({status:409})
   browser.controller = id
@@ -26,6 +26,22 @@ it('keeps browser actions inside the owner binding and explicit controller lease
   expect(browser.dispose).not.toHaveBeenCalled()
   await gateway.close({ownerId:'owner'}, id)
   expect(browser.dispose).toHaveBeenCalledOnce()
+})
+it('counts independent tabs and native popups together and closes only the selected native page', async () => {
+  const worker={closed:false,closedPages:new Set(),command:vi.fn(async()=>{}),publish:vi.fn(),dispose:vi.fn(),done:new Promise(()=>{})}
+  const gateway=new WorkbenchBrowsers({create:()=>worker,service:{requireChat:vi.fn()}})
+  const root='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',child='bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb',third='cccccccc-cccc-cccc-cccc-cccccccccccc'
+  await gateway.create({ownerId:'owner'},{id:root,chat_id:id},signal())
+  worker.onPageOpen(child);worker.onPageOpen(third)
+  expect(worker.onPageOpen('dddddddd-dddd-dddd-dddd-dddddddddddd')).toBe(false)
+  await expect(gateway.create({ownerId:'owner'},{id:'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee',chat_id:id},signal())).rejects.toMatchObject({status:429})
+  expect(gateway.currentId({ownerId:'owner'},id)).toBe(third)
+  await gateway.close({ownerId:'owner'},child)
+  expect(worker.command).toHaveBeenLastCalledWith({action:'close-page',page_id:child},undefined)
+  expect(worker.dispose).not.toHaveBeenCalled()
+  expect(gateway.require({ownerId:'owner'},root)).toBe(worker)
+  expect(()=>gateway.require({ownerId:'owner'},child)).toThrow()
+  expect(gateway.count('owner',id)).toBe(2)
 })
 it('does not remove a replacement browser when an earlier initialization fails', async () => {
   let rejectFirst
@@ -101,16 +117,16 @@ it('counts closing subprocesses until done before admitting replacement browsers
     workers.push(value)
     return value
   }})
-  for(let index=0;index<4;index++) {
+  for(let index=0;index<3;index++) {
     const browserId=`12345678-1234-1234-1234-123456789ab${index}`
     await gateway.create({ownerId:'owner'},{id:browserId},signal())
     workers[index].dispose()
   }
   await expect(gateway.create({ownerId:'owner'},{id},signal())).rejects.toMatchObject({status:429})
-  expect(workers).toHaveLength(4)
+  expect(workers).toHaveLength(3)
   exits[0](); await Promise.resolve()
   await gateway.create({ownerId:'owner'},{id},signal())
-  expect(workers).toHaveLength(5)
+  expect(workers).toHaveLength(4)
   gateway.dispose(); for(const exit of exits) exit()
 })
 

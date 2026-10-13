@@ -46,6 +46,30 @@ function worker() {
   return {page,browser,runtime,frames,exit,command,input,context}
 }
 
+it('opens native popups as independent pages, retains the opener and closes only the selected page', async () => {
+  const value=worker()
+  value.page.close=vi.fn(async()=>{})
+  const popup=Object.assign(new EventEmitter(),{url:()=> 'https://example.com/child',viewportSize:()=>({width:1000,height:700}),isClosed:()=>false,
+    screenshot:vi.fn(async()=>Buffer.from('popup')),title:async()=> 'Child',setDefaultTimeout:vi.fn(),setDefaultNavigationTimeout:vi.fn(),
+    close:vi.fn(async()=>{}),keyboard:{insertText:vi.fn(async()=>{})}})
+  try {
+    const root='12345678-1234-1234-1234-123456789abc'
+    await value.command(1,'init',{width:1000,height:700,browser_id:root})
+    value.page.emit('popup',popup)
+    await vi.waitFor(()=>expect(value.frames.some(frame=>frame.type==='page-open')).toBe(true))
+    const id=value.frames.find(frame=>frame.type==='page-open').page_id
+    expect(value.page.close).not.toHaveBeenCalled()
+    await value.command(2,'text',{page_id:root,text:'parent'})
+    await value.command(3,'text',{page_id:id,text:'child'})
+    expect(value.page.keyboard.insertText).toHaveBeenCalledWith('parent')
+    expect(popup.keyboard.insertText).toHaveBeenCalledWith('child')
+    await value.command(4,'close-page',{page_id:id})
+    expect(popup.close).toHaveBeenCalledOnce()
+    expect(value.page.close).not.toHaveBeenCalled()
+    expect(value.browser.close).not.toHaveBeenCalled()
+  } finally { await value.runtime.shutdown() }
+})
+
 it('acknowledges rapid input without taking a screenshot for every action while streaming', async () => {
   const value = worker()
   try {
