@@ -17,6 +17,7 @@ export function registerTerminalTool(ctx, { native, runtime, database, ownerId }
     parameters: {
       action: { type: 'string', required: true, enum: ['open', 'read', 'write', 'key', 'close'] },
       terminal_id: { type: 'string', description: 'A terminal_id returned by this tool; omitted uses the most recent terminal in this chat.' },
+      new_terminal: { type: 'boolean', description: 'For open, create another terminal instead of reusing the current one. The owner sandbox permits three terminals in total.' },
       data: { type: 'string', description: 'Exact raw input for write, including newline when executing a command.' },
       key: { type: 'string', enum: Object.keys(keys), description: 'Control key for key action.' },
       wait_ms: { type: 'integer', description: 'Wait 0–2000 ms before reading the screen; default 200. Long commands continue running.' },
@@ -38,6 +39,7 @@ export function registerTerminalTool(ctx, { native, runtime, database, ownerId }
         throw httpError(403, '当前智能体没有此终端的执行权限')
       if (!['open', 'read', 'write', 'key', 'close'].includes(args.action)
         || (args.terminal_id !== undefined && (typeof args.terminal_id !== 'string' || !uuid.test(args.terminal_id)))
+        || (args.new_terminal !== undefined && typeof args.new_terminal !== 'boolean')
         || (args.action === 'write' && (typeof args.data !== 'string' || Buffer.byteLength(args.data, 'utf8') > 32768))
         || (args.action === 'key' && !Object.hasOwn(keys, args.key))
         || (args.wait_ms !== undefined && (!Number.isSafeInteger(args.wait_ms) || args.wait_ms < 0 || args.wait_ms > 2000)))
@@ -46,8 +48,13 @@ export function registerTerminalTool(ctx, { native, runtime, database, ownerId }
       let info = args.terminal_id ? existing.find(item => item.id === args.terminal_id)
         : [...existing].reverse().find(item => item.state === 'running') || existing.at(-1)
       if (!info && (args.terminal_id || args.action === 'close')) throw httpError(404, '终端不存在或已经关闭')
-      if (!info || (args.action === 'open' && info.state !== 'running'))
-        info = await native.create(root, { id: randomUUID(), cols: 80, rows: 24 }, exec.signal)
+      if (!info || (args.action === 'open' && (info.state !== 'running' || args.new_terminal === true))) {
+        try { info = await native.create(root, { id: randomUUID(), cols: 80, rows: 24 }, exec.signal) }
+        catch (error) {
+          if (error?.code === 'terminal/limit-reached') throw httpError(429, '最多打开3个终端标签，请先关闭一个')
+          throw error
+        }
+      }
       exec.signal.throwIfAborted()
       if (args.action === 'close') {
         await native.close(root, info.id)

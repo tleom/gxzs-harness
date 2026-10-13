@@ -42,6 +42,10 @@ export class SandboxBrowser {
     this.listeners = new Set()
     this.buffer = ''
     this.sequence = 0
+    this.pageFrames = new Map()
+    this.closedPages = new Set()
+    this.popupSequence = 0
+    this.rejectedPages = new Set()
     this.closed = false
     this.watchEnabled = false
     this.watchBusy = false
@@ -81,13 +85,28 @@ export class SandboxBrowser {
         if (frame.type === 'fatal' && typeof frame.error === 'string' && frame.error.length <= 256) {
           this.dispose(httpError(502, frame.error))
           return
+        } else if (frame.type === 'page-open' && uuid.test(frame.page_id) && uuid.test(frame.opener_id)) {
+          if (this.onPageOpen?.(frame.page_id) === false) {
+            this.rejectedPages.add(frame.page_id)
+            void this.command({ action: 'close-page', page_id: frame.page_id }).catch(() => this.dispose())
+            continue
+          }
+          this.openedPageId = frame.page_id
+          this.popupSequence++
+          this.publish()
+        } else if (frame.type === 'page-close' && uuid.test(frame.page_id)) {
+          this.closedPages.add(frame.page_id)
+          this.onPageClose?.(frame.page_id)
+          this.publish()
         } else if (frame.type === 'result') {
           const pending = this.pending.get(frame.id)
-          if (frame.error) pending?.reject(httpError(502, frame.error))
+          if (frame.value?.page_limit || this.rejectedPages.has(frame.value?.page_id)) pending?.reject(httpError(429, '最多打开3个浏览器标签，请先关闭一个'))
+          else if (frame.error) pending?.reject(httpError(502, frame.error))
           else pending?.resolve(frame.value)
         } else if (frame.type === 'frame' && typeof frame.image === 'string' && frame.image.length <= 6 * 1024 * 1024
           && integer(frame.width, 320, 1920) && integer(frame.height, 240, 1080)) {
           this.frame = frame
+          if (uuid.test(frame.page_id)) this.pageFrames.set(frame.page_id, frame)
           this.publish()
         } else throw new Error('Invalid frame')
       } catch { this.dispose(httpError(502, '沙盒浏览器数据无效')); return }
@@ -117,7 +136,7 @@ export class SandboxBrowser {
       this.pending.set(id, { resolve: value => finish(resolve, value), reject: error => finish(reject, error) })
       signal.addEventListener('abort', cancel, { once: true })
       timer = setTimeout(cancel, 35000)
-      try { this.handle.stdin.write(JSON.stringify({ ...value, id }) + '\n') }
+      try { this.handle.stdin.write(JSON.stringify({ page_id: this.rootPageId, ...value, id }) + '\n') }
       catch { this.dispose(httpError(502, '沙盒浏览器连接中断')) }
     })
   }
@@ -127,19 +146,22 @@ export class SandboxBrowser {
   syncWatch() {
     if (this.closed || this.watchBusy || this.pending.size >= 32) return
     const enabled = this.listeners.size > 0
-    if (enabled === this.watchEnabled) return
+    const pageId = this.controllerPageId || this.rootPageId
+    if (enabled === this.watchEnabled && (!enabled || this.watchPageId === pageId)) return
     this.watchBusy = true
-    this.command({ action: 'watch', enabled }).then(
-      () => { this.watchEnabled = enabled },
+    this.command({ action: 'watch', enabled, page_id: pageId }).then(
+      () => { this.watchEnabled = enabled; this.watchPageId = pageId },
       error => this.dispose(error),
     ).finally(() => { this.watchBusy = false; this.syncWatch() })
   }
-  async *follow(attachment, signal) {
+  async *follow(attachment, signal, pageId = this.rootPageId) {
     if (this.closed) throw this.failure
     signal.throwIfAborted()
     const lease = Symbol('browser stream')
     this.controllerLease = lease
     this.controller = attachment
+    this.controllerPageId = pageId
+    let popupCursor = this.popupSequence
     let wake, changed = true
     const update = () => { changed = true; wake?.(); wake = undefined }
     this.listeners.add(update)
@@ -148,19 +170,26 @@ export class SandboxBrowser {
     this.publish()
     this.syncWatch()
     try {
-      while (!signal.aborted && !this.closed) {
+      while (!signal.aborted && !this.closed && !this.closedPages.has(pageId)) {
         if (!changed) await new Promise(resolve => { wake = resolve })
         if (signal.aborted || this.closed) break
         changed = false
-        if (this.frame) yield { event: 'workbench_browser', value: { ...this.frame, writable: this.controllerLease === lease } }
+        const frame = this.pageFrames.get(pageId) || this.frame
+        if (frame) {
+          yield { event: 'workbench_browser', value: { ...frame, writable: this.controllerLease === lease,
+            ...(this.popupSequence > popupCursor ? { opened_page_id: this.openedPageId } : {}) } }
+          popupCursor = this.popupSequence
+        }
       }
       if (this.closed && !signal.aborted) throw this.failure
+      if (this.closedPages.has(pageId) && !signal.aborted) throw httpError(410, '浏览器标签已经关闭')
     } finally {
       signal.removeEventListener('abort', update)
       this.listeners.delete(update)
       if (this.controllerLease === lease) {
         this.controllerLease = undefined
         this.controller = undefined
+        this.controllerPageId = undefined
       }
       this.publish()
       this.syncWatch()
@@ -179,32 +208,65 @@ export class SandboxBrowser {
   }
 }
 
+/** A native popup remains in its opener's Chromium context, with a separate sidebar identity. */
+class BrowserPage {
+  constructor(worker, id, chatId) { this.worker = worker; this.id = id; this.chatId = chatId; this.ready = worker.ready }
+  get closed() { return this.worker.closed || this.worker.closedPages.has(this.id) }
+  get controller() { return this.worker.controllerPageId === this.id ? this.worker.controller : undefined }
+  command(value, signal) { return this.worker.command({ ...value, page_id: this.id }, signal) }
+  follow(attachment, signal) { return this.worker.follow(attachment, signal, this.id) }
+}
+
 export class WorkbenchBrowsers {
-  constructor({ subprocess, service, create = () => new SandboxBrowser(subprocess) }) { this.items = new Map(); this.workers = new Set(); this.createBrowser = create; this.service = service }
+  constructor({ subprocess, service, create = () => new SandboxBrowser(subprocess) }) { this.items = new Map(); this.workers = new Set(); this.current = new Map(); this.slots = new Map(); this.createBrowser = create; this.service = service }
+  count(ownerId) { return [...this.slots.values()].filter(slot => slot.ownerId === ownerId).length }
   async create(owner, request, signal) {
     signal.throwIfAborted()
     if (!uuid.test(request.id)) throw httpError(400, '浏览器标识无效')
     if (request.chat_id !== undefined) {
-      if (request.chat_id !== request.id) throw httpError(400, '浏览器与对话标识不一致')
       this.service?.requireChat(owner, request.chat_id)
     }
     const key = `${owner.ownerId}/${request.id}`
     let browser = this.items.get(key)
+    if (browser && request.chat_id && browser.chatId !== request.chat_id) throw httpError(403, '浏览器不属于当前对话')
     if (browser?.closed) { this.items.delete(key); browser = undefined }
     if (!browser) {
       for (const [id, item] of this.items) if (item.closed) this.items.delete(id)
-      if (this.workers.size >= 4) throw httpError(429, '浏览器数量已达上限，请关闭其他标签或稍后重试')
+      if (this.count(owner.ownerId, request.chat_id) >= 3) throw httpError(429, '最多打开3个浏览器标签，请先关闭一个')
       browser = this.createBrowser()
+      browser.rootPageId = request.id
+      browser.id = request.id
+      browser.chatId = request.chat_id
+      this.slots.set(key, { ownerId: owner.ownerId, chatId: request.chat_id, worker: browser })
+      browser.onPageOpen = id => {
+        if (this.count(owner.ownerId, request.chat_id) >= 3) return false
+        this.slots.set(`${owner.ownerId}/${id}`, { ownerId: owner.ownerId, chatId: request.chat_id, worker: browser })
+        this.items.set(`${owner.ownerId}/${id}`, new BrowserPage(browser, id, request.chat_id))
+        this.current.set(`${owner.ownerId}/${request.chat_id}`, id)
+      }
+      browser.onPageClose = id => { this.items.delete(`${owner.ownerId}/${id}`); this.slots.delete(`${owner.ownerId}/${id}`) }
       this.workers.add(browser)
       const worker = browser
-      const settled = () => this.workers.delete(worker)
+      const settled = () => {
+        this.workers.delete(worker)
+        if (worker.closed) {
+          for (const [key, slot] of this.slots) if (slot.worker === worker) { this.slots.delete(key); this.items.delete(key) }
+          worker.pageFrames?.clear()
+        }
+      }
       Promise.resolve(worker.done).then(settled, settled)
       this.items.set(key, browser)
-      browser.ready = browser.command({ action: 'init', width: 1000, height: 700 }, signal)
+      browser.ready = browser.command({ action: 'init', browser_id: request.id, width: 1000, height: 700 }, signal)
     }
     try { await browser.ready }
-    catch (error) { browser.dispose(); if (this.items.get(key) === browser) this.items.delete(key); throw error }
+    catch (error) { (browser.worker || browser).dispose(); if (this.items.get(key) === browser) this.items.delete(key); throw error }
+    this.current.set(`${owner.ownerId}/${request.chat_id}`, request.id)
     return { id: request.id }
+  }
+  currentId(owner, chatId) {
+    const id = this.current.get(`${owner.ownerId}/${chatId}`)
+    const item = id && this.items.get(`${owner.ownerId}/${id}`)
+    return item && !item.closed && item.chatId === chatId ? id : undefined
   }
   require(owner, id) {
     const browser = this.items.get(`${owner.ownerId}/${id}`)
@@ -213,19 +275,29 @@ export class WorkbenchBrowsers {
   }
   follow(owner, id, attachment, signal) {
     if (!uuid.test(attachment)) throw httpError(400, '浏览器连接标识无效')
-    return this.require(owner, id).follow(attachment, signal)
+    const browser = this.require(owner, id)
+    this.current.set(`${owner.ownerId}/${browser.chatId}`, id)
+    return browser.follow(attachment, signal)
   }
   async control(owner, id, request, signal) {
     const browser = this.require(owner, id)
-    if (!uuid.test(request.attachment_id) || browser.controller !== request.attachment_id) throw httpError(409, '另一页面正在控制此浏览器，请接管后重试')
+    if (!uuid.test(request.attachment_id) || browser.controller !== request.attachment_id
+      || (browser.rootPageId && browser.controllerPageId && browser.controllerPageId !== id)) throw httpError(409, '另一页面正在控制此浏览器，请重新连接后重试')
+    this.current.set(`${owner.ownerId}/${browser.chatId}`, id)
     await browser.command(browserAction(request), signal)
   }
   async close(owner, id) {
     const key = `${owner.ownerId}/${id}`, browser = this.items.get(key)
     if (!browser) return
-    browser.dispose()
-    await browser.done
+    const worker = browser.worker || browser
+    const siblings = [...this.items.values()].filter(item => (item.worker || item) === worker && !item.closed)
+    if (siblings.length > 1) {
+      await browser.command({ action: 'close-page' })
+      worker.closedPages.add(id)
+      worker.publish()
+    } else { worker.dispose(); await worker.done }
     if (this.items.get(key) === browser) this.items.delete(key)
+    this.slots.delete(key)
   }
-  dispose() { for (const browser of this.items.values()) browser.dispose(); this.items.clear() }
+  dispose() { for (const worker of this.workers) worker.dispose(); this.items.clear(); this.current.clear() }
 }

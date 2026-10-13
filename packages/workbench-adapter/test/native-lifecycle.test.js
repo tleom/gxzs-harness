@@ -163,7 +163,7 @@ it('registers the sidebar browser with the real native prompt and tool services'
   await test.scheduler.tick()
   await test.agent.whenIdle()
   expect(test.model.requests).toHaveLength(1)
-  expect(JSON.stringify(test.model.requests[0])).toContain('The browser tool operates the real browser shown in the current chat sidebar')
+  expect(JSON.stringify(test.model.requests[0])).toContain('The browser tool operates real browser tabs in the current chat sidebar')
   expect(test.model.requests[0].tools).toContainEqual(expect.objectContaining({ name: 'browser' }))
   expect(test.db.getRun(test.owner.ownerId, run.id).status).toBe('completed')
 })

@@ -19,7 +19,7 @@ it('uses the root chat browser and returns a fresh observation after selector in
   expect(test.browsers.create).toHaveBeenCalledWith({ ownerId: 'owner' }, { id: test.chat.id, chat_id: test.chat.id }, test.exec.signal)
   expect(test.browser.command.mock.calls.map(([value]) => value)).toEqual([{ action: 'element-text', selector: '#search', text: '中文' }, { action: 'snapshot' }])
   expect(value).toMatchObject({ browser_id: test.chat.id, url: 'https://example.com/', content: expect.stringContaining('Example') })
-  expect(test.database.appendEvent).toHaveBeenCalledWith('owner', 'run', { event: 'workbench_browser_open', chat_id: test.chat.id })
+  expect(test.database.appendEvent).toHaveBeenCalledWith('owner', 'run', { event: 'workbench_browser_open', chat_id: test.chat.id, browser_id: test.chat.id })
 })
 
 it('returns the current snapshot URL and title when an SPA changed without an active sidebar watcher', async () => {

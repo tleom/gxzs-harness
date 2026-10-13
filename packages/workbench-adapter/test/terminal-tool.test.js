@@ -67,8 +67,8 @@ it('keeps the native UI attachment writable while the Agent observes and writes 
   expect(()=>sidebarTerminalSource('upstream changed')).toThrow('contract changed')
   const standalone=patched.replace(/from "([^".][^"]*)"/g,(_all,name)=>`from ${JSON.stringify(pathToFileURL(require.resolve(name)).href)}`)
     .replaceAll('import.meta.url',JSON.stringify(pathToFileURL(entry).href))
-    .replace('export { TerminalController, TerminalController as default };','export { BrowserTerminal };')
-  const {BrowserTerminal}=await import('data:text/javascript;base64,'+Buffer.from(standalone).toString('base64'))
+    .replace('export { TerminalController, TerminalController as default };','export { BrowserTerminal, TerminalController };')
+  const {BrowserTerminal,TerminalController}=await import('data:text/javascript;base64,'+Buffer.from(standalone).toString('base64'))
   let output, finish
   const handle={write:vi.fn(async()=>{}),output:{async *[Symbol.asyncIterator](){yield await new Promise(resolve=>{output=resolve})}},done:new Promise(resolve=>{finish=resolve}),terminate:async()=>{finish({exitCode:0})}}
   const terminal=new BrowserTerminal(handle,{id,title:'bash',cols:80,rows:24,state:'running'},100,1024*1024)
@@ -88,4 +88,15 @@ it('keeps the native UI attachment writable while the Agent observes and writes 
   expect(handle.write).toHaveBeenCalledTimes(2)
   finish({exitCode:0})
   abort.abort();await ui.return();await terminal.close()
+  const owner=()=>({terminals:new Map(),pending:new Map(),allocations:new Map(),closedIds:new Set(),lifetime:new AbortController()})
+  const a=owner(),b=owner();a.terminals.set('one',{});a.terminals.set('two',{});b.terminals.set('three',{})
+  const allocation={info:{id:'new'},monitor:vi.fn()}
+  const controller={lifetime:new AbortController(),config:{maxTerminals:3},owners:new Map([['a',a],['b',b]]),
+    owner:()=>b,dimensions:()=>{},requireOpen:()=>{},spawn:vi.fn(async()=>allocation)}
+  const signal=new AbortController().signal
+  await expect(TerminalController.prototype.create.call(controller,{}, {id:'new',cols:80,rows:24},signal)).rejects.toMatchObject({code:'terminal/limit-reached'})
+  expect(controller.spawn).not.toHaveBeenCalled()
+  a.terminals.delete('two')
+  await TerminalController.prototype.create.call(controller,{}, {id:'new',cols:80,rows:24},signal)
+  expect(controller.spawn).toHaveBeenCalledOnce()
 })

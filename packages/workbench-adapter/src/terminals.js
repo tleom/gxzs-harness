@@ -13,8 +13,13 @@ export class WorkbenchTerminals {
   async create(owner, chatId, request, signal) {
     if (!uuid.test(request.id)) throw httpError(400, '终端标识无效')
     const agent = await this.agent(owner, chatId)
-    return this.native.create(agent, { id: request.id, cols: request.cols, rows: request.rows,
-      ...(request.shellPath ? { shellPath: request.shellPath } : {}) }, signal)
+    try {
+      return await this.native.create(agent, { id: request.id, cols: request.cols, rows: request.rows,
+        ...(request.shellPath ? { shellPath: request.shellPath } : {}) }, signal)
+    } catch (error) {
+      if (error?.code === 'terminal/limit-reached') throw httpError(429, '最多打开3个终端标签，请先关闭一个')
+      throw error
+    }
   }
   async *follow(owner, chatId, id, attachment, signal) {
     if (!uuid.test(attachment)) throw httpError(400, '终端连接标识无效')
