@@ -1,5 +1,15 @@
 import { httpError } from './http.js'
 const uuid = /^[a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12}$/i
+async function waitFor(promise, signal) {
+  let abort
+  const cancelled = new Promise((_, reject) => {
+    abort = () => reject(signal.reason || new Error('Terminal request cancelled'))
+    signal.addEventListener('abort', abort, { once: true })
+    if (signal.aborted) abort()
+  })
+  try { return await Promise.race([promise, cancelled]) }
+  finally { signal.removeEventListener('abort', abort) }
+}
 /** The native terminal controller owns PTYs, screens, attachments and cleanup. */
 export class WorkbenchTerminals {
   constructor({ native, service, sessions }) { this.native = native; this.service = service; this.sessions = sessions; this.creating = new Map() }
@@ -17,6 +27,10 @@ export class WorkbenchTerminals {
     signal.throwIfAborted()
     const key = `${owner.ownerId}/${chatId}`
     let allocation = this.creating.get(key)
+    if (allocation?.controller.signal.aborted) {
+      await waitFor(allocation.promise.catch(() => {}), signal)
+      return this.create(owner, chatId, request, signal)
+    }
     if (!allocation) {
       const retained = this.native.list(agent.session.id)
       const running = retained.findLast(info => info.state === 'running')
@@ -40,16 +54,9 @@ export class WorkbenchTerminals {
       this.creating.set(key, current)
     }
     allocation.waiters++
-    let abort
-    const cancelled = new Promise((_, reject) => {
-      abort = () => reject(signal.reason || new Error('Terminal request cancelled'))
-      signal.addEventListener('abort', abort, { once: true })
-      if (signal.aborted) abort()
-    })
     try {
-      return await Promise.race([allocation.promise, cancelled])
+      return await waitFor(allocation.promise, signal)
     } finally {
-      signal.removeEventListener('abort', abort)
       if (--allocation.waiters === 0 && !allocation.settled) allocation.controller.abort()
     }
   }

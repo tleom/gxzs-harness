@@ -257,10 +257,21 @@ export class WorkbenchBrowsers {
       Promise.resolve(worker.done).then(settled, settled)
       this.items.set(key, browser)
       this.current.set(`${owner.ownerId}/${request.chat_id}`, request.id)
-      browser.ready = browser.command({ action: 'init', browser_id: request.id, width: 1000, height: 700 }, signal)
+      browser.ready = browser.command({ action: 'init', browser_id: request.id, width: 1000, height: 700 },
+        browser.lifetime?.signal || new AbortController().signal).catch(error => {
+        worker.dispose()
+        if (this.items.get(key) === worker) this.items.delete(key)
+        throw error
+      })
     }
-    try { await browser.ready }
-    catch (error) { (browser.worker || browser).dispose(); if (this.items.get(key) === browser) this.items.delete(key); throw error }
+    let abort
+    const cancelled = new Promise((_, reject) => {
+      abort = () => reject(signal.reason || new Error('Browser request cancelled'))
+      signal.addEventListener('abort', abort, { once: true })
+      if (signal.aborted) abort()
+    })
+    try { await Promise.race([browser.ready, cancelled]); signal.throwIfAborted() }
+    finally { signal.removeEventListener('abort', abort) }
     this.current.set(`${owner.ownerId}/${request.chat_id}`, request.id)
     return { id: request.id }
   }

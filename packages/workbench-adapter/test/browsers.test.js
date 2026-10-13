@@ -75,6 +75,25 @@ it('does not remove a replacement browser when an earlier initialization fails',
   expect(gateway.require({ownerId:'owner'},id)).toBe(second)
   gateway.dispose()
 })
+it('keeps shared initialization alive when its first browser caller disconnects', async () => {
+  let ready
+  const browser = { closed:false, lifetime:new AbortController(), done:new Promise(()=>{}), dispose:vi.fn(),
+    command:vi.fn((_value,signal)=>new Promise((resolve,reject)=>{
+      ready=resolve; signal.addEventListener('abort',()=>reject(signal.reason),{once:true})
+    })) }
+  const gateway=new WorkbenchBrowsers({create:()=>browser,service:{requireChat:vi.fn()}})
+  const a=new AbortController(),b=new AbortController(),chatId='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
+  const first=gateway.create({ownerId:'owner'},{id,chat_id:chatId},a.signal)
+  const second=gateway.create({ownerId:'owner'},{id,chat_id:chatId},b.signal)
+  a.abort(new Error('first disconnected'))
+  await expect(first).rejects.toThrow('first disconnected')
+  expect(browser.lifetime.signal.aborted).toBe(false)
+  expect(browser.dispose).not.toHaveBeenCalled()
+  ready()
+  await expect(second).resolves.toEqual({id})
+  expect(browser.command).toHaveBeenCalledOnce()
+  gateway.dispose()
+})
 it('streams a bounded latest frame, reports takeover, and aborts its sandbox process on close', async () => {
   let finish
   const stdout = new PassThrough(), stdin = new PassThrough()

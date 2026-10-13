@@ -59,6 +59,28 @@ it('closes exited retained terminals before allocating a usable shell', async ()
   expect(native.close).toHaveBeenCalledWith(expect.anything(),attachment)
   expect(native.close.mock.invocationCallOrder[0]).toBeLessThan(native.create.mock.invocationCallOrder[0])
 })
+it('waits for cancelled terminal cleanup before allocating for a reconnecting caller', async () => {
+  let finishCleanup, lifetime
+  const native={list:()=>[],create:vi.fn((_agent,request,signal)=>{
+    if(native.create.mock.calls.length>1) return Promise.resolve({id:request.id,state:'running'})
+    lifetime=signal
+    return new Promise((_,reject)=>{ finishCleanup=()=>reject(new Error('old allocation cancelled')) })
+  })}
+  const gateway=new WorkbenchTerminals({native,service,sessions:{resolveAgent:async()=>({agent:{session:{id:'root'}}})}})
+  const firstAbort=new AbortController()
+  const first=gateway.create(owner,chat.id,{id:attachment},firstAbort.signal)
+  await vi.waitFor(()=>expect(native.create).toHaveBeenCalledOnce())
+  firstAbort.abort(new Error('disconnected'))
+  await expect(first).rejects.toThrow('disconnected')
+  expect(lifetime.aborted).toBe(true)
+  const id='22345678-1234-1234-1234-123456789abc'
+  const replacement=gateway.create(owner,chat.id,{id},new AbortController().signal)
+  await Promise.resolve(); await Promise.resolve()
+  expect(native.create).toHaveBeenCalledOnce()
+  finishCleanup()
+  await expect(replacement).resolves.toEqual({id,state:'running'})
+  expect(native.create).toHaveBeenCalledTimes(2)
+})
 it('binds terminals to the signed Session and holds the native process until stream cancellation', async () => {
   const agent = { session: { id: chat.sessionId } }
   const released = vi.fn()
