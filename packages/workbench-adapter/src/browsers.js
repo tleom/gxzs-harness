@@ -219,7 +219,7 @@ class BrowserPage {
 
 export class WorkbenchBrowsers {
   constructor({ subprocess, service, create = () => new SandboxBrowser(subprocess) }) { this.items = new Map(); this.workers = new Set(); this.current = new Map(); this.slots = new Map(); this.createBrowser = create; this.service = service }
-  count(ownerId) { return [...this.slots.values()].filter(slot => slot.ownerId === ownerId).length }
+  count(ownerId, chatId) { return [...this.slots.values()].filter(slot => slot.ownerId === ownerId && slot.chatId === chatId).length }
   async create(owner, request, signal) {
     signal.throwIfAborted()
     if (!uuid.test(request.id)) throw httpError(400, '浏览器标识无效')
@@ -232,14 +232,14 @@ export class WorkbenchBrowsers {
     if (browser?.closed) { this.items.delete(key); browser = undefined }
     if (!browser) {
       for (const [id, item] of this.items) if (item.closed) this.items.delete(id)
-      if (this.count(owner.ownerId, request.chat_id) >= 3) throw httpError(429, '最多打开3个浏览器标签，请先关闭一个')
+      if (this.count(owner.ownerId, request.chat_id) >= 1) throw httpError(409, '当前对话已有浏览器，请打开已有标签')
       browser = this.createBrowser()
       browser.rootPageId = request.id
       browser.id = request.id
       browser.chatId = request.chat_id
       this.slots.set(key, { ownerId: owner.ownerId, chatId: request.chat_id, worker: browser })
       browser.onPageOpen = id => {
-        if (this.count(owner.ownerId, request.chat_id) >= 3) return false
+        if (this.count(owner.ownerId, request.chat_id) >= 1) return false
         this.slots.set(`${owner.ownerId}/${id}`, { ownerId: owner.ownerId, chatId: request.chat_id, worker: browser })
         this.items.set(`${owner.ownerId}/${id}`, new BrowserPage(browser, id, request.chat_id))
         this.current.set(`${owner.ownerId}/${request.chat_id}`, id)
@@ -256,10 +256,22 @@ export class WorkbenchBrowsers {
       }
       Promise.resolve(worker.done).then(settled, settled)
       this.items.set(key, browser)
-      browser.ready = browser.command({ action: 'init', browser_id: request.id, width: 1000, height: 700 }, signal)
+      this.current.set(`${owner.ownerId}/${request.chat_id}`, request.id)
+      browser.ready = browser.command({ action: 'init', browser_id: request.id, width: 1000, height: 700 },
+        browser.lifetime?.signal || new AbortController().signal).catch(error => {
+        worker.dispose()
+        if (this.items.get(key) === worker) this.items.delete(key)
+        throw error
+      })
     }
-    try { await browser.ready }
-    catch (error) { (browser.worker || browser).dispose(); if (this.items.get(key) === browser) this.items.delete(key); throw error }
+    let abort
+    const cancelled = new Promise((_, reject) => {
+      abort = () => reject(signal.reason || new Error('Browser request cancelled'))
+      signal.addEventListener('abort', abort, { once: true })
+      if (signal.aborted) abort()
+    })
+    try { await Promise.race([browser.ready, cancelled]); signal.throwIfAborted() }
+    finally { signal.removeEventListener('abort', abort) }
     this.current.set(`${owner.ownerId}/${request.chat_id}`, request.id)
     return { id: request.id }
   }

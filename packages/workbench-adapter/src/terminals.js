@@ -1,8 +1,18 @@
 import { httpError } from './http.js'
 const uuid = /^[a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12}$/i
+async function waitFor(promise, signal) {
+  let abort
+  const cancelled = new Promise((_, reject) => {
+    abort = () => reject(signal.reason || new Error('Terminal request cancelled'))
+    signal.addEventListener('abort', abort, { once: true })
+    if (signal.aborted) abort()
+  })
+  try { return await Promise.race([promise, cancelled]) }
+  finally { signal.removeEventListener('abort', abort) }
+}
 /** The native terminal controller owns PTYs, screens, attachments and cleanup. */
 export class WorkbenchTerminals {
-  constructor({ native, service, sessions }) { this.native = native; this.service = service; this.sessions = sessions }
+  constructor({ native, service, sessions }) { this.native = native; this.service = service; this.sessions = sessions; this.creating = new Map() }
   async agent(owner, chatId) {
     const chat = this.service.requireChat(owner, chatId)
     const resolved = await this.sessions.resolveAgent(chat.sessionId)
@@ -11,14 +21,43 @@ export class WorkbenchTerminals {
   }
   list(owner, chatId) { return this.native.list(this.service.requireChat(owner, chatId).sessionId) }
   async create(owner, chatId, request, signal) {
+    signal.throwIfAborted()
     if (!uuid.test(request.id)) throw httpError(400, '终端标识无效')
     const agent = await this.agent(owner, chatId)
+    signal.throwIfAborted()
+    const key = `${owner.ownerId}/${chatId}`
+    let allocation = this.creating.get(key)
+    if (allocation?.controller.signal.aborted) {
+      await waitFor(allocation.promise.catch(() => {}), signal)
+      return this.create(owner, chatId, request, signal)
+    }
+    if (!allocation) {
+      const retained = this.native.list(agent.session.id)
+      const running = retained.findLast(info => info.state === 'running')
+      if (running) return running
+      allocation = { controller: new AbortController(), waiters: 0, settled: false }
+      const current = allocation
+      current.promise = (async () => {
+        for (const info of retained) await this.native.close(agent, info.id)
+        current.controller.signal.throwIfAborted()
+        try {
+          return await this.native.create(agent, { id: request.id, cols: request.cols, rows: request.rows,
+            ...(request.shellPath ? { shellPath: request.shellPath } : {}) }, current.controller.signal)
+        } catch (error) {
+          if (error?.code === 'terminal/limit-reached') throw httpError(409, '当前对话已有终端，请打开已有标签')
+          throw error
+        }
+      })().finally(() => {
+        current.settled = true
+        if (this.creating.get(key) === current) this.creating.delete(key)
+      })
+      this.creating.set(key, current)
+    }
+    allocation.waiters++
     try {
-      return await this.native.create(agent, { id: request.id, cols: request.cols, rows: request.rows,
-        ...(request.shellPath ? { shellPath: request.shellPath } : {}) }, signal)
-    } catch (error) {
-      if (error?.code === 'terminal/limit-reached') throw httpError(429, '最多打开3个终端标签，请先关闭一个')
-      throw error
+      return await waitFor(allocation.promise, signal)
+    } finally {
+      if (--allocation.waiters === 0 && !allocation.settled) allocation.controller.abort()
     }
   }
   async *follow(owner, chatId, id, attachment, signal) {

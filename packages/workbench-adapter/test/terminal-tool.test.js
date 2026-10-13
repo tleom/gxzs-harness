@@ -34,6 +34,14 @@ it('creates one bounded native PTY when no terminal exists and returns its actua
   expect(result.terminal_id).toMatch(/^[a-f\d-]{36}$/)
   expect(test.native.writeFromAgent).not.toHaveBeenCalled()
 })
+it('reopens an exited terminal as a usable shell for the model', async()=>{
+  const test=fixture();test.native.list.mockReturnValue([{id,title:'bash',state:'exited'}])
+  const result=await test.definition.execute({action:'open',wait_ms:0},test.exec)
+  expect(test.native.close).toHaveBeenCalledWith(test.agent,id)
+  expect(test.native.create).toHaveBeenCalledOnce()
+  expect(result.terminal_id).not.toBe(id)
+  expect(result.state).toBe('running')
+})
 it('rejects foreign terminal IDs and invalid input before allocating, writing or opening a tab', async () => {
   for (const args of [{action:'write'}, {action:'key',key:'__proto__'}, {action:'read',wait_ms:2001}, {action:'read',terminal_id:'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'}]) {
     const test=fixture()
@@ -89,14 +97,14 @@ it('keeps the native UI attachment writable while the Agent observes and writes 
   finish({exitCode:0})
   abort.abort();await ui.return();await terminal.close()
   const owner=()=>({terminals:new Map(),pending:new Map(),allocations:new Map(),closedIds:new Set(),lifetime:new AbortController()})
-  const a=owner(),b=owner();a.terminals.set('one',{});a.terminals.set('two',{});b.terminals.set('three',{})
+  const a=owner(),b=owner();a.terminals.set('one',{});b.terminals.set('other',{})
   const allocation={info:{id:'new'},monitor:vi.fn()}
-  const controller={lifetime:new AbortController(),config:{maxTerminals:3},owners:new Map([['a',a],['b',b]]),
+  const controller={lifetime:new AbortController(),config:{maxTerminals:1},owners:new Map([['a',a],['b',b]]),
     owner:()=>b,dimensions:()=>{},requireOpen:()=>{},spawn:vi.fn(async()=>allocation)}
   const signal=new AbortController().signal
   await expect(TerminalController.prototype.create.call(controller,{}, {id:'new',cols:80,rows:24},signal)).rejects.toMatchObject({code:'terminal/limit-reached'})
   expect(controller.spawn).not.toHaveBeenCalled()
-  a.terminals.delete('two')
+  b.terminals.delete('other')
   await TerminalController.prototype.create.call(controller,{}, {id:'new',cols:80,rows:24},signal)
   expect(controller.spawn).toHaveBeenCalledOnce()
 })
