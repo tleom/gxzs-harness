@@ -59,18 +59,19 @@ const optional = async path => {
   catch(error){if(error.code==='ENOENT')return undefined;throw error}
 }
 
-/** Operator entry point: seed a captured, pinned old-image baseline without changing user settings. */
+/** Internal writer for bytes extracted by prepare-profile-upgrade.py from the old image. */
 export async function provisionLegacyBaseline(profileDirectory,{ownerId,imageId,baseline,baselineSha256}={}) {
   if(!ownerId || !/^sha256:[a-f0-9]{64}$/.test(imageId ?? '')
     || !/^[a-f0-9]{64}$/.test(baselineSha256 ?? '') || typeof baseline!=='string'
-    || digest(baseline)!==baselineSha256) throw new Error('Verified legacy image, owner and baseline digest are required')
+    || digest(baseline)!==baselineSha256) throw new Error('Legacy image, owner and baseline digest inputs are inconsistent')
   documentOf(baseline)
   const directory=resolve(profileDirectory)
   await mkdir(directory,{recursive:true})
   return withFileLock(join(directory,'package.json'),async()=>{
     const path=join(directory,'legacy-platform-baseline.patch.yml')
     const proof=join(directory,'legacy-platform-baseline.json')
-    const metadata={schemaVersion:1,ownerId,imageId,baselineSha256}
+    const metadata={schemaVersion:1,ownerId,imageId,baselineSha256,
+      sourcePath:'/opt/workbench/profiles/workbench/cordis.runtime.patch.yml'}
     const saved=await optional(path), previous=await optional(proof)
     if(saved!==undefined && saved!==baseline) throw new Error('An existing legacy baseline must not be replaced')
     if(previous!==undefined && !isDeepStrictEqual(JSON.parse(previous),metadata))
@@ -102,7 +103,8 @@ export async function migratePlatformPatch(profileDirectory,{ownerId}={}) {
       const proof=await optional(join(directory,'legacy-platform-baseline.json'))
       if(!baseline || !proof) throw new Error('An exact legacy platform baseline is required to preserve profile settings')
       const metadata=JSON.parse(proof)
-      if(metadata.schemaVersion!==1 || !/^sha256:[a-f0-9]{64}$/.test(metadata.imageId ?? '')
+      if(metadata.schemaVersion!==1 || metadata.sourcePath!=='/opt/workbench/profiles/workbench/cordis.runtime.patch.yml'
+        || !/^sha256:[a-f0-9]{64}$/.test(metadata.imageId ?? '')
         || !/^[a-f0-9]{64}$/.test(metadata.baselineSha256 ?? '') || digest(baseline)!==metadata.baselineSha256
         || !ownerId || metadata.ownerId!==ownerId) throw new Error('Legacy platform baseline identity does not match this owner')
       baselineSha256=metadata.baselineSha256
@@ -123,12 +125,6 @@ export async function migratePlatformPatch(profileDirectory,{ownerId}={}) {
 if(process.argv[1] && resolve(process.argv[1])===fileURLToPath(import.meta.url)) {
   if(!process.env.DSH_HOME) throw new Error('DSH_HOME is required')
   const directory=join(process.env.DSH_HOME,'profiles/workbench')
-  if(process.argv[2]==='--seed-legacy-baseline') {
-    const [, , , path,imageId,baselineSha256]=process.argv
-    await provisionLegacyBaseline(directory,{ownerId:process.env.GXZS_HOST_OWNER_ID,
-      imageId,baselineSha256,baseline:await readFile(path,'utf8')})
-  } else {
-    if(process.argv.length>2) throw new Error('Unknown profile migration operation')
-    await migratePlatformPatch(directory,{ownerId:process.env.GXZS_HOST_OWNER_ID})
-  }
+  if(process.argv.length>2) throw new Error('Unknown profile migration operation; prepare baselines with prepare-profile-upgrade.py')
+  await migratePlatformPatch(directory,{ownerId:process.env.GXZS_HOST_OWNER_ID})
 }

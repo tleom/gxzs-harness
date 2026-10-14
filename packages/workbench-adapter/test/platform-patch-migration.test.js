@@ -17,7 +17,8 @@ async function fixture(user,baseline) {
   if(baseline!==undefined) {
     await writeFile(join(directory,'legacy-platform-baseline.patch.yml'),baseline)
     await writeFile(join(directory,'legacy-platform-baseline.json'),JSON.stringify({schemaVersion:1,ownerId:'owner',
-      imageId:'sha256:'+'1'.repeat(64),baselineSha256:createHash('sha256').update(baseline).digest('hex')}))
+      imageId:'sha256:'+'1'.repeat(64),baselineSha256:createHash('sha256').update(baseline).digest('hex'),
+      sourcePath:'/opt/workbench/profiles/workbench/cordis.runtime.patch.yml'}))
   }
   return directory
 }
@@ -59,6 +60,16 @@ it('refuses missing or mismatched legacy baseline identities before changing the
     expect(await readFile(join(directory,'cordis.patch.yml'),'utf8')).toBe(user)
   }
 })
+it('refuses static-patch provenance before removing any inherited or user rows',async()=>{
+  const user='- id: platform\n  disabled: true\n- id: owner-model\n'
+  const directory=await fixture(user,user)
+  const proof=join(directory,'legacy-platform-baseline.json')
+  const metadata=JSON.parse(await readFile(proof,'utf8'))
+  metadata.sourcePath='/opt/workbench/profiles/workbench/cordis.patch.yml'
+  await writeFile(proof,JSON.stringify(metadata))
+  await expect(migratePlatformPatch(directory,{ownerId:'owner'})).rejects.toThrow('identity')
+  expect(await readFile(join(directory,'cordis.patch.yml'),'utf8')).toBe(user)
+})
 it('backs up the original document and completes an interrupted conversion from the exact saved baseline',async()=>{
   const baseline='- id: platform\n  disabled: true\n'
   const user=baseline+'- id: subagent\n  config: { maxDepth: 3 }\n'
@@ -87,7 +98,7 @@ it('provisions a pinned owner baseline before migration without replacing user s
   expect(await readFile(join(directory,'cordis.patch.yml'),'utf8')).toContain('llm-pi-ai')
 })
 
-it('runs the production baseline provisioning CLI before the normal entrypoint migration',async()=>{
+it('rejects caller-paired baseline and image arguments; only the host Docker extractor prepares production proofs',async()=>{
   const rootDirectory=await fixture()
   const home=join(rootDirectory,'home')
   const directory=join(home,'profiles/workbench')
@@ -100,9 +111,12 @@ it('runs the production baseline provisioning CLI before the normal entrypoint m
   await writeFile(join(directory,'cordis.patch.yml'),user)
   const script=fileURLToPath(new URL('../../../scripts/migrate-platform-patch.mjs',import.meta.url))
   const options={env:{...process.env,DSH_HOME:home,GXZS_HOST_OWNER_ID:'owner'}}
-  execFileSync(process.execPath,[script,'--seed-legacy-baseline',input,'sha256:'+'3'.repeat(64),
-    createHash('sha256').update(baseline).digest('hex')],options)
+  expect(()=>execFileSync(process.execPath,[script,'--seed-legacy-baseline',input,'sha256:'+'3'.repeat(64),
+    createHash('sha256').update(baseline).digest('hex')],{...options,stdio:'pipe'})).toThrow()
   expect(await readFile(join(directory,'cordis.patch.yml'),'utf8')).toBe(user)
+  await expect(readFile(join(directory,'legacy-platform-baseline.json'))).rejects.toMatchObject({code:'ENOENT'})
+  await provisionLegacyBaseline(directory,{ownerId:'owner',imageId:'sha256:'+'3'.repeat(64),baseline,
+    baselineSha256:createHash('sha256').update(baseline).digest('hex')})
   execFileSync(process.execPath,[script],options)
   expect(await readFile(join(directory,'.cordis.patch.before-bundle-layout-v1.yml'),'utf8')).toBe(user)
   expect(await readFile(join(directory,'cordis.patch.yml'),'utf8')).toContain('owner-model')
