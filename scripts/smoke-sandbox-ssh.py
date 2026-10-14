@@ -178,7 +178,11 @@ def verify(container, host_image=None):
                                             text=True, capture_output=True, timeout=max(150, long_seconds + 90) if extra else 65)
                     print(result.stdout, end='')
                     if result.returncode:
-                        print(result.stderr[-4000:], file=sys.stderr, end='')
+                        # Inline modules can put many KiB of source in a stack URL.
+                        # Compact those URLs before truncation so the actual cause survives.
+                        diagnostics = re.sub(r'data:[^\s,]*;base64,[A-Za-z0-9+/=]+',
+                                             '<inline-module>', result.stderr)
+                        print(diagnostics[-4000:], file=sys.stderr, end='')
                         raise ValueError('Native SSH smoke failed: ' + script)
                     # Local bridge bookkeeping can be empty while an SSH remote
                     # command is still stuck. Assert against the sandbox PID
