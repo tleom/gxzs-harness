@@ -39,7 +39,10 @@ for attempt in {1..15}; do
 done
 python3 "$script_dir/smoke-sandbox-ssh.py" "$container_id" "$host_image"
 docker exec -i "$container_id" node < "$script_dir/smoke-browser-observation.cjs"
-GXZS_SMOKE_BOOTSTRAP=1 GXZS_SMOKE_CRASH=1 GXZS_SMOKE_RUNNING=1 GXZS_SMOKE_NATIVE_ATTACHMENTS=1 \
+docker exec -i "$container_id" node < "$script_dir/smoke-browser-display.cjs"
+GXZS_SMOKE_BOOTSTRAP=1 GXZS_SMOKE_FRESH_BOOTSTRAP=1 \
+  python3 "$script_dir/smoke-sandbox-ssh.py" "$container_id" "$host_image"
+GXZS_SMOKE_BOOTSTRAP=1 GXZS_SMOKE_CRASH=1 GXZS_SMOKE_RUNNING=1 GXZS_SMOKE_NATIVE_ATTACHMENTS=1 GXZS_SMOKE_LEGACY_PROFILE=1 \
   python3 "$script_dir/smoke-sandbox-ssh.py" "$container_id" "$host_image"
 docker exec "$container_id" /opt/office/python/bin/python -c \
   "from docx import Document;d=Document();d.add_paragraph('中文预览验证');d.save('/tmp/check.docx')"

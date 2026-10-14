@@ -6,7 +6,7 @@ mkdir -p "$DSH_HOME/profiles/workbench"
 for file in package.json package-lock.json; do
   cp "/opt/workbench/profiles/workbench/$file" "$DSH_HOME/profiles/workbench/$file"
 done
-cp /opt/workbench/profiles/workbench/cordis.runtime.patch.yml "$DSH_HOME/profiles/workbench/cordis.patch.yml"
+node /opt/workbench/scripts/migrate-platform-patch.mjs
 for target in "$DSH_HOME/profiles/workbench/node_modules" "$DSH_HOME/packages"; do
   if [ -e "$target" ] && [ ! -L "$target" ]; then
     # Preserve an older deployment's directory until its operator retires it.

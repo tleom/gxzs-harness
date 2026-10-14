@@ -12,9 +12,19 @@ async function waitFor(promise, signal) {
 }
 /** The native terminal controller owns PTYs, screens, attachments and cleanup. */
 export class WorkbenchTerminals {
-  constructor({ native, service, sessions }) { this.native = native; this.service = service; this.sessions = sessions; this.creating = new Map() }
+  constructor({ native, service, sessions }) { this.native = native; this.service = service; this.sessions = sessions; this.creating = new Map(); this.knownSessions = new Set() }
+  activity() {
+    let count = 0
+    for (const sessionId of this.knownSessions) {
+      const infos = this.native.list(sessionId)
+      count += infos.filter(info => info.state === 'running').length
+      if (!infos.length) this.knownSessions.delete(sessionId)
+    }
+    return count
+  }
   async agent(owner, chatId) {
     const chat = this.service.requireChat(owner, chatId)
+    this.knownSessions.add(chat.sessionId)
     const resolved = await this.sessions.resolveAgent(chat.sessionId)
     if ('error' in resolved) throw resolved.error
     return resolved.agent
@@ -73,7 +83,9 @@ export class WorkbenchTerminals {
       held = this.native.retain(agent.session.id, id, lifetime.signal)[Symbol.asyncIterator]()
       const first = await held.next()
       if (first.done || first.value.type !== 'retained') throw httpError(404, '终端已经关闭')
-      for await (const frame of this.native.follow(agent, id, attachment, signal)) yield { event: 'workbench_terminal', value: frame }
+      const environment = this.native.environment?.(agent, signal)
+      for await (const frame of this.native.follow(agent, id, attachment, signal))
+        yield { event: 'workbench_terminal', value: frame.type === 'snapshot' && environment ? { ...frame, environment } : frame }
     } finally {
       signal.removeEventListener('abort', stop)
       lifetime.abort()

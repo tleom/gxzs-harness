@@ -11,15 +11,24 @@ importers:
       '@vitest/coverage-v8':
         specifier: 3.2.4
         version: 3.2.4(vitest@3.2.4(yaml@2.9.1))
+      immer:
+        specifier: 10.1.1
+        version: 10.1.1
       vitest:
         specifier: 3.2.4
         version: 3.2.4(yaml@2.9.1)
+      zustand:
+        specifier: 4.5.7
+        version: 4.5.7(immer@10.1.1)(react@19.3.0)
 
   packages/workbench-adapter:
     dependencies:
       '@deepseek-ai/cordis':
         specifier: 4.0.5-alpha.1
         version: 4.0.5-alpha.1
+      '@deepseek-ai/dsh-client-modules':
+        specifier: 0.2.1-alpha.2
+        version: 0.2.1-alpha.2(@deepseek-ai/cordis@4.0.5-alpha.1)
       '@deepseek-ai/dsh-llm':
         specifier: 0.2.1-alpha.2
         version: 0.2.1-alpha.2(@deepseek-ai/cordis@4.0.5-alpha.1)
@@ -195,6 +204,11 @@ packages:
 
   '@deepseek-ai/dsh-chunked-list@0.2.1-alpha.2':
     resolution: {integrity: sha512-ci2rXQ/MPxl/lNMqoBv3Bjan/jSwcaXp7mmsrSpIwvh5U1Q22m/ZTF4Z6Ft8AJcvARlTPE4UXl5x1DflPChP6Q==}
+    peerDependencies:
+      '@deepseek-ai/cordis': ~4.0.5-alpha.1
+
+  '@deepseek-ai/dsh-client-modules@0.2.1-alpha.2':
+    resolution: {integrity: sha512-026Npgl/BqF8OEBeYriq8qd6gNFc3ruymZkXc/IXt7bJX047X5b3k/teaK7aK50TEjLFVMc2+il8jNB41jn0nA==}
     peerDependencies:
       '@deepseek-ai/cordis': ~4.0.5-alpha.1
 
@@ -1383,6 +1397,9 @@ packages:
   html-escaper@2.0.2:
     resolution: {integrity: sha512-H2iMtd0I4Mt5eYiapRdIDjp+XzelXQ0tFE4JS7YFwFevXXMmOp9myNrUvCg0D6ws8iqkRPBfKHgbwig1SmlLfg==}
 
+  immer@10.1.1:
+    resolution: {integrity: sha512-s2MPrmjovJcoMaHtx6K11Ra7oD05NT97w1IC5zpMkT6Atjr7H8LjaDd81iIxUYpMKSRRNMJE703M1Fhr/TctHw==}
+
   is-fullwidth-code-point@3.0.0:
     resolution: {integrity: sha512-zymm5+u+sCsSWyD9qNaejV3DFvhCKclKdizYaJUuHA83RLjb7nSuGnddCHGv0hk+KY7BMAlsWeK4Ueg6EV6XQg==}
     engines: {node: '>=8'}
@@ -1499,6 +1516,10 @@ packages:
     resolution: {integrity: sha512-RRuzqDtt5Y9h3quz5hWhK+TPnsmVs6WwSU6LkJMeY4HstUEDuYTG8UJSdawMRzmzAtV+KEoG8N3Qg2qLy5vM/A==}
     engines: {node: ^10 || ^12 || >=14}
 
+  react@19.3.0:
+    resolution: {integrity: sha512-E8LUcbtBWt20bbl2YoHfx4ZDBdxVTfOKtCZn9cDSJ4l6/nuoApcpIBcj47t2wZoVX8g2ZHuMHbiShgCR1T5Sog==}
+    engines: {node: '>=0.10.0'}
+
   readdirp@4.1.2:
     resolution: {integrity: sha512-GDhwkLfywWL2s6vEjyhri+eXmfH6j1L7JE27WhqLeYzoh/A3DBaYGEj2H/HFZCn/kMfim73FXxEJTw06WtxQwg==}
     engines: {node: '>= 14.18.0'}
@@ -1599,6 +1620,11 @@ packages:
     resolution: {integrity: sha512-/y4/bH9YNU5hi9NIrpOuvGXFcxrj3CMrV+/AYpowAYTpHn8gX/XPFjNy766FPoYY0miQhdW977JFWKGNhBdwyQ==}
     engines: {node: '>=22.19.0'}
 
+  use-sync-external-store@1.7.0:
+    resolution: {integrity: sha512-6L+EeigHMQhdaIPNIFUKwfWJSwWFQ8gJbJ2DLOs5sDIegTwR9fRxvnM3uciHKjIZhFz+KAv2emhWMRvDmMcY8A==}
+    peerDependencies:
+      react: ^16.8.0 || ^17.0.0 || ^18.0.0 || ^19.0.0
+
   vite-node@3.2.4:
     resolution: {integrity: sha512-EbKSKh+bh1E1IFxeO0pg1n4dvoOTt0UDiXMd/qn++r98+jPO1xtJilvXldeuQ8giIB5IkpjCgMleHMNEsGH6pg==}
     engines: {node: ^18.0.0 || ^20.0.0 || >=22.0.0}
@@ -1698,6 +1724,21 @@ packages:
   zod@4.6.5:
     resolution: {integrity: sha512-v5l/aFXZQeai4awLbOpSoHecE9UiMrnfx75tEXLjNonXVARxQ5mOeipTjROUchszUNCqnE+hqAMujRsRHsut2Q==}
 
+  zustand@4.5.7:
+    resolution: {integrity: sha512-CHOUy7mu3lbD6o6LJLfllpjkzhHXSBlX8B9+qPddUsIfeF5S/UZ5q0kmCsnRqT1UHFQZchNFDDzMbQsuesHWlw==}
+    engines: {node: '>=12.7.0'}
+    peerDependencies:
+      '@types/react': '>=16.8'
+      immer: '>=9.0.6'
+      react: '>=16.8'
+    peerDependenciesMeta:
+      '@types/react':
+        optional: true
+      immer:
+        optional: true
+      react:
+        optional: true
+
 snapshots:
 
   '@ampproject/remapping@2.3.0':
@@ -1753,6 +1794,10 @@ snapshots:
     dependencies:
       '@deepseek-ai/cordis': 4.0.5-alpha.1
       zod: 4.6.5
+
+  '@deepseek-ai/dsh-client-modules@0.2.1-alpha.2(@deepseek-ai/cordis@4.0.5-alpha.1)':
+    dependencies:
+      '@deepseek-ai/cordis': 4.0.5-alpha.1
 
   '@deepseek-ai/dsh-commands@0.2.1-alpha.2(9028375c0f00602f7fb58529e6dd95fc)':
     dependencies:
@@ -2790,6 +2835,8 @@ snapshots:
 
   html-escaper@2.0.2: {}
 
+  immer@10.1.1: {}
+
   is-fullwidth-code-point@3.0.0: {}
 
   isexe@2.0.0: {}
@@ -2910,6 +2957,8 @@ snapshots:
       picocolors: 1.1.1
       source-map-js: 1.2.1
 
+  react@19.3.0: {}
+
   readdirp@4.1.2: {}
 
   readdirp@5.1.1: {}
@@ -3017,6 +3066,10 @@ snapshots:
 
   undici@8.10.2: {}
 
+  use-sync-external-store@1.7.0(react@19.3.0):
+    dependencies:
+      react: 19.3.0
+
   vite-node@3.2.4(yaml@2.9.1):
     dependencies:
       cac: 6.7.14
@@ -3113,3 +3166,10 @@ snapshots:
   yaml@2.9.1: {}
 
   zod@4.6.5: {}
+
+  zustand@4.5.7(immer@10.1.1)(react@19.3.0):
+    dependencies:
+      use-sync-external-store: 1.7.0(react@19.3.0)
+    optionalDependencies:
+      immer: 10.1.1
+      react: 19.3.0

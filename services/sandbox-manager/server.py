@@ -21,6 +21,7 @@ from admission import Admission
 from resource_limits import cgroup_args, owner_cgroup, ResourceUnavailable
 from owner_networks import OwnerNetworks
 from owner_auth import authorize as authorize_request
+from office_conversions import OfficeConversions
 
 
 LOGGER = logging.getLogger(__name__)
@@ -36,6 +37,7 @@ LOCKS = {}
 LOCKS_GUARD = threading.Lock()
 REQUEST_CONTEXT = threading.local()
 OPERATION_CAPACITY = threading.BoundedSemaphore(int(os.environ.get('WORKBENCH_MANAGER_MAX_OPERATIONS', '24')))
+OFFICE_CONVERSIONS = OfficeConversions()
 CONTROL_ACTIONS = frozenset({'stop-binding', 'fence-binding', 'schedule', 'runtime-epoch', 'touch', 'diagnostics'})
 MAX_BODY = 30 * 1024 * 1024
 ADMISSION = Admission(str(STATE / 'admission.sqlite3'))
@@ -74,6 +76,7 @@ def schedule_mcp_refresh(key, items):
             try:
                 operation(target[0], "personal-mcp", {"operation": "mcp_test", "name": target[1],
                                                       "version": version,
+                                                      "maintenance": True,
                                                       "deadline_ms": int(time.time() * 1000) + 30_000})
             except Exception:
                 LOGGER.warning("Personal MCP catalog refresh failed for %s", target[1])
@@ -170,7 +173,7 @@ def save_operation(path, value):
     os.replace(temporary, path)
 
 
-def ensure(key):
+def ensure(key, *, track_activity=True):
     pids_limit = int(os.environ.get('WORKBENCH_SANDBOX_PIDS_LIMIT', '1024'))
     if pids_limit <= 0:
         raise ValueError('WORKBENCH_SANDBOX_PIDS_LIMIT must be positive')
@@ -221,7 +224,7 @@ def ensure(key):
             docker("run", "--rm", *cgroup_args(key), '--memory', '256m', '--cpus', '1', '--pids-limit', '128',
                    "--user", "0", "--network", "none", "--entrypoint", MANAGER_PYTHON[0],
                    "-v", name + "-home:/home/dify", "-v", name + "-files:/workspace", "-v", name + "-env:/opt/user-env",
-                   IMAGE, *MANAGER_PYTHON[1:], "-c", "import os; paths=['/home/dify','/workspace','/workspace/conversations','/workspace/" + key + "','/opt/user-env']; "
+                   IMAGE, *MANAGER_PYTHON[1:], "-c", "import os; paths=['/home/dify','/workspace','/workspace/conversations','/opt/user-env']; "
                    "[(os.makedirs(p,exist_ok=True),os.chown(p,1000,1000)) for p in paths]")
             # Existing personal venvs gain the immutable office fallback without replacing their packages.
             docker("run", "--rm", *cgroup_args(key), '--memory', '256m', '--cpus', '1', '--pids-limit', '128',
@@ -247,7 +250,8 @@ def ensure(key):
             docker("start", name)
             docker("exec", "--user", "0", name, *MANAGER_PYTHON, "-c",
                    "import os; os.makedirs('/opt/workbench-global', mode=0o755, exist_ok=True)")
-        touch(key)
+        if track_activity or info.returncode or not existing['State']['Running']:
+            touch(key)
         return {"endpoint": "http://" + name + ":5004", "auth_token": token}
 
 
@@ -303,6 +307,16 @@ def operation(key, action, payload):
         return HOSTS.ensure(key, payload)
     if action == 'replace-host':
         return HOSTS.replace(key, payload)
+    if action == 'host-settings':
+        if payload != {'operation': 'check'}:
+            raise ValueError('Unsupported Host settings operation')
+        # This lock also revalidates the owner/generation. The caller counts
+        # its write before this check; replace marks draining before probing.
+        with lock(key):
+            record = json.loads((HOSTS.root / key / 'host.json').read_text(encoding='utf-8'))
+            if record.get('state') not in {'ready', 'provisioning'}:
+                raise SandboxUpdatePending('工作台正在维护，请稍后保存设置')
+            return {'writable': True}
     if action == 'diagnostics':
         from mcp_runtime import statistics
         from global_memory import statistics as memory_statistics
@@ -363,8 +377,12 @@ def operation(key, action, payload):
         allowed = {"mcp_list", "mcp_read", "mcp_save", "mcp_delete", "mcp_toggle", "mcp_pin", "mcp_test", "mcp_call"}
         if payload.get("operation") not in allowed:
             raise ValueError("Unsupported MCP operation")
+        tracked = payload['operation'] != 'mcp_list' and payload.get('maintenance') is not True
         with lock(key):
-            ensure(key)
+            record = HOSTS.root / key / 'host.json'
+            if payload.get('maintenance') is True and record.exists() and json.loads(record.read_text(encoding='utf-8')).get('state') == 'stopped':
+                raise ResourceUnavailable('个人工作环境已休眠，维护请求稍后重试', 'HOST_IDLE', 30)
+            ensure(key, track_activity=tracked)
             request = payload
             if payload["operation"] in {"mcp_test", "mcp_call"}:
                 request = {"operation": "mcp_probe", "name": payload.get("name")}
@@ -376,27 +394,52 @@ def operation(key, action, payload):
                 # Parse errors and tracebacks may include user-supplied secrets.
                 raise ValueError("MCP 配置操作失败，请检查 JSON、路径和版本")
             output = json.loads(result.stdout)
-            touch(key)
+            if tracked:
+                touch(key)
         if payload["operation"] in {"mcp_save", "mcp_delete", "mcp_toggle"} and not output.get("conflict"):
             invalidate(key, payload["name"])
         if payload["operation"] in {"mcp_test", "mcp_call"}:
             output = invoke(key, name, payload, output, authorize=authorize_mcp)
         elif payload["operation"] == "mcp_list":
             schedule_mcp_refresh(key, output.get("mcp", []))
-        touch(key)
+        if tracked:
+            touch(key)
         return output
     if action == "office-preview":
-        # No owner volumes, credentials, network or writable image are exposed.
-        preview_name = PREFIX + "-preview-" + uuid.uuid4().hex
+        if payload.get('operation') == 'cancel':
+            return OFFICE_CONVERSIONS.cancel(key, payload.get('request_id'))
         with lock(key):
+            touch(key)
+        # No owner volumes, credentials, network or writable image are exposed.
+        image = docker('image', 'inspect', '--format', '{{.Id}}', IMAGE).stdout.strip()
+        requested_path = payload.get('path')
+        if requested_path is not None:
+            with lock(key):
+                metadata = operation(key, 'files', {'operation': 'stat', 'path': requested_path})
+            if metadata.get('kind') != 'file' or metadata.get('size', 0) > 20 * 1024 * 1024 or not metadata.get('version'):
+                raise ValueError('文件不存在或超过 20 MiB 预览范围')
+            payload = {**payload, 'name': metadata['name'], 'source_digest': metadata['version']}
+        def convert(job):
+            preview_name = PREFIX + "-preview-" + uuid.uuid4().hex
             try:
+                document = payload
+                if requested_path is not None:
+                    with lock(key):
+                        document = operation(key, 'files', {'operation': 'get', 'path': requested_path})
+                    if document.get('version') != payload['source_digest']:
+                        raise ValueError('文件已改变，请刷新后重试')
                 script = Path(__file__).with_name("office_preview.py").read_text()
-                result = docker("run", "--rm", "--name", preview_name, *cgroup_args(key), "--network", "none",
+                docker("create", "--rm", "--name", preview_name, *cgroup_args(key), "--network", "none",
                                 "--read-only", "--tmpfs", "/tmp:rw,nosuid,noexec,size=256m",
                                 "--user", "1000", "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true",
                                 "--memory", "1g", "--cpus", "1", "--pids-limit", "128", "-e", "HOME=/tmp",
-                                "--entrypoint", MANAGER_PYTHON[0], "-i", IMAGE, *MANAGER_PYTHON[1:], "-c", script,
-                                stdin=json.dumps(payload), timeout=55, check=False)
+                                "--entrypoint", MANAGER_PYTHON[0], "-i", image, *MANAGER_PYTHON[1:], "-c", script)
+                with OFFICE_CONVERSIONS.lock:
+                    job.stop = lambda: docker("rm", "-f", preview_name, check=False)
+                if job.cancelled.is_set():
+                    raise ValueError('文档预览已取消')
+                result = docker('start', '--attach', '--interactive', preview_name,
+                                stdin=json.dumps(document), timeout=55, check=False)
                 output = json.loads(result.stdout or "{}")
                 if result.returncode or not output.get("data"):
                     raise ValueError(output.get("error", "文档排版失败"))
@@ -405,6 +448,10 @@ def operation(key, action, payload):
                 raise ValueError("文档排版超时，请下载原文件查看") from error
             finally:
                 docker("rm", "-f", preview_name, check=False)
+        output = OFFICE_CONVERSIONS.convert(key, payload, image, convert)
+        with lock(key):
+            touch(key)  # Revalidate the owner generation and record actual preview activity.
+        return output
     if action == "files":
         with lock(key):
             ensure(key)
@@ -577,7 +624,7 @@ class Handler(BaseHTTPRequestHandler):
             payload = json.loads(body or "{}")
             if not isinstance(payload, dict):
                 raise ValueError('Request must be an object')
-            if parts[2] not in CONTROL_ACTIONS:
+            if parts[2] not in CONTROL_ACTIONS and not (parts[2] == 'office-preview' and payload.get('operation') == 'cancel'):
                 admitted = OPERATION_CAPACITY.acquire(blocking=False)
                 if not admitted:
                     raise CapacityError('Sandbox manager is busy; operation was not started')

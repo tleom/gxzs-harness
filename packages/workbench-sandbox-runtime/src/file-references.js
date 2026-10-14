@@ -42,7 +42,7 @@ lines.on('close',()=>{
 ready.catch(error=>{process.stderr.write(error.message);process.exit(1)});
 `
 
-/** One native index per agent, transported by the existing DSH subprocess. */
+/** One native index per Session, transported by the existing DSH subprocess. */
 export class SandboxReferenceSearch {
   constructor(subprocess,{root,config={},node='/usr/local/bin/node',workspace='/workspace',idleMs=60_000}) {
     if(typeof root!=='string'||!posix.isAbsolute(root)||
@@ -150,15 +150,20 @@ export default class SandboxFileReferences extends LocalFileReferences {
     this.remoteSearches=new Map()
     this.disposedAgents=new WeakSet()
     this.stopped=false
+    ctx.on('agent/created',({agent})=>{
+      const search=this.remoteSearches.get(agent.id)
+      if(search)search.ownerAgent=agent
+    })
     ctx.on('agent/disposed',async({agent})=>{
       this.disposedAgents.add(agent)
-      const search=this.remoteSearches.get(agent)
-      this.remoteSearches.delete(agent)
+      const search=this.remoteSearches.get(agent.id)
+      if(search?.ownerAgent!==agent)return
       search?.dispose()
       await search?.done
+      if(this.remoteSearches.get(agent.id)===search)this.remoteSearches.delete(agent.id)
     })
     ctx.on('session/event',(session,event)=>{
-      if(event.type==='tool/result')this.remoteSearches.get(ctx.agents.get(session.id))?.invalidate()
+      if(event.type==='tool/result')this.remoteSearches.get(session.id)?.invalidate()
     })
     ctx.effect(()=>async()=>{
       this.stopped=true
@@ -172,12 +177,27 @@ export default class SandboxFileReferences extends LocalFileReferences {
     signal.throwIfAborted()
     if(this.stopped||this.disposedAgents?.has(agent))return Promise.reject(new Error('Sandbox reference service disposed'))
     const root=await this.ctx.workingDirectory.ensure(agent,signal)
+    return this.listSearch(agent.id,root,query,signal,agent)
+  }
+  // Native observation carries the committed projection for live and cold
+  // children. Reading it must not resolve/wake an ordinary Agent or append cwd.
+  async listObserved(observed,query,signal) {
+    const root=observed.projections?.values.workingDirectory
+      ?? observed.header.cwd ?? this.ctx.workingDirectory.defaultDirectory
+    if(typeof root!=='string')throw new Error('Session working directory unavailable')
+    return this.listSearch(observed.header.id,root,query,signal,this.ctx.agents.get(observed.header.id))
+  }
+  async listSearch(sessionId,root,query,signal,agent) {
     signal.throwIfAborted()
-    if(this.stopped||this.disposedAgents?.has(agent))throw new Error('Sandbox reference service disposed')
-    let search=this.remoteSearches.get(agent)
-    if(search && !search.closed && search.root!==root)search.dispose()
+    const assertActive=()=>{
+      signal.throwIfAborted()
+      if(this.stopped||(agent&&this.disposedAgents?.has(agent)))throw new Error('Sandbox reference service disposed')
+    }
+    assertActive()
+    let search=this.remoteSearches.get(sessionId)
     // A replacement must not overlap a still-closing index and its SSH pipes.
-    if(search?.closed) {
+    while(search && (search.closed||search.root!==root)) {
+      if(!search.closed)search.dispose()
       let cancel
       try {
         await Promise.race([search.done,new Promise((_,reject)=>{
@@ -186,9 +206,9 @@ export default class SandboxFileReferences extends LocalFileReferences {
           if(signal.aborted)cancel()
         })])
       }finally{signal.removeEventListener('abort',cancel)}
-      signal.throwIfAborted()
-      if(this.stopped||this.disposedAgents?.has(agent))throw new Error('Sandbox reference service disposed')
-      search=this.remoteSearches.get(agent)
+      assertActive()
+      if(this.remoteSearches.get(sessionId)===search)this.remoteSearches.delete(sessionId)
+      search=this.remoteSearches.get(sessionId)
     }
     if(!search||search.closed) {
       search=new SandboxReferenceSearch(this.ctx.subprocess,{
@@ -197,12 +217,13 @@ export default class SandboxFileReferences extends LocalFileReferences {
         workspace:process.env.GXZS_SANDBOX_WORKSPACE||'/workspace',
         idleMs:Number(process.env.GXZS_REFERENCE_IDLE_MS??60_000),
       })
-      this.remoteSearches.set(agent,search)
+      this.remoteSearches.set(sessionId,search)
       const current=search
       void search.done.then(()=>{
-        if(this.remoteSearches.get(agent)===current)this.remoteSearches.delete(agent)
+        if(this.remoteSearches.get(sessionId)===current)this.remoteSearches.delete(sessionId)
       })
     }
+    search.ownerAgent=agent
     return search.list(query,signal)
   }
 }

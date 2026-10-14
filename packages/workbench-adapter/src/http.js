@@ -1,5 +1,17 @@
 export const MAX_JSON_BYTES = 32 * 1024 * 1024
 
+/** Bind read-only upstream work to the response connection, including early disconnects. */
+export async function withResponseSignal(res, operation) {
+  const controller = new AbortController()
+  const cancel = () => controller.abort()
+  res.once('close', cancel)
+  if (res.destroyed) cancel()
+  try {
+    controller.signal.throwIfAborted()
+    return await operation(controller.signal)
+  } finally { res.off('close', cancel) }
+}
+
 export async function readBody(req, limit = MAX_JSON_BYTES) {
   const chunks = []
   let size = 0
@@ -72,6 +84,8 @@ const REMOTE_ERRORS = {
   'subagent/invalid-time-zone': [400, '时区参数无效'],
   'subagent/attachment-invalid': [400, '图片无效或所选模型不支持图片'],
   'session/conflict': [409, '会话配置已改变，请刷新后重试'],
+  'settings/conflict': [409, '设置已在其他位置更新，请放弃修改后重试'],
+  'settings/rejected': [400, '设置未被接受，请检查填写的值'],
   'session/writer-held': [409, '会话正在被其他执行器使用，请稍后重试'],
   'session/agent-busy': [409, '会话正在执行其他任务，请刷新当前状态'],
   'agent-preset/conflict': [409, '会话预设已改变，请刷新后重试'],

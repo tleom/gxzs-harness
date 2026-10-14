@@ -18,6 +18,20 @@ def root(tmp_path):
     return str(tmp_path)
 
 
+def test_large_directory_pages_without_omission_and_rejects_changed_directory(root):
+    directory = Path(root) / 'large'
+    directory.mkdir()
+    for number in range(2003):
+        (directory / f'{number:04d}.txt').touch()
+    first = module.operate({'operation': 'list', 'path': 'large'}, root)
+    assert len(first['entries']) == 2000 and first['total'] == 2003 and first['next_cursor']
+    second = module.operate({'operation': 'list', 'path': 'large', 'cursor': first['next_cursor']}, root)
+    assert [item['name'] for item in second['entries']] == ['2000.txt', '2001.txt', '2002.txt']
+    assert second['next_cursor'] is None
+    (directory / 'new.txt').touch()
+    assert module.operate({'operation': 'list', 'path': 'large', 'cursor': first['next_cursor']}, root)['conflict']
+
+
 @pytest.mark.parametrize('name', ['mcp', 'skills'])
 def test_resource_roots_allow_browsing_and_zip_download_but_reject_deletion(root, name):
     directory = Path(root) / name

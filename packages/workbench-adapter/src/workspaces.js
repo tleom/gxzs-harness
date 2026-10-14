@@ -94,9 +94,19 @@ export class WorkbenchWorkspaces {
         await this.fileManager.operate({ operation: 'mkdir', path: relative })
         return { path: path.posix.relative('conversations', relative) }
       }
-      const result = await this.fileManager.operate({ operation: 'list', path: relative })
+      const entries = [], cursors = new Set()
+      let cursor
+      do {
+        const result = await this.fileManager.operate({ operation: 'list', path: relative, ...(cursor ? { cursor } : {}) })
+        entries.push(...result.entries)
+        if (entries.length > 100_000) throw httpError(413, '目录条目超过 100000，请缩小浏览范围')
+        cursor = result.next_cursor
+        if (cursor && (typeof cursor !== 'string' || !result.entries.length || cursors.has(cursor)))
+          throw httpError(502, '目录分页未向前推进，请刷新后重试')
+        if (cursor) cursors.add(cursor)
+      } while (cursor)
       return { path: path.posix.relative('conversations', relative) || '.',
-        entries: result.entries.filter(entry => entry.kind === 'directory').map(entry => ({ name: entry.name,
+        entries: entries.filter(entry => entry.kind === 'directory').map(entry => ({ name: entry.name,
           path: path.posix.join(path.posix.relative('conversations', relative), entry.name) })) }
     } else if (operation === 'create') {
       // The owner's workspace volume is mounted read-only at the same absolute
@@ -121,7 +131,7 @@ export class WorkbenchWorkspaces {
     } else if (['archiveSession', 'unarchiveSession', 'pinSession', 'unpinSession'].includes(operation)) {
       const sessionId = this.session(owner, request.chatId)
       if (operation === 'archiveSession' && this.schedules &&
-        (await this.schedules.catalog(owner)).some(task => task.chat_id === request.chatId))
+        (await this.schedules.catalog(owner)).some(task => task.chat_id === request.chatId && task.status === 'active'))
         throw httpError(409, '该对话关联了定时任务，请先删除定时任务', 'WORKSPACE_SCHEDULE_ATTACHED')
       await this.controller[operation]({ sessionId,
         ...(operation === 'archiveSession' ? { stopActivity: request.stopActivity === true } : {}) })

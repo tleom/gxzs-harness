@@ -23,13 +23,19 @@ function fixture() {
 describe('native workspace boundary', () => {
   it('identifies an associated schedule before archive while retaining the native activity error for other chats', async () => {
     const { bridge, owner, controller } = fixture()
-    bridge.schedules = { catalog: vi.fn(async () => [{ chat_id: 'chat-a', id: 'schedule' }]) }
+    bridge.schedules = { catalog: vi.fn(async () => [{ chat_id: 'chat-a', id: 'schedule', status: 'active' }]) }
     await expect(bridge.mutate(owner, { operation: 'archiveSession', chatId: 'chat-a' }))
       .rejects.toMatchObject({ status: 409, code: 'WORKSPACE_SCHEDULE_ATTACHED', message: '该对话关联了定时任务，请先删除定时任务' })
     expect(controller.archiveSession).not.toHaveBeenCalled()
     const error = { isDSHRemoteError: true, code: 'workspace/session-active' }
     controller.archiveSession.mockRejectedValue(error)
     await expect(bridge.mutate(owner, { operation: 'archiveSession', chatId: 'chat-b' })).rejects.toBe(error)
+  })
+  it('allows an ended native schedule to remain in history when archiving its conversation', async () => {
+    const { bridge, owner, controller } = fixture()
+    bridge.schedules = { catalog: vi.fn(async () => [{ chat_id: 'chat-a', id: 'schedule', status: 'inactive' }]) }
+    await bridge.mutate(owner, { operation: 'archiveSession', chatId: 'chat-a' })
+    expect(controller.archiveSession).toHaveBeenCalledWith({ sessionId: 'session-a', stopActivity: false })
   })
   it('validates workspace membership independently of an unavailable schedule store', async () => {
     const { bridge, owner, controller } = fixture()
@@ -69,6 +75,24 @@ describe('native workspace boundary', () => {
     await bridge.mutate(owner, { operation: 'mkdir', path: 'case-a', name: '证据' })
     expect(fileManager.operate).toHaveBeenCalledWith({ operation: 'mkdir', path: 'conversations/case-a/证据' })
     await expect(bridge.mutate(owner, { operation: 'mkdir', path: 'case-a', name: '../outside' })).rejects.toMatchObject({ status: 400 })
+  })
+  it('reads every native directory page before filtering files and preserves conflict failures', async () => {
+    const { bridge, owner, fileManager } = fixture()
+    fileManager.operate.mockResolvedValueOnce({ entries: [{ name: 'note.md', kind: 'file' }], next_cursor: 'next' })
+      .mockResolvedValueOnce({ entries: [{ name: '案件', kind: 'directory' }] })
+    expect(await bridge.mutate(owner, { operation: 'browse', path: '.' })).toEqual({ path: '.', entries: [{ name: '案件', path: '案件' }] })
+    expect(fileManager.operate).toHaveBeenLastCalledWith({ operation: 'list', path: 'conversations', cursor: 'next' })
+    const conflict = Object.assign(new Error('changed'), { status: 409, code: 'RESOURCE_CONFLICT' })
+    fileManager.operate.mockResolvedValueOnce({ entries: [{ name: 'first', kind: 'directory' }], next_cursor: 'next' })
+      .mockRejectedValueOnce(conflict)
+    await expect(bridge.mutate(owner, { operation: 'browse', path: '.' })).rejects.toBe(conflict)
+  })
+  it('rejects oversized and stalled directory pages instead of truncating or retrying forever', async () => {
+    const { bridge, owner, fileManager } = fixture()
+    fileManager.operate.mockResolvedValueOnce({ entries: Array.from({ length: 100001 }, () => ({ name: 'a', kind: 'file' })) })
+    await expect(bridge.mutate(owner, { operation: 'browse', path: '.' })).rejects.toMatchObject({ status: 413 })
+    fileManager.operate.mockResolvedValue({ entries: [{ name: 'a', kind: 'directory' }], next_cursor: 'same' })
+    await expect(bridge.mutate(owner, { operation: 'browse', path: '.' })).rejects.toMatchObject({ status: 502 })
   })
   it('rejects a canonical target outside conversation files before native registration or directory access', async () => {
     const { bridge, owner, controller, fileManager } = fixture()

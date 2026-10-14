@@ -34,6 +34,22 @@ const { SessionCommandController } = await import(pathToFileURL(controllerPath).
 const cleanups = []
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup() })
 
+it('settles two original queued Schedule turns without leaving the second receipt active', async () => {
+  const test = await fixture(['first reminder complete', 'second reminder complete'], { scheduledClaims: true })
+  test.runtime.mcpCatalogState = { ready: true }
+  test.runtime.mcpResources = () => []
+  test.scheduler.start()
+  const first = createUserMessage({ source: { kind: 'schedule' }, content: [{ type: 'text', text: 'first scheduled reminder' }] })
+  const second = createUserMessage({ source: { kind: 'schedule' }, content: [{ type: 'text', text: 'second scheduled reminder' }] })
+  test.agent.followup(first)
+  test.agent.followup(second)
+  await test.agent.whenIdle()
+  expect(test.model.requests).toHaveLength(2)
+  expect(test.agent.session.snapshotEvents().filter(event => event.type === 'turn/end').map(event => event.data.reason.kind)).toEqual(['completed', 'completed'])
+  expect(test.db.getRun(test.owner.ownerId, first.id)).toMatchObject({ status: 'completed' })
+  expect(test.db.getRun(test.owner.ownerId, second.id)).toMatchObject({ status: 'completed' })
+})
+
 it('continues an owned background-child notice after the parent completed and replays it once', async () => {
   const test = await fixture(['parent done', 'child result incorporated'])
   const original = test.create('delegate')
@@ -56,6 +72,57 @@ it('continues an owned background-child notice after the parent completed and re
   await reconcileNativeSessions(test.db,query,test.owner.ownerId)
   expect(test.db.listRuns(test.owner.ownerId,test.chat.id)).toHaveLength(2)
   expect(test.model.requests).toHaveLength(2)
+})
+
+it('lets a native job completion wake an idle root and retains one admission receipt on replay', async () => {
+  const test = await fixture(['root done', 'job output collected'])
+  const original = test.create('start background work')
+  await test.scheduler.enqueue(original, [{ type: 'text', text: original.query }])
+  await test.scheduler.tick()
+  await test.agent.whenIdle()
+  const message = createUserMessage({ content: [{ type: 'text', text: 'Native background job completed' }],
+    source: { kind: 'tool-jobs', form: 'notice', summary: 'Background job completed' } })
+  test.agent.followup(message)
+  await test.agent.whenIdle()
+  expect(test.model.requests).toHaveLength(2)
+  expect(JSON.stringify(test.model.requests[1].messages)).toContain('Native background job completed')
+  expect(test.db.getRun(test.owner.ownerId, message.id)).toMatchObject({ status: 'completed',
+    selection: { native_source: 'tool-jobs', native_notice: true } })
+  await reconcileNativeSessions(test.db, { observeSession: async () => ({ events: test.agent.session.snapshotEvents() }) }, test.owner.ownerId)
+  expect(test.db.listRuns(test.owner.ownerId, test.chat.id)).toHaveLength(2)
+  expect(test.model.requests).toHaveLength(2)
+})
+
+it('injects a native job completion into a busy root without starting a second business run', async () => {
+  let release
+  const test = await fixture([new Promise(resolve => { release = resolve }), 'collected'])
+  const original = test.create('working')
+  await test.scheduler.enqueue(original, [{ type: 'text', text: original.query }])
+  await test.scheduler.tick()
+  await vi.waitFor(() => expect(test.model.requests).toHaveLength(1))
+  test.agent.inject(createUserMessage({ content: [{ type: 'text', text: 'Background output is ready' }],
+    source: { kind: 'tool-jobs', form: 'notice', summary: 'Background job completed' } }))
+  release('continue collecting')
+  await test.agent.whenIdle()
+  expect(test.model.requests).toHaveLength(2)
+  expect(JSON.stringify(test.model.requests[1].messages)).toContain('Background output is ready')
+  expect(test.db.listRuns(test.owner.ownerId, test.chat.id)).toHaveLength(1)
+})
+
+it('waits for the current MCP catalog before a native job wake freezes its scope and assembles the model prompt', async () => {
+  const test = await fixture(['collected'], { scheduledClaims: true })
+  test.runtime.mcpCatalogState = { ready: false }
+  test.runtime.mcpResources = () => test.runtime.mcpCatalogState.ready ? [{ id: 'current-catalog' }] : []
+  const message = createUserMessage({ content: [{ type: 'text', text: 'Background output is ready' }],
+    source: { kind: 'tool-jobs', form: 'notice', summary: 'Background job completed' } })
+  test.agent.followup(message)
+  await vi.waitFor(() => expect(test.agent.status).toBe('running'))
+  expect(test.model.requests).toHaveLength(0)
+  expect(test.db.getRun(test.owner.ownerId, message.id)).toBeUndefined()
+  test.runtime.mcpCatalogState.ready = true
+  await test.agent.whenIdle()
+  expect(test.model.requests).toHaveLength(1)
+  expect(test.db.getRun(test.owner.ownerId, message.id).mcpTools).toEqual([{ id: 'current-catalog' }])
 })
 
 class FakeModel extends LlmAdapter {
@@ -154,6 +221,63 @@ async function delayedScheduledCatalog(test) {
   await applyMcpTools(test.ctx)
   return { tool, configRequests, release() { available = true; test.ctx.emit('workbench/resources-changed') } }
 }
+
+it.each(['queue', 'steer'])('delivers native root %s after renewal without a second ticket or queue-to-steer request', async mode => {
+  let release
+  const test = await fixture([new Promise(resolve => { release = resolve }), 'received'])
+  const first = test.create('working')
+  await test.scheduler.enqueue(first, [{ type: 'text', text: first.query }])
+  await test.scheduler.tick()
+  await vi.waitFor(() => expect(test.model.requests).toHaveLength(1))
+  const next = test.create('new evidence')
+  test.db.updateRunResources(next, { ...next.selection, prompt_mode: mode }, next.mcpTools)
+  let unavailable = true
+  const platform = test.scheduler.platformClient.json
+  test.scheduler.platformClient.json = request => {
+    if (unavailable && JSON.parse(request.body).action === 'renew')
+      throw Object.assign(new Error('temporary unavailable'), { status: 503 })
+    return platform(request)
+  }
+  await test.scheduler.enqueue(test.db.getRun(test.owner.ownerId, next.id), [{ type: 'text', text: next.query }])
+  await test.scheduler.tick()
+  expect([...test.agent.inbox.nextTurn, ...test.agent.inbox.nextStep]).toEqual([])
+  expect(test.model.requests).toHaveLength(1)
+  unavailable = false
+  await test.scheduler.tick()
+  const target = mode === 'steer' ? test.agent.inbox.nextStep : test.agent.inbox.nextTurn
+  expect(target.map(message => message.source.rpcId)).toEqual([next.id])
+  expect(test.requests.filter(request => request.action === 'acquire')).toHaveLength(1)
+  release('first response')
+  await test.agent.whenIdle()
+  expect(test.model.requests).toHaveLength(2)
+  expect(JSON.stringify(test.model.requests[1].messages)).toContain('new evidence')
+  const firstTurn = test.db.getRun(test.owner.ownerId, first.id).turnNumber
+  const accepted = test.db.getRun(test.owner.ownerId, next.id)
+  expect(accepted.status).toBe(mode === 'steer' ? 'steered' : 'completed')
+  expect(accepted.turnNumber === firstTurn).toBe(mode === 'steer')
+  expect(test.agent.session.snapshotEvents().filter(event => event.type === 'user/message' && event.data.source.rpcId === next.id)).toHaveLength(1)
+})
+
+it('lets the original AgentLoop handle a closed steering window as a new admitted turn and deduplicate its replay', async () => {
+  const test = await fixture(['first response', 'next response'])
+  const first = test.create('working')
+  await test.scheduler.enqueue(first, [{ type: 'text', text: first.query }])
+  await test.scheduler.tick()
+  await test.agent.whenIdle()
+  const next = test.create('late evidence')
+  test.db.updateRunResources(next, { ...next.selection, prompt_mode: 'steer' }, next.mcpTools)
+  const accepted = test.db.getRun(test.owner.ownerId, next.id)
+  const content = [{ type: 'text', text: next.query }]
+  await test.scheduler.enqueue(accepted, content)
+  await test.scheduler.tick()
+  await test.agent.whenIdle()
+  expect(test.db.getRun(test.owner.ownerId, next.id)).toMatchObject({ status: 'completed', turnNumber: 2 })
+  expect(test.requests.filter(request => request.action === 'acquire')).toHaveLength(2)
+  await dispatchRunPrompt(test, { ...accepted, sessionId: test.agent.id, selection: { ...accepted.selection, prompt_mode: 'queue' } }, content)
+  await test.agent.whenIdle()
+  expect(test.model.requests).toHaveLength(2)
+  expect(test.agent.session.snapshotEvents().filter(event => event.type === 'user/message' && event.data.source.rpcId === next.id)).toHaveLength(1)
+})
 
 it('registers the sidebar browser with the real native prompt and tool services', async () => {
   const test = await fixture(['browser ready'])

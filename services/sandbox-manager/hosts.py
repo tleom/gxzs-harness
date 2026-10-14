@@ -25,6 +25,7 @@ class Hosts:
         self.failures = {}
         self.recoveries = {}
         self.cleanup_at = {}
+        self.native_snapshots = {}
 
     def _cleanup_superseded(self, item):
         """Remove only stopped, identity-verified predecessors after the new Host is healthy."""
@@ -252,6 +253,21 @@ class Hosts:
             self._save(record, current)
             if self.admission.busy(current['owner_id']):
                 return current
+            observed = dict(current)
+        # Native background work can outlive the platform's model admission.
+        # Probe outside the workspace lock because Host plugins can call back
+        # into this manager. Future schedules and UI leases survive replacement
+        # through native recovery; they are not in-flight task admission.
+        inspected = self.docker('inspect', expected[1], timeout=5, check=False)
+        info = json.loads(inspected.stdout)[0] if not inspected.returncode else None
+        if info and info['State']['Running']:
+            activity = self.native_activity(observed.get('endpoint')) if observed.get('endpoint') else None
+            if activity is None or any(activity[key] for key in ('runningAgents', 'pendingMessages', 'runningJobs', 'activeSettingsWrites')):
+                return observed
+        with self.lock(workspace):
+            current = json.loads(record.read_text(encoding='utf-8'))
+            if current != observed or self.admission.busy(current['owner_id']):
+                return current
             current['state'] = 'fencing'
             self._save(record, current)
             from mcp_runtime import invalidate
@@ -272,6 +288,7 @@ class Hosts:
             return self.ensure(workspace, payload)
 
     def _fence(self, workspace, owner, instance):
+        self.native_snapshots.pop(instance, None)
         from global_memory import fence_workspace
         fence_workspace(workspace)
         from mcp_runtime import fence_workspace as fence_mcp
@@ -345,6 +362,26 @@ class Hosts:
             return False
         return (payload.get('live') is True and payload.get('recovery') == 'ready'
                 and payload.get('resources') == 'unavailable')
+
+    def native_activity(self, endpoint):
+        """Only a complete native activity read can authorize idle shutdown.
+
+        Active schedules keep their DSH timer resident, including while the
+        user is offline. The manager never computes or delivers reminders.
+        Older Hosts and unavailable catalogs fail closed until upgraded/ready.
+        """
+        try:
+            with self.opener.open(endpoint + '/ai/workbench/health', timeout=2) as response:
+                payload = json.loads(response.read(4096))
+                activity = payload.get('activity') or {}
+                keys = ('runningAgents', 'pendingMessages', 'runningJobs', 'activeSchedules', 'activeSidebarResources', 'activeSettingsWrites')
+                if (response.status == 200 and payload.get('ready') is True
+                        and activity.get('protocol') == 1 and activity.get('status') == 'ready'
+                        and all(type(activity.get(key)) is int and activity[key] >= 0 for key in keys)):
+                    return {key: activity[key] for key in keys}
+        except Exception:
+            pass
+        return None
 
     def maintain(self):
         # A slow or broken host must not expire every other owner's heartbeat.
@@ -448,14 +485,25 @@ class Hosts:
                                        and self.dependency_degraded(item['endpoint']))
             process_pressure = bool(host_running and sandbox_running and
                                     (pid_pressure(info) or pid_pressure(sandbox_info)))
+            native_activity = self.native_activity(item['endpoint']) if healthy else None
             with self.lock(record.parent.name):
                 item = json.loads(record.read_text())
                 if item != observed:
                     return
                 activity = self.root.parent / item['workspace_id']
+                if native_activity is not None:
+                    previous = self.native_snapshots.get(item['instance_id'])
+                    # Ongoing native work or a confirmed state transition is
+                    # real activity. Empty unchanged probes and unknown reads
+                    # cannot extend the idle window.
+                    if (any(native_activity[key] for key in ('runningAgents', 'pendingMessages', 'runningJobs', 'activeSidebarResources', 'activeSettingsWrites'))
+                            or previous is not None and previous != native_activity):
+                        activity.touch()
+                    self.native_snapshots[item['instance_id']] = dict(native_activity)
+                native_idle = native_activity is not None and not any(native_activity.values())
                 idle = (item.get('state') != 'draining' and activity.exists()
                         and time.time() - activity.stat().st_mtime > 1800
-                        and not self.admission.busy(item['owner_id']))
+                        and not self.admission.busy(item['owner_id']) and native_idle)
                 if host_running and idle:
                     self.docker('stop', '--time', '10', item['instance_id'])
                     self.docker('stop', '--time', '10', sandbox, check=False)

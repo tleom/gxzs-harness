@@ -1,0 +1,68 @@
+import { EventEmitter } from 'node:events'
+import { createRequire } from 'node:module'
+import { expect, it, vi } from 'vitest'
+const { createScreencast } = createRequire(import.meta.url)('../src/browser-screencast.cjs')
+
+it('streams lossless 2x frames without changing the CSS viewport and waits for viewer receipts', async () => {
+  const session = Object.assign(new EventEmitter(), {send:vi.fn(async()=>({}))})
+  const emit = vi.fn(async()=>true)
+  let sequence=0
+  const stream = createScreencast({session,page:{viewportSize:()=>({width:1000,height:700})},emit,nextId:()=>++sequence})
+  expect(await stream.start()).toBe(true)
+  expect(session.send).toHaveBeenCalledWith('Emulation.setDeviceMetricsOverride',expect.objectContaining({
+    width:1000,height:700,deviceScaleFactor:2,viewport:{x:0,y:0,width:1000,height:700,scale:1}}))
+  expect(session.send).toHaveBeenCalledWith('Page.startScreencast',expect.objectContaining({format:'png',maxWidth:2000,maxHeight:1400}))
+  session.emit('Page.screencastFrame',{sessionId:7,data:'aA=='})
+  await vi.waitFor(()=>expect(emit).toHaveBeenCalledOnce())
+  expect(session.send.mock.calls.filter(([method])=>method==='Page.screencastFrameAck')).toHaveLength(0)
+  await stream.acknowledge(1)
+  expect(session.send).toHaveBeenCalledWith('Page.screencastFrameAck',{sessionId:7})
+  await stream.dispose()
+  expect(session.listenerCount('Page.screencastFrame')).toBe(0)
+})
+
+it('coalesces frames when the transport is slow and releases discarded frame receipts', async () => {
+  const session = Object.assign(new EventEmitter(), {send:vi.fn(async()=>({}))})
+  let release,sequence=0
+  const emit=vi.fn(()=>new Promise(resolve=>{release=resolve}))
+  const stream=createScreencast({session,page:{viewportSize:()=>({width:500,height:500})},emit,nextId:()=>++sequence})
+  await stream.start()
+  session.emit('Page.screencastFrame',{sessionId:1,data:'aA=='})
+  session.emit('Page.screencastFrame',{sessionId:2,data:'aA=='})
+  session.emit('Page.screencastFrame',{sessionId:3,data:'aA=='})
+  await vi.waitFor(()=>expect(session.send).toHaveBeenCalledWith('Page.screencastFrameAck',{sessionId:2}))
+  expect(emit).toHaveBeenCalledOnce()
+  const firstRelease=release
+  firstRelease(true)
+  await vi.waitFor(()=>expect(emit).toHaveBeenCalledTimes(2))
+  expect(emit.mock.calls[1][0].frame_id).toBe(3)
+  release(true)
+  await stream.dispose()
+})
+
+it('uses high-quality motion encoding during rapid repaint and restores lossless text when settled', async()=>{
+  vi.useFakeTimers()
+  const session=Object.assign(new EventEmitter(),{send:vi.fn(async()=>({}))})
+  let sequence=0
+  const stream=createScreencast({session,page:{viewportSize:()=>({width:1000,height:700})},emit:async()=>true,nextId:()=>++sequence})
+  try {
+    await stream.start()
+    for(let id=1;id<=4;id++) {session.emit('Page.screencastFrame',{sessionId:id,data:'aA=='});await vi.advanceTimersByTimeAsync(1)}
+    expect(session.send).toHaveBeenCalledWith('Page.startScreencast',expect.objectContaining({format:'jpeg',quality:95}))
+    session.emit('Page.screencastFrame',{sessionId:5,data:'aA=='})
+    await vi.advanceTimersByTimeAsync(1600)
+    expect(session.send.mock.calls.filter(([name])=>name==='Page.startScreencast').at(-1)[1].format).toBe('png')
+  } finally {await stream.dispose();vi.useRealTimers()}
+})
+
+it('does not restart encoding when a hidden view stops during CDP configuration', async()=>{
+  let release
+  const session=Object.assign(new EventEmitter(),{send:vi.fn(async name=>{if(name==='Emulation.setDeviceMetricsOverride')await new Promise(resolve=>{release=resolve});return{}})})
+  const stream=createScreencast({session,page:{viewportSize:()=>({width:1000,height:700})},emit:async()=>true,nextId:()=>1})
+  const starting=stream.start()
+  await stream.stop()
+  release()
+  expect(await starting).toBe(false)
+  expect(session.send.mock.calls.some(([name])=>name==='Page.startScreencast')).toBe(false)
+  await stream.dispose()
+})

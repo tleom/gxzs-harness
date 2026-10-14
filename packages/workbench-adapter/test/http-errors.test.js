@@ -21,7 +21,7 @@ describe('public HTTP error contract', () => {
     expect(JSON.stringify(result)).not.toContain('secret')
     expect(JSON.stringify(result)).not.toContain('/host')
   })
-  it.each(['session/queue-item-not-found', 'session/agent-busy', 'session/steer-unavailable'])('preserves native %s as a recoverable conflict', (code) => {
+  it.each(['session/queue-item-not-found', 'session/agent-busy', 'session/steer-unavailable', 'settings/conflict'])('preserves native %s as a recoverable conflict', (code) => {
     const result = serialize(Object.assign(new Error('private host details'), { isDSHRemoteError: true, code, details: { token: 'secret' } }))
     expect(result).toMatchObject({ status: 409, code })
     expect(JSON.stringify(result)).not.toContain('private host details')

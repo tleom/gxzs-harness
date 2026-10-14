@@ -95,6 +95,26 @@ async function call(handler, key, method, route, value, authenticated = true, us
 }
 
 describe('authenticated workbench HTTP handler', () => {
+  it('cancels the owner file read when its response connection closes', async () => {
+    const { handler, key, context } = setup()
+    const previous = context.workbenchFileManager.operate.getMockImplementation()
+    let entered, response, observedSignal
+    const reading = new Promise(resolve => { entered = resolve })
+    context.workbenchFileManager.operate.mockImplementation((payload, signal) => {
+      if (payload.operation !== 'stat') return previous(payload, signal)
+      observedSignal = signal
+      entered()
+      return new Promise((_, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }))
+    })
+    const request = call(handler, key, 'GET', '/files/stat?path=a.bin', undefined, true, '42', {}, res => { response = res })
+    await reading
+    response.destroyed = true
+    response.emit('close')
+    const result = await request
+    expect(observedSignal.aborted).toBe(true)
+    expect(result.status).toBeUndefined()
+    expect(response.listenerCount('close')).toBe(0)
+  })
   it('bounds a stalled native activity query without deleting private files', async () => {
     const context = { waterfall: vi.fn(() => new Promise(() => {})) }
     await expect(waitSessionActivity(context, 'session', { timeoutMs: 20 })).rejects.toThrow('did not settle')

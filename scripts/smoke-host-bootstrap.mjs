@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// Run inside the built host image with --network none and this script mounted
-// read-only. All HTTP fixtures, state and child processes stay in the container.
+// Run in the built Host sharing an isolated Sandbox network, with this script
+// mounted read-only. HTTP fixtures and user state stay in the disposable pair.
 import assert from 'node:assert/strict'
 import { execFileSync, spawn } from 'node:child_process'
 import { createHash, createHmac, randomUUID } from 'node:crypto'
@@ -35,15 +35,20 @@ let registered = false
 let deniedCatalogs = 0
 let acceptedCatalogs = 0
 let fixtureFailure
+let settingsWritable = true
+let heldSettingsCheck
 let child
 let childError
 let hostLogs = ''
 let passed = false
 const sessionCreate = process.argv.includes('--session-create')
 const realSsh = process.argv.includes('--real-ssh')
+if (!realSsh) throw new Error('Host bootstrap smoke requires the real disposable Sandbox SSH transport')
 const crashRestart = process.argv.includes('--crash-restart')
 const runningRestart = process.argv.includes('--running-restart')
 const nativeAttachments = process.argv.includes('--native-attachments')
+const legacyProfile = process.argv.includes('--legacy-profile')
+if (legacyProfile && !sessionCreate) throw new Error('Legacy profile smoke requires the full session/restart fixture')
 if (nativeAttachments && (!realSsh || !sessionCreate || !runningRestart || process.env.GXZS_SMOKE_DSH_HOME !== '/srv/dsh'))
   throw new Error('Native attachment smoke requires the disposable shared home, real SSH and running restart fixture')
 let modelPort
@@ -79,7 +84,7 @@ const fixture = (handler) => http.createServer(async (req, res) => {
     for await (const chunk of req) chunks.push(chunk)
     const body = Buffer.concat(chunks)
     req.fixtureBody = body.length ? JSON.parse(body) : undefined
-    handler(req, res)
+    await handler(req, res)
   }
   catch (error) {
     fixtureFailure ??= error
@@ -126,10 +131,22 @@ const platform = fixture((req, res) => {
   }
   throw new Error(`Unexpected platform fixture request: ${req.method} ${req.url}`)
 })
-const manager = fixture((req, res) => {
+const manager = fixture(async (req, res) => {
   checkIdentity(req, managerToken)
   assert.equal(req.method, 'POST', 'Manager fixture only accepts POST')
   const base = `/sandboxes/${workspace}/`
+  if (req.url === `${base}host-settings`) {
+    assert.deepEqual(req.fixtureBody, { operation: 'check' }, 'Only the fixed settings check is admitted')
+    const gate = heldSettingsCheck
+    if (gate) {
+      heldSettingsCheck = undefined
+      gate.observed.resolve()
+      await gate.release.promise
+    }
+    respond(res, settingsWritable ? 200 : 503, settingsWritable ? { writable: true }
+      : { error: 'Synthetic Host maintenance in progress', code: 'SANDBOX_UPDATING', retry_after: 5 })
+    return
+  }
   if (req.url === `${base}personal-resources`) { respond(res, 200, { skills: [fixtureSkill] }); return }
   if (req.url === `${base}personal-mcp`) { respond(res, 200, { mcp: [] }); return }
   if (req.url === `${base}files`) {
@@ -275,7 +292,7 @@ async function waitForHealth(predicate, stage, timeoutMs = 60_000) {
       const response = await fetch('http://127.0.0.1:3081/ai/workbench/health', { signal: AbortSignal.timeout(1500) })
       const body = await response.json()
       lastHealth = {status:response.status, live:body.live, ready:body.ready,
-        recovery:body.recovery, resources:body.resources}
+        recovery:body.recovery, resources:body.resources, activity:body.activity}
       if (predicate(response.status, body)) return body
     } catch { /* Relay can be listening before DSH mounts the adapter route. */ }
     await delay(100)
@@ -324,6 +341,185 @@ async function signedRequest(method, route, value) {
     method, headers: { 'X-GXZS-Assertion': token, ...(contentType ? { 'content-type': contentType } : {}) },
     ...(body ? { body } : {}), signal: AbortSignal.timeout(30_000),
   })
+}
+
+async function nativeClientRoundtrip() {
+  const response = await signedRequest('GET', '/native/client')
+  const payload = await response.json()
+  assert.equal(response.status, 200, `Native client graph must be installed: ${sanitize(JSON.stringify(payload))}`)
+  const manifest = payload.data
+  assert.equal(manifest.protocol, 1)
+  assert.equal(manifest.version, '0.2.1-alpha.2')
+  assert.match(manifest.bootstrap, /__ModuleLoader__/)
+  assert.match(manifest.boot.rev, /^[a-f0-9]{64}$/)
+  const ids = new Set(manifest.boot.entries.map(row => row.id))
+  for (const id of ['@deepseek-ai/dsh-client-modules', '@deepseek-ai/dsh-api-gateway',
+    '@deepseek-ai/dsh-api-job-controller', '@deepseek-ai/dsh-api-session-controller', '@gxzs/dsh-workbench-adapter'])
+    assert.ok(ids.has(id), `Missing native client module ${id}`)
+  for (const row of manifest.boot.entries) {
+    const route = `/native/client/bundle?url=${encodeURIComponent(row.url)}&rev=${encodeURIComponent(manifest.boot.rev)}`
+    const resource = await signedRequest('GET', route)
+    const value = await resource.json()
+    assert.equal(resource.status, 200, `Native client bundle ${row.id} must be present in the built image`)
+    assert.equal(typeof value.data.source, 'string')
+    assert.ok(value.data.source.includes(row.id), `Native client bundle must register ${row.id}`)
+    if (row.id === '@deepseek-ai/dsh-api-session-controller') {
+      assert.equal([...value.data.source.matchAll(/this\.remote\.subagents\.prompt\(\{\s+requestId: requestId \?\? randomUUID\(\),/g)].length, 1,
+        'The image-served child Session.prompt must preserve the caller requestId')
+      assert.doesNotMatch(value.data.source, /this\.remote\.subagents\.prompt\(\{\s+requestId: randomUUID\(\),/)
+      console.log(JSON.stringify({ check: 'prepared_native_session_sdk',
+        sourceSha256: createHash('sha256').update(value.data.source).digest('hex'), callerRequestIdGuard: true }))
+    }
+    assert.ok(Buffer.byteLength(value.data.source, 'utf8') <= 8 * 1024 * 1024)
+  }
+  console.log(`PASS native client image: signed boot graph and ${ids.size} original registration bundles; generated presenter included`)
+}
+
+async function nativeSettingsView() {
+  const response = await signedRequest('GET', '/native/settings')
+  assert.equal(response.status, 200, 'Native subagent settings must be available in the built Host')
+  const view = (await response.json()).data
+  assert.equal(view.hasDocument, false, 'The carrier must not expose the whole settings document')
+  assert.deepEqual(view.namespaces.map(row => row.ns).sort(), ['subagent', 'subagent-model-selection-settings', 'ui-conversation'])
+  return view
+}
+
+async function nativeSettingsRoundtrip() {
+  const view = await nativeSettingsView()
+  const before = view.namespaces.find(row => row.ns === 'subagent')
+  assert.equal(view.writable, true)
+  assert.ok(Number.isSafeInteger(before.revision))
+  const value = before.value.maxDepth === 2 ? 3 : 2
+  const gate = { observed: Promise.withResolvers(), release: Promise.withResolvers() }
+  heldSettingsCheck = gate
+  const changing = signedRequest('POST', '/native/settings/mutate', {
+    ns: 'subagent', expectedRevision: before.revision, ops: [{ op: 'set', path: ['maxDepth'], value }],
+  })
+  void changing.catch(() => {})
+  try {
+    await Promise.race([gate.observed.promise, delay(5000).then(() => { throw new Error('Manager settings check did not arrive') })])
+    await waitForHealth((status, body) => status === 200 && body.activity?.activeSettingsWrites === 1,
+      'in-flight settings write is visible before Manager approval', 5000)
+  } finally {
+    gate.release.resolve()
+    heldSettingsCheck = undefined
+  }
+  const changed = await changing
+  assert.equal(changed.status, 200, 'Native volatile setting must save through signed HTTP')
+  const saved = (await changed.json()).data
+  assert.equal(saved.value.maxDepth, value)
+  assert.notEqual(saved.revision, before.revision)
+  settingsWritable = false
+  try {
+    const denied = await signedRequest('POST', '/native/settings/mutate', {
+      ns: 'subagent', expectedRevision: saved.revision, ops: [{ op: 'set', path: ['maxDepth'], value: 4 }],
+    })
+    assert.equal(denied.status, 503, 'Draining must reject new settings writes before native mutation')
+    assert.equal((await denied.json()).code, 'SANDBOX_UPDATING')
+  } finally { settingsWritable = true }
+  await waitForHealth((status, body) => status === 200 && body.activity?.activeSettingsWrites === 0,
+    'completed and refused settings writes release their activity count', 5000)
+  assert.equal((await nativeSettingsView()).namespaces.find(row => row.ns === 'subagent').value.maxDepth, value,
+    'The maintenance refusal must preserve the committed setting')
+  const stale = await signedRequest('POST', '/native/settings/mutate', {
+    ns: 'subagent', expectedRevision: before.revision, ops: [{ op: 'set', path: ['maxDepth'], value: 4 }],
+  })
+  assert.equal(stale.status, 409, 'Stale settings revisions must survive the HTTP error projection')
+  assert.equal((await stale.json()).code, 'settings/conflict')
+  const preference = view.namespaces.find(row => row.ns === 'ui-conversation')
+  const busyEnter = preference.value.busyEnter === 'steer' ? 'queue' : 'steer'
+  const updatedPreference = await signedRequest('POST', '/native/settings/mutate', {
+    ns: 'ui-conversation', expectedRevision: preference.revision,
+    ops: [{ op: 'set', path: ['busyEnter'], value: busyEnter }],
+  })
+  assert.equal(updatedPreference.status, 200)
+  const preferenceSaved = (await updatedPreference.json()).data
+  assert.equal(preferenceSaved.value.busyEnter, busyEnter)
+  const invalidPreference = await signedRequest('POST', '/native/settings/mutate', {
+    ns: 'ui-conversation', expectedRevision: preferenceSaved.revision,
+    ops: [{ op: 'set', path: ['busyEnter'], value: 'unknown-smoke-mode' }],
+  })
+  assert.equal(invalidPreference.status, 400)
+  assert.equal((await invalidPreference.json()).code, 'settings/rejected')
+  for (const request of [
+    { ns: 'llm-pi-ai', expectedRevision: saved.revision, ops: [{ op: 'unset', path: ['providers'] }] },
+    { ns: 'subagent', expectedRevision: saved.revision, ops: [{ op: 'set', path: ['unexposed'], value: true }] },
+    { ns: 'subagent', ops: [{ op: 'set', path: ['maxDepth'], value: 4 }] },
+    { ns: 'ui-conversation', expectedRevision: preferenceSaved.revision, ops: [{ op: 'set', path: ['enabled'], value: true }] },
+  ]) {
+    const denied = await signedRequest('POST', '/native/settings/mutate', request)
+    assert.equal(denied.status, 400, 'Unadmitted fields, namespaces and missing revisions must fail before native writes')
+  }
+  assert.equal((await nativeSettingsView()).namespaces.find(row => row.ns === 'subagent').value.maxDepth, value)
+  const models = await signedRequest('GET', '/native/models')
+  assert.equal(models.status, sessionCreate ? 200 : 503)
+  if (sessionCreate) {
+    const catalog = (await models.json()).data
+    assert.ok(catalog.groups.some(group => group.id === 'smoke'))
+  }
+  const restore = Object.hasOwn(before.user ?? {}, 'maxDepth')
+    ? { op: 'set', path: ['maxDepth'], value: before.user.maxDepth }
+    : { op: 'unset', path: ['maxDepth'] }
+  console.log('PASS native settings HTTP: fixed Manager identity check, in-flight activity, maintenance refusal, restricted fields, revision conflict and platform model catalog')
+  const restorePreference = Object.hasOwn(preference.user ?? {}, 'busyEnter')
+    ? { op: 'set', path: ['busyEnter'], value: preference.user.busyEnter }
+    : { op: 'unset', path: ['busyEnter'] }
+  return { value, original: before.value.maxDepth, restore,
+    preference: { value: busyEnter, original: preference.value.busyEnter, restore: restorePreference } }
+}
+
+async function restoreNativeSettings(proof, { restarted = false } = {}) {
+  const current = (await nativeSettingsView()).namespaces.find(row => row.ns === 'subagent')
+  assert.equal(current.value.maxDepth, proof.value,
+    restarted ? 'Saved native settings must survive the full start-workbench restart' : 'Rejected writes must not alter native settings')
+  const restored = await signedRequest('POST', '/native/settings/mutate', {
+    ns: 'subagent', expectedRevision: current.revision, ops: [proof.restore],
+  })
+  assert.equal(restored.status, 200)
+  assert.equal((await restored.json()).data.value.maxDepth, proof.original)
+  const preference = (await nativeSettingsView()).namespaces.find(row => row.ns === 'ui-conversation')
+  assert.equal(preference.value.busyEnter, proof.preference.value,
+    'Busy Enter preference must remain persisted through the full entrypoint restart')
+  const resetPreference = await signedRequest('POST', '/native/settings/mutate', {
+    ns: 'ui-conversation', expectedRevision: preference.revision, ops: [proof.preference.restore],
+  })
+  assert.equal(resetPreference.status, 200)
+  assert.equal((await resetPreference.json()).data.value.busyEnter, proof.preference.original)
+  console.log(`PASS native settings ${restarted ? 'full entrypoint restart persistence and ' : ''}reset to prior composition`)
+}
+
+async function seedLegacyProfile(home) {
+  const supplied = process.env.GXZS_SMOKE_LEGACY_BASELINE
+  const bytes = await readFile(supplied || '/opt/workbench/profiles/workbench/cordis.runtime.patch.yml')
+  const baselineSha256 = createHash('sha256').update(bytes).digest('hex')
+  const imageId = supplied ? process.env.GXZS_SMOKE_LEGACY_IMAGE_ID : `sha256:${'0'.repeat(64)}`
+  assert.match(imageId ?? '', /^sha256:[a-f0-9]{64}$/)
+  if (supplied) assert.equal(baselineSha256, process.env.GXZS_SMOKE_LEGACY_BASELINE_SHA256)
+  const directory = path.join(home, 'profiles/workbench')
+  await mkdir(directory, { recursive: true })
+  const user = `${bytes.toString('utf8').trimEnd()}\n\n- id: subagent\n  config:\n    maxDepth: 2\n- id: ui-conversation\n  config:\n    busyEnter: steer\n`
+  await writeFile(path.join(directory, 'cordis.patch.yml'), user, { flag: 'wx', mode: 0o600 })
+  await writeFile(path.join(directory, 'legacy-platform-baseline.patch.yml'), bytes, { flag: 'wx', mode: 0o600 })
+  await writeFile(path.join(directory, 'legacy-platform-baseline.json'), JSON.stringify({
+    schemaVersion: 1, imageId, baselineSha256, ownerId: owner,
+  }) + '\n', { flag: 'wx', mode: 0o600 })
+  return { directory, baselineSha256, userSha256: createHash('sha256').update(user).digest('hex'),
+    source: supplied ? 'captured-old-image' : 'synthetic-pre-layout' }
+}
+
+async function assertLegacyProfileMigration(proof) {
+  const receipt = JSON.parse(await readFile(path.join(proof.directory, '.gxzs-bundle-layout-v1.json'), 'utf8'))
+  assert.equal(receipt.layout, 'bundle-base')
+  assert.equal(receipt.baselineSha256, proof.baselineSha256)
+  assert.ok(receipt.removed > 0)
+  assert.equal(receipt.retained, 2, 'Legacy user limit and input preference must remain in the native user layer')
+  const backup = await readFile(path.join(proof.directory, '.cordis.patch.before-bundle-layout-v1.yml'))
+  assert.equal(createHash('sha256').update(backup).digest('hex'), proof.userSha256)
+  const view = await nativeSettingsView()
+  assert.equal(view.namespaces.find(row => row.ns === 'subagent').value.maxDepth, 2)
+  assert.equal(view.namespaces.find(row => row.ns === 'ui-conversation').value.busyEnter, 'steer')
+  console.log(JSON.stringify({ check: 'entrypoint_legacy_profile_migration', source: proof.source,
+    baselineSha256: proof.baselineSha256, removed: receipt.removed, retained: receipt.retained, backupVerified: true }))
 }
 
 async function historySnapshot(chatId) {
@@ -404,10 +600,8 @@ try {
   const platformPort = await listen(platform)
   const managerPort = await listen(manager)
   const home = path.join(root, 'home')
-  const bin = path.join(root, 'bin')
-  const sandboxWorkspace = sessionCreate ? '/workspace' : path.join(root, 'workspace')
-  const helper = '/opt/workbench/profiles/workbench/node_modules/@deepseek-ai/dsh-ssh/lib/helper.js'
-  await Promise.all([mkdir(home), mkdir(bin), sessionCreate ? Promise.resolve() : mkdir(sandboxWorkspace)])
+  const sandboxWorkspace = '/workspace'
+  await mkdir(home)
   if (sessionCreate) {
     assert.equal(process.getuid(), 1000, 'Run the host smoke as its production non-root user')
     assert.equal((await stat('/')).uid, 0, 'The parent remains owned by root')
@@ -421,13 +615,8 @@ try {
     for (const name of ['gxzs-fs-ssh', 'gxzs-subprocess-ssh', 'gxzs-spill-sandbox'])
       assert.ok(patch.includes(`- id: ${name}`), `Missing SSH tool override: ${name}`)
   }
-  // Exercise the real helper handshake without an SSH daemon or another image.
-  // Only the initial RPC channel is needed: user tasks/forwarded streams are
-  // outside this readiness smoke. Reject any unexpected SSH control request.
-  await writeFile(path.join(bin, 'ssh'), '#!/bin/sh\n[ "$1" = "-T" ] && [ "$2" = "-M" ] || exit 70\nexec "$GXZS_SANDBOX_NODE" --disable-sigusr1 "$GXZS_SANDBOX_HELPER"\n', { mode: 0o700 })
-  const helperHash = createHash('sha256').update(await readFile(helper)).digest('hex')
   const env = {
-    PATH: `${bin}:${process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin'}`,
+    PATH: process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin',
     HOME: home, USER: 'node', LANG: 'C.UTF-8',
     DSH_HOME: nativeAttachments ? process.env.GXZS_SMOKE_DSH_HOME : path.join(root, 'dsh'),
     GXZS_NATIVE_FILE_ATTACHMENTS: nativeAttachments ? '1' : '0', DSH_TELEMETRY_DISABLED: '1', DSH_PERMISSION_MODE: 'danger-full-access',
@@ -439,11 +628,7 @@ try {
     GXZS_PLATFORM_INTERNAL_TOKEN: platformToken,
     GXZS_SANDBOX_MANAGER_URL: `http://127.0.0.1:${managerPort}`, GXZS_SANDBOX_MANAGER_TOKEN: managerToken,
     GXZS_SANDBOX_WORKSPACE_ID: workspace, GXZS_SANDBOX_WORKSPACE: sandboxWorkspace,
-    GXZS_SANDBOX_SSH_HOST: '127.0.0.1', GXZS_SANDBOX_NODE: '/usr/local/bin/node',
-    GXZS_SANDBOX_HELPER: helper, GXZS_SANDBOX_HELPER_HASH: helperHash,
-    // The host image deliberately has no sandbox ripgrep. Readiness resolves
-    // this executable but must never perform a user search in this fixture.
-    GXZS_SANDBOX_RG: '/usr/bin/false',
+    GXZS_SANDBOX_NODE: '/usr/local/bin/node',
   }
   if (realSsh) {
     assert.ok(process.env.GXZS_SANDBOX_SSH_HOST, 'Real SSH mode requires the isolated sandbox alias')
@@ -456,6 +641,7 @@ try {
       GXZS_SANDBOX_RG: '/usr/bin/rg',
     })
   }
+  const legacyProof = legacyProfile ? await seedLegacyProfile(env.DSH_HOME) : undefined
   child = spawn('/usr/local/bin/start-workbench', [], { env, detached: true, stdio: ['ignore', 'pipe', 'pipe'] })
   child.once('error', (error) => { childError = error })
   for (const stream of [child.stdout, child.stderr]) stream.on('data', (chunk) => { hostLogs = (hostLogs + chunk.toString()).slice(-24_000) })
@@ -465,6 +651,10 @@ try {
   registered = true
   await waitForHealth((status, body) => acceptedCatalogs > 0 && status === 200 && body.live === true && body.ready === true,
     'registered catalog: HTTP 200, live=true, ready=true', 30_000)
+  await nativeClientRoundtrip()
+  if (legacyProof) await assertLegacyProfileMigration(legacyProof)
+  const nativeSettingsProof = await nativeSettingsRoundtrip()
+  if (!sessionCreate) await restoreNativeSettings(nativeSettingsProof)
   if (sessionCreate) {
     const response = await signedRequest('POST', '/chats')
     if (fixtureFailure) throw fixtureFailure
@@ -549,6 +739,7 @@ try {
     child.once('error', error => { childError = error })
     for (const stream of [child.stdout, child.stderr]) stream.on('data', chunk => { hostLogs = (hostLogs + chunk.toString()).slice(-24_000) })
     await waitForHealth((status, body) => status === 200 && body.ready === true, 'restarted host with native session', 30_000)
+    await restoreNativeSettings(nativeSettingsProof, { restarted: true })
     if (runningRestart) {
       const recovered = await signedRequest('GET', `/runs/${runningId}`)
       assert.equal((await recovered.json()).data.status, 'interrupted', 'In-flight native turn must not stay falsely running')
@@ -721,4 +912,4 @@ try {
   }
   await rm(root, { recursive: true, force: true })
 }
-if (passed) process.stdout.write(`PASS host bootstrap: unauthorized -> live/not-ready -> registered/ready${sessionCreate ? '; non-root native session create=201/detail=200/rename=200/cold-resume=200; empty local cwd and SSH tool overrides' : ''}${realSsh ? '; real SSH sandbox file survives host restart' : ''}; restart=${crashRestart ? 'SIGKILL' : 'SIGTERM'}${runningRestart ? '; active turn recovered as interrupted; no duplicate model request; explicit retry completed in same session' : ''}; process group stopped\n`)
+if (passed) process.stdout.write(`PASS host bootstrap: unauthorized -> live/not-ready -> registered/ready${sessionCreate ? '; non-root native session create=201/detail=200/rename=200/cold-resume=200; empty local cwd and SSH tool overrides; real SSH sandbox file survives host restart' : '; fresh native profile over real SSH, no user Session or model turn'}${sessionCreate ? `; restart=${crashRestart ? 'SIGKILL' : 'SIGTERM'}` : ''}${runningRestart ? '; active turn recovered as interrupted; no duplicate model request; explicit retry completed in same session' : ''}; process group stopped\n`)

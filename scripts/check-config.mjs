@@ -1,4 +1,4 @@
-import { cpSync, mkdirSync, rmSync } from 'node:fs'
+import { cpSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
 import path from 'node:path'
 
@@ -17,7 +17,7 @@ cpSync(profileSource, profileTarget, {
   recursive: true,
   filter: (source) => !source.includes(`${path.sep}node_modules`),
 })
-cpSync(path.join(profileSource, 'cordis.runtime.patch.yml'), path.join(profileTarget, 'cordis.patch.yml'))
+writeFileSync(path.join(profileTarget, 'cordis.patch.yml'), '[]\n')
 for (const name of packages) {
   cpSync(path.resolve('packages', name), path.join(home, 'packages', name), {
     recursive: true,

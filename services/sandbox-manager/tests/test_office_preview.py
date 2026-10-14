@@ -4,6 +4,7 @@ import importlib.util
 import io
 from pathlib import Path
 import zipfile
+from types import SimpleNamespace
 from xml.etree import ElementTree
 
 import pytest
@@ -45,3 +46,9 @@ def test_exact_spacing_overrides_grid_only_in_conversion_copy():
 def test_unsafe_xml_is_rejected_before_conversion():
     with pytest.raises(ValueError, match="声明"):
         preview.preserve_exact_spacing(document('<!DOCTYPE spacing><spacing/>'), ".docx")
+
+
+def test_missing_declared_fonts_accepts_localized_and_english_family_names(monkeypatch):
+    monkeypatch.setattr(preview.subprocess, 'run', lambda *args, **kwargs: SimpleNamespace(stdout='SimSun,宋体\nFangSong,仿宋\n'))
+    source = document(f'<w:document xmlns:w="{NS}"><w:rFonts w:eastAsia="宋体" w:ascii="SimSun" w:cs="Unavailable"/></w:document>')
+    assert preview.missing_fonts(source, '.docx') == ['Unavailable']

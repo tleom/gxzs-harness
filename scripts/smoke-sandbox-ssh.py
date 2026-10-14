@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Verify current manager SSH setup against an existing isolated sandbox."""
 import ast
+import hashlib
 import io
 import json
 import os
@@ -121,13 +122,25 @@ def verify(container, host_image=None):
                 assert mount['Type'] == 'volume' and mount['RW'] is False
                 attachment_args = ['--mount', 'type=volume,source=' + mount['Name'] + ',destination=/srv/dsh',
                                    '-e', 'GXZS_SMOKE_DSH_HOME=/srv/dsh']
+            legacy_args = []
+            if os.environ.get('GXZS_SMOKE_LEGACY_PROFILE') == '1' and os.environ.get('GXZS_SMOKE_LEGACY_BASELINE'):
+                baseline = Path(os.environ['GXZS_SMOKE_LEGACY_BASELINE'])
+                assert baseline.is_absolute() and baseline.is_file() and not baseline.is_symlink()
+                digest = hashlib.sha256(baseline.read_bytes()).hexdigest()
+                assert digest == os.environ.get('GXZS_SMOKE_LEGACY_BASELINE_SHA256')
+                image_id = os.environ.get('GXZS_SMOKE_LEGACY_IMAGE_ID', '')
+                assert re.fullmatch(r'sha256:[a-f0-9]{64}', image_id)
+                legacy_args = ['--mount', 'type=bind,source=' + str(baseline) + ',destination=/legacy-platform-baseline.patch.yml,readonly',
+                               '-e', 'GXZS_SMOKE_LEGACY_BASELINE=/legacy-platform-baseline.patch.yml',
+                               '-e', 'GXZS_SMOKE_LEGACY_BASELINE_SHA256=' + digest,
+                               '-e', 'GXZS_SMOKE_LEGACY_IMAGE_ID=' + image_id]
             host = docker('create', '--network', 'container:' + container,
                     '--user', '1000:1000', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges:true',
                     '--memory', '1g', '--cpus', '2', '--pids-limit', '256',
                     '-v', str(scripts) + ':/smoke:ro', '-e', 'GXZS_SANDBOX_SSH_HOST=fixture-sandbox',
                     '-e', 'GXZS_SANDBOX_HELPER_HASH=' + helper_hash,
                     '-e', 'GXZS_SMOKE_LONG_SECONDS=' + str(long_seconds),
-                    *attachment_args,
+                    *attachment_args, *legacy_args,
                     '--entrypoint', 'sleep', host_image, str(max(300, long_seconds + 240))).stdout.strip()
             try:
                 # Preserve UID 1000 through the Docker archive API even when
@@ -150,7 +163,11 @@ def verify(container, host_image=None):
                     before = bridge_processes(container)
                     extra = ['--changes-check', '--long-check'] if script == 'smoke-native-sandbox-tools.mjs' and os.environ.get('GXZS_SMOKE_EXTENDED') == '1' else []
                     if script == 'smoke-host-bootstrap.mjs':
-                        extra = ['--session-create', '--real-ssh']
+                        extra = ['--real-ssh']
+                        if os.environ.get('GXZS_SMOKE_FRESH_BOOTSTRAP') != '1':
+                            extra.append('--session-create')
+                        if os.environ.get('GXZS_SMOKE_LEGACY_PROFILE') == '1':
+                            extra.append('--legacy-profile')
                         if os.environ.get('GXZS_SMOKE_CRASH') == '1':
                             extra.append('--crash-restart')
                         if os.environ.get('GXZS_SMOKE_RUNNING') == '1':

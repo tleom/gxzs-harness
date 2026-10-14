@@ -24,6 +24,48 @@ def server(tmp_path, monkeypatch):
     module.ADMISSION.close()
 
 
+def test_native_settings_check_is_owner_scoped_and_serialized_with_draining(server):
+    from concurrent.futures import ThreadPoolExecutor
+    from email.message import Message
+    import threading
+    from owner_auth import owner_token
+    key = str(uuid4())
+    folder = server.HOSTS.root / key
+    folder.mkdir()
+    record = dict(owner_id='tenant:7', workspace_id=key, generation=2, instance_id='host-2', state='ready')
+    (folder / 'host.json').write_text(json.dumps(record), encoding='utf-8')
+    headers = Message()
+    headers['Authorization'] = 'Bearer ' + owner_token(server.TOKEN, 'tenant:7', key, 2, 'host-2')
+    headers['X-GXZS-Owner'] = 'tenant:7'
+    headers['X-GXZS-Host-Generation'] = '2'
+    headers['X-GXZS-Host-Instance'] = 'host-2'
+    entered = threading.Event()
+    def check():
+        server.REQUEST_CONTEXT.owner = (headers, key, 'host-settings')
+        entered.set()
+        try:
+            return server.operation(key, 'host-settings', {'operation': 'check'})
+        finally:
+            server.REQUEST_CONTEXT.owner = None
+    assert check() == {'writable': True}
+    with pytest.raises(ValueError, match='Unsupported'):
+        server.operation(key, 'host-settings', {'operation': 'mutate'})
+    entered.clear()
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with server.lock(key):
+            record['state'] = 'draining'
+            (folder / 'host.json').write_text(json.dumps(record), encoding='utf-8')
+            future = pool.submit(check)
+            assert entered.wait(timeout=1)
+            assert not future.done()
+        with pytest.raises(server.SandboxUpdatePending):
+            future.result(timeout=1)
+    record.update(state='ready', generation=3, instance_id='host-3')
+    (folder / 'host.json').write_text(json.dumps(record), encoding='utf-8')
+    with pytest.raises(PermissionError, match='identity mismatch'):
+        check()
+
+
 def test_owner_network_names_are_deterministic_and_separate(server, monkeypatch):
     created = {}
 
@@ -47,6 +89,52 @@ def test_owner_network_names_are_deterministic_and_separate(server, monkeypatch)
     assert server.ensure_network(first) == first_name
     assert server.ensure_network(second) != first_name
     assert len(created) == 2
+
+
+@pytest.mark.parametrize('operation,maintenance,tracked', [
+    ('mcp_list', True, False), ('mcp_list', False, False), ('mcp_test', True, False),
+    ('mcp_test', False, True), ('mcp_read', False, True), ('mcp_call', False, True),
+    ('mcp_save', False, True), ('mcp_delete', False, True), ('mcp_toggle', False, True),
+])
+def test_mcp_maintenance_does_not_refresh_user_activity(server, monkeypatch, operation, maintenance, tracked):
+    import mcp_runtime
+    ensured, touched = Mock(), Mock()
+    monkeypatch.setattr(server, 'ensure', ensured)
+    monkeypatch.setattr(server, 'touch', touched)
+    monkeypatch.setattr(server, 'schedule_mcp_refresh', Mock())
+    monkeypatch.setattr(server, 'docker', lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout='{"mcp":[]}'))
+    monkeypatch.setattr(mcp_runtime, 'module_source', lambda *args: '')
+    monkeypatch.setattr(mcp_runtime, 'invoke', lambda *args, **kwargs: {'ok': True})
+    monkeypatch.setattr(mcp_runtime, 'invalidate', Mock())
+    key = str(uuid4())
+    server.operation(key, 'personal-mcp', {'operation': operation, 'maintenance': maintenance, 'name': 'example'})
+    ensured.assert_called_once_with(key, track_activity=tracked)
+    assert bool(touched.call_count) is tracked
+
+
+def test_stopped_host_is_not_woken_by_a_maintenance_catalog_read(server, monkeypatch):
+    key = str(uuid4())
+    folder = server.HOSTS.root / key
+    folder.mkdir()
+    (folder / 'host.json').write_text(json.dumps({'state': 'stopped'}))
+    ensured = Mock()
+    monkeypatch.setattr(server, 'ensure', ensured)
+    with pytest.raises(server.ResourceUnavailable) as error:
+        server.operation(key, 'personal-mcp', {'operation': 'mcp_list', 'maintenance': True})
+    assert error.value.code == 'HOST_IDLE'
+    ensured.assert_not_called()
+
+
+def test_background_mcp_refresh_is_marked_as_maintenance(server, monkeypatch):
+    calls = []
+    class InlineThread:
+        def __init__(self, target, **kwargs): self.target = target
+        def start(self): self.target()
+    monkeypatch.setattr(server.threading, 'Thread', InlineThread)
+    monkeypatch.setattr(server, 'operation', lambda *args: calls.append(args))
+    server.schedule_mcp_refresh(str(uuid4()), [{'id': 'example', 'enabled': True, 'status': 'unverified', 'version': 1}])
+    assert calls[0][2]['maintenance'] is True
+    assert calls[0][2]['operation'] == 'mcp_test'
 
 
 @pytest.mark.parametrize('native_attachments', [False, True])

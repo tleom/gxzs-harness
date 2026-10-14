@@ -809,12 +809,14 @@ export class WorkbenchDatabase {
     return result
   }
 
-  recoverInterrupted(now = Date.now(), nativeQueued = []) {
+  recoverInterrupted(now = Date.now(), nativeQueued = [], initialRunIds) {
     const recover = this.transaction(() => {
       const keep = new Set(nativeQueued)
+      const initial = initialRunIds === undefined ? undefined : new Set(initialRunIds)
       const rows = this.db.prepare(`SELECT id, owner_id FROM runs
         WHERE status NOT IN ('completed', 'failed', 'cancelled', 'interrupted', 'discarded', 'steered')
-        AND id NOT IN (SELECT run_id FROM run_submissions WHERE dispatched=0)`).all().filter(row => !keep.has(row.id))
+        AND id NOT IN (SELECT run_id FROM run_submissions WHERE dispatched=0)`).all()
+        .filter(row => !keep.has(row.id) && (!initial || initial.has(row.id)))
       for (const row of rows) {
         this.transitionRun(row.owner_id, row.id, 'interrupted', '适配层进程重启，任务已中断', now)
         this.appendEvent(row.owner_id, row.id, { event: 'workbench_end', status: 'interrupted', error: '适配层进程重启，任务已中断' })

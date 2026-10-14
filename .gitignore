@@ -1,4 +1,5 @@
 node_modules/
+packages/workbench-adapter/lib/
 profiles/workbench/presets/
 profiles/workbench/cordis.runtime.patch.yml
 coverage/

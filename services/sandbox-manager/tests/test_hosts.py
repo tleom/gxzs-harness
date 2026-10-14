@@ -4,7 +4,7 @@ import sys
 import threading
 import time
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock
 import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from hosts import Hosts
@@ -46,6 +46,7 @@ def setup(tmp_path, monkeypatch):
     host.heartbeat = Mock()
     host._ssh = Mock()
     host.healthy = Mock(return_value=True)
+    host.native_activity = Mock(return_value=dict(runningAgents=0, pendingMessages=0, runningJobs=0, activeSchedules=0, activeSidebarResources=0, activeSettingsWrites=0))
     host.dependency_degraded = Mock(return_value=False)
     payload = dict(owner_id='t:1', generation=1, instance_id='host-1', platform_token='derived', assertion_key='a2V5', assertion_issuer='gxzs')
     return host, control, ensure, payload, created
@@ -213,6 +214,84 @@ def test_active_task_prevents_idle_shutdown(tmp_path, monkeypatch):
     host.maintain()
     assert not any(call.args[0] == 'stop' for call in docker.call_args_list)
     assert host.heartbeat.call_args.args[1] == 'ready'
+
+
+def test_native_activity_prevents_idle_shutdown_without_platform_admission(tmp_path, monkeypatch):
+    import os
+    host, docker, _, payload, _ = setup(tmp_path, monkeypatch)
+    host.ensure('workspace', payload)
+    (tmp_path / 'workspace').touch()
+    os.utime(tmp_path / 'workspace', (1, 1))
+    host.native_activity.return_value = None
+    host.maintain()
+    assert not any(call.args[0] == 'stop' for call in docker.call_args_list)
+    host.admission.fence.assert_not_called()
+    assert host.heartbeat.call_args.args[1] == 'ready'
+
+
+@pytest.mark.parametrize('activity', [None, {'protocol': 1, 'status': 'unknown'},
+    {'protocol': 1, 'status': 'ready'}])
+def test_incomplete_native_activity_does_not_authorize_shutdown(tmp_path, monkeypatch, activity):
+    host, _, _, _, _ = setup(tmp_path, monkeypatch)
+    host.opener = MagicMock()
+    response = host.opener.open.return_value.__enter__.return_value
+    response.status = 200
+    response.read.return_value = json.dumps({'ready': True, 'activity': activity}).encode()
+    assert Hosts.native_activity(host, 'http://host') is None
+
+
+@pytest.mark.parametrize('key,value', [('runningAgents', 1), ('pendingMessages', 1), ('runningJobs', 1),
+                                      ('activeSchedules', 1), ('activeSidebarResources', 1), ('activeSettingsWrites', 1), ('runningJobs', False), ('runningAgents', -1)])
+def test_native_work_keeps_host_resident(tmp_path, monkeypatch, key, value):
+    host, _, _, _, _ = setup(tmp_path, monkeypatch)
+    activity = dict(protocol=1, status='ready', runningAgents=0, pendingMessages=0, runningJobs=0, activeSchedules=0, activeSidebarResources=0, activeSettingsWrites=0)
+    host.opener = MagicMock()
+    response = host.opener.open.return_value.__enter__.return_value
+    response.status = 200
+    response.read.return_value = json.dumps({'ready': True, 'activity': activity}).encode()
+    assert Hosts.native_activity(host, 'http://host') == {key: value for key, value in activity.items() if key not in {'protocol', 'status'}}
+    activity[key] = value
+    response.read.return_value = json.dumps({'ready': True, 'activity': activity}).encode()
+    projected = Hosts.native_activity(host, 'http://host')
+    if type(value) is not int or value < 0:
+        assert projected is None
+    else:
+        assert projected[key] == value
+
+
+@pytest.mark.parametrize('key', ['runningAgents', 'pendingMessages', 'runningJobs', 'activeSidebarResources'])
+def test_real_native_work_refreshes_idle_clock_and_keeps_recently_closed_work_alive(tmp_path, monkeypatch, key):
+    import os
+    host, docker, _, payload, _ = setup(tmp_path, monkeypatch)
+    host.ensure('workspace', payload)
+    activity = tmp_path / 'workspace'
+    activity.touch()
+    os.utime(activity, (1, 1))
+    host.native_activity.return_value[key] = 1
+    host.maintain()
+    assert activity.stat().st_mtime > time.time() - 5
+    host.native_activity.return_value = {field: 0 for field in host.native_activity.return_value}
+    host.maintain()
+    assert not any(call.args[0] == 'stop' for call in docker.call_args_list)
+    assert json.loads((host.root / 'workspace' / 'host.json').read_text())['state'] == 'ready'
+
+
+def test_empty_and_unknown_probes_do_not_extend_idle_clock_or_erase_known_activity(tmp_path, monkeypatch):
+    import os
+    host, docker, _, payload, _ = setup(tmp_path, monkeypatch)
+    host.ensure('workspace', payload)
+    activity = tmp_path / 'workspace'
+    activity.touch()
+    host.maintain()
+    host.native_activity.return_value = None
+    os.utime(activity, (1, 1))
+    host.maintain()
+    assert activity.stat().st_mtime == 1
+    assert not any(call.args[0] == 'stop' for call in docker.call_args_list)
+    host.native_activity.return_value = dict(runningAgents=0, pendingMessages=0, runningJobs=0, activeSchedules=0, activeSidebarResources=0, activeSettingsWrites=0)
+    host.maintain()
+    assert any(call.args[0] == 'stop' for call in docker.call_args_list)
+    assert activity.stat().st_mtime == 1
 
 
 @pytest.mark.parametrize('state', ['ready', 'provisioning', 'draining'])
@@ -616,9 +695,11 @@ def test_draining_finishes_previously_queued_tickets_without_admitting_new_work(
         host.admission.db.close()
 
 
-def test_replace_stops_then_fences_and_keeps_home_across_restart(tmp_path, monkeypatch):
+@pytest.mark.parametrize('resident', ['activeSchedules', 'activeSidebarResources'])
+def test_replace_stops_then_fences_and_keeps_home_across_restart(tmp_path, monkeypatch, resident):
     host, control, _, payload, created = setup(tmp_path, monkeypatch)
     initial = host.ensure('workspace', payload)
+    host.native_activity.return_value[resident] = 1
     containers = {'host-1': json.loads(json.dumps(created)), 'sandbox-workspace': {'State': {'Running': True}}}
     ordered = []
     def docker(*args, **kwargs):
@@ -649,6 +730,44 @@ def test_replace_stops_then_fences_and_keeps_home_across_restart(tmp_path, monke
     # Same durable transition is accepted after a coordinator response loss.
     assert host.replace('workspace', request)['generation'] == 2
     assert len([call for call in ordered if call[0] == 'create']) == 1
+
+
+@pytest.mark.parametrize('native_work', ['runningAgents', 'pendingMessages', 'runningJobs', 'activeSettingsWrites', 'unavailable'])
+def test_replace_preserves_native_work_after_model_admission_is_released(tmp_path, monkeypatch, native_work):
+    host, _, _, payload, _ = setup(tmp_path, monkeypatch)
+    host.ensure('workspace', payload)
+    if native_work == 'unavailable':
+        host.native_activity.return_value = None
+    else:
+        host.native_activity.return_value[native_work] = 1
+    host.docker.reset_mock()
+    request = {**payload, 'generation': 2, 'instance_id': 'host-2', 'expected_generation': 1, 'expected_instance_id': 'host-1'}
+    result = host.replace('workspace', request)
+    assert result['state'] == 'draining' and result['generation'] == 1
+    assert not any(call.args[0] == 'stop' for call in host.docker.call_args_list)
+    host.admission.fence.assert_not_called()
+
+
+def test_replace_native_probe_does_not_hold_lock_or_apply_a_stale_result(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    host, _, _, payload, _ = setup(tmp_path, monkeypatch)
+    host.ensure('workspace', payload)
+    baseline = host.native_activity.return_value
+    def activity(_):
+        def change_record():
+            with host.lock('workspace'):
+                record = host.root / 'workspace' / 'host.json'
+                current = json.loads(record.read_text())
+                current['probe_change'] = True
+                host._save(record, current)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pool.submit(change_record).result(timeout=1)
+        return baseline
+    host.native_activity.side_effect = activity
+    host.docker.reset_mock()
+    result = host.replace('workspace', {**payload, 'generation': 2, 'instance_id': 'host-2', 'expected_generation': 1, 'expected_instance_id': 'host-1'})
+    assert result['probe_change'] and result['state'] == 'draining'
+    assert not any(call.args[0] == 'stop' for call in host.docker.call_args_list)
 
 
 def test_changed_digest_and_legacy_credentials_require_replace(tmp_path, monkeypatch):
