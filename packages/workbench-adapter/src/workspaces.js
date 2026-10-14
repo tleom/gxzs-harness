@@ -98,6 +98,8 @@ export class WorkbenchWorkspaces {
       let cursor
       do {
         const result = await this.fileManager.operate({ operation: 'list', path: relative, ...(cursor ? { cursor } : {}) })
+        if (result.conflict) throw httpError(409,
+          typeof result.message === 'string' ? result.message : '目录已发生变化，请刷新后重试', 'RESOURCE_CONFLICT')
         entries.push(...result.entries)
         if (entries.length > 100_000) throw httpError(413, '目录条目超过 100000，请缩小浏览范围')
         cursor = result.next_cursor

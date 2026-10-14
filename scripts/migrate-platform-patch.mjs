@@ -59,6 +59,28 @@ const optional = async path => {
   catch(error){if(error.code==='ENOENT')return undefined;throw error}
 }
 
+/** Operator entry point: seed a captured, pinned old-image baseline without changing user settings. */
+export async function provisionLegacyBaseline(profileDirectory,{ownerId,imageId,baseline,baselineSha256}={}) {
+  if(!ownerId || !/^sha256:[a-f0-9]{64}$/.test(imageId ?? '')
+    || !/^[a-f0-9]{64}$/.test(baselineSha256 ?? '') || typeof baseline!=='string'
+    || digest(baseline)!==baselineSha256) throw new Error('Verified legacy image, owner and baseline digest are required')
+  documentOf(baseline)
+  const directory=resolve(profileDirectory)
+  await mkdir(directory,{recursive:true})
+  return withFileLock(join(directory,'package.json'),async()=>{
+    const path=join(directory,'legacy-platform-baseline.patch.yml')
+    const proof=join(directory,'legacy-platform-baseline.json')
+    const metadata={schemaVersion:1,ownerId,imageId,baselineSha256}
+    const saved=await optional(path), previous=await optional(proof)
+    if(saved!==undefined && saved!==baseline) throw new Error('An existing legacy baseline must not be replaced')
+    if(previous!==undefined && !isDeepStrictEqual(JSON.parse(previous),metadata))
+      throw new Error('An existing legacy baseline identity must not be replaced')
+    if(saved===undefined) await writeFileAtomic(path,baseline,{mode:0o600})
+    if(previous===undefined) await writeFileAtomic(proof,JSON.stringify(metadata)+'\n',{mode:0o600})
+    return metadata
+  })
+}
+
 /** One-time bootstrap conversion; future starts leave the native user document untouched. */
 export async function migratePlatformPatch(profileDirectory,{ownerId}={}) {
   const directory=resolve(profileDirectory)
@@ -100,5 +122,13 @@ export async function migratePlatformPatch(profileDirectory,{ownerId}={}) {
 
 if(process.argv[1] && resolve(process.argv[1])===fileURLToPath(import.meta.url)) {
   if(!process.env.DSH_HOME) throw new Error('DSH_HOME is required')
-  await migratePlatformPatch(join(process.env.DSH_HOME,'profiles/workbench'),{ownerId:process.env.GXZS_HOST_OWNER_ID})
+  const directory=join(process.env.DSH_HOME,'profiles/workbench')
+  if(process.argv[2]==='--seed-legacy-baseline') {
+    const [, , , path,imageId,baselineSha256]=process.argv
+    await provisionLegacyBaseline(directory,{ownerId:process.env.GXZS_HOST_OWNER_ID,
+      imageId,baselineSha256,baseline:await readFile(path,'utf8')})
+  } else {
+    if(process.argv.length>2) throw new Error('Unknown profile migration operation')
+    await migratePlatformPatch(directory,{ownerId:process.env.GXZS_HOST_OWNER_ID})
+  }
 }

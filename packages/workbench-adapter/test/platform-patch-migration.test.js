@@ -1,9 +1,10 @@
 import { afterEach, expect, it } from 'vitest'
 import { mkdtemp, mkdir, readFile, writeFile, rm } from 'node:fs/promises'
 import { createHash } from 'node:crypto'
+import { execFileSync } from 'node:child_process'
 import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { inheritedUserPatch, migratePlatformPatch } from '../../../scripts/migrate-platform-patch.mjs'
+import { inheritedUserPatch, migratePlatformPatch, provisionLegacyBaseline } from '../../../scripts/migrate-platform-patch.mjs'
 
 const directories=[]
 const root=resolve(fileURLToPath(new URL('../../../',import.meta.url)),'../temp/three-modules-align-20261014/profile-layer-validation')
@@ -68,4 +69,41 @@ it('backs up the original document and completes an interrupted conversion from 
   expect(await migratePlatformPatch(directory,{ownerId:'owner'})).toMatchObject({removed:1,retained:1})
   expect(await readFile(join(directory,'.cordis.patch.before-bundle-layout-v1.yml'),'utf8')).toBe(user)
   expect(await readFile(join(directory,'cordis.patch.yml'),'utf8')).toBe(converted)
+})
+
+it('provisions a pinned owner baseline before migration without replacing user settings or prior proof',async()=>{
+  const baseline='- id: platform\n  disabled: true\n'
+  const user=baseline+'- id: llm-pi-ai\n  config: { models: [] }\n'
+  const directory=await fixture(user)
+  const metadata={ownerId:'owner',imageId:'sha256:'+'2'.repeat(64),baseline,
+    baselineSha256:createHash('sha256').update(baseline).digest('hex')}
+  await provisionLegacyBaseline(directory,metadata)
+  await provisionLegacyBaseline(directory,metadata)
+  expect(await readFile(join(directory,'cordis.patch.yml'),'utf8')).toBe(user)
+  await expect(provisionLegacyBaseline(directory,{...metadata,ownerId:'foreign'})).rejects.toThrow('identity')
+  await expect(provisionLegacyBaseline(directory,{...metadata,baselineSha256:'0'.repeat(64)})).rejects.toThrow('digest')
+  expect(await migratePlatformPatch(directory,{ownerId:'owner'})).toMatchObject({removed:1,retained:1})
+  expect(await readFile(join(directory,'.cordis.patch.before-bundle-layout-v1.yml'),'utf8')).toBe(user)
+  expect(await readFile(join(directory,'cordis.patch.yml'),'utf8')).toContain('llm-pi-ai')
+})
+
+it('runs the production baseline provisioning CLI before the normal entrypoint migration',async()=>{
+  const rootDirectory=await fixture()
+  const home=join(rootDirectory,'home')
+  const directory=join(home,'profiles/workbench')
+  await mkdir(directory,{recursive:true})
+  const baseline='- id: platform\n  disabled: true\n'
+  const user=baseline+'- id: agent-default-model\n  config: { model: owner-model }\n'
+  const input=join(rootDirectory,'captured-old-image.patch.yml')
+  await writeFile(input,baseline)
+  await writeFile(join(directory,'package.json'),'{}')
+  await writeFile(join(directory,'cordis.patch.yml'),user)
+  const script=fileURLToPath(new URL('../../../scripts/migrate-platform-patch.mjs',import.meta.url))
+  const options={env:{...process.env,DSH_HOME:home,GXZS_HOST_OWNER_ID:'owner'}}
+  execFileSync(process.execPath,[script,'--seed-legacy-baseline',input,'sha256:'+'3'.repeat(64),
+    createHash('sha256').update(baseline).digest('hex')],options)
+  expect(await readFile(join(directory,'cordis.patch.yml'),'utf8')).toBe(user)
+  execFileSync(process.execPath,[script],options)
+  expect(await readFile(join(directory,'.cordis.patch.before-bundle-layout-v1.yml'),'utf8')).toBe(user)
+  expect(await readFile(join(directory,'cordis.patch.yml'),'utf8')).toContain('owner-model')
 })

@@ -499,10 +499,12 @@ async function seedLegacyProfile(home) {
   await mkdir(directory, { recursive: true })
   const user = `${bytes.toString('utf8').trimEnd()}\n\n- id: subagent\n  config:\n    maxDepth: 2\n- id: ui-conversation\n  config:\n    busyEnter: steer\n`
   await writeFile(path.join(directory, 'cordis.patch.yml'), user, { flag: 'wx', mode: 0o600 })
-  await writeFile(path.join(directory, 'legacy-platform-baseline.patch.yml'), bytes, { flag: 'wx', mode: 0o600 })
-  await writeFile(path.join(directory, 'legacy-platform-baseline.json'), JSON.stringify({
-    schemaVersion: 1, imageId, baselineSha256, ownerId: owner,
-  }) + '\n', { flag: 'wx', mode: 0o600 })
+  const seedPath = path.join(root, 'legacy-baseline-for-seed.yml')
+  await writeFile(seedPath, bytes, { mode: 0o600 })
+  execFileSync(process.execPath, ['/opt/workbench/scripts/migrate-platform-patch.mjs',
+    '--seed-legacy-baseline', seedPath, imageId, baselineSha256], {
+    env: { ...process.env, DSH_HOME: home, GXZS_HOST_OWNER_ID: owner }, stdio: 'pipe',
+  })
   return { directory, baselineSha256, userSha256: createHash('sha256').update(user).digest('hex'),
     source: supplied ? 'captured-old-image' : 'synthetic-pre-layout' }
 }

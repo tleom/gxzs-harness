@@ -12,7 +12,7 @@ export const Config = z.object({
 })
 
 const ROUTES = new Set([
-  'GET files/preview', 'POST files/preview',
+  'GET files/preview', 'POST files/preview', 'DELETE files/preview',
   'GET files/shares', 'POST files/shares', 'DELETE files/shares',
   'POST audio',
   'GET mcp/catalog', 'POST mcp/call', 'POST mcp/cancel',

@@ -87,6 +87,15 @@ describe('native workspace boundary', () => {
       .mockRejectedValueOnce(conflict)
     await expect(bridge.mutate(owner, { operation: 'browse', path: '.' })).rejects.toBe(conflict)
   })
+  it('reports a native snapshot conflict between directory pages without returning partial entries', async () => {
+    const { bridge, owner, fileManager } = fixture()
+    fileManager.operate.mockResolvedValueOnce({ entries: [{ name: 'first', kind: 'directory' }], next_cursor: 'next' })
+      .mockResolvedValueOnce({ conflict: true, message: '目录已发生变化，请刷新后重试' })
+    await expect(bridge.mutate(owner, { operation: 'browse', path: '.' })).rejects.toMatchObject({
+      status: 409, code: 'RESOURCE_CONFLICT', message: '目录已发生变化，请刷新后重试',
+    })
+    expect(fileManager.operate).toHaveBeenCalledTimes(2)
+  })
   it('rejects oversized and stalled directory pages instead of truncating or retrying forever', async () => {
     const { bridge, owner, fileManager } = fixture()
     fileManager.operate.mockResolvedValueOnce({ entries: Array.from({ length: 100001 }, () => ({ name: 'a', kind: 'file' })) })
