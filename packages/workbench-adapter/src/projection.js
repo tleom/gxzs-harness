@@ -1,3 +1,5 @@
+import { nativePresentation, fileToolPreparation, isNativeNotice, contentText } from './display-events.js'
+export { nativePresentation, fileToolPreparation } from './display-events.js'
 import { nativeCommandRun } from './native-command.js'
 import { runPromptId } from './native-prompt.js'
 import { presentRunEvent } from './run-failure.js'
@@ -5,23 +7,6 @@ import { presentRunEvent } from './run-failure.js'
 const END_STATUS = {
   completed: 'completed', aborted: 'cancelled', error: 'failed',
   'max-tokens': 'failed', blocked: 'failed', interrupted: 'interrupted',
-}
-
-/** DSH FileMutationRow's preparation counter; raw arguments stay in the native stream. */
-export function fileToolPreparation(run, calls, chunk) {
-  if (chunk?.type !== 'tool-call-delta') return undefined
-  const previous = calls.get(chunk.index) ?? { id: '', name: '', characters: 0 }
-  previous.id ||= String(chunk.id ?? '')
-  previous.name = chunk.name ?? previous.name
-  previous.characters += chunk.argumentsDelta?.length ?? 0
-  calls.set(chunk.index, previous)
-  if (!previous.id || !['write', 'edit'].includes(previous.name)) return undefined
-  const kilobytes = Math.ceil(previous.characters / 1024)
-  if (previous.publishedKilobytes === kilobytes) return undefined
-  previous.publishedKilobytes = kilobytes
-  return { kind: 'tool', workbench_run_id: run.id, call_id: previous.id,
-    tool_call_id: previous.id, tool_name: previous.name, activity_id: previous.id,
-    stage: 'preparing', argument_chars: previous.characters }
 }
 
 export function createAssistantStreamProjector(database, expectedOwnerId) {
@@ -75,10 +60,17 @@ export function createAssistantStreamProjector(database, expectedOwnerId) {
 
 export function projectSessionEvent(database, sessionId, event, expectedOwnerId, context) {
   database.flushStreamEvents()
-  if (database.hasProjectedEvent(sessionId, event.seq)) return undefined
+  const turn = event.data?.turn
+  const run = Number.isInteger(turn) ? database.runForTurn(sessionId, turn) : undefined
+  // Earlier adapter versions could acknowledge a native completion before its
+  // autonomous receipt existed. Recover that durable end once after binding.
+  const unprojectedEnd = event.type === 'turn/end' && run && run.sourceEndSeq == null
+  if (database.hasProjectedEvent(sessionId, event.seq) && !unprojectedEnd) return undefined
   return database.transaction(() => {
     const result = projectEvent(database, sessionId, event, expectedOwnerId, context)
-    database.markProjectedEvent(sessionId, event.seq)
+    // Native events may precede verified autonomous admission at startup.
+    // Leave per-turn facts replayable until their receipt can own the output.
+    if (!Number.isInteger(turn) || run) database.markProjectedEvent(sessionId, event.seq)
     return result
   })()
 }
@@ -207,88 +199,19 @@ function projectEvent(database, sessionId, event, expectedOwnerId, context) {
 }
 
 /** Shared, side-effect-free display projection for live events and native history pages. */
-export function nativePresentation(run, event, { streamed = false, toolName = '', messageRun } = {}) {
-  switch (event.type) {
-    case 'user/message': {
-      const source = event.data?.source
-      if (isNativeNotice(event.data)) {
-        const blocks = event.data.content ?? []
-        const prefix = `Agent ${source.senderSessionId} sent a message: `
-        const content = source.kind === 'agent-message' && blocks[0]?.text === prefix ? blocks.slice(1)
-          : source.kind === 'subagent-settled' && blocks[0]?.text === source.summary &&
-            ['Its closing message:', 'It left no closing message.'].includes(blocks[1]?.text)
-            ? blocks.slice(blocks[1].text === 'Its closing message:' ? 2 : 1) : blocks
-        return [{ event: 'workbench_agent_message', message_id: event.data.id, created_at: event.time / 1000,
-          sender_session_id: source.senderSessionId, sender_name: run.selection?.subagent_names?.[source.senderSessionId] ?? source.senderSessionId,
-          sender_type: source.senderSessionId === run.selection?.parent_session_id ? 'parent' : 'child',
-          query: contentText(content), native: event }]
-      }
-      const id = messageRun?.id ?? event.data?.source?.rpcId
-      if (typeof id !== 'string' || id === run.id || (run.messageId && run.messageId === event.data?.id)) return []
-      return [{ event: 'workbench_steering', steering_id: id,
-        created_at: messageRun?.createdAt != null ? messageRun.createdAt / 1000 : undefined,
-        query: messageRun?.query ?? contentText(event.data?.content?.slice(0, 1)), native: event }]
-    }
-    case 'deliverables/presented':
-      return [{ event: 'workbench_presented', native: event, files: event.data?.files ?? [] }]
-    case 'workspace/changes':
-      return [{ event: 'workbench_changes', turn: event.data?.turn, source_seq: event.seq }]
-    case 'tool/call':
-      return [{ event: 'workbench_activity', native: event, backend_run_id: run.id,
-        data: { kind: 'tool', workbench_run_id: run.id, call_id: String(event.data?.callId ?? ''),
-          tool_call_id: String(event.data?.callId ?? ''), tool_name: String(event.data?.name ?? ''),
-          activity_id: String(event.data?.callId ?? ''), stage: 'started',
-          ...toolPresentation(run, event.data),
-          input: typeof event.data?.arguments === 'string' ? event.data.arguments : JSON.stringify(event.data?.arguments ?? {}),
-        } }]
-    case 'tool/result': {
-      const block = Array.isArray(event.data?.message?.content) ? event.data.message.content[0] : undefined
-      const callId = String(event.data?.message?.source?.callId ?? block?.toolCallId ?? '')
-      return [{ event: 'workbench_activity', native: event, backend_run_id: run.id,
-        data: { kind: 'tool', workbench_run_id: run.id, call_id: callId, tool_call_id: callId,
-          tool_name: toolName, activity_id: callId,
-          ...toolPresentation(run, { name: toolName }),
-          stage: event.data?.error || event.data?.message?.isError || block?.isError ? 'error' : 'returned',
-          output: contentText(block?.content ?? event.data?.message?.content),
-          ...(event.data?.meta === undefined ? {} : { result_meta: event.data.meta }),
-        } }]
-    }
-    case 'assistant/message': {
-      const result = [], content = event.data?.message?.content ?? []
-      if (event.surfaceOp == null || event.surfaceOp === 'append') result.push({
-        event: 'workbench_assistant_final', turn: event.data.turn, step: event.data.step,
-        has_reply: content.some(block => block.type === 'text' && block.text?.trim()),
-        has_tool_calls: content.some(block => block.type === 'tool-call'),
-      })
-      if (!streamed) for (const [index, block] of content.entries()) {
-        if ((block?.type === 'text' || block?.type === 'reasoning') && typeof block.text === 'string' && block.text)
-          result.push({ event: 'workbench_activity', native: event, backend_run_id: run.id,
-            data: { kind: block.type, workbench_run_id: run.id, segment_id: `t${event.data.turn}s${event.data.step}b${index}`, text: block.text } })
-      }
-      return result
-    }
-    default: return []
-  }
-}
-
-function toolPresentation(run, call) {
-  if (call?.name === 'skill') {
-    try {
-      const args = typeof call.arguments === 'string' ? JSON.parse(call.arguments) : call.arguments
-      const name = args?.name
-      if (typeof name === 'string') return { display_name: run.selection?.skill_names?.[name] ?? name }
-    } catch { /* Partial input has no reliable skill identity. */ }
-  }
-  const tool = run.mcpTools?.find(item => item.runtime_name === call?.name || item.public_name === call?.name)
-  return tool ? { provider_name: tool.provider_name ?? tool.server_id, display_name: tool.tool_name } : {}
-}
-
 export function projectInboxClaim(database, { agent, message, turn }, expectedOwnerId, context) {
   const sessionId = agent?.session?.id ?? agent?.id
   if (!Number.isInteger(turn) || typeof message?.id !== 'string') return undefined
   const chat = database.getChatBySession(sessionId)
   if (!chat || (expectedOwnerId && chat.ownerId !== expectedOwnerId)) return undefined
   let run
+  if (message.source?.kind === 'tool-jobs') {
+    // The native job plugin targets the Agent currently registered for its
+    // owner. A busy turn consumes the notice in-place; an idle owner starts a
+    // fresh turn with current permissions, never a revoked earlier run.
+    run = database.runForTurn(sessionId, turn) ?? adoptJobNotice(database, chat, message, context)
+    if (run) run = database.bindNativeTurn(run, turn)
+  }
   if (isNativeNotice(message)) {
     run = database.runForTurn(sessionId, turn) ?? adoptNativeNotice(database, chat, message)
     if (run) run = database.bindNativeTurn(run, turn)
@@ -299,10 +222,12 @@ export function projectInboxClaim(database, { agent, message, turn }, expectedOw
     if (scheduled) {
       run = database.bindRunMessage(sessionId, scheduled.id, turn, message.id)
       if (current && current.id !== scheduled.id) {
-        database.transitionRun(chat.ownerId, scheduled.id, 'steered')
-        database.appendEvent(chat.ownerId, scheduled.id, { event: 'workbench_steered', steer_target_run_id: current.id })
-        database.appendEvent(chat.ownerId, current.id, { event: 'workbench_steering', steering_id: scheduled.id,
-          query: scheduled.query, attachments: [] })
+        if (run.status !== 'steered') {
+          database.transitionRun(chat.ownerId, scheduled.id, 'steered')
+          database.appendEvent(chat.ownerId, scheduled.id, { event: 'workbench_steered', steer_target_run_id: current.id })
+          database.appendEvent(chat.ownerId, current.id, { event: 'workbench_steering', steering_id: scheduled.id,
+            query: scheduled.query, attachments: [] })
+        }
         return run
       }
     }
@@ -345,7 +270,21 @@ export function projectInboxClaim(database, { agent, message, turn }, expectedOw
   return run
 }
 
-const isNativeNotice = message => ['agent-message', 'subagent-settled'].includes(message?.source?.kind)
+function adoptJobNotice(database, chat, message, context) {
+  if (chat.deletedAt || message?.source?.kind !== 'tool-jobs' || typeof message.id !== 'string') return
+  const existing = database.getRun(chat.ownerId, message.id)
+  if (existing) return existing.sessionId === chat.sessionId ? existing : undefined
+  // Pre-step waits for the native MCP catalog before freezing a new receipt.
+  // Replays of an existing receipt do not need another catalog read.
+  if (context?.mcpCatalogReady === false) return
+  const { run } = database.createRun({ ownerId: chat.ownerId, chatId: chat.id, sessionId: chat.sessionId,
+    id: message.id, requestKey: `native-job-notice:${message.id}`, query: contentText(message.content),
+    selection: { ...chat.selection, native_source: 'tool-jobs', native_notice: true,
+      native_child: false, subagent_ids: [], is_continuation: true, silent_resume: true },
+    mcpTools: context?.mcpTools ?? [] })
+  database.adoptInboxMessage(chat.sessionId, run.id, message.id)
+  return run
+}
 function adoptNativeNotice(database, chat, message) {
   if (chat.deletedAt || !isNativeNotice(message) || typeof message.id !== 'string') return
   const existing = database.listRuns(chat.ownerId, chat.id).find(run => run.id === message.id)
@@ -434,13 +373,17 @@ export function settleNativeIdle(database, sessionId, goal) {
 }
 
 /** Replay native facts before declaring readiness; never wake a recovered agent. */
-export async function reconcileNativeSessions(database, sessionQuery, ownerId, context) {
+export async function reconcileNativeSessions(database, sessionQuery, ownerId, context, startupRunIds) {
+  const chats = database.listChats(ownerId)
+  // Native timers may deliver while asynchronous cold history reads are pending.
+  // Only receipts that existed on entry belong to this startup interruption pass.
+  const initialRunIds = startupRunIds ?? chats.flatMap(chat => database.listRuns(ownerId, chat.id).map(run => run.id))
   const queued = []
   const resources = message => {
-    if (message?.source?.kind !== 'schedule' || database.getRun(ownerId, message.id)) return undefined
+    if (!['schedule', 'tool-jobs'].includes(message?.source?.kind) || database.getRun(ownerId, message.id)) return undefined
     return typeof context === 'function' ? context() : context
   }
-  for (const chat of database.listChats(ownerId)) {
+  for (const chat of chats) {
     let observed
     try { observed = await sessionQuery.observeSession(chat.sessionId) }
     catch (error) {
@@ -462,10 +405,13 @@ export async function reconcileNativeSessions(database, sessionQuery, ownerId, c
         if (event.type === 'user/message' && Number.isInteger(turn)) {
           const message = event.data
           const admitted = message.source?.kind === 'schedule' ? adoptMessage(database, chat.sessionId, message, resources(message))
+            : message.source?.kind === 'tool-jobs' ? (database.runForTurn(chat.sessionId, turn) ?? adoptJobNotice(database, chat, message, resources(message)))
             : isNativeNotice(message) ? (database.runForTurn(chat.sessionId, turn) ?? adoptNativeNotice(database, chat, message))
             : database.listRuns(chat.ownerId, chat.id).find(item => item.messageId === message.id)
           if (isNativeNotice(message) && admitted) database.bindNativeTurn(admitted, turn)
-          if (message.source?.kind === 'schedule' && admitted) database.bindRunMessage(chat.sessionId, admitted.id, turn, message.id)
+          if (message.source?.kind === 'tool-jobs' && admitted) database.bindNativeTurn(admitted, turn)
+          if (message.source?.kind === 'schedule' && admitted)
+            projectInboxClaim(database, { agent: { id: chat.sessionId }, message, turn }, ownerId)
           if (runPromptId(message) || (message.source?.kind === 'user' && admitted))
             database.bindRunMessage(chat.sessionId, message.source.rpcId ?? admitted.id, turn, message.id)
           else if (message.source?.kind === 'goal' || (message.source?.kind === 'user' && !message.source.rpcId)) {
@@ -499,6 +445,7 @@ export async function reconcileNativeSessions(database, sessionQuery, ownerId, c
         const requestId = runPromptId(message)
         const run = requestId ? database.getRun(ownerId, requestId)
           : message.source?.kind === 'schedule' ? adoptMessage(database, chat.sessionId, message, resources(message))
+          : message.source?.kind === 'tool-jobs' ? adoptJobNotice(database, chat, message, resources(message))
           : isNativeNotice(message) ? adoptNativeNotice(database, chat, message)
           : database.listRuns(chat.ownerId, chat.id).find(item => item.messageId === message.id)
         if (run && run.sessionId === chat.sessionId) {
@@ -508,16 +455,5 @@ export async function reconcileNativeSessions(database, sessionQuery, ownerId, c
       }
     } finally { observed[Symbol.dispose]?.() }
   }
-  database.recoverInterrupted(Date.now(), queued)
-}
-
-function contentText(content) {
-  if (typeof content === 'string') return content
-  if (!Array.isArray(content)) return ''
-  return content.map((block) => {
-    if (typeof block === 'string') return block
-    if (typeof block?.text === 'string') return block.text
-    if (typeof block?.content === 'string') return block.content
-    return ''
-  }).filter(Boolean).join('\n')
+  database.recoverInterrupted(Date.now(), queued, initialRunIds)
 }

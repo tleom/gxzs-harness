@@ -1,12 +1,14 @@
 // Runs only in the owner sandbox. The Host transports pixels and validated input.
 const { createInterface } = require('node:readline')
 const { randomUUID } = require('node:crypto')
+const { createScreencast } = require('./browser-screencast.cjs')
+const { startDisplay, displayAvailable } = require('./browser-display.cjs')
 /** Prefer lossless text at 2x scale; bound photographic frames without low-quality encoding. */
 function createImageCapture({ now = Date.now, budgetMs = 8000 } = {}) {
   const formats = [{type:'png'}, ...[95,90,85].map(quality => ({type:'jpeg',quality}))]
   let key, start = 0
   return async (page, captureBudgetMs = budgetMs) => {
-    const viewport = page.viewportSize()
+    const viewport = page.viewportSize() || await page.evaluate(() => ({ width: innerWidth, height: innerHeight }))
     const current = `${page.url()}|${viewport.width}:${viewport.height}`
     if (current !== key) { key = current; start = 0 }
     const deadline = now() + Math.min(budgetMs, captureBudgetMs)
@@ -46,6 +48,8 @@ function observePage() {
     if (!matches || matches.length !== 1 || matches[0] !== element) continue
     elements.push({ selector, tag: element.tagName.toLowerCase(), role: element.getAttribute('role'),
       focused: element === document.activeElement,
+      ...(typeof element.checked === 'boolean' ? { checked: element.checked } : {}),
+      disabled: element.disabled === true, expanded: element.getAttribute('aria-expanded'),
       label: (element.getAttribute('aria-label') || element.getAttribute('placeholder') || element.innerText || '').slice(0,200),
       ...(['INPUT','TEXTAREA','SELECT'].includes(element.tagName) && element.type !== 'password' ? { value: element.value.slice(0,200) } : {}) })
   }
@@ -81,16 +85,58 @@ function observePage() {
     viewport: { x: scrollX, y: scrollY, width: innerWidth, height: innerHeight }, text: parts.join('\n').slice(0,20000), elements }
 }
 
-function runWorker({ chromium, input = process.stdin, output = process.stdout, exit = code => process.exit(code) }) {
+function runWorker({ chromium, input = process.stdin, output = process.stdout, exit = code => process.exit(code), displayFactory = displayAvailable() ? startDisplay : undefined }) {
   let browser, context, page, session, watching = false, capturing = false, closed = false
+  let display
+  let legacyPixels = false
+  let adoptNewPage
   let timer, notice = '', navigation = 0, hasFrame = false, navigating = false, lastFrame
   let captureFinished = Promise.resolve(), finishCapture = () => {}
+  let shutdownPromise
   const pages = new Map()
-  let pageId, pendingPopup, popupLimited = false
+  let pageId, pendingPopup, frameSequence = 0, activeCommand, revision = 0
+  const streams = new Map(), cancelled = new Set(), pressedButtons = new Set(), pressedModifiers = new Set()
+  const observedFrames = new Map()
+  let frameReference = 0
+  async function observe() {
+    for (let attempt = 0; ; attempt++) {
+      try { return await observeOnce() }
+      catch (error) {
+        if (error.message !== 'stale_observation' || attempt >= 2) throw error
+        await new Promise(resolve => setTimeout(resolve, 16))
+      }
+    }
+  }
+  async function observeOnce() {
+    const baseline = revision
+    const result = { ...await page.evaluate(observePage), page_id: pageId, revision }
+    if (typeof page.locator === 'function') {
+      try { result.accessibility = (await page.locator('body').ariaSnapshot({ timeout: 1500 })).slice(0, 16000) } catch {}
+    }
+    result.frames = []
+    for (const frame of page.frames?.() ?? []) {
+      if (frame === page.mainFrame() || result.frames.length >= 6) continue
+      try {
+        const handle = await frame.frameElement()
+        const box = await handle.boundingBox()
+        await handle.dispose()
+        if (!box || box.x >= result.viewport.width || box.y >= result.viewport.height || box.x + box.width < 0 || box.y + box.height < 0) continue
+        let ref = [...observedFrames].find(([, value]) => value === frame)?.[0]
+        if (!ref) { ref = `frame-${++frameReference}`; observedFrames.set(ref, frame) }
+        const content = await frame.evaluate(observePage)
+        const entry = { frame_ref: ref, ...content, text: content.text.slice(0, 5000), bounds: box }
+        try { entry.accessibility = (await frame.locator('body').ariaSnapshot({ timeout: 1000 })).slice(0, 6000) } catch {}
+        result.frames.push(entry)
+      } catch {}
+    }
+    for (const [ref, frame] of observedFrames) if (frame.isDetached() || frame.page() !== page) observedFrames.delete(ref)
+    if (revision !== baseline) throw new Error('stale_observation')
+    return result
+  }
   function selectPage(id) {
     const selected = pages.get(id)
     if (!selected || selected.page.isClosed()) throw new Error('browser_closed')
-    if (page !== selected.page) { navigation++; lastFrame = undefined; hasFrame = false }
+    if (page !== selected.page) { navigation++; revision++; lastFrame = undefined; hasFrame = false }
     pageId = id; page = selected.page; session = selected.session
   }
   const send = value => new Promise(resolve => {
@@ -98,6 +144,50 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
     else output.once('drain', resolve)
   })
   const capture = createImageCapture()
+  async function publishImage(target, cdp, epoch, url, image, extra = {}) {
+    const viewport = target.viewportSize() || await target.evaluate(() => ({ width: innerWidth, height: innerHeight }))
+    const history = await cdp.send('Page.getNavigationHistory')
+    const title = (await target.title()).slice(0, 1024)
+    if (target !== page || target.url() !== url || navigation !== epoch || closed || (extra.frame_id && !watching)) return false
+    const meta = { type: 'frame', page_id: pageId, url: url === 'about:blank' ? '' : url, title,
+      ...viewport, mediaType: extra.mediaType || image.mediaType, back: history.currentIndex > 0,
+      forward: history.currentIndex < history.entries.length - 1, notice, ...extra }
+    const stamp = JSON.stringify(meta)
+    if (extra.frame_id || !lastFrame || lastFrame.stamp !== stamp || !lastFrame.image.equals(image)) {
+      await send({ ...meta, image: typeof image === 'string' ? image : image.toString('base64') })
+      if (Buffer.isBuffer(image)) lastFrame = { stamp, image }
+    }
+    hasFrame = true
+    return true
+  }
+  function assertCurrent(value) {
+    if (cancelled.has(value.id)) throw new Error('operation_cancelled')
+  }
+  async function releaseInput() {
+    for (const button of pressedButtons) await page.mouse.up({ button }).catch(() => {})
+    pressedButtons.clear()
+    await setModifiers([])
+  }
+  async function setModifiers(modifiers) {
+    for (const key of pressedModifiers) if (!modifiers.includes(key)) { await page.keyboard.up(key); pressedModifiers.delete(key) }
+    for (const key of modifiers) if (!pressedModifiers.has(key)) { await page.keyboard.down(key); pressedModifiers.add(key) }
+  }
+  async function selectedText() {
+    for (const frame of page.frames?.() || [page]) {
+      const text = await frame.evaluate(() => {
+        if (!document.hasFocus()) return ''
+        let active = document.activeElement
+        while (active?.shadowRoot?.activeElement) active = active.shadowRoot.activeElement
+        if (active instanceof HTMLInputElement && active.type === 'password') return ''
+        if (active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement)
+          return active.value.slice(active.selectionStart || 0, active.selectionEnd || 0).slice(0, 32769)
+        return String(getSelection() || '').slice(0, 32769)
+      }).catch(() => '')
+      if (text.length > 32768) throw new Error('selection_too_large')
+      if (text) return text
+    }
+    return ''
+  }
   const validUrl = value => {
     const url = new URL(value)
     if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || value.length > 4096) throw new Error('invalid_url')
@@ -110,26 +200,33 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
     const target = page, cdp = session, epoch = navigation, url = target.url()
     try {
       if (url !== 'about:blank') validUrl(url)
-      const viewport = target.viewportSize()
-      const image = await capture(target, deadline === undefined ? undefined : deadline - Date.now())
-      const history = await cdp.send('Page.getNavigationHistory')
-      const title = (await target.title()).slice(0, 1024)
-      if (target !== page || target.url() !== url || navigation !== epoch || closed) return false
-      const meta = { type: 'frame', page_id: pageId, url: url === 'about:blank' ? '' : url, title,
-        ...viewport, mediaType: image.mediaType, back: history.currentIndex > 0,
-        forward: history.currentIndex < history.entries.length - 1, notice }
-      const stamp = JSON.stringify(meta)
-      if (!lastFrame || lastFrame.stamp !== stamp || !lastFrame.image.equals(image)) {
-        await send({ ...meta, image: image.toString('base64') })
-        lastFrame = { stamp, image }
+      if (display) {
+        // The desktop's RFB stream owns pixels. This stream only carries navigation/control metadata.
+        const viewport = await target.evaluate(() => ({ width: innerWidth, height: innerHeight }))
+        const history = await cdp.send('Page.getNavigationHistory')
+        const meta = { type: 'frame', page_id: pageId, display: 'kasm', url: url === 'about:blank' ? '' : url,
+          title: (await target.title()).slice(0, 1024), ...viewport, back: history.currentIndex > 0,
+          forward: history.currentIndex < history.entries.length - 1, notice }
+        if (target !== page || closed || navigation !== epoch) return false
+        const stamp = JSON.stringify(meta)
+        if (lastFrame?.stamp !== stamp) { await send(meta); lastFrame = { stamp } }
+        if (legacyPixels) {
+          const image = await capture(target)
+          if (!closed && target === page && navigation === epoch) {
+            const { display: _display, ...legacy } = meta
+            await send({ ...legacy, legacy: true, mediaType: image.mediaType, image: image.toString('base64') })
+          }
+        }
+        hasFrame = true
+        return true
       }
-      hasFrame = true
-      return true
+      const image = await capture(target, deadline === undefined ? undefined : deadline - Date.now())
+      return await publishImage(target, cdp, epoch, url, image)
     } catch (error) {
       // A navigation invalidates old-page captures; it is not a stable-page timeout.
       if (closed || target !== page || navigating || navigation !== epoch || target.url() !== url) return false
-      if (error.message === 'frame_too_large') fatal('网页图像过大，请重新打开浏览器')
-      else if (error.message === 'capture_timeout' || error.name === 'TimeoutError') fatal('网页图像获取超时，请重新打开浏览器')
+      if (error.message === 'frame_too_large' && !hasFrame) fatal('网页图像过大，请重新打开浏览器')
+      else if (error.message === 'capture_timeout' || error.name === 'TimeoutError') notice = '网页画面暂时获取失败，正在重试'
       else if (error.message === 'invalid_url') fatal('浏览器仅支持 HTTP 和 HTTPS 页面')
       // Navigation can temporarily invalidate a screenshot; the next frame retries.
     }
@@ -144,20 +241,37 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
       if (capturing) await captureFinished
       if (await frame(deadline)) return
     }
-    if (!closed) fatal(Date.now() >= deadline ? '网页图像获取超时，请重新打开浏览器' : '网页图像获取失败，请重新打开浏览器')
+    if (!closed) notice = '网页画面暂时获取失败，正在重试'
     throw new Error('frame_unavailable')
+  }
+  async function fitDisplayWindow(cdp) {
+    const window = await cdp.send('Browser.getWindowForTarget')
+    await cdp.send('Browser.setWindowBounds', { windowId: window.windowId, bounds: { windowState: 'normal' } })
+    await cdp.send('Browser.setWindowBounds', { windowId: window.windowId,
+      bounds: { left: 0, top: 0, ...display.size } })
+    await cdp.send('Browser.setWindowBounds', { windowId: window.windowId, bounds: { windowState: 'fullscreen' } })
   }
   async function bind(target, id) {
     const cdp = await context.newCDPSession(target)
+    if (display) {
+      await fitDisplayWindow(cdp)
+      await target.bringToFront()
+    } else streams.set(target, createScreencast({ page: target, session: cdp, nextId: () => ++frameSequence,
+      onUnavailable: () => startFallback(target),
+      emit: value => {
+        if (target !== page || closed || navigating || !watching || target.isClosed()) return false
+        return publishImage(target, cdp, navigation, target.url(), value.image,
+          { frame_id: value.frame_id, mediaType: value.mediaType })
+      } }))
     target.on('crash', () => { if (target === page) fatal('网页进程已退出，请重新打开浏览器') })
     target.on('close', () => {
+      void streams.get(target)?.dispose()
+      streams.delete(target)
       if (pages.get(id)?.page !== target) return
       pages.delete(id)
       void send({ type: 'page-close', page_id: id })
       if (target === page) {
-        const next = pages.keys().next().value
-        if (next) { selectPage(next); void frame() }
-        else fatal('网页已经关闭，请重新打开浏览器')
+        fatal('网页已经关闭，请重新打开浏览器')
       }
     })
     target.setDefaultTimeout(5000)
@@ -167,12 +281,13 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
     target.on('framenavigated', main => {
       if (main !== target.mainFrame() || target !== page) return
       navigation++
+      revision++
       if (main.url() === 'about:blank') return
       try {
         validUrl(main.url())
       } catch { notice = '浏览器仅支持 HTTP 和 HTTPS 页面'; void target.close().catch(() => {}) }
     })
-    target.on('popup', popup => {
+    const adopt = popup => {
       pendingPopup = (async () => {
       const popupId = id
       let popupSession
@@ -203,9 +318,11 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
         pages.set(popupId, { page: popup, session: popupSession })
         adopted = true
         selectPage(popupId)
+        await streams.get(previous?.page)?.stop()
         await previous?.page.close().catch(() => {})
         await previous?.session.detach?.().catch(() => {})
         await frame()
+        if (watching && !display) await streams.get(popup)?.start()
       } catch {
         if (!adopted) {
           await popupSession?.detach().catch(() => {})
@@ -214,17 +331,52 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
         } else fatal('网页连接中断，请重新打开浏览器')
       }
       })()
-    })
+    }
+    target.on('popup', adopt)
+    adoptNewPage = adopt
     return cdp
+  }
+  function startFallback(target) {
+    if (target !== page || !watching || closed || streams.get(target)?.active) return
+    clearInterval(timer)
+    let nextAttempt = Date.now() + 5000, recovering = false
+    timer = setInterval(() => {
+      if (!watching || closed || target !== page) return
+      if (streams.get(target)?.active) { clearInterval(timer); return }
+      if (!recovering && Date.now() >= nextAttempt) {
+        recovering = true
+        nextAttempt = Date.now() + 5000
+        void streams.get(target)?.start().then(started => {
+          if (started && watching && target === page) clearInterval(timer)
+        }).finally(() => { recovering = false })
+      }
+      void frame()
+    }, 500)
   }
   async function operation(value) {
     const action = value.action
     if (action === 'init') {
-      browser = await chromium.launch({ executablePath: '/usr/bin/chromium', headless: true,
-        args: ['--no-sandbox', '--disable-dev-shm-usage'], timeout: 20000 })
+      if (displayFactory) display = await displayFactory({ width: value.width, height: value.height, emit: send,
+        onExit: () => fatal('沙盒浏览器显示服务已退出') })
+      browser = await chromium.launch({ executablePath: '/usr/bin/chromium', headless: !display,
+        ...(display ? { env: display.env } : {}),
+        args: ['--no-sandbox', '--disable-dev-shm-usage', ...(display ? ['--force-device-scale-factor=2', '--no-first-run',
+          '--kiosk', '--window-position=0,0', `--window-size=${value.width},${value.height}`] : [])], timeout: 20000 })
       browser.on('disconnected', () => fatal('沙盒浏览器已退出，请重新打开浏览器'))
-      context = await browser.newContext({ viewport: { width: value.width, height: value.height },
-        deviceScaleFactor: 2, locale: 'zh-CN', acceptDownloads: false, serviceWorkers: 'block' })
+      context = await browser.newContext({ viewport: display ? null : { width: value.width, height: value.height },
+        ...(!display ? { deviceScaleFactor: 2 } : {}), locale: 'zh-CN', acceptDownloads: false, serviceWorkers: 'block' })
+      if (display) {
+        await context.exposeBinding('__workbenchInputChanged', () => { revision++ })
+        await context.addInitScript(() => {
+          for (const name of ['pointerdown', 'keydown', 'input', 'wheel'])
+            addEventListener(name, event => { if (event.isTrusted) void window.__workbenchInputChanged() }, { capture: true, passive: true })
+        })
+      }
+      context.on?.('page', target => {
+        if (!page || target === page) return
+        // Ctrl+T/Ctrl+N can create a page without a window.open opener.
+        void target.opener().then(opener => { if (!opener && !closed) adoptNewPage?.(target) })
+      })
       await context.route('**/*', route => {
         const request = route.request()
         if (request.isNavigationRequest() && !/^https?:\/\//i.test(request.url())) return route.abort()
@@ -234,26 +386,47 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
       pageId = value.browser_id || randomUUID()
       session = await bind(page, pageId)
       pages.set(pageId, { page, session })
-      timer = setInterval(() => { if (watching) void frame() }, 400)
       await frame()
       if (!hasFrame) throw new Error('initial_frame_unavailable')
+      return { display: display ? 'kasm' : 'cdp', input_protocol: 2 }
+    }
+    if (action === 'display-open') { if (!display) throw new Error('display_unavailable'); display.open(value.connection); return }
+    if (action === 'display-close') { display?.close(value.connection); return }
+    if (action === 'display-write') { if (!display) throw new Error('display_unavailable'); display.write(value.connection, value.data); return }
+    if (action === 'watch' && value.enabled !== true) {
+      watching = false
+      legacyPixels = false
+      clearInterval(timer)
+      await streams.get(page)?.stop()
+      await releaseInput()
       return
     }
-    if (action === 'watch' && value.enabled !== true) { watching = false; return }
     if (value.page_id) selectPage(value.page_id)
     if (!page || page.isClosed()) throw new Error('browser_closed')
-    if (action === 'watch') { watching = value.enabled === true; if (watching) await frame(); return }
-    if (action === 'snapshot') return { ...await page.evaluate(observePage), page_id: pageId }
-    if (action === 'close-page') {
-      const previous = page
-      pages.delete(pageId)
-      const next = pages.keys().next().value
-      if (next) selectPage(next)
-      await previous.close()
-      if (next) await frame()
+    if (action === 'ack') { await streams.get(page)?.acknowledge(value.frame_id); return }
+    if (action === 'release-input') { await releaseInput(); return }
+    if (action === 'selection') return { text: await selectedText(), revision }
+    if (action === 'watch') {
+      watching = true
+      legacyPixels = value.legacy_pixels === true
+      clearInterval(timer)
+      if (display) { await frame(); timer = setInterval(() => void frame(), 500); return }
+      if (!await streams.get(page)?.start()) {
+        await frame()
+        startFallback(page)
+      }
       return
     }
+    if (action === 'snapshot') return observe()
+    if (action === 'screenshot') {
+      const target = page, epoch = navigation
+      const image = await capture(page)
+      if (target !== page || epoch !== navigation) throw new Error('stale_observation')
+      return { image: image.toString('base64'), mediaType: image.mediaType }
+    }
     notice = ''
+    if (value.expected_revision !== undefined && value.expected_revision !== revision) throw new Error('stale_observation')
+    revision++
     const moves = ['navigate', 'reload', 'back', 'forward'].includes(action)
     if (moves) { navigation++; navigating = true }
     try { switch (action) {
@@ -263,25 +436,66 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
       case 'forward': await page.goForward({ waitUntil: 'domcontentloaded' }); break
       case 'resize':
         navigation++
-        await page.setViewportSize({ width: value.width, height: value.height })
+        if (display) {
+          await display.resize(value.width, value.height)
+          await fitDisplayWindow(session)
+        } else await page.setViewportSize({ width: value.width, height: value.height })
         navigation++
         if (capturing) await captureFinished
+        await streams.get(page)?.resize()
         break
-      case 'click': await page.mouse.click(value.x, value.y, { button: value.button || 'left', clickCount: value.count || 1 }); break
-      case 'element-click': await page.locator(value.selector).click(); break
-      case 'element-text': await page.locator(value.selector).fill(value.text); break
-      case 'move': await page.mouse.move(value.x, value.y); break
+      case 'modifiers': await setModifiers(value.modifiers); break
+      case 'cut-selection':
+        if (!value.text || await selectedText() !== value.text) throw new Error('stale_observation')
+        assertCurrent(value); await page.keyboard.press('ControlOrMeta+X'); break
+      case 'click':
+        await setModifiers(value.modifiers || [])
+        await page.mouse.click(value.x, value.y, { button: value.button || 'left', clickCount: value.count || 1 }); break
+      case 'pointer-down':
+        await setModifiers(value.modifiers || [])
+        await page.mouse.move(value.x, value.y); assertCurrent(value)
+        await page.mouse.down({ button: value.button, clickCount: value.count }); pressedButtons.add(value.button); break
+      case 'pointer-up':
+        await setModifiers(value.modifiers || [])
+        await page.mouse.move(value.x, value.y); assertCurrent(value)
+        await page.mouse.up({ button: value.button, clickCount: value.count }); pressedButtons.delete(value.button); break
+      case 'element-click': {
+        const owner = value.frame_ref ? observedFrames.get(value.frame_ref) : page
+        if (!owner || owner.isDetached?.()) throw new Error('stale_observation')
+        const locator = value.role ? owner.getByRole(value.role, { name: value.name, exact: true }) : owner.locator(value.selector)
+        if (await locator.count() !== 1) throw new Error('ambiguous_element')
+        await locator.scrollIntoViewIfNeeded(); assertCurrent(value)
+        const box = await locator.boundingBox(); assertCurrent(value)
+        if (!box) throw new Error('element_not_visible')
+        await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2)
+        break
+      }
+      case 'element-text': {
+        const owner = value.frame_ref ? observedFrames.get(value.frame_ref) : page
+        if (!owner || owner.isDetached?.()) throw new Error('stale_observation')
+        const locator = value.role ? owner.getByRole(value.role, { name: value.name, exact: true }) : owner.locator(value.selector)
+        if (await locator.count() !== 1) throw new Error('ambiguous_element')
+        await locator.focus(); assertCurrent(value)
+        if (!await locator.isEditable()) throw new Error('element_not_editable')
+        assertCurrent(value)
+        await page.keyboard.press('ControlOrMeta+A'); assertCurrent(value)
+        await page.keyboard.insertText(value.text)
+        break
+      }
+      case 'move': await setModifiers(value.modifiers || []); await page.mouse.move(value.x, value.y); break
       case 'wheel': await page.mouse.wheel(value.x, value.y); break
       case 'text': await page.keyboard.insertText(value.text); break
       case 'key': await page.keyboard.press(value.key); break
       default: throw new Error('invalid_action')
     } } finally { if (moves) { navigation++; navigating = false } }
+    if (moves && streams.get(page)?.active) await streams.get(page).resize()
     if (pendingPopup) { const pending = pendingPopup; await pending; if (pendingPopup === pending) pendingPopup = undefined }
     if (moves && capturing) await captureFinished
-    if (!watching || !['move', 'wheel', 'text', 'key'].includes(action)) await freshFrame()
-    const result = { page_id: pageId, ...(popupLimited ? { page_limit: true } : {}) }
-    popupLimited = false
-    return result
+    assertCurrent(value)
+    // Observed frames stream independently; a click never waits for image encoding.
+    if (display) await frame()
+    else if (!streams.get(page)?.active && (!watching || !['move', 'wheel', 'text', 'key'].includes(action))) await freshFrame()
+    return { page_id: pageId }
   }
   function fatal(error) {
     if (closed) return
@@ -289,30 +503,54 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
     const forced = setTimeout(() => exit(2), 1500)
     Promise.all([send({ type: 'fatal', error }), stop]).finally(() => { clearTimeout(forced); exit(2) }).catch(() => {})
   }
-  async function shutdown() {
-    if (closed) return
+  function shutdown() {
+    if (shutdownPromise) return shutdownPromise
     closed = true
     clearInterval(timer)
-    await browser?.close().catch(() => {})
+    shutdownPromise = (async () => {
+      await Promise.all([...streams.values()].map(value => value.dispose()))
+      await browser?.close().catch(() => {})
+      await display?.stop()
+    })()
+    return shutdownPromise
   }
   let queue = Promise.resolve()
   const lines = createInterface({ input })
   lines.on('line', line => {
     if (line.length > 256 * 1024) { void shutdown().finally(() => exit(2)); return }
+    let request
+    try { request = JSON.parse(line) } catch { return }
+    if (request.action === 'cancel') {
+      cancelled.add(request.cancel_id)
+      if (cancelled.size > 512) cancelled.delete(cancelled.values().next().value)
+      if (activeCommand?.id === request.cancel_id && ['navigate', 'reload', 'back', 'forward'].includes(activeCommand.action))
+        void session?.send('Page.stopLoading').catch(() => {})
+      return
+    }
+    if (['ack', 'watch', 'release-input', 'display-open', 'display-write', 'display-close'].includes(request.action)) {
+      void operation(request).then(value => send({ type: 'result', id: request.id, value }),
+        () => send({ type: 'result', id: request.id, error: '浏览器画面连接失败' }))
+      return
+    }
     queue = queue.then(async () => {
       let value
       try {
-        value = JSON.parse(line)
+        value = request
+        activeCommand = value
+        assertCurrent(value)
         const result = await operation(value)
         if (!closed) await send({ type: 'result', id: value.id, ...(result === undefined ? {} : { value: result }) })
-      } catch {
+      } catch (failure) {
         if (closed) return
-        const error = ['navigate', 'reload', 'back', 'forward'].includes(value?.action)
+        if (cancelled.has(value?.id)) { await send({ type: 'result', id: value.id, error: '浏览器操作已取消' }); return }
+        const error = failure.message === 'stale_observation' ? '页面已变化，请重新查看页面后操作'
+          : failure.message === 'ambiguous_element' ? '网页元素匹配不唯一，请重新查看页面'
+          : ['navigate', 'reload', 'back', 'forward'].includes(value?.action)
           ? '网页加载失败，请检查地址或稍后刷新' : '浏览器操作失败'
         notice = error
         await send({ type: 'result', id: value?.id, error })
-        await frame()
-      }
+        if (!streams.get(page)?.active) await frame()
+      } finally { cancelled.delete(value?.id); activeCommand = undefined }
     })
   })
   lines.on('close', () => { void shutdown().finally(() => exit()) })

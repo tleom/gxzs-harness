@@ -3,6 +3,37 @@ import { expect, it, vi } from 'vitest'
 import { browserAction, SandboxBrowser, WorkbenchBrowsers } from '../src/browsers.js'
 const id = '12345678-1234-1234-1234-123456789abc'
 const signal = () => new AbortController().signal
+it('binds RFB input to its owner, active attachment and current ordered display handshake', async () => {
+  const worker = { closed:false, done:new Promise(()=>{}), command:vi.fn(async()=>({display:'kasm'})), dispose:vi.fn() }
+  const gateway = new WorkbenchBrowsers({create:()=>worker})
+  const owner={ownerId:'owner'}
+  await gateway.create(owner,{id},signal())
+  worker.controller=id;worker.displayConnection={id}
+  await gateway.displayInput(owner,id,{attachment_id:id,connection:id,data:'AAEC'},signal())
+  expect(worker.command).toHaveBeenLastCalledWith({action:'display-write',connection:id,data:'AAEC'},expect.any(AbortSignal))
+  for (const data of ['', 'a', 'AA=A', 'AB==', 'A'.repeat(87388)])
+    await expect(gateway.displayInput(owner,id,{attachment_id:id,connection:id,data},signal())).rejects.toMatchObject({status:400})
+  await expect(gateway.displayInput({ownerId:'foreign'},id,{attachment_id:id,connection:id,data:'AA=='},signal())).rejects.toMatchObject({status:404})
+  await expect(gateway.displayInput(owner,id,{attachment_id:id,connection:'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',data:'AA=='},signal())).rejects.toMatchObject({status:409})
+  expect(worker.closed).toBe(false)
+})
+it('cancels only its operation while keeping Chromium and other observers alive', async () => {
+  const stdin = new PassThrough(), stdout = new PassThrough(), requests = []
+  stdin.on('data', data => requests.push(JSON.parse(String(data))))
+  const browser = new SandboxBrowser({spawn:spec => ({stdin,stdout,
+    done:new Promise(resolve => spec.signal.addEventListener('abort',resolve))})})
+  const controller = new AbortController()
+  const first = browser.command({action:'navigate',url:'https://example.com'},controller.signal)
+  controller.abort(new Error('view detached'))
+  await expect(first).rejects.toThrow('view detached')
+  expect(browser.closed).toBe(false)
+  expect(browser.lifetime.signal.aborted).toBe(false)
+  expect(requests.at(-1)).toEqual({action:'cancel',cancel_id:requests[0].id})
+  const next = browser.command({action:'key',key:'Enter'})
+  stdout.write(JSON.stringify({type:'result',id:requests.at(-1).id})+'\n')
+  await expect(next).resolves.toBeUndefined()
+  browser.dispose();await browser.done
+})
 it('bounds input and schemes without accepting command/config fields', () => {
   expect(browserAction({ action: 'navigate', url: 'https://www.baidu.com', command: 'rm' })).toEqual({ action: 'navigate', url: 'https://www.baidu.com/' })
   for (const url of ['file:///workspace/secrets', 'javascript:alert(1)', 'https://user:password@example.com'])
@@ -33,7 +64,7 @@ it('allows one browser per chat and independent browsers in other chats', async 
   const gateway=new WorkbenchBrowsers({create:()=>created++ ? {...worker,command:vi.fn(async()=>{}),dispose:vi.fn()} : worker,service:{requireChat:vi.fn()}})
   const root='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',child='bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb',third='cccccccc-cccc-cccc-cccc-cccccccccccc'
   await gateway.create({ownerId:'owner'},{id:root,chat_id:id},signal())
-  expect(worker.onPageOpen(child)).toBe(false)
+  expect(worker.onPageOpen).toBeUndefined()
   await expect(gateway.create({ownerId:'owner'},{id:third,chat_id:id},signal())).rejects.toMatchObject({status:409})
   await gateway.create({ownerId:'owner'},{id:child,chat_id:child},signal())
   expect(gateway.currentId({ownerId:'owner'},id)).toBe(root)

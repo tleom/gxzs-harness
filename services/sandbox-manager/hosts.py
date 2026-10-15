@@ -1,5 +1,8 @@
 """Owner-scoped host lifecycle. Runtime templates are administrator-controlled."""
 import json
+import hashlib
+import hmac
+import secrets
 from resource_limits import cgroup_args, owner_cgroup, pid_pressure, ResourceUnavailable
 import logging
 from concurrent.futures import ThreadPoolExecutor
@@ -25,6 +28,7 @@ class Hosts:
         self.failures = {}
         self.recoveries = {}
         self.cleanup_at = {}
+        self.native_snapshots = {}
 
     def _cleanup_superseded(self, item):
         """Remove only stopped, identity-verified predecessors after the new Host is healthy."""
@@ -69,7 +73,7 @@ class Hosts:
                 current = json.loads(record.read_text())
                 if (current['owner_id'], current['generation'], current['instance_id']) != (owner, generation, instance):
                     raise ValueError('Host identity changed; fence the previous generation before replacement')
-                if current.get('state') in {'draining', 'fencing'}:
+                if 'profile_upgrade' in current or current.get('state') in {'draining', 'fencing'}:
                     return {**current, 'ready': False}
                 # A ready generation can temporarily be unavailable while the
                 # manager restarts its host/sandbox pair. Never regress the
@@ -232,6 +236,9 @@ class Hosts:
             if not record.exists():
                 raise ValueError('Replacement requires a registered host')
             current = json.loads(record.read_text(encoding='utf-8'))
+            if 'profile_upgrade' in current and current['profile_upgrade'].get('phase') != 'prepared':
+                return {'conflict': True, 'code': 'PROFILE_UPGRADE_PREPARING',
+                        'error': 'Profile upgrade preparation must complete before replacement'}
             expected = (int(payload['expected_generation']), payload['expected_instance_id'])
             desired = (int(payload['generation']), payload['instance_id'])
             if payload['owner_id'] != current['owner_id'] or desired[0] != expected[0] + 1 or desired[1] == expected[1]:
@@ -252,6 +259,21 @@ class Hosts:
             self._save(record, current)
             if self.admission.busy(current['owner_id']):
                 return current
+            observed = dict(current)
+        # Native background work can outlive the platform's model admission.
+        # Probe outside the workspace lock because Host plugins can call back
+        # into this manager. Future schedules and UI leases survive replacement
+        # through native recovery; they are not in-flight task admission.
+        inspected = self.docker('inspect', expected[1], timeout=5, check=False)
+        info = json.loads(inspected.stdout)[0] if not inspected.returncode else None
+        if info and info['State']['Running']:
+            activity = self.native_activity(observed.get('endpoint')) if observed.get('endpoint') else None
+            if activity is None or any(activity[key] for key in ('runningAgents', 'pendingMessages', 'runningJobs', 'activeSettingsWrites')):
+                return observed
+        with self.lock(workspace):
+            current = json.loads(record.read_text(encoding='utf-8'))
+            if current != observed or self.admission.busy(current['owner_id']):
+                return current
             current['state'] = 'fencing'
             self._save(record, current)
             from mcp_runtime import invalidate
@@ -267,11 +289,151 @@ class Hosts:
             self._fence(workspace, current['owner_id'], expected[1])
             current.update(generation=desired[0], instance_id=desired[1], state='provisioning', ready=False,
                            home_volume=current.get('home_volume') or expected[1] + '-home')
+            current.pop('profile_upgrade', None)
             current.pop('endpoint', None)
             self._save(record, current)
             return self.ensure(workspace, payload)
 
+    def _upgrade_result(self, workspace, marker):
+        identity = {key: marker[key] for key in
+                    ('owner_id', 'generation', 'instance_id', 'home_volume', 'image_digest')}
+        message = json.dumps([workspace, marker['nonce'], identity], sort_keys=True, separators=(',', ':'))
+        token = hmac.new(os.environ['WORKBENCH_SANDBOX_MANAGER_TOKEN'].encode(),
+                         ('profile-upgrade\n' + message).encode(), hashlib.sha256).hexdigest()
+        return dict(identity, workspace_id=workspace, fenced=True, phase=marker['phase'], token=token)
+
+    def _upgrade_stopped(self, workspace, marker):
+        sandbox, _ = self.identity(workspace)
+        for container in (marker['instance_id'], sandbox):
+            info = self._upgrade_inspect(container)
+            if info is None:
+                continue
+            if info['State']['Running']:
+                raise ValueError('Profile upgrade requires both original containers to remain stopped')
+            if container == marker['instance_id'] and info['Image'] != marker['image_digest']:
+                raise ValueError('Profile upgrade image identity changed')
+            if container == marker['instance_id']:
+                labels = info.get('Config', {}).get('Labels') or {}
+                if any(labels.get(key) != value for key, value in {
+                    'gxzs.owner': marker['owner_id'], 'gxzs.workspace': workspace,
+                    'gxzs.generation': str(marker['generation']),
+                }.items()):
+                    raise ValueError('Profile upgrade container identity changed')
+
+    def _upgrade_inspect(self, container):
+        inspected = self.docker('inspect', container, timeout=5, check=False)
+        if not inspected.returncode:
+            return json.loads(inspected.stdout)[0]
+        message = getattr(inspected, 'stderr', '').lower()
+        if 'no such object' in message or 'no such container' in message:
+            return None
+        raise ValueError('Profile upgrade container state could not be verified')
+
+    def profile_upgrade(self, workspace, payload):
+        """Root-only maintenance barrier; only explicit replacement can resume this owner."""
+        operation = payload.get('operation')
+        if operation not in {'begin', 'check', 'complete'}:
+            raise ValueError('Unsupported profile upgrade operation')
+        record = self.root / workspace / 'host.json'
+        with self.lock(workspace):
+            if not record.exists():
+                raise ValueError('Profile upgrade requires a registered host')
+            current = json.loads(record.read_text(encoding='utf-8'))
+            if current.get('workspace_id') != workspace:
+                raise ValueError('Profile upgrade workspace identity changed')
+            marker = current.get('profile_upgrade')
+            if operation == 'begin':
+                try:
+                    expected = (payload['owner_id'], int(payload['generation']), payload['instance_id'])
+                except (KeyError, ValueError, TypeError) as error:
+                    raise ValueError('Profile upgrade requires the original host identity') from error
+                if expected != (current['owner_id'], current['generation'], current['instance_id']):
+                    raise ValueError('Profile upgrade host identity changed')
+                if marker is None:
+                    transition = current.get('replacement') or {}
+                    if (current.get('state') == 'fencing' or
+                            transition.get('generation', current['generation']) > current['generation']):
+                        raise ValueError('Another host maintenance transition is in progress')
+                    info = self._upgrade_inspect(current['instance_id'])
+                    if info:
+                        labels = info.get('Config', {}).get('Labels') or {}
+                        if any(labels.get(key) != value for key, value in {
+                            'gxzs.owner': current['owner_id'], 'gxzs.workspace': workspace,
+                            'gxzs.generation': str(current['generation']),
+                        }.items()):
+                            raise ValueError('Profile upgrade container identity changed')
+                    image = info['Image'] if info else current.get('image_digest')
+                    if not isinstance(image, str) or not re.fullmatch(r'sha256:[0-9a-f]{64}', image):
+                        raise ValueError('Profile upgrade requires the registered immutable image')
+                    if current.get('image_digest') and current['image_digest'] != image:
+                        raise ValueError('Profile upgrade registered image identity changed')
+                    installed = json.loads(self.docker('image', 'inspect', image).stdout)[0]
+                    if installed.get('Id') != image:
+                        raise ValueError('Profile upgrade immutable image is not installed')
+                    home = current.get('home_volume') or current['instance_id'] + '-home'
+                    if not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_.-]+', home):
+                        raise ValueError('Profile upgrade attachment volume is invalid')
+                    marker = dict(owner_id=current['owner_id'], generation=current['generation'],
+                                  instance_id=current['instance_id'], image_digest=image, home_volume=home,
+                                  nonce=secrets.token_hex(32), phase='draining')
+                    current.update(home_volume=home, profile_upgrade=marker, state='draining', ready=False)
+                    self._save(record, current)
+            if not isinstance(marker, dict) or marker.get('phase') not in {'draining', 'fencing', 'preparing', 'prepared'}:
+                raise ValueError('Profile upgrade has not begun')
+            if any(current.get(key) != marker[key] for key in ('owner_id', 'generation', 'instance_id', 'home_volume')):
+                raise ValueError('Profile upgrade original binding changed')
+            result = self._upgrade_result(workspace, marker)
+            if operation != 'begin':
+                supplied = payload.get('token')
+                if not isinstance(supplied, str) or not hmac.compare_digest(supplied, result['token']):
+                    raise PermissionError('Profile upgrade token does not match this maintenance operation')
+                if marker['phase'] not in {'preparing', 'prepared'} or current.get('state') != 'fencing':
+                    raise ValueError('Profile upgrade is not fenced for preparation')
+                self._upgrade_stopped(workspace, marker)
+                if operation == 'complete':
+                    marker['phase'] = 'prepared'
+                    self._save(record, current)
+                return self._upgrade_result(workspace, marker)
+            if marker['phase'] in {'preparing', 'prepared'}:
+                if current.get('state') != 'fencing':
+                    raise ValueError('Profile upgrade maintenance barrier changed')
+                self._upgrade_stopped(workspace, marker)
+                return result
+            if self.admission.busy(current['owner_id']):
+                return dict(fenced=False, phase=marker['phase'], reason='workspace_busy', retry_after=3)
+            observed = json.loads(json.dumps(current))
+        # Native activity may call back into the manager; never hold its workspace lock here.
+        if marker['phase'] == 'draining':
+            info = self._upgrade_inspect(marker['instance_id'])
+            if info and info['State']['Running']:
+                activity = self.native_activity(observed.get('endpoint')) if observed.get('endpoint') else None
+                if activity is None or any(activity[key] for key in
+                                           ('runningAgents', 'pendingMessages', 'runningJobs', 'activeSettingsWrites')):
+                    return dict(fenced=False, phase='draining', reason='host_activity_unknown_or_busy', retry_after=3)
+        with self.lock(workspace):
+            current = json.loads(record.read_text(encoding='utf-8'))
+            if current != observed or self.admission.busy(current['owner_id']):
+                return dict(fenced=False, phase='draining', reason='binding_or_activity_changed', retry_after=3)
+            marker = current['profile_upgrade']
+            current.update(state='fencing', ready=False)
+            marker['phase'] = 'fencing'
+            self._save(record, current)
+            from mcp_runtime import invalidate
+            from global_memory import invalidate as cancel_memory
+            invalidate(workspace)
+            cancel_memory(workspace)
+            sandbox, _ = self.identity(workspace)
+            for container in (marker['instance_id'], sandbox):
+                if self._upgrade_inspect(container) is not None:
+                    self.docker('stop', '--time', '10', container)
+            self._upgrade_stopped(workspace, marker)
+            self._fence(workspace, current['owner_id'], marker['instance_id'])
+            marker['phase'] = 'preparing'
+            self._save(record, current)
+            return self._upgrade_result(workspace, marker)
+
     def _fence(self, workspace, owner, instance):
+        self.native_snapshots.pop(instance, None)
         from global_memory import fence_workspace
         fence_workspace(workspace)
         from mcp_runtime import fence_workspace as fence_mcp
@@ -346,6 +508,26 @@ class Hosts:
         return (payload.get('live') is True and payload.get('recovery') == 'ready'
                 and payload.get('resources') == 'unavailable')
 
+    def native_activity(self, endpoint):
+        """Only a complete native activity read can authorize idle shutdown.
+
+        Active schedules keep their DSH timer resident, including while the
+        user is offline. The manager never computes or delivers reminders.
+        Older Hosts and unavailable catalogs fail closed until upgraded/ready.
+        """
+        try:
+            with self.opener.open(endpoint + '/ai/workbench/health', timeout=2) as response:
+                payload = json.loads(response.read(4096))
+                activity = payload.get('activity') or {}
+                keys = ('runningAgents', 'pendingMessages', 'runningJobs', 'activeSchedules', 'activeSidebarResources', 'activeSettingsWrites')
+                if (response.status == 200 and payload.get('ready') is True
+                        and activity.get('protocol') == 1 and activity.get('status') == 'ready'
+                        and all(type(activity.get(key)) is int and activity[key] >= 0 for key in keys)):
+                    return {key: activity[key] for key in keys}
+        except Exception:
+            pass
+        return None
+
     def maintain(self):
         # A slow or broken host must not expire every other owner's heartbeat.
         with ThreadPoolExecutor(max_workers=16) as pool:
@@ -391,6 +573,9 @@ class Hosts:
             draining_ticket = item.get('state') == 'draining' and self.admission.pending(
                 payload['owner_id'], int(payload['generation']), payload['instance_id'],
                 payload.get('ticket_id') or payload['run_id'], payload['chat_id']) is True
+            if ('profile_upgrade' in item and payload['action'] == 'acquire'
+                    and not (draining_ticket and item['profile_upgrade'].get('phase') == 'draining')):
+                raise ValueError('Profile upgrade has paused new task admission')
             if item.get('state') in {'draining', 'fencing', 'stopped'} and payload['action'] == 'acquire' and not draining_ticket:
                 raise ValueError('Host is draining; new task admission is paused')
             if payload['action'] != 'release':
@@ -411,6 +596,9 @@ class Hosts:
             with self.lock(record.parent.name):
                 item = json.loads(record.read_text())
                 if item.get('state') == 'fencing':
+                    return
+                if 'profile_upgrade' in item:
+                    heartbeats.append((dict(item), 'draining'))
                     return
                 observed = dict(item)
             # Both Docker inspection and health checks can be slow. In
@@ -448,14 +636,25 @@ class Hosts:
                                        and self.dependency_degraded(item['endpoint']))
             process_pressure = bool(host_running and sandbox_running and
                                     (pid_pressure(info) or pid_pressure(sandbox_info)))
+            native_activity = self.native_activity(item['endpoint']) if healthy else None
             with self.lock(record.parent.name):
                 item = json.loads(record.read_text())
                 if item != observed:
                     return
                 activity = self.root.parent / item['workspace_id']
+                if native_activity is not None:
+                    previous = self.native_snapshots.get(item['instance_id'])
+                    # Ongoing native work or a confirmed state transition is
+                    # real activity. Empty unchanged probes and unknown reads
+                    # cannot extend the idle window.
+                    if (any(native_activity[key] for key in ('runningAgents', 'pendingMessages', 'runningJobs', 'activeSidebarResources', 'activeSettingsWrites'))
+                            or previous is not None and previous != native_activity):
+                        activity.touch()
+                    self.native_snapshots[item['instance_id']] = dict(native_activity)
+                native_idle = native_activity is not None and not any(native_activity.values())
                 idle = (item.get('state') != 'draining' and activity.exists()
                         and time.time() - activity.stat().st_mtime > 1800
-                        and not self.admission.busy(item['owner_id']))
+                        and not self.admission.busy(item['owner_id']) and native_idle)
                 if host_running and idle:
                     self.docker('stop', '--time', '10', item['instance_id'])
                     self.docker('stop', '--time', '10', sandbox, check=False)

@@ -5,11 +5,34 @@ import { sendError } from '../src/http.js'
 const owner = { ownerId: 'signed-owner' }
 const chat = { id: 'chat', sessionId: 'root' }
 const child = { id: 'child', mode: 'continuable', label: '调查' }
+const descendants = entries => vi.fn(async () => entries.map(entry => ({ ...entry, kind: 'child', parentId: 'root', depth: 1, activity: 'inactive', hasChildren: false })))
 const attachment = '12345678-1234-1234-1234-123456789abc'
 const service = { requireChat: (who, id) => {
   if (who.ownerId !== owner.ownerId || id !== chat.id) throw Object.assign(new Error('missing'), { status: 404 })
   return chat
 } }
+it('reads child references from a disposable native observation without waking either Agent', async () => {
+  const disposed=vi.fn(), observed={header:{id:'grandchild',parentSession:'child'},[Symbol.dispose]:disposed}
+  const scoped={...service,sessionQuery:{observeSession:vi.fn(async()=>observed)},
+    observedReferenceCandidates:vi.fn(async()=>[{path:'child.md',kind:'file'}])}
+  const gateway=new WorkbenchSubagents({service:scoped,native:{listDescendants:async()=>[
+    {id:'grandchild',kind:'child',mode:'continuable',parentId:'child',depth:2},
+  ]},sessions:{list:async()=>({items:[]})}})
+  const signal=new AbortController().signal
+  expect(await gateway.references(owner,chat.id,'grandchild','',signal)).toHaveLength(1)
+  expect(scoped.sessionQuery.observeSession).toHaveBeenCalledWith('grandchild',{signal})
+  expect(scoped.observedReferenceCandidates).toHaveBeenCalledWith(owner,observed,'',signal)
+  expect(disposed).toHaveBeenCalledOnce()
+  await expect(gateway.references({ownerId:'foreign'},chat.id,'grandchild','',signal)).rejects.toMatchObject({status:404})
+  await expect(gateway.references(owner,chat.id,'other','',signal)).rejects.toMatchObject({status:404})
+  observed.header.parentSession='wrong-parent'
+  await expect(gateway.references(owner,chat.id,'grandchild','',signal)).rejects.toMatchObject({status:403})
+  expect(disposed).toHaveBeenCalledTimes(2)
+  observed.header.parentSession='child'
+  scoped.observedReferenceCandidates.mockRejectedValue(new Error('provider failed'))
+  await expect(gateway.references(owner,chat.id,'grandchild','',signal)).rejects.toThrow('provider failed')
+  expect(disposed).toHaveBeenCalledTimes(3)
+})
 it('shares a terminal allocation within one chat while other chats remain independent', async () => {
   const terminalId = '22345678-1234-1234-1234-123456789abc'
   const retained = new Map()
@@ -106,7 +129,8 @@ it('authorizes native child history only through its parent catalog and rejects 
     { sessionId: 'child', running: true, projections: { values: { title: '原生标题' } } },
     { sessionId: 'foreign' },
   ] })), page: vi.fn(async () => ({ records: [], hasMore: false })) }
-  const gateway = new WorkbenchSubagents({ sessions, service })
+  const native = { listDescendants: descendants([child, { id: 'external', mode: 'external' }]) }
+  const gateway = new WorkbenchSubagents({ sessions, service, native })
   const signal = new AbortController().signal
   expect((await gateway.catalog(owner, chat.id, signal))[0]).toMatchObject({ title: '调查', summary: '原生标题', running: true })
   await expect(gateway.history(owner, chat.id, 'foreign', {}, signal)).rejects.toMatchObject({ status: 404 })
@@ -126,7 +150,7 @@ it('returns stable input and terminal errors without publishing internal diagnos
   expect(res.writeHead.mock.calls[1][0]).toBe(404)
 })
 it('routes only an owned continuable child through native subagent delivery', async () => {
-  const native = { prompt: vi.fn(async () => ({ messageId: 'accepted' })) }
+  const native = { listDescendants: descendants([child, { id: 'once', mode: 'one-shot' }]), prompt: vi.fn(async () => ({ messageId: 'accepted' })) }
   const sessions = { list: async () => ({ items: [{ sessionId: 'root', agentAvailable: true, projections: { values: { subagentCatalog: [child, { id:'once', mode:'one-shot' }] } } }] }) }
   const gateway = new WorkbenchSubagents({ native, sessions, service })
   const request = { requestId:attachment, text:'继续调研' }, signal = new AbortController().signal
@@ -141,7 +165,7 @@ it('hides a child cursor when only its descriptor metadata precedes the visible 
     page: vi.fn(async request => request.maxMessages === 1
       ? { records: [{ event: { seq: 0, type: 'subagent/descriptor', data: {} } }], hasMore: false }
       : { records: [{ event: { seq: 1, time: 1000, type: 'turn/start', data: { turn: 1 } } }], hasMore: true }) }
-  const gateway = new WorkbenchSubagents({ sessions, service })
+  const gateway = new WorkbenchSubagents({ sessions, service, native: { listDescendants: descendants([child]) } })
   const result = await gateway.history(owner, chat.id, child.id, { sessionId: child.id, throughSeq: 9, beforeSeq: 5 }, new AbortController().signal)
   expect(result.history_cursor).toBeNull()
   expect(sessions.page.mock.calls[1][0].address).toMatchObject({ kind: 'subagent', childSessionId: child.id })
@@ -152,12 +176,12 @@ it.each(['subagent/invalid-time-zone','subagent/parent-unavailable'])('settles a
   const receipt = { requestKey: `subagent-prompt:${child.id}:${attachment}`, status: 'running' }
   const runtime = { prepareChildPrompt: () => receipt, rejectChildPrompt: vi.fn() }
   const sessions = { list: async () => ({ items: [{ sessionId: 'root', projections: { values: { subagentCatalog: [child] } } }] }) }
-  const gateway = new WorkbenchSubagents({ sessions, service, runtime, native: { prompt: async () => { throw error } } })
+  const gateway = new WorkbenchSubagents({ sessions, service, runtime, native: { listDescendants: descendants([child]), prompt: async () => { throw error } } })
   await expect(gateway.prompt(owner,chat.id,child.id,{requestId:attachment,text:'continue'},new AbortController().signal)).rejects.toBe(error)
   expect(runtime.rejectChildPrompt).toHaveBeenCalledWith(receipt)
 })
 it('admits image-only continuation through the native image store and scopes binary reads to the owner', async () => {
-  const native = {prompt:vi.fn(async () => ({messageId:'accepted'}))}
+  const native = {listDescendants:descendants([child]),prompt:vi.fn(async () => ({messageId:'accepted'}))}
   const attachments = {readImage:vi.fn(async ref => ({ref,data:Buffer.from('image')}))}
   const sessions = {list:async () => ({items:[{sessionId:'root',agentAvailable:true,projections:{values:{subagentCatalog:[child]}}}]})}
   const gateway = new WorkbenchSubagents({native,sessions,service,attachments})
@@ -178,7 +202,7 @@ it('presents stored child image references through the shared attachment rendere
     {event:{seq:1,time:1000,type:'turn/start',data:{turn:1}}},
     {event:{seq:2,time:1001,type:'user/message',data:{source:{kind:'user'},content:[{type:'image',attachment:ref}]}}},
   ]})}
-  const gateway = new WorkbenchSubagents({sessions,service})
+  const gateway = new WorkbenchSubagents({sessions,service,native:{listDescendants:descendants([child])}})
   const result = await gateway.history(owner,chat.id,child.id,{sessionId:child.id,throughSeq:2,beforeSeq:3},new AbortController().signal)
   expect(result.runs[0].attachments).toEqual([{name:'调查.png',path:'native-image:image-id',size:12,native_image:{parentChatId:chat.id,childId:child.id,ref}}])
 })
@@ -188,8 +212,45 @@ it('renders the first child user message once and retains later steering message
   const sessions={list:async()=>({items:[{sessionId:'root',projections:{values:{subagentCatalog:[child]}}}]}),page:async()=>({hasMore:false,records:[
     {event:{seq:1,time:1000,type:'turn/start',data:{turn:1}}},event(2,'first','request-first','首条'),event(3,'second','request-second','追加'),
   ]})}
-  const gateway=new WorkbenchSubagents({sessions,service})
+  const gateway=new WorkbenchSubagents({sessions,service,native:{listDescendants:descendants([child])}})
   const result=await gateway.history(owner,chat.id,child.id,{sessionId:child.id,throughSeq:3,beforeSeq:4},new AbortController().signal)
   expect(result.runs[0]).toMatchObject({query:'首条',message_id:'first'})
   expect(result.runs[0].events.filter(e=>e.event==='workbench_steering').map(e=>e.query)).toEqual(['追加'])
+})
+
+it('uses the native recursive catalog and the true direct parent for nested history, steering and offline interruption', async () => {
+  const native = { listDescendants: vi.fn(async () => [
+    { ...child, kind: 'child', parentId: 'root', depth: 1, hasChildren: true },
+    { id: 'grandchild', label: '复核', mode: 'continuable', kind: 'child', parentId: 'child', depth: 2, hasChildren: false },
+    { id: 'unknown', kind: 'diagnostic', parentId: 'root', depth: 1, reason: 'unsupported' },
+  ]), prompt: vi.fn(async () => ({ messageId: 'accepted' })), interruptByParent: vi.fn(() => ({ accepted: true })) }
+  const sessions = { list: vi.fn(async () => ({ items: [
+    { sessionId: 'root', agentAvailable: true }, { sessionId: 'child', agentAvailable: false },
+    { sessionId: 'grandchild', running: true, projections: { values: { inbox: { 'next-turn': [{ id: 'queued' }], 'next-step': [] } } } },
+  ] })), page: vi.fn(async () => ({ records: [], hasMore: false })), updateQueue: vi.fn(async () => ({ accepted: true })) }
+  const gateway = new WorkbenchSubagents({ native, sessions, service })
+  const signal = new AbortController().signal
+  expect(await gateway.catalog(owner, chat.id, signal)).toEqual(expect.arrayContaining([
+    expect.objectContaining({ id: 'grandchild', depth: 2, parentSessionId: 'child', parentAvailable: false, running: true }),
+    expect.objectContaining({ id: 'unknown', mode: 'unknown', reason: 'unsupported' }),
+  ]))
+  await gateway.history(owner, chat.id, 'grandchild', { sessionId: 'grandchild', throughSeq: 2, beforeSeq: 3 }, signal)
+  expect(sessions.page).toHaveBeenCalledWith(expect.objectContaining({ address: { kind: 'subagent', parentSessionId: 'child', childSessionId: 'grandchild', mode: 'continuable' } }), signal)
+  await gateway.prompt(owner, chat.id, 'grandchild', { requestId: attachment, text: '立即纠正', delivery: 'steer' }, signal)
+  expect(native.prompt).toHaveBeenCalledWith(expect.objectContaining({ parentSessionId: 'child', delivery: 'steer' }), signal)
+  await gateway.stop(owner, chat.id, 'grandchild', signal)
+  expect(native.interruptByParent).toHaveBeenCalledWith('grandchild', 'child', 'continuable')
+  const action = { kind: 'edit', content: [{ type: 'text', text: '更新队列' }] }
+  await gateway.updateQueue(owner, chat.id, 'grandchild', { itemId: 'queued', action }, signal)
+  expect(sessions.updateQueue).toHaveBeenCalledWith({ sessionId: 'grandchild', itemId: 'queued', action })
+  await expect(gateway.stop(owner, chat.id, 'foreign', signal)).rejects.toMatchObject({ status: 404 })
+  await expect(gateway.prompt(owner, chat.id, 'grandchild', { requestId: attachment, text: 'bad', delivery: 'invalid' }, signal)).rejects.toMatchObject({ status: 400 })
+})
+
+it('does not present an unreadable native catalog as an empty catalog or an unknown parent as offline', async () => {
+  const native = { listDescendants: descendants([child]) }
+  const gateway = new WorkbenchSubagents({ native, service, sessions: { list: async () => ({ items: [] }) } })
+  expect((await gateway.catalog(owner, chat.id))[0].parentAvailable).toBeUndefined()
+  native.listDescendants.mockRejectedValue(new Error('catalog unavailable'))
+  await expect(gateway.catalog(owner, chat.id)).rejects.toThrow('catalog unavailable')
 })

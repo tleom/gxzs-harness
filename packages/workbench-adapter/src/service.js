@@ -20,6 +20,7 @@ import { withGoalUpdates } from './goal-updates.js'
 import { withNativeCommandRun, nativeCommandRecords } from './native-command.js'
 import { dispatchRunPrompt } from './native-prompt.js'
 import { goalFailureReason, presentRunEvent, resumeGoalSelection, runFailure } from './run-failure.js'
+import { ownedSessionRoots } from './owned-session-roots.js'
 
 export class WorkbenchService {
   constructor({ database, sessionController, agents, commands, skills, fileManager, platformClient, workspace, sessionQuery, agentPresets, agentDefaultModel, modelSettings, scheduler, attachments, goals, fileUploads, nativeFileAttachments = false }) {
@@ -69,6 +70,20 @@ export class WorkbenchService {
     await this.ensureChatSession(owner, chat)
     const agent = this.agents.get(chat.sessionId)
     if (!agent || !this.sessionReferences) throw httpError(503, '对话引用服务尚未就绪')
+    return this.collectReferenceCandidates(owner, query, signal,
+      () => this.fileReferences?.list(agent, query, signal) ?? [],
+      (sessionQuery, limit) => this.sessionReferences.listCandidates(agent, sessionQuery, limit, signal))
+  }
+
+  async observedReferenceCandidates(owner, observed, query, signal) {
+    if (!this.sessionReferences?.listSessionCandidates || (this.fileReferences && !this.fileReferences.listObserved))
+      throw httpError(503, '子智能体引用服务尚未就绪')
+    return this.collectReferenceCandidates(owner, query, signal,
+      () => this.fileReferences?.listObserved(observed, query, signal) ?? [],
+      (sessionQuery, limit) => this.sessionReferences.listSessionCandidates(observed.header, sessionQuery, limit, signal))
+  }
+
+  async collectReferenceCandidates(owner, query, signal, readFiles, readSessions) {
     const byIdentity = query.startsWith('dsh-session:')
     let sessionQuery = query
     if (byIdentity) {
@@ -76,20 +91,22 @@ export class WorkbenchService {
       catch { throw httpError(400, '无效的对话引用') }
     }
     const [files, metadata, workspace] = await Promise.all([
-      this.fileReferences && !byIdentity ? this.fileReferences.list(agent, query, signal) : [],
+      !byIdentity ? readFiles() : [],
       this.sessionQuery.listSessions(signal),
       this.workspaces?.baseline(owner, signal, { includeSchedules: false }),
     ])
     // DSH owns matching and ranking. Apply its display limit after platform visibility.
-    const candidates = await this.sessionReferences.listCandidates(agent, sessionQuery, Math.max(1, metadata.length), signal)
+    const candidates = await readSessions(sessionQuery, Math.max(1, metadata.length))
     const archived = new Set(workspace?.archivedSessionIds ?? [])
-    const allowed = new Map(this.database.listChats(owner.ownerId)
-      .filter(item => !archived.has(item.sessionId)).map(item => [item.sessionId, item.id]))
+    const allowed = ownedSessionRoots(this.database.listChats(owner.ownerId), metadata, archived)
     return [
       ...files.map(item => ({ ...item, group: 'files', label: item.path })),
       ...candidates.filter(item => allowed.has(item.sessionId) && (!byIdentity || item.sessionId === sessionQuery))
         .slice(0, this.sessionReferences.config.candidateLimit)
-        .map(({ cwd, ...item }) => ({ ...item, chatId: allowed.get(item.sessionId),
+        .map(({ cwd, ...item }) => ({ ...item, chatId: allowed.get(item.sessionId).chatId,
+          ...(allowed.get(item.sessionId).rootSessionId !== item.sessionId ? {
+            origin: 'subagent', parentSessionId: allowed.get(item.sessionId).parentSessionId,
+          } : {}),
           mention: formatSessionReferenceMention({ sessionId: item.sessionId, label: item.displayTitle ?? item.label }) })),
     ]
   }
@@ -236,7 +253,7 @@ export class WorkbenchService {
     return this.database.listChats(owner.ownerId).map((chat) => this.chatSummary(owner, chat))
   }
 
-  getChat(owner, chatId, includeEvents = true) {
+  getChat(owner, chatId, includeEvents = false) {
     const chat = this.requireChat(owner, chatId)
     return { ...this.chatSummary(owner, chat), selection: chat.selection, runs: this.database.listRuns(owner.ownerId, chat.id).filter(run => !run.selection?.native_child).map((run) => this.getRun(owner, run.id, includeEvents)) }
   }
@@ -275,7 +292,7 @@ export class WorkbenchService {
         || (run.sourceStartSeq == null && run.sourceEndSeq == null)
         || run.sourceEndSeq > page.through_seq || run.sourceStartSeq > page.through_seq) {
         runs.set(run.id, nativeLive ? (runs.get(run.id) ?? this.inputRunDto(owner, run))
-          : { ...this.getRun(owner, run.id), history_complete: true })
+          : { ...this.getRun(owner, run.id, true), history_complete: true })
       }
     }
     return { ...this.chatSummary(owner, chat), selection: chat.selection,
@@ -355,7 +372,7 @@ export class WorkbenchService {
     const waiting = active?.status === 'waiting_input' ? this.database.getPendingInput(owner.ownerId, active.id) : null
     const pendingInteraction = waiting?.payload?.questions?.some(question => question.intent?.kind === 'plan-review') ? 'plan-review' : 'question'
     return {
-      id: chat.id, title: chat.title, version: chat.version, pinned: chat.pinned, favorited: chat.favorited,
+      id: chat.id, sessionId: chat.sessionId, title: chat.title, version: chat.version, pinned: chat.pinned, favorited: chat.favorited,
       file_directory: chat.directory ?? `conversations/${chat.id}`,
       created_at: Math.floor(chat.createdAt / 1000), updated_at: Math.floor(chat.updatedAt / 1000),
       has_active_run: Boolean(active), is_running: ['queued', 'running', 'stopping'].includes(active?.status), needs_input: active?.status === 'waiting_input',
@@ -378,6 +395,8 @@ export class WorkbenchService {
     // Explicit retries submit a new key and retain parent_run_id for lineage.
     const existing = this.database.findRunByRequestKey(owner.ownerId, chatId, requestKey)
     if (existing) return this.getRun(owner, existing.id)
+    if (body.mode !== undefined && !['queue', 'steer'].includes(body.mode))
+      throw httpError(400, '消息提交方式无效')
     if (body.version !== undefined && body.version !== chat.version)
       throw httpError(409, '配置版本已改变，请刷新后重试')
     if (body.silent_resume === true && typeof body.continue_run_id !== 'string')
@@ -419,7 +438,8 @@ export class WorkbenchService {
     checkCancelled()
     const { run, created } = this.database.createRun({
       ownerId: owner.ownerId, chatId, sessionId: chat.sessionId, query, attachments: admitted.attachments, mcpTools,
-      selection: { ...chat.selection, ...(silentResume ? { silent_resume: true } : {}), resource_mentions: mentions,
+      selection: { ...chat.selection, ...(silentResume ? { silent_resume: true } : {}),
+        ...(!silentResume && body.mode ? { prompt_mode: body.mode } : {}), resource_mentions: mentions,
         mentioned_resources: await this.mentionSnapshot(mentions, mcpTools),
         skill_names: await this.skillNames(), ...(command ? { command } : {}) }, requestKey,
       parentRunId,
@@ -463,10 +483,10 @@ export class WorkbenchService {
   async mentionSnapshot(mentions, tools) {
     const skills = mentions.skills.length ? await this.listSkills() : []
     return [
-      ...mentions.tools.map(id => {
+      ...groupPluginMentions(mentions.tools.map(id => {
         const tool = tools.find(item => item.id === id)
         return { id, kind: 'tools', name: tool?.provider_name ?? tool?.server_id ?? id }
-      }),
+      }), tools),
       ...mentions.skills.map(id => {
         const skill = skills.find(item => item.id === id || item.name === id || `personal:${item.name}` === id)
         return { id, kind: 'skills', name: skill?.displayName ?? skill?.name ?? id }
@@ -1008,7 +1028,7 @@ export class WorkbenchService {
       throw Object.assign(httpError(409, '目标任务已结束或正在切换，请刷新后重试'), { code: 'STALE_RUN' })
     pending = this.database.submission(owner.ownerId, runId)
     if (pending && !pending.dispatched) {
-      await this.sessions.prompt({ sessionId: run.sessionId, requestId: run.id, content, mode: 'steer' })
+      await this.sessions.prompt({ sessionId: run.sessionId, requestId: run.id, content, mode: 'steer' }, new AbortController().signal)
       this.database.finishSubmission(owner.ownerId, run.id)
     } else {
       const message = [...agent.inbox.nextTurn, ...agent.inbox.nextStep].find(item => item.id === current.messageId)
@@ -1025,7 +1045,7 @@ export class WorkbenchService {
     return this.getRun(owner, run.id)
   }
 
-  getRun(owner, runId, includeEvents = true) {
+  getRun(owner, runId, includeEvents = false) {
     const run = this.database.getRun(owner.ownerId, runId)
     if (!run) throw httpError(404, '任务不存在')
     return { ...this.inputRunDto(owner, run, includeEvents ? this.database.allEvents(owner.ownerId, run.id) : []), history_complete: includeEvents }
@@ -1098,7 +1118,7 @@ function normalizeSelection(value) {
   }
   for (const field of ['tools', 'skills', 'knowledge']) {
     if (!Array.isArray(selection[field]) || selection[field].some((item) => typeof item !== 'string')) throw httpError(400, '资源配置无效')
-    if (field !== 'tools' && selection[field].length) throw httpError(501, '技能选择与知识库尚未接入此版本')
+    if (field === 'knowledge' && selection[field].length) throw httpError(501, '知识库选择尚未接入此版本')
   }
   if (Object.keys(selection.tool_parameters).length || Object.keys(selection.model_parameters).some((key) => key !== 'reasoning_effort'))
     throw httpError(400, '不支持的模型或工具参数')
@@ -1115,7 +1135,7 @@ export function runDto(run, events = [], pending = null) {
     created_at: run.createdAt / 1000,
     can_fork: ['completed', 'failed', 'cancelled', 'interrupted'].includes(run.status) && Number.isInteger(run.selection?.fork_source?.endSeq ?? run.sourceEndSeq),
     resource_mentions: normalizeResourceMentions(run.selection?.resource_mentions),
-    mentioned_resources: run.selection?.mentioned_resources ?? [],
+    mentioned_resources: groupPluginMentions(run.selection?.mentioned_resources ?? [], run.mcpTools ?? []),
     ...(run.selection?.command ? { command: run.selection.command } : {}),
     ...(run.selection?.silent_resume || run.selection?.is_continuation ? { is_continuation: true } : {}),
     ...(run.selection?.native_source === 'schedule' ? { source: { kind: 'schedule', titles: run.selection.schedule_titles ?? [] } } : {}),
@@ -1131,6 +1151,22 @@ export function runDto(run, events = [], pending = null) {
       interacted: waiting.interacted, server_now: Math.floor(Date.now() / 1000),
     } : null,
   }
+}
+
+function groupPluginMentions(resources, tools) {
+  const byId = new Map(tools.map(tool => [tool.id, tool]))
+  const seen = new Set()
+  return resources.filter(resource => {
+    if (resource.kind !== 'tools') return true
+    const tool = byId.get(resource.id)
+    const provider = tool?.provider && tool.provider !== 'mcp' ? tool.provider
+      : tool?.server_id ? `${tool.scope ?? 'global'}:mcp:${tool.server_id}`
+        : /^(?:global|personal):mcp:[^:]+(?=:)/.exec(resource.id)?.[0]
+    const identity = provider ?? resource.id
+    if (seen.has(identity)) return false
+    seen.add(identity)
+    return true
+  })
 }
 
 // HTTP admission maps provider validation errors; parsing remains owned by DSH.

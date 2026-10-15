@@ -87,6 +87,119 @@ it('replays an acknowledged scheduled turn after restart without generating anot
   expect(db.submissions(owner.ownerId)).toEqual([])
 })
 
+it('reconstructs multiple native schedule messages in one completed turn with one steering receipt', async () => {
+  const { db, chat, owner } = fixture()
+  const first = { id: 'same-turn-schedule-first', source: { kind: 'schedule' }, content: [{ type: 'text', text: 'first reminder' }] }
+  const second = { id: 'same-turn-schedule-second', source: { kind: 'schedule' }, content: [{ type: 'text', text: 'second reminder' }] }
+  const query = { observeSession: async () => ({ events: [
+    { type: 'turn/start', seq: 1, data: { turn: 1 } },
+    { type: 'user/message', seq: 2, data: first },
+    { type: 'user/message', seq: 3, data: second },
+    { type: 'turn/end', seq: 4, data: { turn: 1, reason: { kind: 'completed' } } },
+  ], [Symbol.dispose]() {} }) }
+  await reconcileNativeSessions(db, query, owner.ownerId, undefined, [])
+  expect(db.getRun(owner.ownerId, first.id)).toMatchObject({ status: 'completed' })
+  expect(db.getRun(owner.ownerId, second.id)).toMatchObject({ status: 'steered' })
+  await reconcileNativeSessions(db, query, owner.ownerId, undefined, [])
+  expect(db.allEvents(owner.ownerId, second.id).filter(event => event.event === 'workbench_steered')).toHaveLength(1)
+  expect(db.allEvents(owner.ownerId, first.id).filter(event => event.event === 'workbench_steering')).toHaveLength(1)
+})
+
+it('replays completed native turns whose events arrived before autonomous receipt admission was ready', async () => {
+  const { db, chat, owner } = fixture()
+  const first = { id: 'early-completed-schedule', source: { kind: 'schedule' }, content: [{ type: 'text', text: 'first reminder' }] }
+  const second = { id: 'early-second-schedule', source: { kind: 'schedule' }, content: [{ type: 'text', text: 'second reminder' }] }
+  const events = [
+    { type: 'agent/inbox/spliced', seq: 1, data: { target: 'next-turn', start: 0, removedCount: 0, inserted: [first] } },
+    { type: 'turn/start', seq: 2, data: { turn: 1 } },
+    { type: 'agent/inbox/spliced', seq: 3, data: { target: 'next-turn', start: 0, removedCount: 1, inserted: [second] } },
+    { type: 'user/message', seq: 4, data: first },
+    { type: 'turn/end', seq: 5, data: { turn: 1, reason: { kind: 'completed' } } },
+    { type: 'turn/start', seq: 6, data: { turn: 2 } },
+    { type: 'agent/inbox/spliced', seq: 7, data: { target: 'next-turn', start: 0, removedCount: 1, inserted: [] } },
+    { type: 'user/message', seq: 8, data: second },
+    { type: 'turn/end', seq: 9, data: { turn: 2, reason: { kind: 'completed' } } },
+  ]
+  for (const event of events) projectSessionEvent(db, chat.sessionId, event, owner.ownerId, { mcpCatalogReady: false })
+  expect(db.hasProjectedEvent(chat.sessionId, 5)).toBe(false)
+  expect(db.hasProjectedEvent(chat.sessionId, 9)).toBe(false)
+  // The current autonomous claim is verified before cold recovery adopts the
+  // earlier delivery, matching the actual startup receipt ordering.
+  projectInboxClaim(db, { agent: { id: chat.sessionId }, message: second, turn: 2 }, owner.ownerId, { mcpTools: [] })
+  const query = { observeSession: async () => ({ events, [Symbol.dispose]() {} }) }
+  await reconcileNativeSessions(db, query, owner.ownerId, () => ({ mcpTools: [] }), [])
+  expect(db.getRun(owner.ownerId, first.id)).toMatchObject({ status: 'completed', sourceEndSeq: 5 })
+  expect(db.getRun(owner.ownerId, second.id)).toMatchObject({ status: 'completed', sourceEndSeq: 9 })
+  await reconcileNativeSessions(db, query, owner.ownerId, () => ({ mcpTools: [] }), [])
+  for (const message of [first, second])
+    expect(db.allEvents(owner.ownerId, message.id).filter(event => event.event === 'workbench_end')).toHaveLength(1)
+  expect(db.listRuns(owner.ownerId, chat.id)).toHaveLength(2)
+  expect(db.submissions(owner.ownerId)).toEqual([])
+})
+
+it('repairs a previously acknowledged native completion that had no bound receipt output', async () => {
+  const { db, chat, owner } = fixture()
+  const message = { id: 'formerly-unbound-schedule', source: { kind: 'schedule' }, content: [{ type: 'text', text: 'reminder' }] }
+  const events = [
+    { type: 'turn/start', seq: 1, data: { turn: 1 } },
+    { type: 'user/message', seq: 2, data: message },
+    { type: 'turn/end', seq: 3, data: { turn: 1, reason: { kind: 'completed' } } },
+  ]
+  for (const event of events) db.markProjectedEvent(chat.sessionId, event.seq)
+  projectInboxClaim(db, { agent: { id: chat.sessionId }, message, turn: 1 }, owner.ownerId)
+  const query = { observeSession: async () => ({ events, [Symbol.dispose]() {} }) }
+  await reconcileNativeSessions(db, query, owner.ownerId, undefined, [])
+  await reconcileNativeSessions(db, query, owner.ownerId, undefined, [])
+  expect(db.getRun(owner.ownerId, message.id)).toMatchObject({ status: 'completed', sourceEndSeq: 3 })
+  expect(db.allEvents(owner.ownerId, message.id).filter(event => event.event === 'workbench_end')).toHaveLength(1)
+})
+
+it('does not interrupt a new native schedule delivery arriving during cold history recovery', async () => {
+  const { db, chat, owner } = fixture()
+  const old = db.createRun({ ownerId: owner.ownerId, chatId: chat.id, sessionId: chat.sessionId,
+    query: 'old unfinished work', selection: {} }).run
+  db.transitionRun(owner.ownerId, old.id, 'running')
+  let releaseHistory
+  const coldSnapshot = new Promise(resolve => { releaseHistory = resolve })
+  const recovering = reconcileNativeSessions(db, { observeSession: () => coldSnapshot }, owner.ownerId)
+  const message = { id: 'new-schedule-during-recovery', source: { kind: 'schedule' },
+    content: [{ type: 'text', text: 'new timer delivery' }] }
+  projectSessionEvent(db, chat.sessionId, { type: 'agent/inbox/spliced', seq: 1,
+    data: { target: 'next-turn', start: 0, removedCount: 0, inserted: [message] } }, owner.ownerId)
+  projectSessionEvent(db, chat.sessionId, { type: 'turn/start', seq: 2, data: { turn: 2 } }, owner.ownerId)
+  projectInboxClaim(db, { agent: { id: chat.sessionId }, message, turn: 2 }, owner.ownerId)
+  expect(db.getRun(owner.ownerId, message.id)).toMatchObject({ status: 'running' })
+  // The original history read began before this live delivery was committed.
+  releaseHistory({ events: [], [Symbol.dispose]() {} })
+  await recovering
+  expect(db.getRun(owner.ownerId, old.id)).toMatchObject({ status: 'interrupted' })
+  expect(db.getRun(owner.ownerId, message.id)).toMatchObject({ status: 'running' })
+  projectSessionEvent(db, chat.sessionId, { type: 'turn/end', seq: 4,
+    data: { turn: 2, reason: { kind: 'completed' } } }, owner.ownerId)
+  expect(db.getRun(owner.ownerId, message.id)).toMatchObject({ status: 'completed', error: undefined })
+})
+
+it('keeps the same startup recovery boundary when MCP recovery retries after a new native claim', async () => {
+  const { db, chat, owner } = fixture()
+  const stale = db.createRun({ ownerId: owner.ownerId, chatId: chat.id, sessionId: chat.sessionId,
+    query: 'unfinished before startup', selection: {} }).run
+  db.transitionRun(owner.ownerId, stale.id, 'running')
+  const startupRunIds = [stale.id]
+  const oldPending = { id: 'cold-pending-schedule', source: { kind: 'schedule' }, content: [{ type: 'text', text: 'old pending' }] }
+  const query = { observeSession: async () => ({ events: [
+    { type: 'agent/inbox/spliced', seq: 1, data: { target: 'next-turn', start: 0, removedCount: 0, inserted: [oldPending] } },
+  ], [Symbol.dispose]() {} }) }
+  await expect(reconcileNativeSessions(db, query, owner.ownerId,
+    () => { throw new Error('catalog unavailable') }, startupRunIds)).rejects.toThrow('catalog unavailable')
+  const message = { id: 'new-claimed-before-recovery-retry', source: { kind: 'schedule' }, content: [{ type: 'text', text: 'new timer' }] }
+  projectSessionEvent(db, chat.sessionId, { type: 'turn/start', seq: 2, data: { turn: 2 } }, owner.ownerId)
+  projectInboxClaim(db, { agent: { id: chat.sessionId }, message, turn: 2 }, owner.ownerId)
+  await reconcileNativeSessions(db, query, owner.ownerId, () => ({ mcpTools: [] }), startupRunIds)
+  expect(db.getRun(owner.ownerId, message.id)).toMatchObject({ status: 'running' })
+  expect(db.getRun(owner.ownerId, stale.id)).toMatchObject({ status: 'interrupted' })
+  expect(db.getRun(owner.ownerId, oldPending.id)).toMatchObject({ status: 'queued' })
+})
+
 it('waits for verified MCP resources before creating a recovered schedule receipt and freezes them once', async () => {
   const {db,chat,owner}=fixture()
   const message={id:'unclaimed-delivery',source:{kind:'schedule'},content:[{type:'text',text:'reminder'}]}

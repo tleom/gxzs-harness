@@ -26,7 +26,7 @@ it('shares one bounded screenshot deadline across quality retries', async () => 
   expect(page.screenshot.mock.calls.map(([value])=>value.timeout)).toEqual([5000,3000,1000])
 })
 
-function worker() {
+function worker(displayFactory) {
   const page = Object.assign(new EventEmitter(), {
     url: () => 'https://example.com', viewportSize: () => ({width:1000,height:700}), isClosed: () => false,
     screenshot: vi.fn(async () => Buffer.from('jpeg')), title: async () => 'Example',
@@ -38,13 +38,35 @@ function worker() {
   const browser = Object.assign(new EventEmitter(), {newContext:async()=>context,close:vi.fn(async()=>{})})
   const input = new PassThrough(), output = new PassThrough(), frames = [], exit = vi.fn()
   output.on('data',chunk=>frames.push(JSON.parse(String(chunk))))
-  const runtime = runWorker({chromium:{launch:async()=>browser},input,output,exit})
+  const launch=vi.fn(async()=>browser)
+  const runtime = runWorker({chromium:{launch},input,output,exit,displayFactory})
   const command = async (id,action,extra={}) => {
     input.write(JSON.stringify({id,action,...extra})+'\n')
     await vi.waitFor(()=>expect(frames.some(frame=>frame.type==='result' && frame.id===id)).toBe(true))
   }
-  return {page,browser,runtime,frames,exit,command,input,context}
+  return {page,browser,runtime,frames,exit,command,input,context,launch}
 }
+it('uses a private visible display without starting CDP pixel encoding, and releases it with Chromium', async () => {
+  const display={env:{DISPLAY:':100'},size:{width:1000,height:700},resize:vi.fn(),open:vi.fn(),write:vi.fn(),close:vi.fn(),stop:vi.fn(async()=>{})}
+  const factory=vi.fn(async()=>display),value=worker(factory)
+  value.context.exposeBinding=vi.fn(async()=>{})
+  value.context.addInitScript=vi.fn(async()=>{})
+  value.page.bringToFront=vi.fn(async()=>{})
+  value.page.evaluate=vi.fn(async()=>({width:1000,height:700}))
+  try {
+    await value.command(1,'init',{width:1000,height:700})
+    expect(value.frames.find(frame=>frame.id===1).value).toEqual({display:'kasm',input_protocol:2})
+    expect(value.launch).toHaveBeenCalledWith(expect.objectContaining({headless:false,env:{DISPLAY:':100'}}))
+    expect(value.frames.find(frame=>frame.type==='frame')).toMatchObject({display:'kasm',width:1000,height:700})
+    expect(value.page.screenshot).not.toHaveBeenCalled()
+    await value.command(2,'display-open',{connection:'viewer'})
+    await value.command(3,'display-write',{connection:'viewer',data:'AA=='})
+    expect(display.open).toHaveBeenCalledWith('viewer')
+    expect(display.write).toHaveBeenCalledWith('viewer','AA==')
+  } finally {await value.runtime.shutdown()}
+  expect(display.stop).toHaveBeenCalledOnce()
+  expect(value.browser.close).toHaveBeenCalledOnce()
+})
 
 it('replaces the displayed page with a native popup, preserving the browser identity', async () => {
   const value=worker()
@@ -61,10 +83,9 @@ it('replaces the displayed page with a native popup, preserving the browser iden
     await value.command(2,'text',{page_id:root,text:'child'})
     expect(value.page.keyboard.insertText).not.toHaveBeenCalled()
     expect(popup.keyboard.insertText).toHaveBeenCalledWith('child')
-    await value.command(3,'close-page',{page_id:root})
-    expect(popup.close).toHaveBeenCalledOnce()
+    await value.runtime.shutdown()
     expect(value.page.close).toHaveBeenCalledOnce()
-    expect(value.browser.close).not.toHaveBeenCalled()
+    expect(value.browser.close).toHaveBeenCalledOnce()
   } finally { await value.runtime.shutdown() }
 })
 
@@ -124,15 +145,18 @@ it('rejects initialization without a first frame rather than leaving the client 
   } finally { await value.runtime.shutdown() }
 })
 
-it('invalidates the live stream when screenshot timeouts would otherwise leave stale pixels', async () => {
+it('keeps the browser context after a transient screenshot timeout and recovers on a later frame', async () => {
   const value=worker()
   try {
     await value.command(1,'init',{width:1000,height:700})
     const timeout=new Error('screenshot timeout'); timeout.name='TimeoutError'
     value.page.screenshot.mockRejectedValue(timeout)
     value.input.write(JSON.stringify({id:2,action:'watch',enabled:true})+'\n')
-    await vi.waitFor(()=>expect(value.exit).toHaveBeenCalledWith(2))
-    expect(value.frames.find(frame=>frame.type==='fatal').error).toContain('超时')
+    await vi.waitFor(()=>expect(value.page.screenshot.mock.calls.length).toBeGreaterThan(1))
+    expect(value.exit).not.toHaveBeenCalled()
+    expect(value.browser.close).not.toHaveBeenCalled()
+    value.page.screenshot.mockResolvedValue(Buffer.from('recovered'))
+    await vi.waitFor(()=>expect(value.frames.some(frame=>frame.image===Buffer.from('recovered').toString('base64'))).toBe(true))
   } finally { await value.runtime.shutdown() }
 })
 
@@ -269,8 +293,9 @@ it('keeps discarded-frame retries within one shared deadline and never acknowled
       elapsed+=4500;url+='x';return Buffer.from('stale')
     })
     value.input.write(JSON.stringify({id:2,action:'resize',width:800,height:600})+'\n')
-    await vi.waitFor(()=>expect(value.frames.some(frame=>frame.type==='fatal')).toBe(true))
-    expect(value.page.screenshot.mock.calls.map(([arg])=>arg.timeout)).toEqual([8000,3500])
+    await vi.waitFor(()=>expect(value.frames.some(frame=>frame.type==='result'&&frame.id===2&&frame.error)).toBe(true))
+    expect(value.page.screenshot.mock.calls.slice(0,2).map(([arg])=>arg.timeout)).toEqual([8000,3500])
+    expect(value.frames.some(frame=>frame.type==='fatal')).toBe(false)
     expect(value.frames.some(frame=>frame.type==='result'&&frame.id===2&&!frame.error)).toBe(false)
   } finally { await value.runtime.shutdown();clock.mockRestore() }
 })
@@ -289,5 +314,25 @@ it('discards a frame when the same Page navigates during capture and publishes t
     expect(value.frames.some(frame=>frame.type==='frame')).toBe(false)
     await value.command(3,'watch',{enabled:true})
     expect(value.frames.find(frame=>frame.type==='frame').url).toBe('https://example.com/new')
+  } finally { await value.runtime.shutdown() }
+})
+
+it('tracks held pointer modifiers and refuses to cut a selection observed before another action', async () => {
+  const value=worker()
+  value.page.keyboard.down=vi.fn(async()=>{});value.page.keyboard.up=vi.fn(async()=>{})
+  value.page.evaluate=vi.fn(async()=> 'selected text')
+  try {
+    await value.command(1,'init',{width:1000,height:700})
+    await value.command(2,'move',{x:20,y:30,modifiers:['Shift']})
+    expect(value.page.keyboard.down).toHaveBeenCalledWith('Shift')
+    await value.command(3,'release-input')
+    expect(value.page.keyboard.up).toHaveBeenCalledWith('Shift')
+    await value.command(4,'selection')
+    const selected=value.frames.find(frame=>frame.type==='result'&&frame.id===4).value
+    expect(selected.text).toBe('selected text')
+    await value.command(5,'text',{text:'another action'})
+    await value.command(6,'cut-selection',{text:selected.text,expected_revision:selected.revision})
+    expect(value.frames.find(frame=>frame.type==='result'&&frame.id===6).error).toContain('页面已变化')
+    expect(value.page.keyboard.press).not.toHaveBeenCalledWith('ControlOrMeta+X')
   } finally { await value.runtime.shutdown() }
 })

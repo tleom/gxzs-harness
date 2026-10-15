@@ -1,0 +1,6 @@
+{
+  "name": "workbench-browser-client",
+  "private": true,
+  "type": "module",
+  "dependencies": { "esbuild": "0.28.2", "pako": "2.1.0" }
+}

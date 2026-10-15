@@ -2,6 +2,28 @@ import { describe, expect, it } from 'vitest'
 import { adaptInputSchema } from '../src/schema.js'
 
 describe('MCP schema projection', () => {
+  it('projects nullable weather fields to equivalent disjoint unions and preserves source validation', () => {
+    const source = { type: 'object', properties: {
+      latitude: { type: 'number' }, longitude: { type: 'number' },
+      hourly_vars: { anyOf: [{ type: 'string' }, { type: 'null' }], default: null },
+    }, required: ['latitude', 'longitude'] }
+    const before = structuredClone(source)
+    const adapted = adaptInputSchema(source)
+    expect(source).toEqual(before)
+    expect(adapted.schema.properties.hourly_vars).toEqual({ oneOf: [{ type: 'string' }, { type: 'null' }], default: null })
+    expect(() => adapted.validate({ latitude: 31, longitude: 121, hourly_vars: null })).not.toThrow()
+    expect(() => adapted.validate({ latitude: 31, longitude: 121, hourly_vars: 'temperature_2m' })).not.toThrow()
+    expect(() => adapted.validate({ latitude: 31, longitude: 121, hourly_vars: 12 })).toThrow('schema')
+    expect(() => adapted.validate({ latitude: 31 })).toThrow('required')
+  })
+
+  it.each([
+    [{ type: 'number' }, { type: 'integer' }],
+    [{ type: 'string', enum: ['temperature'] }, { type: 'string' }],
+  ])('retains rejection of overlapping anyOf branches', branches => {
+    expect(() => adaptInputSchema({ type: 'object', properties: { value: { anyOf: branches } } })).toThrow('anyOf')
+  })
+
   it('projects nested string lengths while enforcing the original Unicode bounds', () => {
     const source = { type: 'object', properties: {
       title: { type: 'string', description: 'Title', minLength: 1, maxLength: 2 },

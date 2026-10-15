@@ -1,5 +1,6 @@
 import {PassThrough} from 'node:stream'
 import {expect,it,vi} from 'vitest'
+import {Context} from '@deepseek-ai/cordis'
 import SandboxFileReferences,{SandboxReferenceSearch} from '../src/file-references.js'
 const options=()=>({root:'/workspace/conversations/example',config:{maxResults:20,maxEntries:50000,excludedDirectories:[]}})
 function runtime(){
@@ -100,27 +101,27 @@ it('keeps in-flight searches alive and starts the idle deadline after their last
  }finally{search.dispose();await search.done;vi.useRealTimers()}
 })
 it('waits for the old index to exit and shares a single lazy replacement',async()=>{
- const provider=runtime(),agent={session:{header:{cwd:options().root}}}
+ const provider=runtime(),agent={id:'child',session:{header:{cwd:options().root}}}
  let finish
  const old={root:options().root,closed:true,done:new Promise(resolve=>{finish=resolve})}
  const service=Object.assign(Object.create(SandboxFileReferences.prototype),{
-  ctx:{subprocess:provider,workingDirectory:{ensure:async()=>options().root}},searchConfig:options().config,remoteSearches:new Map([[agent,old]]),stopped:false,
+  ctx:{subprocess:provider,workingDirectory:{ensure:async()=>options().root}},searchConfig:options().config,remoteSearches:new Map([[agent.id,old]]),stopped:false,
  })
  const first=service.list(agent,'a',new AbortController().signal)
  const second=service.list(agent,'b',new AbortController().signal)
  expect(provider.spawn).not.toHaveBeenCalled();finish();await vi.waitFor(()=>expect(provider.spawn).toHaveBeenCalledTimes(1))
  expect(provider.spawn).toHaveBeenCalledTimes(1)
  provider.reply(1,[]);provider.reply(2,[]);await Promise.all([first,second])
- const search=service.remoteSearches.get(agent);search.dispose();await search.done
+ const search=service.remoteSearches.get(agent.id);search.dispose();await search.done
  expect(service.remoteSearches.size).toBe(0)
 })
 it('does not rebuild an index when the agent is disposed while the old process exits',async()=>{
- const provider=runtime(),agent={session:{header:{cwd:options().root}}}
+ const provider=runtime(),agent={id:'child',session:{header:{cwd:options().root}}}
  let finish
  const old={root:options().root,closed:true,done:new Promise(resolve=>{finish=resolve})}
  const disposedAgents=new WeakSet()
  const service=Object.assign(Object.create(SandboxFileReferences.prototype),{
-  ctx:{subprocess:provider,workingDirectory:{ensure:async()=>options().root}},searchConfig:options().config,remoteSearches:new Map([[agent,old]]),disposedAgents,stopped:false,
+  ctx:{subprocess:provider,workingDirectory:{ensure:async()=>options().root}},searchConfig:options().config,remoteSearches:new Map([[agent.id,old]]),disposedAgents,stopped:false,
  })
  const rejected=expect(service.list(agent,'a',new AbortController().signal)).rejects.toThrow('disposed')
  disposedAgents.add(agent);finish();await rejected
@@ -130,7 +131,7 @@ it('does not rebuild an index when the agent is disposed while the old process e
 it('uses the live native working directory and retires the previous sandbox index before switching',async()=>{
  const instances=[]
  const provider={spawn:vi.fn(spec=>{const next=runtime();instances.push(next);return next.spawn(spec)})}
- const agent={session:{header:{cwd:'/workspace/old-header'}}}
+ const agent={id:'child',session:{header:{cwd:'/workspace/old-header'}}}
  let cwd=options().root
  const ensure=vi.fn(async()=>cwd)
  const service=Object.assign(Object.create(SandboxFileReferences.prototype),{
@@ -140,12 +141,48 @@ it('uses the live native working directory and retires the previous sandbox inde
  await vi.waitFor(()=>expect(provider.spawn).toHaveBeenCalledTimes(1))
  expect(provider.spawn.mock.calls[0][0].cwd).toBe(cwd)
  instances[0].reply(1,[]);await first
- const previous=service.remoteSearches.get(agent)
+ const previous=service.remoteSearches.get(agent.id)
  cwd='/workspace/another-project'
  const second=service.list(agent,'b',new AbortController().signal)
  await vi.waitFor(()=>expect(provider.spawn).toHaveBeenCalledTimes(2))
  expect(previous.closed).toBe(true)
  expect(provider.spawn.mock.calls[1][0].cwd).toBe(cwd)
  instances[1].reply(1,[]);await second
- const search=service.remoteSearches.get(agent);search.dispose();await search.done
+ const search=service.remoteSearches.get(agent.id);search.dispose();await search.done
+})
+
+it('shares the native index for a cold observed child and its next live owner without cwd mutations',async()=>{
+ const provider=runtime(),ensure=vi.fn(async()=>options().root)
+ const old={id:'child'},next={id:'child'}
+ let agent
+ const ctx=new Context()
+ ctx.provide('agents',{list:()=>[],get:()=>agent})
+ ctx.provide('subprocess',provider)
+ ctx.provide('workingDirectory',{ensure})
+ const service=new SandboxFileReferences(ctx,options().config)
+ try{
+  const observed={header:{id:'child',cwd:'/workspace/outdated-header'},projections:{values:{workingDirectory:options().root}}}
+  const cold=service.listObserved(observed,'cold',new AbortController().signal)
+  await vi.waitFor(()=>expect(provider.spawn).toHaveBeenCalledOnce())
+  expect(provider.spawn.mock.calls[0][0].cwd).toBe(options().root)
+  provider.reply(1,[]);await cold
+  agent=old
+  const live=service.list(old,'live',new AbortController().signal)
+  await vi.waitFor(()=>expect(provider.messages).toHaveLength(2))
+  provider.reply(2,[]);await live
+  agent=next
+  const replaced=service.list(next,'next',new AbortController().signal)
+  await vi.waitFor(()=>expect(provider.messages).toHaveLength(3))
+  provider.reply(3,[]);await replaced
+  const search=service.remoteSearches.get('child')
+  await ctx.parallel('agent/disposed',{agent:old})
+  expect(search.closed).toBe(false)
+  await ctx.parallel('session/event',{id:'child'},{type:'tool/result'})
+  expect(provider.messages.at(-1)).toEqual({op:'invalidate'})
+  expect(provider.spawn).toHaveBeenCalledOnce()
+  expect(ensure).toHaveBeenCalledTimes(2)
+  await ctx.parallel('agent/disposed',{agent:next})
+  expect(search.closed).toBe(true)
+  expect(service.remoteSearches.size).toBe(0)
+ }finally{await ctx.fiber.dispose()}
 })

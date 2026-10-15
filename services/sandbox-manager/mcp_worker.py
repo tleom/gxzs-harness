@@ -18,7 +18,7 @@ from mcp import Client
 from mcp.client.sse import sse_client
 from mcp.client.stdio import StdioServerParameters, stdio_client
 from mcp.client.streamable_http import streamable_http_client
-from mcp_ops import MAX_TOOLS, load, manifest_version, personal_mcp, tool_manifest
+from mcp_ops import MAX_MANIFEST, ManifestError, load, manifest_version, personal_mcp, tool_manifest
 
 MAX_RESULT = 8 * 1024 * 1024
 
@@ -36,20 +36,28 @@ def emit(value):
 
 
 async def discover(client):
-    tools, cursor, visited = [], None, set()
+    tools, cursor, visited, size, response_size = [], None, set(), 2, 0
     while True:
         page = await client.list_tools(cursor=cursor, cache_mode="refresh")
-        tools.extend(
+        response_size += len(json.dumps(
+            page.model_dump(mode="json", by_alias=True, exclude_none=True)
+        ).encode())
+        if response_size > MAX_MANIFEST:
+            raise ManifestError("MCP 工具发现响应累计超过 1 MiB", "MCP_DISCOVERY_TOO_LARGE")
+        declarations = tool_manifest([
             item.model_dump(mode="json", by_alias=True, exclude_none=True)
             for item in page.tools
-        )
-        if len(tools) > MAX_TOOLS:
-            raise ValueError("MCP 工具数量超过限制")
+        ])
+        for declaration in declarations:
+            size += len(json.dumps(declaration).encode()) + (2 if tools else 0)
+            if size > MAX_MANIFEST:
+                raise ManifestError("MCP 工具目录超过 1 MiB", "MCP_MANIFEST_TOO_LARGE")
+            tools.append(declaration)
         cursor = page.next_cursor
         if not cursor:
             break
         if cursor in visited:
-            raise ValueError("MCP 工具目录分页游标重复")
+            raise ManifestError("MCP 工具目录分页游标重复", "MCP_MANIFEST_CURSOR_REPEAT")
         visited.add(cursor)
     return tool_manifest(tools)
 
@@ -126,7 +134,12 @@ async def serve(name, expected_version, root="/workspace"):
         )
         tools = await asyncio.wait_for(discover(client), min(timeout, 10))
         for tool in tools:
-            Draft202012Validator.check_schema(tool["inputSchema"])
+            try:
+                Draft202012Validator.check_schema(tool["inputSchema"])
+                if "outputSchema" in tool:
+                    Draft202012Validator.check_schema(tool["outputSchema"])
+            except Exception:
+                raise ManifestError("MCP 工具的 JSON Schema 无效") from None
         catalog = personal_mcp(
             {
                 "operation": "mcp_cache",
@@ -241,10 +254,21 @@ async def serve(name, expected_version, root="/workspace"):
             pipe.close()
 
 
+def discovery_failure(error):
+    """Transport exception groups must not hide safe manifest diagnostics."""
+    if isinstance(error, ManifestError):
+        return {"error": str(error), "code": error.code}
+    for nested in getattr(error, "exceptions", ()):
+        result = discovery_failure(nested)
+        if result.get("code"):
+            return result
+    return {"error": "MCP 连接失败，请检查地址、认证、依赖和服务状态后重新测试"}
+
+
 if __name__ == "__main__":
     try:
         asyncio.run(serve(sys.argv[1], sys.argv[2]))
-    except Exception:
+    except Exception as error:
         # Exceptions can contain URLs, authorization headers and server stderr.
-        emit({"error": "MCP 连接失败，请检查地址、认证、依赖和服务状态后重新测试"})
+        emit(discovery_failure(error))
         sys.exit(1)

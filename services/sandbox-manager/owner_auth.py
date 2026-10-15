@@ -4,7 +4,7 @@ import hmac
 import json
 import base64
 
-OWNER_ACTIONS = frozenset({"files", "personal-resources", "personal-mcp", "office-preview", "touch"})
+OWNER_ACTIONS = frozenset({"files", "personal-resources", "personal-mcp", "office-preview", "touch", "host-settings"})
 
 
 def owner_token(root_token, owner, workspace, generation, instance):
@@ -35,5 +35,7 @@ def authorize(headers, root_token, hosts_root, workspace, action):
         if not hmac.compare_digest(supplied, "Bearer " + expected):
             raise PermissionError("Manager credential is invalid")
         return "owner"
+    except PermissionError:
+        raise
     except (OSError, ValueError, KeyError) as error:
         raise PermissionError("Manager host is not registered") from error

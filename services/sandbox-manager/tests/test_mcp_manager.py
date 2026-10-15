@@ -68,7 +68,7 @@ def manager(tmp_path, monkeypatch):
             result = {"mcp": []}
         return SimpleNamespace(returncode=0, stdout=json.dumps(result))
 
-    monkeypatch.setattr(module, "ensure", lambda _: None)
+    monkeypatch.setattr(module, "ensure", lambda _, **kwargs: None)
     monkeypatch.setattr(module, "docker", docker)
     monkeypatch.setattr(mcp_runtime, "Worker", Worker)
     monkeypatch.setattr(module, "authorize_mcp", lambda _: True)

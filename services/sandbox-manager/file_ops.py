@@ -1,5 +1,6 @@
 """Executed as the sandbox user. All traversal uses directory descriptors, never symlinks."""
 import base64
+import bisect
 import hashlib
 import io
 import json
@@ -203,10 +204,26 @@ def operate(payload, root="/workspace"):
             child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
             try:
                 result = []
-                for entry in sorted(os.listdir(child))[:2000]:
+                names = sorted(os.listdir(child))
+                snapshot = hashlib.sha256(json.dumps(names, ensure_ascii=True).encode()).hexdigest()
+                cursor = payload.get('cursor')
+                offset = 0
+                if cursor:
+                    if not isinstance(cursor, str) or len(cursor) > 2048:
+                        raise ValueError('目录分页参数无效')
+                    try:
+                        previous = json.loads(base64.urlsafe_b64decode(cursor).decode())
+                        if previous['snapshot'] != snapshot:
+                            return {'conflict': True, 'message': '目录已改变，请刷新后重试'}
+                        offset = bisect.bisect_right(names, previous['after'])
+                    except (ValueError, TypeError, KeyError) as error:
+                        raise ValueError('目录分页参数无效') from error
+                page = names[offset:offset + 2000]
+                for entry in page:
                     info = os.stat(entry, dir_fd=child, follow_symlinks=False)
                     result.append(entry_metadata(child, entry, ("" if path == "." else path + "/") + entry, info, shallow=True))
-                return {"path": path, "entries": result}
+                next_cursor = base64.urlsafe_b64encode(json.dumps({'after': page[-1], 'snapshot': snapshot}).encode()).decode() if offset + len(page) < len(names) else None
+                return {"path": path, "entries": result, 'next_cursor': next_cursor, 'total': len(names)}
             finally:
                 os.close(child)
         try:

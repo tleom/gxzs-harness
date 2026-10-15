@@ -2,7 +2,7 @@ import z from '@deepseek-ai/schemastery'
 import { AssertionVerifier } from './assertion.js'
 import { RunEventBus } from './events.js'
 import { HumanInputBridge } from './human-input.js'
-import { httpError, parseJson, readBody, sendError, sendJson } from './http.js'
+import { httpError, parseJson, readBody, sendError, sendJson, withResponseSignal } from './http.js'
 import { streamRunEvents } from './sse.js'
 import { streamHistoryEvents, streamNativeEvents } from './history-events.js'
 import { WorkbenchDatabase } from './persistence.js'
@@ -21,10 +21,16 @@ import { WorkbenchSchedules } from './schedules.js'
 import { WorkbenchSubagents } from './subagents.js'
 import { WorkbenchTerminals } from './terminals.js'
 import { WorkbenchBrowsers } from './browsers.js'
+import { SidebarLeases } from './sidebar-leases.js'
 import { registerBrowserTool } from './browser-tool.js'
+import { browserClient } from './browser-client.js'
 import { registerTerminalTool } from './terminal-tool.js'
 import { WorkbenchJobs } from './jobs.js'
 import { registerScheduledClaims } from './scheduled-claims.js'
+import { nativeHostActivity } from './host-activity.js'
+import { WorkbenchNativeClient } from './native-client.js'
+import { WorkbenchNativeSessions } from './native-sessions.js'
+import { WorkbenchSubagentSettings } from './settings.js'
 import { setTimeout as delay } from 'node:timers/promises'
 
 export const name = 'workbench-adapter'
@@ -81,11 +87,18 @@ export function apply(ctx, config) {
   const schedules = new WorkbenchSchedules({ native: () => ctx.get('schedule'), database, service })
   workspaces.schedules = schedules
   const subagents = new WorkbenchSubagents({ sessions: ctx.sessionController, service, native: ctx.subagents, attachments: ctx.attachments, runtime })
+  const nativeSessions = new WorkbenchNativeSessions({ ctx, sessions: ctx.sessionController, service, subagents, database })
   const terminals = new WorkbenchTerminals({ native: ctx.terminalController, service, sessions: ctx.sessionController })
   const browsers = new WorkbenchBrowsers({ subprocess: ctx.subprocess, service })
+  const sidebarLeases = new SidebarLeases({ browsers, terminals, service })
+  runtime.sidebarActivity = () => ({ browser: browsers.activity(), terminal: terminals.activity() })
   registerBrowserTool(ctx, { browsers, runtime, database, ownerId: config.ownerId })
   registerTerminalTool(ctx, { native: ctx.terminalController, terminals, runtime, database, ownerId: config.ownerId })
-  const jobs = new WorkbenchJobs({ native: ctx.jobController, registry: ctx.jobs, service })
+  const jobs = new WorkbenchJobs({ native: ctx.jobController, registry: ctx.jobs, service, subagents })
+  const nativeClient = new WorkbenchNativeClient({ modules: () => ctx.get('clientModules') })
+  const subagentSettings = new WorkbenchSubagentSettings({ controller: () => ctx.get('settingsController'),
+    modelCatalog: owner => databaseModelCatalog(ctx.workbenchPlatformClient, ctx.sessionController, owner, ctx.settings),
+    assertWritable: () => ctx.workbenchFileManager.assertSettingsWritable() })
   service.closeTerminals = async sessionId => {
     const items = ctx.terminalController.list(sessionId)
     if (!items.length) return
@@ -96,6 +109,10 @@ export function apply(ctx, config) {
   service.subscribeGoal = (sessionId, listener) => ctx.on('goal/activation-changed', event => {
     if (event.sessionId === sessionId) listener()
   }, { global: true })
+  // MCP readiness can retry recovery after native timers already claimed new work.
+  // Freeze the startup boundary once, independently of those retry entry points.
+  const startupRunIds = database.listChats(config.ownerId)
+    .flatMap(chat => database.listRuns(config.ownerId, chat.id).map(run => run.id))
   let recovered = false
   let recoveryError
   let recoveryTimer
@@ -108,11 +125,11 @@ export function apply(ctx, config) {
     recovered = false
     recovery = (async () => {
       await reconcileNativeSessions(database, ctx.sessionQuery, config.ownerId, () => {
-        // Only a missing scheduled receipt needs a fresh frozen catalog. Retry
+        // Missing autonomous receipts need a fresh frozen catalog. Retry
         // recovery until its first verified sync; an unavailable read is not empty.
-        if (!runtime.mcpCatalogState?.ready) throw new Error('MCP catalog is not ready for schedule recovery')
+        if (!runtime.mcpCatalogState?.ready) throw new Error('MCP catalog is not ready for native notice recovery')
         return { mcpTools: runtime.mcpResources?.() ?? [] }
-      })
+      }, startupRunIds)
       await scheduler.flushFences()
       if (scheduler.closed) return
       recovered = true
@@ -148,17 +165,17 @@ export function apply(ctx, config) {
   }, { global: true, prepend: true })
   registerScheduledClaims(ctx, { runtime, database, ownerId: config.ownerId })
   ctx.on('agent/pre-step', async (payload, next) => {
-    const scheduled = payload.messages?.filter(message => message.source?.kind === 'schedule') ?? []
-    if (scheduled.length) {
+    const autonomous = payload.messages?.filter(message => ['schedule', 'tool-jobs'].includes(message.source?.kind)) ?? []
+    if (autonomous.length) {
       while (!runtime.mcpCatalogState?.ready) {
         await delay(100, undefined, { signal: payload.signal })
       }
       payload.signal?.throwIfAborted()
-      for (const message of scheduled) projectInboxClaim(database, { agent: payload.agent, message, turn: payload.turn }, config.ownerId,
+      for (const message of autonomous) projectInboxClaim(database, { agent: payload.agent, message, turn: payload.turn }, config.ownerId,
         { mcpTools: runtime.mcpResources?.() ?? [] })
     }
     await recovery
-    if (scheduled.length && recoveryError) await beginRecovery()
+    if (autonomous.length && recoveryError) await beginRecovery()
     if (recoveryError) return { kind: 'reject' }
     const run = runtime.executionRun(payload.agent.session?.id ?? payload.agent.id)
     if (run?.selection?.native_source === 'schedule') {
@@ -206,8 +223,11 @@ export function apply(ctx, config) {
     })))
     return {
       resources_pending: modelsOnly,
-      dsh_version: '0.2.1-alpha.2', schedule_protocol: 1, subagent_protocol: 1, terminal_protocol: 1, browser_protocol: 1, job_protocol: 1,
-      activity_protocol: 1, human_input_protocol: 1, followup_protocol: 1, history_protocol: 1, native_history_protocol: 1,
+      dsh_version: '0.2.1-alpha.2', schedule_protocol: 1, subagent_protocol: 1, terminal_protocol: 1, browser_protocol: 1, browser_input_protocol: 2, job_protocol: 1,
+      activity_protocol: 1, sidebar_lease_protocol: 1, human_input_protocol: 1, followup_protocol: 1, history_protocol: 1, native_history_protocol: 1,
+      ...(ctx.get('clientModules') ? { native_client_protocol: 1, native_session_client_protocol: 2, native_schedule_client_protocol: 1,
+        ...(ctx.sessionReferenceResolver.listSessionCandidates && ctx.get('fileReferences')?.listObserved ? { native_subagent_reference_protocol: 1 } : {}),
+        ...(ctx.get('settingsController') ? { native_subagent_settings_protocol: 1, native_prompt_mode_protocol: 1 } : {}) } : {}),
       control_protocol: 1, goal_events_protocol: 1, compact_events_protocol: 1, resources_protocol: 1, command_resources_protocol: 1, submission_control_protocol: 1,
       default_selection: { model: catalog.default ? `${catalog.default.provider}/${catalog.default.model}` : models[0]?.id ?? '', tools: [], skills: [], knowledge: [], model_parameters: {}, tool_parameters: {} },
       models, tools: mcpTools.map((tool) => ({
@@ -238,21 +258,51 @@ export function apply(ctx, config) {
     return absolute.slice(prefix.length)
   }
 
-  const proxyPlatform = async (context, res, route) => {
+  const proxyPlatform = async (context, res, route) => withResponseSignal(res, async signal => {
     const result = await ctx.workbenchPlatformClient.request({
       owner: context.owner, method: context.req.method, route, query: context.url.search,
       body: context.body, contentType: context.req.headers['content-type'] ?? '',
+      signal,
+      ...(route === 'files/preview' && context.req.method !== 'DELETE' ? { timeoutMs: 120000 } : {}),
     })
+    signal.throwIfAborted()
     const headers = { 'cache-control': 'private, no-store' }
-    for (const name of ['content-type', 'content-disposition', 'etag']) {
+    for (const name of ['content-type', 'content-disposition', 'etag', 'x-workbench-preview-metadata']) {
       const value = result.headers.get(name)
       if (value) headers[name] = value
     }
     res.writeHead(result.status, headers)
     res.end(Buffer.from(result.bytes))
-  }
+  })
 
   const routes = [
+    ['GET', /^\/native\/sessions$/, async ({ owner }, res) => {
+      const controller = new AbortController()
+      const close = () => controller.abort()
+      res.on('close', close)
+      try { sendJson(res, 200, { data: await nativeSessions.list(owner, controller.signal) }) }
+      finally { res.off('close', close) }
+    }],
+    ['GET', /^\/native\/sessions\/control$/, async ({ owner }, res) =>
+      streamNativeEvents({ res, follow: signal => nativeSessions.control(owner, signal) })],
+    ['GET', /^\/native\/sessions\/events$/, async ({ owner }, res) =>
+      streamNativeEvents({ res, follow: signal => nativeSessions.events(owner, signal) })],
+    ['GET', /^\/chats\/([\w-]+)\/native\/session\/follow$/, async ({ owner, url }, res, match) => {
+      const request = parseJson(Buffer.from(url.searchParams.get('request') || '{}'))
+      await streamNativeEvents({ res, follow: signal => nativeSessions.follow(owner, match[1], request, signal) })
+    }],
+    ['GET', /^\/chats\/([\w-]+)\/native\/session\/(page|projections|attachment)$/, async ({ owner, url }, res, match) => {
+      const request = parseJson(Buffer.from(url.searchParams.get('request') || '{}'))
+      const controller = new AbortController()
+      const close = () => controller.abort()
+      res.on('close', close)
+      try { sendJson(res, 200, { data: await nativeSessions.read(owner, match[1], match[2], request, controller.signal) }) }
+      finally { res.off('close', close) }
+    }],
+    ['GET', /^\/native\/client$/, async (_context, res) => sendJson(res, 200, { data: nativeClient.manifest() })],
+    ['GET', /^\/native\/client\/bundle$/, async ({ url }, res) => sendJson(res, 200, {
+      data: await nativeClient.bundle(url.searchParams.get('url'), url.searchParams.get('rev')),
+    })],
     ['GET', /^\/chats\/([\w-]+)\/events$/, async ({ owner }, res, match) => {
       await service.ensureChatDirectory(owner, match[1])
       await streamHistoryEvents({ service, owner, chatId: match[1], res })
@@ -287,6 +337,9 @@ export function apply(ctx, config) {
       workspaces: [{ id: owner.tenantId, name: owner.tenantId, current: true }],
     })],
     ['GET', /^\/catalog$/, async ({ owner, url }, res) => sendJson(res, 200, { data: await buildCatalog(owner, url.searchParams.get('view') === 'models') })],
+    ['GET', /^\/native\/settings$/, async (_context, res) => sendJson(res, 200, { data: subagentSettings.describe() })],
+    ['POST', /^\/native\/settings\/mutate$/, async ({ owner, body }, res) => sendJson(res, 200, { data: await subagentSettings.mutate(owner, parseJson(body)) })],
+    ['GET', /^\/native\/models$/, async ({ owner }, res) => sendJson(res, 200, { data: await databaseModelCatalog(ctx.workbenchPlatformClient, ctx.sessionController, owner, ctx.settings) })],
     ['GET', /^\/chats\/([\w-]+)\/references$/, async ({ owner, url }, res, match) => {
       const abort = new AbortController()
       const disconnected = () => abort.abort()
@@ -296,8 +349,14 @@ export function apply(ctx, config) {
         if (!abort.signal.aborted) sendJson(res, 200, { data })
       } finally { res.off('close', disconnected) }
     }],
+    ['GET', /^\/chats\/([\w-]+)\/subagents\/([\w-]+)\/references$/, async ({ owner, url }, res, match) => withResponseSignal(res, async signal => {
+      const data = await subagents.references(owner, match[1], match[2], url.searchParams.get('query') || '', signal)
+      if (!signal.aborted) sendJson(res, 200, { data })
+    })],
     ['GET', /^\/workspaces$/, async ({ owner }, res) => sendJson(res, 200, { data: await workspaces.baseline(owner) })],
     ['GET', /^\/schedules$/, async ({ owner }, res) => sendJson(res, 200, { data: await schedules.catalog(owner) })],
+    ['POST', /^\/sidebar\/lease$/, async ({ owner, json }, res) => sendJson(res, 200, { data: await sidebarLeases.update(owner, json) })],
+    ['DELETE', /^\/sidebar\/lease\/([\w-]+)$/, async ({ owner }, res, match) => { await sidebarLeases.release(owner, match[1]); sendJson(res, 200, { data: {} }) }],
     ['POST', /^\/browsers$/, async ({ owner, json }, res) => {
       const abort = new AbortController()
       const cancel = () => abort.abort()
@@ -305,15 +364,20 @@ export function apply(ctx, config) {
       try { sendJson(res, 201, { data: await browsers.create(owner, json, abort.signal) }) }
       finally { res.off('close', cancel) }
     }],
+    ['GET', /^\/browser-client$/, async (_context, res) => sendJson(res, 200, { data: await browserClient() })],
+    ['POST', /^\/browsers\/([\w-]+)\/display$/, async ({ owner, json }, res, match) => withResponseSignal(res, async signal => {
+      await browsers.displayInput(owner, match[1], json, signal)
+      if (!signal.aborted) sendJson(res, 200, { data: {} })
+    })],
     ['GET', /^\/browsers\/([\w-]+)\/events$/, async ({ owner, url }, res, match) =>
-      streamNativeEvents({ res, follow: signal => browsers.follow(owner, match[1], url.searchParams.get('attachment'), signal) })],
+      streamNativeEvents({ res, follow: signal => browsers.follow(owner, match[1], url.searchParams.get('attachment'), signal, url.searchParams.get('visible') !== '0', url.searchParams.get('display_protocol') === '1') })],
     ['POST', /^\/browsers\/([\w-]+)\/actions$/, async ({ owner, json }, res, match) => {
       const abort = new AbortController()
       const cancel = () => abort.abort()
       res.on('close', cancel)
       try {
-        await browsers.control(owner, match[1], json, AbortSignal.any([abort.signal, AbortSignal.timeout(35000)]))
-        if (!abort.signal.aborted) sendJson(res, 200, { data: {} })
+        const value = await browsers.control(owner, match[1], json, AbortSignal.any([abort.signal, AbortSignal.timeout(35000)]))
+        if (!abort.signal.aborted) sendJson(res, 200, { data: value || {} })
       } finally { res.off('close', cancel) }
     }],
     ['DELETE', /^\/browsers\/([\w-]+)$/, async ({ owner }, res, match) => {
@@ -332,13 +396,17 @@ export function apply(ctx, config) {
     ['GET', /^\/chats\/([\w-]+)\/terminals\/([\w-]+)\/events$/, async ({ owner, url }, res, match) => streamNativeEvents({ res, follow: signal => terminals.follow(owner, match[1], match[2], url.searchParams.get('attachment'), signal) })],
     ['POST', /^\/chats\/([\w-]+)\/terminals\/([\w-]+)\/(write|resize)$/, async ({ owner, json }, res, match) => { await terminals.control(owner, match[1], match[2], match[3], json); sendJson(res, 200, { data: {} }) }],
     ['DELETE', /^\/chats\/([\w-]+)\/terminals\/([\w-]+)$/, async ({ owner }, res, match) => { await terminals.control(owner, match[1], match[2], 'close', {}); sendJson(res, 200, { data: {} }) }],
-    ['GET', /^\/chats\/([\w-]+)\/jobs\/events$/, async ({ owner }, res, match) =>
-      streamNativeEvents({ res, follow: signal => jobs.list(owner, match[1], signal) })],
+    ['GET', /^\/chats\/([\w-]+)\/jobs\/events$/, async ({ owner, url }, res, match) =>
+      streamNativeEvents({ res, follow: signal => jobs.list(owner, match[1], signal, url.searchParams.get('session_id')) })],
     ['GET', /^\/chats\/([\w-]+)\/jobs\/([\w-]{1,128})\/events$/, async ({ owner, url }, res, match) =>
-      streamNativeEvents({ res, follow: signal => jobs.follow(owner, match[1], match[2], url.searchParams.get('from'), signal) })],
-    ['POST', /^\/chats\/([\w-]+)\/jobs\/([\w-]{1,128})\/stop$/, async ({ owner }, res, match) =>
-      sendJson(res, 200, { data: await jobs.stop(owner, match[1], match[2]) })],
+      streamNativeEvents({ res, follow: signal => jobs.follow(owner, match[1], match[2], url.searchParams.get('from'), signal, url.searchParams.get('session_id')) })],
+    ['POST', /^\/chats\/([\w-]+)\/jobs\/([\w-]{1,128})\/stop$/, async ({ owner, url }, res, match) =>
+      sendJson(res, 200, { data: await jobs.stop(owner, match[1], match[2], url.searchParams.get('session_id'), new AbortController().signal) })],
     ['GET', /^\/chats\/([\w-]+)\/subagents$/, async ({ owner }, res, match) => sendJson(res, 200, { data: await subagents.catalog(owner, match[1], new AbortController().signal) })],
+    ['POST', /^\/chats\/([\w-]+)\/subagents\/([\w-]+)\/stop$/, async ({ owner }, res, match) =>
+      sendJson(res, 200, { data: await subagents.stop(owner, match[1], match[2], new AbortController().signal) })],
+    ['PATCH', /^\/chats\/([\w-]+)\/subagents\/([\w-]+)\/queue$/, async ({ owner, json }, res, match) =>
+      sendJson(res, 200, { data: await subagents.updateQueue(owner, match[1], match[2], json, new AbortController().signal) })],
     ['POST', /^\/chats\/([\w-]+)\/subagents\/([\w-]+)\/messages$/, async ({ owner, json }, res, match) => {
       const abort = new AbortController()
       const disconnected = () => abort.abort()
@@ -482,6 +550,7 @@ export function apply(ctx, config) {
     // The platform renders Word in an offline, resource-limited container.
     ['GET', /^\/files\/preview$/, async (context, res) => proxyPlatform(context, res, 'files/preview')],
     ['POST', /^\/files\/preview$/, async (context, res) => proxyPlatform(context, res, 'files/preview')],
+    ['DELETE', /^\/files\/preview$/, async (context, res) => proxyPlatform(context, res, 'files/preview')],
     ['GET', /^\/files\/shares$/, async (context, res) => proxyPlatform(context, res, 'files/shares')],
     ['POST', /^\/files\/shares$/, async (context, res) => proxyPlatform(context, res, 'files/shares')],
     ['DELETE', /^\/files\/shares$/, async (context, res) => proxyPlatform(context, res, 'files/shares')],
@@ -490,17 +559,20 @@ export function apply(ctx, config) {
       service.requireChat(context.owner, match[1])
       await proxyPlatform(context, res, 'audio')
     }],
-    ['GET', /^\/files$/, async ({ url }, res) => {
+    ['GET', /^\/files$/, async ({ url }, res) => withResponseSignal(res, async signal => {
       const requested = managerPath(url.searchParams.get('path') || '.', { allowRoot: true })
-      const result = await ctx.workbenchFileManager.operate({ operation: 'list', path: requested })
+      const result = await ctx.workbenchFileManager.operate({ operation: 'list', path: requested, ...(url.searchParams.get('cursor') ? { cursor: url.searchParams.get('cursor') } : {}) }, signal)
+      signal.throwIfAborted()
+      if (result.conflict) throw httpError(409, result.message || '目录已改变，请刷新后重试')
       sendJson(res, 200, { data: result })
-    }],
-    ['GET', /^\/files\/stat$/, async ({ url }, res) => {
+    })],
+    ['GET', /^\/files\/stat$/, async ({ url }, res) => withResponseSignal(res, async signal => {
       const requested = managerPath(url.searchParams.get('path'), { allowRoot: true })
-      const result = await ctx.workbenchFileManager.operate({ operation: 'stat', path: requested })
+      const result = await ctx.workbenchFileManager.operate({ operation: 'stat', path: requested }, signal)
+      signal.throwIfAborted()
       if (result.kind === 'missing') throw httpError(404, '路径不存在')
       sendJson(res, 200, { data: result })
-    }],
+    })],
     ['POST', /^\/files$/, async ({ json }, res) => {
       const requested = managerPath(json.path)
       if (typeof json.data !== 'string') throw httpError(400, '缺少 data')
@@ -521,9 +593,10 @@ export function apply(ctx, config) {
       const result = await ctx.workbenchFileManager.operate({ operation: 'mkdir', path: managerPath(json.path) })
       sendJson(res, 200, { data: result })
     }],
-    ['GET', /^\/files\/download$/, async ({ url }, res) => {
+    ['GET', /^\/files\/download$/, async ({ url }, res) => withResponseSignal(res, async signal => {
       const requested = managerPath(url.searchParams.get('path'))
-      const result = await ctx.workbenchFileManager.operate({ operation: 'get', path: requested })
+      const result = await ctx.workbenchFileManager.operate({ operation: 'get', path: requested }, signal)
+      signal.throwIfAborted()
       const bytes = Buffer.from(result.data, 'base64')
       res.writeHead(200, {
         'content-type': 'application/octet-stream', 'content-length': bytes.byteLength,
@@ -531,19 +604,20 @@ export function apply(ctx, config) {
         etag: `"${String(result.version)}"`, 'cache-control': 'no-store',
       })
       res.end(bytes)
-    }],
-    ['GET', /^\/files\/text$/, async ({ url }, res) => {
+    })],
+    ['GET', /^\/files\/text$/, async ({ url }, res) => withResponseSignal(res, async signal => {
       const requested = managerPath(url.searchParams.get('path'))
-      const result = await ctx.workbenchFileManager.operate({ operation: 'get', path: requested })
+      const result = await ctx.workbenchFileManager.operate({ operation: 'get', path: requested }, signal)
+      signal.throwIfAborted()
       if (result.kind === 'directory') throw httpError(400, '文件不是 UTF-8 文本，请下载后编辑')
       const bytes = Buffer.from(result.data, 'base64')
       if (bytes.length > 2 * 1024 * 1024) throw httpError(400, '在线编辑支持 2 MiB 以内的 UTF-8 文本文件')
       let text
-      try { text = new TextDecoder('utf-8', { fatal: true }).decode(bytes) }
+      try { text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes) }
       catch { throw httpError(400, '文件不是 UTF-8 文本，请下载后编辑') }
       if (text.includes('\0')) throw httpError(400, '文件不是 UTF-8 文本，请下载后编辑')
       sendJson(res, 200, { data: { text, version: String(result.version) } })
-    }],
+    })],
     ['GET', /^\/runs\/([\w-]+)\/events$/, async ({ owner, req, url }, res, match) => {
       streamRunEvents({
         database, eventBus, ownerId: owner.ownerId, runId: match[1], req, res,
@@ -557,7 +631,8 @@ export function apply(ctx, config) {
       if (req.method === 'GET' && req.url === config.basePath + '/health') {
         const ready = recovered && !database.streamFlushError && runtime.mcpCatalogState?.ready === true
         sendJson(res, ready ? 200 : 503, { live: true, ready, recovery: recovered ? 'ready' : recoveryError ? 'failed' : 'recovering',
-          resources: runtime.mcpCatalogState?.status ?? 'initializing' })
+          resources: runtime.mcpCatalogState?.status ?? 'initializing',
+          activity: ready ? await nativeHostActivity(ctx, runtime.sidebarActivity, () => subagentSettings.activeWrites) : { protocol: 1, status: 'unknown' } })
         return
       }
       await recovery
@@ -584,6 +659,7 @@ export function apply(ctx, config) {
       if (methodNotAllowed) throw httpError(405, '方法不允许')
       throw httpError(501, '该工作台能力尚未迁移')
     } catch (error) {
+      if (res.destroyed || res.writableEnded) return
       if (!res.headersSent) sendError(res, error)
       else res.end()
     }
@@ -594,6 +670,7 @@ export function apply(ctx, config) {
     return () => {
       clearTimeout(recoveryTimer)
       scheduler.close()
+      sidebarLeases.dispose()
       browsers.dispose()
       disposeRoute?.()
       database.close()

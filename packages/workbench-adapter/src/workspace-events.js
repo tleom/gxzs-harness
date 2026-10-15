@@ -3,6 +3,7 @@
 export function streamWorkspaceEvents({ workspaces, owner, res, subscribe, heartbeatMs = 15000, drainTimeoutMs = 30000 }) {
   const abort = new AbortController()
   let dirty = true, pumping = false, blocked = false, closed = false
+  let previousSnapshot
   let drainTimeout, scheduled, unsubscribe
   const finish = () => {
     if (closed) return
@@ -32,7 +33,11 @@ export function streamWorkspaceEvents({ workspaces, owner, res, subscribe, heart
     dirty = false
     try {
       const value = await workspaces.baseline(owner, abort.signal)
-      if (!closed) write(`data: ${JSON.stringify({ event: 'workspace_snapshot', value })}\n\n`)
+      const encoded = JSON.stringify({ event: 'workspace_snapshot', value })
+      if (!closed && encoded !== previousSnapshot) {
+        previousSnapshot = encoded
+        write(`data: ${encoded}\n\n`)
+      }
     } catch { finish() }
     finally { pumping = false; if (dirty) schedule() }
   }

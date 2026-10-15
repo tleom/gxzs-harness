@@ -32,6 +32,18 @@ export function adaptInputSchema(source) {
     if (typeof result.additionalProperties === 'object') result.additionalProperties = project(result.additionalProperties)
     for (const key of ['anyOf', 'allOf', 'oneOf']) if (Array.isArray(result[key])) result[key] = result[key].map(value => project(value))
     if (result.not) result.not = project(result.not)
+    // Nullable MCP fields commonly use anyOf. An exact-one union is equivalent
+    // only when branch types are disjoint; overlapping unions remain rejected.
+    if (Array.isArray(result.anyOf)) {
+      const types = result.anyOf.map(branch => branch?.type)
+      const supported = new Set(['string', 'number', 'integer', 'boolean', 'null', 'array', 'object'])
+      if (types.length >= 2 && types.every(type => supported.has(type))
+        && new Set(types).size === types.length
+        && !(types.includes('integer') && types.includes('number')) && !result.oneOf) {
+        result.oneOf = result.anyOf
+        delete result.anyOf
+      }
+    }
     return result
   }
   // The source schema remains authoritative. Standard validation is needed because

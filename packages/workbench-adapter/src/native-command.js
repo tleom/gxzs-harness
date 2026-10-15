@@ -1,3 +1,5 @@
+import { compactionSummary } from './display-events.js'
+export { compactionSummary } from './display-events.js'
 import { AsyncLocalStorage } from 'node:async_hooks'
 
 const admissions = new AsyncLocalStorage()
@@ -38,12 +40,4 @@ export function nativeCommandRecords(events, runs) {
     }
   }
   return [...commands.values()]
-}
-
-export function compactionSummary(data) {
-  return {
-    summary: Array.isArray(data?.summary) ? data.summary.filter(block => block.type === 'text').map(block => block.text).join('') || null : null,
-    items: Array.isArray(data?.shadowedSeqs) ? data.shadowedSeqs.length : null,
-    tokens: Number.isSafeInteger(data?.shadowedTokenCount) ? data.shadowedTokenCount : null,
-  }
 }

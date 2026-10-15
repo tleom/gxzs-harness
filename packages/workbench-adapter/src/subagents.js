@@ -8,24 +8,56 @@ export class WorkbenchSubagents {
   constructor({ sessions, service, native, attachments, runtime }) { this.sessions = sessions; this.service = service; this.native = native; this.attachments = attachments; this.runtime = runtime }
   async catalog(owner, chatId, signal) {
     const parent = this.service.requireChat(owner, chatId)
-    const { items } = await this.sessions.list({}, signal)
-    const root = items.find(item => item.sessionId === parent.sessionId)
-    const catalog = root?.projections?.values?.subagentCatalog ?? []
+    if (!this.native) throw httpError(503, '子智能体服务尚未就绪')
+    const [catalog, { items }] = await Promise.all([
+      this.native.listDescendants(parent.sessionId, signal), this.sessions.list({}, signal),
+    ])
+    const summaries = new Map(items.map(item => [item.sessionId, item]))
     return catalog.map(entry => {
-      const item = items.find(item => item.sessionId === entry.id)
+      const item = summaries.get(entry.id)
       const values = item?.projections?.values ?? {}
-      return { ...entry, title: entry.label || entry.id, summary: values.title, running: item?.running === true, parentAvailable: root?.agentAvailable === true,
-        timing: values.subagentTiming, usage: values.tokenUsage, parentSessionId: parent.sessionId }
+      return { ...entry, mode: entry.kind === 'diagnostic' ? 'unknown' : entry.mode,
+        title: entry.label || entry.id, summary: values.title, running: item?.running === true,
+        parentAvailable: summaries.get(entry.parentId)?.agentAvailable,
+        timing: values.subagentTiming, usage: values.tokenUsage, inbox: values.inbox,
+        formatStatus: item?.formatStatus, parentSessionId: entry.parentId }
     })
   }
-  async prompt(owner, chatId, childId, request, signal) {
+  async requireChild(owner, chatId, childId, signal) {
     const child = (await this.catalog(owner, chatId, signal)).find(item => item.id === childId)
     if (!child) throw httpError(404, '子智能体不属于此对话')
+    return child
+  }
+  async stop(owner, chatId, childId, signal) {
+    const child = await this.requireChild(owner, chatId, childId, signal)
+    if (child.mode !== 'continuable') throw httpError(409, '此子智能体不支持独立停止')
+    // The native interrupt authority remains valid while the direct parent is offline.
+    return this.native.interruptByParent(child.id, child.parentSessionId, 'continuable')
+  }
+  async references(owner, chatId, childId, query, signal) {
+    const child = await this.requireChild(owner, chatId, childId, signal)
+    if (child.mode === 'external') throw httpError(409, '外部子智能体没有本地引用')
+    const observed = await this.service.sessionQuery.observeSession(child.id, { signal })
+    try {
+      signal.throwIfAborted()
+      if (observed.header.id !== child.id || observed.header.parentSession !== child.parentSessionId)
+        throw httpError(403, '子会话父地址不匹配')
+      return await this.service.observedReferenceCandidates(owner, observed, query, signal)
+    } finally { observed[Symbol.dispose]() }
+  }
+  async updateQueue(owner, chatId, childId, request, signal) {
+    const child = await this.requireChild(owner, chatId, childId, signal)
+    if (child.mode !== 'continuable') throw httpError(409, '此子智能体不支持后续消息')
+    return this.sessions.updateQueue({ sessionId: child.id, itemId: request.itemId, action: request.action })
+  }
+  async prompt(owner, chatId, childId, request, signal) {
+    const child = await this.requireChild(owner, chatId, childId, signal)
     if (child.mode !== 'continuable') throw httpError(409, '此子智能体不支持后续消息')
     if (!this.native) throw httpError(503, '子智能体服务尚未就绪')
     const images = request.images ?? []
+    const delivery = request.delivery ?? 'queue'
     if (typeof request.text !== 'string' || (!request.text.trim() && !images.length) || typeof request.requestId !== 'string'
-      || !Array.isArray(images) || images.length > 20) throw httpError(400, '子智能体消息无效')
+      || !['queue', 'steer'].includes(delivery) || !Array.isArray(images) || images.length > 20) throw httpError(400, '子智能体消息无效')
     let bytes = 0
     for (const image of images) {
       if (!image || !['image/png', 'image/jpeg', 'image/gif', 'image/webp'].includes(image.mediaType)
@@ -37,7 +69,7 @@ export class WorkbenchSubagents {
     signal.throwIfAborted()
     const receipt = this.runtime?.prepareChildPrompt(this.service.requireChat(owner, chatId), child, request.requestId)
     try { return await this.native.prompt({ parentSessionId: child.parentSessionId, childSessionId: child.id,
-      mode: 'continuable', requestId: request.requestId, delivery: 'queue', content: [
+      mode: 'continuable', requestId: request.requestId, delivery, content: [
         ...(request.text.trim() ? [{ type: 'text', text: request.text }] : []),
         ...images.map(({ data, mediaType, name }) => ({ type: 'image', data, mediaType, ...(name ? { name } : {}) }))],
       ...(request.clientTimeZone ? { clientTimeZone: request.clientTimeZone } : {}) }, signal)

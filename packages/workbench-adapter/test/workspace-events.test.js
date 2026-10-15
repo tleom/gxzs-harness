@@ -16,6 +16,14 @@ function setup(baseline = vi.fn(async () => ({ items: [] }))) {
   return { res, baseline, close, notify: () => notify(), unsubscribe, signal: () => followSignal }
 }
 describe('native workspace event transport', () => {
+  it('does not send an unchanged native projection again after duplicate notifications', async () => {
+    const s = setup();
+    await tick();
+    s.notify(); await tick(); await tick();
+    expect(s.baseline).toHaveBeenCalledTimes(2);
+    expect(s.res.write).toHaveBeenCalledTimes(1);
+    s.close();
+  });
   it('coalesces changes while a snapshot is pending and cancels on disconnect', async () => {
     let complete
     const baseline = vi.fn().mockImplementationOnce(() => new Promise(resolve => { complete = resolve })).mockResolvedValue({ items: [] })

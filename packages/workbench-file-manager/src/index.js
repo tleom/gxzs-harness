@@ -18,6 +18,7 @@ const ACTIONS = {
   files: new Set(['list', 'stat', 'manifest', 'get', 'upload', 'delete', 'mkdir']),
   'personal-resources': new Set(['list', 'skill_inspect', 'skill_import', 'skill_update', 'skill_uninstall', 'skill_toggle', 'skill_pin']),
   'personal-mcp': new Set(['mcp_list', 'mcp_read', 'mcp_save', 'mcp_delete', 'mcp_toggle', 'mcp_pin', 'mcp_test']),
+  'host-settings': new Set(['check']),
 }
 
 export class FileManagerClient {
@@ -43,6 +44,10 @@ export class FileManagerClient {
   operate(payload, signal) { return this.request('files', payload, signal) }
   personalResources(payload) { return this.request('personal-resources', payload) }
   personalMcp(payload) { return this.request('personal-mcp', payload) }
+  async assertSettingsWritable() {
+    const result = await this.request('host-settings', { operation: 'check' })
+    if (result.writable !== true) throw Object.assign(new Error('工作台正在维护，请稍后保存设置'), { status: 503, code: 'HOST_UPDATING' })
+  }
 
   async request(action, payload, signal) {
     if (!ACTIONS[action]?.has(payload?.operation)) throw new TypeError(action === 'files' ? 'unsupported file operation' : `unsupported ${action} operation`)
@@ -111,9 +116,10 @@ export class WorkbenchFileManager extends Service {
     this.client = new FileManagerClient(config)
   }
   get workspaceId() { return this.client.workspaceId }
-  operate(payload) { return this.client.operate(payload) }
+  operate(payload, signal) { return this.client.operate(payload, signal) }
   personalResources(payload) { return this.client.personalResources(payload) }
   personalMcp(payload) { return this.client.personalMcp(payload) }
+  assertSettingsWritable() { return this.client.assertSettingsWritable() }
 }
 
 export function apply(ctx, config) { return new WorkbenchFileManager(ctx, config) }

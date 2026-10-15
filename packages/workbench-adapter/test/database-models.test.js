@@ -19,6 +19,16 @@ function setup() {
 }
 
 describe('database model publication', () => {
+  it('preserves native catalog failures for visible providers without exposing private provider diagnostics', async () => {
+    const {client,sessions,settings,config}=setup()
+    config.models.providers.failed={name:'Failed provider',models:[{id:'missing',name:'Missing'}]}
+    const original=await sessions.modelCatalog()
+    sessions.modelCatalog.mockResolvedValue({...original,routableProviders:['p','other'],
+      failures:[{id:'failed',name:'Native failed',message:'private endpoint token'},{id:'other',name:'Private',message:'secret'}]})
+    const catalog=await databaseModelCatalog(client,sessions,{},settings)
+    expect(catalog.routableProviders).toEqual(['p'])
+    expect(catalog.failures).toEqual([{id:'failed',name:'Failed provider',message:'模型目录暂时不可用'}])
+  })
   it('shares synchronization and capabilities across fresh Cordis service proxies', async () => {
     const { client, sessions, settings } = setup()
     const proxy = target => new Proxy(target, { get: (value, property) => property === symbols.original ? value : value[property] })

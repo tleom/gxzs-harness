@@ -77,7 +77,12 @@ export async function databaseModelCatalog(platformClient, sessions, owner, sett
   const selected = slash > 0 ? { provider: value.slice(0, slash), model: value.slice(slash + 1) } : null
   if (!selected || !groups.some((group) => group.id === selected.provider && group.models.some((model) => model.id === selected.model)))
     throw httpError(503, '后台默认模型未启用或尚未配置可用连接')
-  return { groups, default: selected }
+  const visibleProvider = id => config.models.providers[id]?.enabled !== false && Object.hasOwn(config.models.providers, id)
+  return { groups, default: selected,
+    routableProviders: (native.routableProviders ?? groups.map(group => group.id)).filter(visibleProvider),
+    failures: (native.failures ?? []).filter(item => visibleProvider(item.id)).map(item => ({
+      id: item.id, name: config.models.providers[item.id].name || item.id, message: '模型目录暂时不可用',
+    })) }
 }
 
 export async function requireDatabaseModel(platformClient, sessions, owner, modelId, settings) {

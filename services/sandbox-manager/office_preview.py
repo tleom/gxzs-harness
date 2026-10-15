@@ -9,9 +9,38 @@ import tempfile
 from xml.dom import minidom
 from xml.parsers.expat import ExpatError
 import zipfile
+from xml.etree import ElementTree
 
 MAX_BYTES = 20 * 1024 * 1024
 SUFFIXES = {".doc", ".docx", ".docm", ".dotx", ".dotm", ".odt", ".rtf", ".xls", ".xlsx", ".xlsm", ".xlsb", ".xltx", ".xltm", ".ppt", ".pptx", ".pptm", ".ppsx", ".ppsm", ".potx", ".potm"}
+
+
+def missing_fonts(data, suffix):
+    """Report declared OOXML families; the original document is never rewritten."""
+    if suffix not in {'.docx', '.docm', '.dotx', '.dotm', '.xlsx', '.xlsm', '.xltx', '.xltm', '.pptx', '.pptm', '.ppsx', '.ppsm', '.potx', '.potm'}:
+        return []
+    families = set()
+    with zipfile.ZipFile(io.BytesIO(data)) as source:
+        if len(source.infolist()) > 10000 or sum(item.file_size for item in source.infolist()) > 100 * 1024 * 1024:
+            raise ValueError('文档解压后超过预览范围')
+        for item in source.infolist():
+            if not item.filename.endswith('.xml') or item.file_size > MAX_BYTES:
+                continue
+            content = source.read(item)
+            if b'<!DOCTYPE' in content.upper():
+                raise ValueError('文档包含不支持的声明')
+            for node in ElementTree.fromstring(content).iter():
+                local = node.tag.rpartition('}')[2]
+                for key, value in node.attrib.items():
+                    attr = key.rpartition('}')[2]
+                    if (local == 'rFonts' and attr in {'ascii', 'hAnsi', 'eastAsia', 'cs'}) or attr == 'typeface':
+                        if value and not value.startswith('+') and len(value) <= 100:
+                            families.add(value)
+    if not families:
+        return []
+    result = subprocess.run(['fc-list', '--format', '%{family}\n'], capture_output=True, text=True, timeout=5, check=True)
+    available = {family.strip().casefold() for line in result.stdout.splitlines() for family in line.split(',')}
+    return sorted(name for name in families if name.casefold() not in available)[:20]
 
 
 def preserve_exact_spacing(data, suffix):
@@ -70,12 +99,12 @@ def preview(payload):
         content = target.read_bytes()
         if not content.startswith(b"%PDF-"):
             raise ValueError("文档未生成有效的分页预览")
-        return {"data": base64.b64encode(content).decode(), "name": "preview.pdf"}
+        return {"data": base64.b64encode(content).decode(), "name": "preview.pdf", 'missing_fonts': missing_fonts(data, suffix)}
 
 
 if __name__ == "__main__":
     try:
         print(json.dumps(preview(json.load(sys.stdin))))
-    except (ValueError, OSError, zipfile.BadZipFile, ExpatError, subprocess.TimeoutExpired) as error:
+    except (ValueError, OSError, zipfile.BadZipFile, ExpatError, ElementTree.ParseError, subprocess.SubprocessError) as error:
         print(json.dumps({"error": str(error) if not isinstance(error, subprocess.TimeoutExpired) else "文档排版超时，请下载原文件查看"}))
         sys.exit(2)

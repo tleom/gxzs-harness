@@ -17,8 +17,15 @@ from resource_ops import SETTINGS, PINS, atomic_write, directory, resource_direc
 
 MAX_CONFIG = 65536
 MAX_MANIFEST = 1024 * 1024
-MAX_TOOLS = 200
 DISCOVERY_TTL = 300
+
+
+class ManifestError(ValueError):
+    """Safe, actionable discovery failures; never include server-provided text."""
+
+    def __init__(self, message, code="MCP_MANIFEST_INVALID"):
+        super().__init__(message)
+        self.code = code
 
 
 def server_name(value):
@@ -110,40 +117,40 @@ def authentication_version(config):
 
 
 def tool_manifest(tools):
-    if not isinstance(tools, list) or len(tools) > MAX_TOOLS:
-        raise ValueError("单个 MCP 最多提供 200 个工具")
+    if not isinstance(tools, list):
+        raise ManifestError("MCP 工具目录必须是数组")
     result, seen = [], set()
     for tool in tools:
         if not isinstance(tool, dict):
-            raise ValueError("MCP 工具声明无效")
+            raise ManifestError("MCP 工具声明无效")
         name, schema = tool.get("name"), tool.get("inputSchema")
         if not isinstance(name, str) or not name or len(name) > 128 or name in seen:
-            raise ValueError("MCP 工具名称无效或重复")
+            raise ManifestError("MCP 工具名称无效或重复")
         if not isinstance(schema, dict) or schema.get("type") != "object":
-            raise ValueError("MCP 工具参数必须是 object JSON Schema")
+            raise ManifestError("MCP 工具参数必须是 object JSON Schema")
         output_schema = tool.get("outputSchema")
         if output_schema is not None and (not isinstance(output_schema, dict) or output_schema.get("type") != "object"):
-            raise ValueError("MCP 工具输出必须是 object JSON Schema")
+            raise ManifestError("MCP 工具输出必须是 object JSON Schema")
         pending = [schema, output_schema]
         while pending:
             part = pending.pop()
             if isinstance(part, dict):
                 for key, value in part.items():
                     if key in {"$ref", "$dynamicRef"} and (not isinstance(value, str) or not value.startswith("#")):
-                        raise ValueError("MCP 参数声明不能引用外部 JSON Schema")
+                        raise ManifestError("MCP 参数声明不能引用外部 JSON Schema")
                     pending.append(value)
             elif isinstance(part, list):
                 pending.extend(part)
         description = tool.get("description") or name
         if not isinstance(description, str) or len(description) > 16000:
-            raise ValueError("MCP 工具说明过长或无效")
+            raise ManifestError("MCP 工具说明过长或无效")
         declaration = {"name": name, "description": description, "inputSchema": schema}
         if output_schema is not None:
             declaration["outputSchema"] = output_schema
         result.append(declaration)
         seen.add(name)
     if len(json.dumps(result).encode()) > MAX_MANIFEST:
-        raise ValueError("MCP 工具目录超过 1 MiB")
+        raise ManifestError("MCP 工具目录超过 1 MiB", "MCP_MANIFEST_TOO_LARGE")
     return result
 
 

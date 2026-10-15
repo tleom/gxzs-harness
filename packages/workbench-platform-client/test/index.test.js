@@ -9,6 +9,19 @@ function create(fetchImpl) {
 }
 
 describe('restricted platform client', () => {
+  it('forwards preview cancellation with the same owner and correlation identity', async () => {
+    const fetchImpl = vi.fn(async () => new Response(null, { status: 204 }))
+    const client = create(fetchImpl)
+    const signal = new AbortController().signal
+    const result = await client.request({ owner: { ownerId: 't:1' }, method: 'DELETE',
+      route: 'files/preview', query: '?request_id=12345678-1234-1234-1234-123456789abc', signal })
+    expect(result.status).toBe(204)
+    expect(fetchImpl).toHaveBeenCalledWith(
+      'http://platform/internal/workbench/files/preview?request_id=12345678-1234-1234-1234-123456789abc',
+      expect.objectContaining({ method: 'DELETE', headers: expect.objectContaining({ 'x-gxzs-owner': 't:1' }) }))
+    await expect(client.request({ owner: { ownerId: 't:1' }, method: 'DELETE', route: 'files/arbitrary' }))
+      .rejects.toThrow('unsupported platform route')
+  })
   it('honors the remaining absolute deadline and sends it to the platform', async () => {
     const fetchImpl = vi.fn(async (_url, { signal }) => {
       signal.throwIfAborted()

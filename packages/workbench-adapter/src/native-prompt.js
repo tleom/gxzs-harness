@@ -10,7 +10,7 @@ export function runPromptId(message) {
 
 export async function dispatchRunPrompt({ sessions, agents, database }, run, content) {
   if (!run.selection?.silent_resume)
-    return sessions.prompt({ requestId: run.id, sessionId: run.sessionId, mode: 'queue', content }, new AbortController().signal)
+    return sessions.prompt({ requestId: run.id, sessionId: run.sessionId, mode: run.selection?.prompt_mode ?? 'queue', content }, new AbortController().signal)
   const agent = agents.get(run.sessionId)
   if (!agent) throw httpError(409, '会话暂时无法恢复')
   if (database.getRun(run.ownerId, run.id)?.messageId) return { accepted: true }

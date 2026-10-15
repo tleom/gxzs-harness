@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { FileManagerClient } from '../src/index.js'
+import { FileManagerClient, WorkbenchFileManager } from '../src/index.js'
 
 const workspaceId = '00000000-0000-4000-8000-000000000001'
 
@@ -14,6 +14,22 @@ function create(fetchImpl) {
 }
 
 describe('restricted sandbox-manager file client', () => {
+  it('checks the current owner Host lifecycle through a fixed non-model operation and requires explicit acceptance', async () => {
+    const fetchImpl=vi.fn(async()=>new Response(JSON.stringify({writable:true})))
+    const manager=create(fetchImpl)
+    await manager.assertSettingsWritable()
+    expect(fetchImpl).toHaveBeenCalledWith(`http://manager.internal:5010/sandboxes/${workspaceId}/host-settings`,expect.objectContaining({
+      body:JSON.stringify({operation:'check'}),headers:expect.objectContaining({'x-gxzs-host-generation':'7','x-gxzs-host-instance':'host-7'}),
+    }))
+    fetchImpl.mockResolvedValue(new Response('{}'))
+    await expect(manager.assertSettingsWritable()).rejects.toMatchObject({status:503,code:'HOST_UPDATING'})
+  })
+  it('forwards the native caller signal through the service boundary', () => {
+    const operate = vi.fn(), signal = new AbortController().signal;
+    const payload = { operation: 'list', path: '.' };
+    WorkbenchFileManager.prototype.operate.call({ client: { operate } }, payload, signal);
+    expect(operate).toHaveBeenCalledWith(payload, signal);
+  })
   it('retains temporary capacity errors and safe correlation metadata', async () => {
     const manager = create(async () => new Response(JSON.stringify({error:'资源繁忙',code:'MANAGER_BUSY',request_id:'request-1',retry_after:2}),{status:503}))
     await expect(manager.operate({operation:'list'})).rejects.toMatchObject({status:503,code:'MANAGER_BUSY',request_id:'request-1',retry_after:2})

@@ -1,7 +1,7 @@
 import { expect, it, vi } from 'vitest'
 import { registerBrowserTool } from '../src/browser-tool.js'
 
-function fixture() {
+function fixture(services = {}) {
   const agent = { id: 'native', session: { id: 'native' } }
   const chat = { id: '12345678-1234-1234-1234-123456789abc', sessionId: 'native', ownerId: 'owner' }
   const command = vi.fn(async value => value.action === 'snapshot' ? { url: 'https://example.com/', title: 'Example', text: 'Example', elements: [] } : undefined)
@@ -9,9 +9,38 @@ function fixture() {
   const browsers = { create: vi.fn(async () => {}), require: vi.fn(() => browser) }
   const runtime = { rootOf: () => agent, executionRun: () => ({ id: 'run', status: 'running', ownerId: 'owner' }), scheduler: { hasAdmission: () => true } }
   const database = { getChatBySession: () => chat, appendEvent: vi.fn() }
-  const definition = registerBrowserTool({ tools: { register: vi.fn() }, systemPrompt: { section: vi.fn(), getSectionOrder: () => 3000 } }, { browsers, runtime, database, ownerId: 'owner' })
+  const definition = registerBrowserTool({ get:key=>services[key], tools: { register: vi.fn() }, systemPrompt: { section: vi.fn(), getSectionOrder: () => 3000 } }, { browsers, runtime, database, ownerId: 'owner' })
   return { definition, browser, browsers, runtime, database, chat, exec: { agent, signal: new AbortController().signal } }
 }
+
+it('admits screenshots through native durable image storage only for a declared image-capable route', async () => {
+  const attachment={attachmentId:'image-1',mediaType:'image/png',bytes:4,width:10,height:10}
+  const saveImages=vi.fn(async()=>[attachment])
+  const test=fixture({llm:{resolveModelInfo:vi.fn(async()=>({inputModalities:['text','image']}))},attachments:{saveImages}})
+  test.exec.agent.options={provider:'provider',model:'vision-model'}
+  test.browser.command.mockImplementation(async value=>value.action==='screenshot'
+    ? {image:'cG5n',mediaType:'image/png'} : {url:'https://example.com',title:'Page',text:'Canvas',elements:[],revision:2})
+  const result=await test.definition.execute({action:'screenshot'},test.exec)
+  expect(saveImages).toHaveBeenCalledWith([{data:Buffer.from('png'),mediaType:'image/png',name:'browser-screenshot'}])
+  expect(test.definition.output.render({},result)).toContainEqual({type:'image',attachment})
+  expect(result.content).not.toContain('cG5n')
+})
+
+it('returns structure without creating image bytes for an unverified model route', async () => {
+  const test=fixture()
+  const value=await test.definition.execute({action:'screenshot'},test.exec)
+  expect(test.browser.command.mock.calls.map(([request])=>request.action)).toEqual(['snapshot'])
+  expect(JSON.parse(value.content).image_notice).toContain('未声明图片输入')
+  expect(value.image_attachment).toBeUndefined()
+})
+
+it('carries its last observation revision to the next operation', async () => {
+  const test=fixture()
+  test.browser.command.mockResolvedValue({url:'https://example.com',title:'Page',revision:7})
+  await test.definition.execute({action:'snapshot'},test.exec)
+  await test.definition.execute({action:'click',selector:'#submit'},test.exec)
+  expect(test.browser.command).toHaveBeenCalledWith({action:'element-click',selector:'#submit',expected_revision:7},test.exec.signal)
+})
 
 it('uses the root chat browser and returns a fresh observation after selector input', async () => {
   const test = fixture()
