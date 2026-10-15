@@ -96,6 +96,25 @@ it.each(['cancelled', 'interrupted'])('admits a late owned child message after a
   expect(test.requests.filter(item => item.action === 'acquire')).toHaveLength(1)
 })
 
+it('creates a deferred child receipt before DSH commits the child user message', async () => {
+  const test = await fixture(['new reply'], { scheduledClaims: true })
+  test.runtime.mcpCatalogState = { ready: false }
+  test.runtime.mcpResources = () => [{ id: 'current-catalog' }]
+  const parent = test.create('delegate')
+  test.db.updateRunResources(parent, { subagent_ids: ['owned-child'], subagent_names: { 'owned-child': '核对员' } }, parent.mcpTools)
+  test.db.transitionRun(test.owner.ownerId, parent.id, 'completed')
+  const message = createUserMessage({ content: [{ type: 'text', text: 'late child result' }], source: { kind: 'agent-message', senderSessionId: 'owned-child' } })
+  test.agent.followup(message)
+  await vi.waitFor(() => expect(test.agent.inbox.hasPending).toBe(false))
+  expect(test.agent.session.snapshotEvents().some(event => event.type === 'user/message' && event.data.id === message.id)).toBe(false)
+  expect(test.db.getRun(test.owner.ownerId, message.id)).toBeUndefined()
+  test.runtime.mcpCatalogState = { ready: true }
+  await test.agent.whenIdle()
+  expect(test.db.allEvents(test.owner.ownerId, message.id)).toContainEqual(expect.objectContaining({
+    event: 'workbench_agent_message', message_id: message.id, sender_session_id: 'owned-child', sender_name: '核对员',
+  }))
+})
+
 it('lets a native job completion wake an idle root and retains one admission receipt on replay', async () => {
   const test = await fixture(['root done', 'job output collected'])
   const original = test.create('start background work')

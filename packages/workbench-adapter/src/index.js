@@ -178,8 +178,14 @@ export function apply(ctx, config) {
         await delay(100, undefined, { signal: payload.signal })
       }
       payload.signal?.throwIfAborted()
-      for (const message of autonomous) projectInboxClaim(database, { agent: payload.agent, message, turn: payload.turn }, config.ownerId,
-        { mcpTools: runtime.mcpResources?.() ?? [] })
+      for (const message of autonomous) {
+        const claimed = projectInboxClaim(database, { agent: payload.agent, message, turn: payload.turn }, config.ownerId,
+          { mcpTools: runtime.mcpResources?.() ?? [] })
+        if (claimed?.selection?.native_source === 'schedule') {
+          try { await schedules.rememberRun(claimed) }
+          catch { ctx.logger.warn('Scheduled delivery title enrichment deferred') }
+        }
+      }
     }
     await recovery
     if (autonomous.length && recoveryError) await beginRecovery()
