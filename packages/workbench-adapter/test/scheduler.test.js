@@ -271,6 +271,52 @@ it('rechecks cancellation after waiting for a global ticket', async () => {
   expect(db.submissions('t:1')).toEqual([])
 })
 
+it('ignores a retired queue item in a dispatcher snapshot while the previous ticket is releasing', async () => {
+  const { db, scheduler, platform, create, permit, agent, diagnostics } = setup()
+  permit()
+  const first = create('first')
+  await scheduler.enqueue(first, [])
+  await scheduler.tick()
+  db.transitionRun('t:1', first.id, 'completed')
+  agent.status = 'idle'
+  const second = create('supplement')
+  db.saveSubmission('t:1', second.id, [])
+  let release
+  const calls = []
+  platform.json.mockImplementation(async request => {
+    const body = JSON.parse(request.body)
+    calls.push(body)
+    if (!body.ticket_id) throw Object.assign(new Error('invalid scheduling parameters'), { status: 400 })
+    if (body.run_id === first.id && body.action === 'release')
+      return new Promise(resolve => { release = () => resolve({ data: { state: 'done' } }) })
+    return { data: { state: 'running' } }
+  })
+  const dispatch = scheduler.tick()
+  await vi.waitFor(() => expect(release).toBeTypeOf('function'))
+  db.transitionRun('t:1', second.id, 'steered')
+  db.finishSubmission('t:1', second.id)
+  release()
+  await dispatch
+  expect(calls).toHaveLength(1)
+  expect(calls.every(request => typeof request.ticket_id === 'string')).toBe(true)
+  expect(diagnostics).not.toHaveBeenCalled()
+  expect(db.submissions('t:1')).toEqual([])
+})
+
+it('does not send a missing ticket or revoke another live lease for an already retired submission', async () => {
+  const { db, scheduler, create, permit, platform } = setup()
+  permit()
+  const active = create('active')
+  await scheduler.enqueue(active, [])
+  await scheduler.tick()
+  const old = create('already steered')
+  db.transitionRun('t:1', old.id, 'steered')
+  platform.json.mockClear()
+  await expect(scheduler.request(old, 'release')).resolves.toMatchObject({ state: 'done' })
+  expect(platform.json).not.toHaveBeenCalled()
+  expect(scheduler.hasAdmission('s')).toBe(true)
+})
+
 it.each(['revoked', 'offline'])('handles terminal-turn goal renewal when %s', async (failure) => {
   const { db, sessions, scheduler, create, permit, platform } = setup()
   const run = create('goal')

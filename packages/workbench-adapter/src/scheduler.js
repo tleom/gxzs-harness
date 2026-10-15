@@ -115,11 +115,15 @@ export class TaskScheduler {
   }
 
   async request(run, action, retry = false, signal, rotated = false) {
+    this.database.ensureTicketGeneration(this.ownerId, run.id, this.generation)
+    const ticketId = this.database.submission(this.ownerId, run.id)?.ticketId
+    // An explicit queue action can retire an undispatched submission while a
+    // dispatcher snapshot is waiting on another ticket. Never send an omitted
+    // ticket_id or revoke the live Session's lease for that obsolete snapshot.
+    if (!ticketId) return { state: 'done' }
     // A release may succeed even when its response is lost. Continuations
     // must reacquire capacity rather than trust the previous cached lease.
     if (action === 'release') this.leases.delete(run.sessionId)
-    this.database.ensureTicketGeneration(this.ownerId, run.id, this.generation)
-    const ticketId = this.database.submission(this.ownerId, run.id)?.ticketId
     let value
     try {
       value = await this.platformClient.json({
@@ -290,9 +294,12 @@ export class TaskScheduler {
   }
 
   async dispatchItems(items) {
-    for (const item of items) {
+    for (let item of items) {
       if (this.closed) return
       if (this.retrying.has(item.runId)) continue
+      const submission = this.database.submission(this.ownerId, item.runId)
+      if (!submission) continue
+      item = submission
       let run = this.database.getRun(this.ownerId, item.runId)
       if (run && this.deletingChats.has(run.chatId)) continue
       let admitted = false

@@ -1018,23 +1018,40 @@ export class WorkbenchService {
       : undefined
     const active = this.database.getRun(owner.ownerId, targetRunId)
     const current = this.database.getRun(owner.ownerId, runId)
+    if (!active || active.sessionId !== run.sessionId || active.id === run.id)
+      throw Object.assign(httpError(409, '消息目标已改变，请刷新后重试'), { code: 'STALE_RUN' })
+    // DSH may already have claimed this exact message as the next turn while
+    // the browser was waiting for admission or file preparation.
+    if (['running', 'waiting_input', 'completed'].includes(current?.status)) return this.getRun(owner, runId)
+    if (current?.status !== 'queued')
+      throw Object.assign(httpError(409, '消息已离开队列，请刷新后重试'), { code: 'STALE_RUN' })
     const agent = this.agents.get(run.sessionId)
     const boundary = nativeTurn(agent)
     const bound = boundary?.openTurnStartSeq != null && this.database.runForTurn(run.sessionId, boundary.lastTurn)
-    if (!active || active.sessionId !== run.sessionId || active.id === run.id
-      || !['running', 'waiting_input'].includes(active.status) || current?.status !== 'queued'
+    if (!['running', 'waiting_input'].includes(active.status)
       || agent?.status !== 'running' || bound?.id !== active.id
-      || !this.scheduler?.hasAdmission(run.sessionId))
-      throw Object.assign(httpError(409, '目标任务已结束或正在切换，请刷新后重试'), { code: 'STALE_RUN' })
+      || !this.scheduler?.hasAdmission(run.sessionId)) {
+      // Keep the same durable message. The native AgentLoop turns a late steer
+      // into a new turn after the scheduler acquires its ordinary admission.
+      if (pending && !pending.dispatched)
+        this.database.updateRunResources(current, { ...current.selection, prompt_mode: 'steer' }, current.mcpTools)
+      void this.scheduler?.tick()
+      return this.getRun(owner, runId)
+    }
     pending = this.database.submission(owner.ownerId, runId)
     if (pending && !pending.dispatched) {
       await this.sessions.prompt({ sessionId: run.sessionId, requestId: run.id, content, mode: 'steer' }, new AbortController().signal)
-      this.database.finishSubmission(owner.ownerId, run.id)
     } else {
       const message = [...agent.inbox.nextTurn, ...agent.inbox.nextStep].find(item => item.id === current.messageId)
       if (!message) throw Object.assign(httpError(409, '排队消息已被接收，请刷新后重试'), { code: 'STALE_RUN' })
       await this.sessions.updateQueue({ sessionId: run.sessionId, itemId: message.id, action: { kind: 'steer' } })
     }
+    const accepted = this.database.getRun(owner.ownerId, run.id)
+    if (['running', 'waiting_input', 'completed'].includes(accepted?.status)) return this.getRun(owner, run.id)
+    const after = nativeTurn(agent)
+    const target = after?.openTurnStartSeq != null && this.database.runForTurn(run.sessionId, after.lastTurn)
+    if (accepted?.status !== 'steered' && (target?.id !== targetRunId || agent.status !== 'running')) return this.getRun(owner, run.id)
+    if (pending && !pending.dispatched) this.database.finishSubmission(owner.ownerId, run.id)
     if (this.database.getRun(owner.ownerId, run.id)?.status !== 'steered') {
       this.database.transitionRun(owner.ownerId, run.id, 'steered')
       this.database.appendEvent(owner.ownerId, run.id, { event: 'workbench_steered', steer_target_run_id: targetRunId })
