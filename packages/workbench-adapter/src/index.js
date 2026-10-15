@@ -7,7 +7,7 @@ import { streamRunEvents } from './sse.js'
 import { streamHistoryEvents, streamNativeEvents } from './history-events.js'
 import { WorkbenchDatabase } from './persistence.js'
 import { resolveWorkspacePath } from './paths.js'
-import { createAssistantStreamProjector, projectInboxClaim, projectSessionEvent, reconcileNativeSessions, settleNativeIdle } from './projection.js'
+import { claimNeedsResources, createAssistantStreamProjector, projectInboxClaim, projectSessionEvent, reconcileNativeSessions, settleNativeIdle } from './projection.js'
 import { WorkbenchRuntime } from './runtime.js'
 import { WorkbenchService } from './service.js'
 import { TaskScheduler } from './scheduler.js'
@@ -174,13 +174,15 @@ export function apply(ctx, config) {
   ctx.on('agent/pre-step', async (payload, next) => {
     const autonomous = payload.messages?.filter(message => ['schedule', 'tool-jobs'].includes(message.source?.kind) || isNativeNotice(message)) ?? []
     if (autonomous.length) {
-      while (!runtime.mcpCatalogState?.ready) {
+      const needsResources = autonomous.some(message => claimNeedsResources(database,
+        { agent: payload.agent, message, turn: payload.turn }, config.ownerId))
+      while (needsResources && !runtime.mcpCatalogState?.ready) {
         await delay(100, undefined, { signal: payload.signal })
       }
       payload.signal?.throwIfAborted()
       for (const message of autonomous) {
         const claimed = projectInboxClaim(database, { agent: payload.agent, message, turn: payload.turn }, config.ownerId,
-          { mcpTools: runtime.mcpResources?.() ?? [] })
+          needsResources ? { mcpTools: runtime.mcpResources?.() ?? [] } : undefined)
         if (claimed?.selection?.native_source === 'schedule') {
           try { await schedules.rememberRun(claimed) }
           catch { ctx.logger.warn('Scheduled delivery title enrichment deferred') }

@@ -115,6 +115,28 @@ it('creates a deferred child receipt before DSH commits the child user message',
   }))
 })
 
+it('keeps a busy native turn on its frozen permissions when a child replies during catalog loss', async () => {
+  let release
+  const test = await fixture([new Promise(resolve => { release = resolve }), 'child incorporated'], { scheduledClaims: true })
+  test.runtime.mcpCatalogState = { ready: true }
+  const parent = test.create('working')
+  await test.scheduler.enqueue(parent, [{ type: 'text', text: parent.query }])
+  await test.scheduler.tick()
+  await vi.waitFor(() => expect(test.model.requests).toHaveLength(1))
+  test.runtime.mcpCatalogState = { ready: false }
+  test.runtime.mcpResources = () => []
+  const message = createUserMessage({ content: [{ type: 'text', text: 'child result' }], source: { kind: 'agent-message', senderSessionId: 'owned-child' } })
+  test.agent.steer(message)
+  release('first response')
+  try {
+    await vi.waitFor(() => expect(test.model.requests).toHaveLength(2))
+    await test.agent.whenIdle()
+    expect(test.db.getRun(test.owner.ownerId, parent.id).mcpTools).toEqual(parent.mcpTools)
+    expect(test.db.listRuns(test.owner.ownerId, test.chat.id)).toHaveLength(1)
+    expect(test.db.getRun(test.owner.ownerId, parent.id).status).toBe('completed')
+  } finally { test.runtime.mcpCatalogState = { ready: true }; test.runtime.mcpResources = () => []; await test.agent.whenIdle() }
+})
+
 it('lets a native job completion wake an idle root and retains one admission receipt on replay', async () => {
   const test = await fixture(['root done', 'job output collected'])
   const original = test.create('start background work')

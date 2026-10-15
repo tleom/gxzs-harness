@@ -200,6 +200,16 @@ function projectEvent(database, sessionId, event, expectedOwnerId, context) {
   }
 }
 
+/** Only a fresh autonomous receipt needs a new frozen MCP catalog. */
+export function claimNeedsResources(database, { agent, message, turn }, ownerId) {
+  const sessionId = agent?.session?.id ?? agent?.id
+  const chat = database.getChatBySession(sessionId)
+  if (!chat || chat.ownerId !== ownerId || database.getRun(ownerId, message?.id)) return false
+  if (message?.source?.kind === 'schedule') return true
+  return (message?.source?.kind === 'tool-jobs' || isNativeNotice(message))
+    && !database.runForTurn(sessionId, turn)
+}
+
 /** Shared, side-effect-free display projection for live events and native history pages. */
 export function projectInboxClaim(database, { agent, message, turn }, expectedOwnerId, context) {
   const sessionId = agent?.session?.id ?? agent?.id

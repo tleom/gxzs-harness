@@ -174,6 +174,26 @@ describe('authenticated workbench HTTP handler', () => {
     expect(db.getRun('t:42', message.id)).toMatchObject({ status: 'steered', selection: { schedule_ids: ['task'], schedule_titles: ['原计划'] } })
     expect(db.runForTurn(sessionId, 1).id).toBe(parent.id)
   })
+  it('admits an in-turn child notice without waiting for a new MCP catalog', async () => {
+    const { handler, key, context } = setup()
+    const chat = (await call(handler, key, 'POST', '/chats', {})).body.data
+    const runtime = context.reflect.provide.mock.calls.find(([name]) => name === 'workbenchRuntime')[1]
+    const db = runtime.database, sessionId = db.getChat('t:42', chat.id).sessionId
+    const parent = db.createRun({ ownerId: 't:42', chatId: chat.id, sessionId, query: 'working', selection: {} }).run
+    db.bindNativeTurn(parent, 1)
+    runtime.mcpCatalogState = { ready: false }
+    runtime.mcpResources = vi.fn(() => { throw new Error('catalog unavailable') })
+    runtime.scheduler.admitNativeStep = vi.fn(async () => ({ kind: 'accept' }))
+    const message = { id: 'busy-child', source: { kind: 'agent-message', senderSessionId: 'owned-child' }, content: [] }
+    const gate = context.on.mock.calls.find(([name]) => name === 'agent/pre-step')[1]
+    const controller = new AbortController()
+    const pending = gate({ agent: { id: sessionId }, messages: [message], turn: 1, signal: controller.signal }, () => {})
+    try {
+      await vi.waitFor(() => expect(runtime.scheduler.admitNativeStep).toHaveBeenCalledOnce())
+      await expect(pending).resolves.toEqual({ kind: 'accept' })
+      expect(runtime.mcpResources).not.toHaveBeenCalled()
+    } finally { controller.abort(); await pending.catch(() => {}) }
+  })
   it.each(['PATCH', 'DELETE'])('cancels a pending native schedule %s mutation on response disconnect', async method => {
     const { handler, key, context } = setup()
     const chat = (await call(handler, key, 'POST', '/chats', {})).body.data
@@ -193,13 +213,15 @@ describe('authenticated workbench HTTP handler', () => {
     expect(response.listenerCount('close')).toBe(0)
   })
   it('cancels a scheduled pre-step while waiting for the first MCP catalog', async () => {
-    const { context } = setup()
+    const { handler, key, context } = setup()
+    const chat = (await call(handler, key, 'POST', '/chats', {})).body.data
     const runtime = context.reflect.provide.mock.calls.find(([name]) => name === 'workbenchRuntime')[1]
+    const sessionId = runtime.database.getChat('t:42', chat.id).sessionId
     runtime.mcpCatalogState = { ready: false }
     runtime.scheduler.admitNativeStep = vi.fn()
     const gate = context.on.mock.calls.find(([name]) => name === 'agent/pre-step')[1]
     const abort = new AbortController()
-    const rejected = gate({ agent: { id: 'native' }, turn: 1, messages: [{ id: 'scheduled', source: { kind: 'schedule' } }], signal: abort.signal }, () => {})
+    const rejected = gate({ agent: { id: sessionId }, turn: 1, messages: [{ id: 'scheduled', source: { kind: 'schedule' } }], signal: abort.signal }, () => {})
     abort.abort()
     await expect(rejected).rejects.toMatchObject({ name: 'AbortError' })
     expect(runtime.scheduler.admitNativeStep).not.toHaveBeenCalled()
