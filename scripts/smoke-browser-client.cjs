@@ -11,7 +11,7 @@ async function main() {
       response.end(source)
     } else {
       response.setHeader('content-type', 'text/html')
-      response.end('<!doctype html><div id="screen" style="width:800px;height:600px"></div><textarea id="keyboard"></textarea><script type="module">import {RFB} from "/client.js";window.Client=RFB;</script>')
+      response.end('<!doctype html><div id="screen" style="width:800px;height:600px;background:#fff"></div><textarea id="keyboard"></textarea><script type="module">import {RFB} from "/client.js";window.Client=RFB;</script>')
     }
   })
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
@@ -30,7 +30,7 @@ async function main() {
         close() { this.readyState = 3; queueMicrotask(() => this.onclose?.({ code: 1000, wasClean: true })) } }
       const rfb = new window.Client(document.querySelector('#screen'), document.querySelector('#keyboard'), channel,
         { shared: true, hiDpi: true }, [])
-      Object.assign(rfb, { resizeSession: false, enableWebRTC: false, enableQOI: false, threading: false,
+      Object.assign(rfb, { resizeSession: false, background: '#fff', enableWebRTC: false, enableQOI: false, threading: false,
         clipboardBinary: false, clipboardSeamless: false })
       let connected = false, disconnected = false
       rfb.addEventListener('connect', () => { connected = true })
@@ -52,15 +52,33 @@ async function main() {
       const incompleteDidNotReply = writes.length === partialStart
       await receive([0, 248, 0, 0, 0, 128, 0, 0, 0, 0])
       const fragmentedFenceReplied = writes.slice(partialStart).some(bytes => bytes[0] === 248)
+      const screen = document.querySelector('#screen')
+      const canvas = [...screen.querySelectorAll('canvas')].find(value => value.width > 0 && value.height > 0)
+      const context = canvas.getContext('2d')
+      const initialPixelsTransparent = context.getImageData(1, 1, 1, 1).data[3] === 0
+      context.fillStyle = '#000'
+      context.fillRect(0, 0, 1, 1)
+      // Exercise the real pinned renderer's viewport operation directly, without
+      // making this pixel regression depend on the outer viewer's ResizeObserver.
+      rfb._display._renderer.viewportChangeSize(400, 300)
+      rfb._display._renderer.viewportChangeSize(600, 400)
+      const resetPixelsTransparent = context.getImageData(599, 399, 1, 1).data[3] === 0
+      const websiteBlackPixelPreserved = [...context.getImageData(0, 0, 1, 1).data].join(',') === '0,0,0,255'
+      const whiteBackdrop = getComputedStyle(screen).backgroundColor === 'rgb(255, 255, 255)'
       rfb.disconnect()
-      return { connected, disconnected, coalescedFenceReplied, incompleteDidNotReply, fragmentedFenceReplied }
+      return { connected, disconnected, coalescedFenceReplied, incompleteDidNotReply, fragmentedFenceReplied,
+        initialPixelsTransparent, resetPixelsTransparent, websiteBlackPixelPreserved, whiteBackdrop }
     })
     assert.equal(result.connected, true)
     assert.equal(result.disconnected, false)
     assert.equal(result.coalescedFenceReplied, true, 'Coalesced encoder capabilities must not strand the ServerFence')
     assert.equal(result.incompleteDidNotReply, true)
     assert.equal(result.fragmentedFenceReplied, true)
-    console.log('PASS bundled Kasm client: coalesced and fragmented encoder capabilities continue through ServerFence without another packet')
+    assert.equal(result.initialPixelsTransparent, true, 'Unpainted canvas must reveal the white backdrop')
+    assert.equal(result.resetPixelsTransparent, true, 'Resizing must reveal the white backdrop in newly uncovered areas')
+    assert.equal(result.websiteBlackPixelPreserved, true)
+    assert.equal(result.whiteBackdrop, true)
+    console.log('PASS bundled Kasm client: coalesced/fragmented ServerFence; initial and resized white backdrop; actual black webpage pixels preserved')
   } finally {
     await browser?.close()
     server.closeAllConnections()
