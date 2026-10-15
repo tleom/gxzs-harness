@@ -100,3 +100,39 @@ describe('workbench durable projection', () => {
     expect(first.eventsAfter(ownerId, run.id, 0).map((event) => event._id)).toEqual(['1-0', '2-0'])
   })
 })
+
+it('uses completion receipt time for conversation recency instead of later feedback or configuration edits', () => {
+  const db = new WorkbenchDatabase(':memory:')
+  try {
+    const chat = db.createChat({ ownerId: 'owner', sessionId: 'session', selection: {} })
+    const { run } = db.createRun({ ownerId: 'owner', chatId: chat.id, sessionId: 'session', selection: {}, query: 'schedule' })
+    db.transitionRun('owner', run.id, 'completed', undefined, 200)
+    db.appendEvent('owner', run.id, { event: 'workbench_end', status: 'completed' }, 200)
+    db.setFeedback('owner', run.id, 'like', 900)
+    expect(db.chatCompletions('owner').get('session')).toEqual({ id: run.id, status: 'completed', at: 200 })
+    expect(db.chatCompletions('other').size).toBe(0)
+  } finally { db.close() }
+})
+
+it('orders completion by its native receipt even when a newer queued run cancelled first', () => {
+  const db = new WorkbenchDatabase(':memory:')
+  try {
+    const chat = db.createChat({ ownerId: 'owner', sessionId: 'session', selection: {} })
+    const create = now => db.createRun({ ownerId: 'owner', chatId: chat.id, sessionId: chat.sessionId, query: 'task', selection: {}, now }).run
+    const first = create(10)
+    const newer = create(20)
+    db.transitionRun('owner', first.id, 'running', undefined, 30)
+    db.transitionRun('owner', newer.id, 'cancelled', undefined, 100)
+    db.appendEvent('owner', newer.id, { event: 'workbench_end', status: 'cancelled', occurred_at: 100 }, 500)
+    expect(db.chatCompletions('owner').get('session').id).toBe(newer.id)
+    db.transitionRun('owner', first.id, 'completed', undefined, 200)
+    db.appendEvent('owner', first.id, { event: 'workbench_end', status: 'completed', occurred_at: 200 }, 600)
+    db.setFeedback('owner', newer.id, 'like', 900)
+    expect(db.chatCompletions('owner').get('session')).toEqual({ id: first.id, status: 'completed', at: 200 })
+    // An old cache without a terminal event has no reliable completion time.
+    const legacy = create(40)
+    db.transitionRun('owner', legacy.id, 'completed', undefined, 999)
+    db.setFeedback('owner', legacy.id, 'like', 1000)
+    expect(db.chatCompletions('owner').get('session').id).toBe(first.id)
+  } finally { db.close() }
+})

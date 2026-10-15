@@ -69,7 +69,7 @@ export function nativePresentation(run, event, { streamed = false, toolName = ''
       return [{ event: 'workbench_activity', native: event, backend_run_id: run.id,
         data: { kind: 'tool', workbench_run_id: run.id, call_id: callId, tool_call_id: callId,
           tool_name: toolName, activity_id: callId,
-          ...toolPresentation(run, { name: toolName }),
+          ...toolPresentation(run, { name: toolName, callId }),
           stage: event.data?.error || event.data?.message?.isError || block?.isError ? 'error' : 'returned',
           output: contentText(block?.content ?? event.data?.message?.content),
           ...(event.data?.meta === undefined ? {} : { result_meta: event.data.meta }),
@@ -94,6 +94,9 @@ export function nativePresentation(run, event, { streamed = false, toolName = ''
 }
 
 function toolPresentation(run, call) {
+  const title = run.selection?.tool_titles?.[call.callId]
+  if (call.name === 'schedule_delete' && typeof title === 'string') return { display_name: title }
+
   if (call?.name === 'skill') {
     try {
       const args = typeof call.arguments === 'string' ? JSON.parse(call.arguments) : call.arguments

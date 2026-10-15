@@ -709,7 +709,7 @@ describe('followup and control service', () => {
     ])
     await expect(service.supplement(owner, run.id, { ...body, request_id: 'missing' })).rejects.toMatchObject({ status: 404 })
   })
-  it.each(['running', 'completed'])('sends a historical answer immediately or as a followup when the task is %s', async (status) => {
+  it.each(['running', 'completed'])('admits a historical answer through native prompt when the task is %s', async (status) => {
     const test = setup()
     const { database, owner, chat, service, sessionController, agent } = test
     const { run } = database.createRun({ ownerId: owner.ownerId, chatId: chat.id, sessionId: chat.sessionId, query: '任务', selection: {} })
@@ -717,19 +717,30 @@ describe('followup and control service', () => {
     database.settlePendingInput(owner.ownerId, run.id, 'late-answer', 'skipped')
     if (status === 'running') activateNative(test, run.id)
     else database.transitionRun(owner.ownerId, run.id, status)
+    const enqueue = vi.fn()
+    service.scheduler = { enqueue }
     const body = { request_id: 'late-answer', answers: [{ id: 'format', selected: [], custom: 'Word' }] }
     const result = await service.supplement(owner, run.id, body)
-    const text = status === 'running'
-      ? agent.steer.mock.calls[0][0].content[0].text
-      : sessionController.prompt.mock.calls[0][0].content[0].text
-    expect(text).toContain('交付格式？')
-    expect(text).toContain('Word')
-    expect(result.status).toBe(status === 'running' ? 'steered' : 'queued')
+    const [accepted, content] = enqueue.mock.calls[0]
+    expect(content[0].text).toContain('交付格式？')
+    expect(content[0].text).toContain('Word')
+    expect(accepted.selection.prompt_mode).toBe('steer')
+    expect(result.status).toBe('queued')
     await service.supplement(owner, run.id, body)
-    if (status === 'running') {
-      expect(agent.steer).toHaveBeenCalledTimes(1)
-      expect(sessionController.prompt).not.toHaveBeenCalled()
-    } else expect(sessionController.prompt).toHaveBeenCalledTimes(1)
+    expect(enqueue).toHaveBeenCalledTimes(1)
+    if (status === 'running') expect(agent.steer).not.toHaveBeenCalled()
+    expect(sessionController.prompt).not.toHaveBeenCalled()
+  })
+
+  it('selects the next model during execution while retaining the active run snapshot', async () => {
+    const test = setup()
+    const { database, owner, chat, service, sessionController } = test
+    const { run } = database.createRun({ ownerId: owner.ownerId, chatId: chat.id, sessionId: chat.sessionId, query: '任务', selection: { ...chat.selection, model: 'p/m' } })
+    activateNative(test, run.id)
+    const result = await service.updateConfig(owner, chat.id, { version: chat.version, selection: { ...chat.selection, model_parameters: { reasoning_effort: 'high' } } })
+    expect(sessionController.selectModel).toHaveBeenCalled()
+    expect(result.selection.model_parameters.reasoning_effort).toBe('high')
+    expect(database.getRun(owner.ownerId, run.id).selection.model_parameters).not.toEqual({ reasoning_effort: 'high' })
   })
 
   it.each(['ask_user_question', 'exit_plan_mode'])('keeps %s visible across followup refreshes and preserves settled history', (toolName) => {

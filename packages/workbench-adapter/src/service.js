@@ -164,7 +164,6 @@ export class WorkbenchService {
       const selection = normalizeSelection(body.selection)
       if (JSON.stringify(selection) === JSON.stringify(chat.selection)) return this.getChat(owner, chatId)
       if (body.version !== chat.version) throw httpError(409, '配置版本已改变，请刷新后重试')
-      if (this.database.activeRun(owner.ownerId, chatId)) throw httpError(409, '任务运行时不能修改模型配置')
       // Legacy chat selections are display preferences, not MCP authority.
       const route = splitModel(selection.model)
       await requireDatabaseModel(this.platformClient, this.sessions, owner, selection.model, this.modelSettings)
@@ -917,27 +916,24 @@ export class WorkbenchService {
     const existing = this.database.findRunByRequestKey(owner.ownerId, chat.id, requestKey)
     if (existing && existing.query !== answer) throw httpError(409, '该补答请求已使用不同的回答')
     const active = currentExecutionRun(this.database, this.agents, chat.sessionId)
-    const agent = this.agents.get(chat.sessionId)
-    if (active && (!['running', 'waiting_input'].includes(active.status) || agent?.status !== 'running'
-      || !this.scheduler?.hasAdmission(chat.sessionId)))
-      throw Object.assign(httpError(409, '当前任务正在切换，请稍后重试补答'), { code: 'STALE_RUN' })
     const { run, created } = this.database.createRun({
       ownerId: owner.ownerId, chatId: chat.id, sessionId: chat.sessionId,
-      query: answer, mcpTools: existing?.mcpTools ?? (active ? source.mcpTools : await this.freezeMcpTools(owner, [])),
-      selection: { ...source.selection, silent_resume: false, is_continuation: false }, requestKey,
+      query: answer, mcpTools: existing?.mcpTools ?? (active ? active.mcpTools : await this.freezeMcpTools(owner, [])),
+      selection: { ...chat.selection, silent_resume: false, is_continuation: false, prompt_mode: 'steer' }, requestKey,
       parentRunId: source.id,
     })
     if (created || (run.status === 'queued' && !run.messageId)) {
       if (created) this.database.appendEvent(owner.ownerId, run.id, { event: 'workbench_status', status: 'queued' })
       const context = (input.payload.questions ?? []).map((question) => ({ question: question.question, answer: nativeAnswer.answers.find((item) => item.id === question.id) }))
       const content = [{ type: 'text', text: `用户重新回答了之前跳过的提问。请立即按这些新信息调整当前任务；如先前的假设与补答冲突，以补答为准。\n${JSON.stringify(context)}\n补充回答：${answer}` }]
-      if (active) {
-        agent.steer(createUserMessage({ content, source: { kind: 'user', rpcId: run.id } }))
-        this.database.transitionRun(owner.ownerId, run.id, 'steered')
-        this.database.appendEvent(owner.ownerId, run.id, { event: 'workbench_steered', steer_target_run_id: active.id })
-        this.database.appendEvent(owner.ownerId, active.id, { event: 'workbench_steering', steering_id: run.id, query: run.query, attachments: [] })
-      } else if (this.scheduler) await this.scheduler.enqueue(run, content)
-      else await this.sessions.prompt({ requestId: run.id, sessionId: run.sessionId, mode: 'queue', content }, new AbortController().signal)
+      // A newer native question released its admission while waiting. Close it
+      // through the same bridge as the Skip button, then let the scheduler
+      // reacquire admission and DSH choose the current step or next turn.
+      const pending = active && this.database.getPendingInput(owner.ownerId, active.id)
+      if (pending?.status === 'pending' && pending.requestId !== input.requestId)
+        this.humanInput.skip(owner.ownerId, active.id, pending.requestId)
+      if (this.scheduler) await this.scheduler.enqueue(run, content)
+      else await this.sessions.prompt({ requestId: run.id, sessionId: run.sessionId, mode: 'steer', content }, new AbortController().signal)
     }
     this.database.recordInputSupplement(owner.ownerId, sourceRunId, input.requestId, {
       ...nativeAnswer, supplement_run_id: run.id,
