@@ -71,6 +71,205 @@ def test_first_use_creates_once_and_reuses_workspace(tmp_path, monkeypatch):
     assert not any(value.endswith(':/workspace') for value in create)
 
 
+def upgrade_setup(tmp_path, monkeypatch):
+    host, docker, ensure, payload, created = setup(tmp_path, monkeypatch)
+    host.ensure('workspace', payload)
+    image = 'sha256:' + 'b' * 64
+    created['Image'] = image
+    containers = {'host-1': created, 'sandbox-workspace': {'State': {'Running': True}}}
+    original = docker.side_effect
+    def operate(*args, **kwargs):
+        if args[:2] == ('image', 'inspect') and args[2].startswith('sha256:'):
+            return SimpleNamespace(returncode=0, stdout=json.dumps([{'Id': args[2]}]))
+        if args[0] == 'inspect':
+            item = containers.get(args[1])
+            return SimpleNamespace(returncode=0 if item else 1, stdout=json.dumps([item]) if item else '',
+                                   stderr='' if item else 'Error: No such object: ' + args[1])
+        if args[0] == 'stop':
+            containers[args[-1]]['State']['Running'] = False
+            return SimpleNamespace(returncode=0, stdout='')
+        return original(*args, **kwargs)
+    docker.side_effect = operate
+    record = host.root / 'workspace' / 'host.json'
+    data = json.loads(record.read_text())
+    data.update(image_digest=image, state='ready', ready=True)
+    host._save(record, data)
+    docker.reset_mock()
+    begin = dict(operation='begin', owner_id='t:1', generation=1, instance_id='host-1')
+    return host, docker, payload, containers, record, begin
+
+
+def test_profile_upgrade_fences_durably_and_only_replace_can_resume(tmp_path, monkeypatch):
+    host, docker, payload, containers, record, begin = upgrade_setup(tmp_path, monkeypatch)
+    proof = host.profile_upgrade('workspace', begin)
+    assert proof['fenced'] and proof['phase'] == 'preparing'
+    assert proof['home_volume'] == json.loads(record.read_text())['home_volume']
+    assert proof['image_digest'] == containers['host-1']['Image']
+    assert proof['token'] not in record.read_text()
+    assert all(not item['State']['Running'] for item in containers.values())
+    host.admission.fence.assert_called_once_with('t:1', 'host-1')
+    docker.reset_mock()
+    assert host.ensure('workspace', payload)['ready'] is False
+    host.maintain()
+    assert not docker.called
+    again = Hosts(tmp_path, docker, host.ensure_sandbox, host.identity, host.lock, host.admission, host.ensure_network)
+    assert again.profile_upgrade('workspace', begin) == proof
+    assert again.profile_upgrade('workspace', dict(operation='check', token=proof['token'])) == proof
+    replacement = dict(payload, expected_generation=1, expected_instance_id='host-1', generation=2, instance_id='host-2')
+    assert host.replace('workspace', replacement)['code'] == 'PROFILE_UPGRADE_PREPARING'
+    completed = again.profile_upgrade('workspace', dict(operation='complete', token=proof['token']))
+    assert completed['phase'] == 'prepared' and completed['token'] == proof['token']
+    assert json.loads(record.read_text())['state'] == 'fencing'
+    again.ensure = Mock(return_value={'new_generation': True})
+    assert again.replace('workspace', replacement) == {'new_generation': True}
+    after = json.loads(record.read_text())
+    assert after['generation'] == 2 and 'profile_upgrade' not in after
+    assert not any(call.args[0] in {'start', 'create'} for call in docker.call_args_list)
+
+
+@pytest.mark.parametrize('activity', [None, *[
+    dict(runningAgents=0, pendingMessages=0, runningJobs=0, activeSettingsWrites=0) | {field: 1}
+    for field in ('runningAgents', 'pendingMessages', 'runningJobs', 'activeSettingsWrites')]])
+def test_profile_upgrade_unknown_or_busy_native_work_stays_draining(tmp_path, monkeypatch, activity):
+    host, docker, payload, _, record, begin = upgrade_setup(tmp_path, monkeypatch)
+    host.native_activity.return_value = activity
+    result = host.profile_upgrade('workspace', begin)
+    assert result['fenced'] is False and 'token' not in result
+    assert json.loads(record.read_text())['state'] == 'draining'
+    assert host.ensure('workspace', payload)['ready'] is False
+    host.maintain()
+    assert not any(call.args[0] in {'start', 'create', 'stop'} for call in docker.call_args_list)
+
+
+def test_profile_upgrade_blocks_new_admission_during_drain(tmp_path, monkeypatch):
+    host, docker, _, _, record, begin = upgrade_setup(tmp_path, monkeypatch)
+    host.admission.busy.return_value = 1
+    assert host.profile_upgrade('workspace', begin)['fenced'] is False
+    assert json.loads(record.read_text())['state'] == 'draining'
+    host.admission.pending.return_value = False
+    with pytest.raises(ValueError, match='paused new task admission'):
+        host.schedule('workspace', dict(owner_id='t:1', generation=1, instance_id='host-1', run_id='r', chat_id='c', action='acquire'))
+    host.admission.request.assert_not_called()
+    assert not any(call.args[0] == 'stop' for call in docker.call_args_list)
+
+
+def test_profile_upgrade_drains_real_existing_tickets_without_admitting_new_work(tmp_path, monkeypatch):
+    from admission import Admission
+    host, _, _, _, _, begin = upgrade_setup(tmp_path, monkeypatch)
+    queue = Admission(str(tmp_path / 'upgrade-admission.db'))
+    host.admission = queue
+    def schedule(run, action='acquire'):
+        return host.schedule('workspace', dict(owner_id='t:1', generation=1, instance_id='host-1',
+                                              run_id=run, chat_id='same-chat', action=action))
+    try:
+        assert queue.request('t:1', 1, 'host-1', 'first', 'same-chat', 'acquire')['state'] == 'running'
+        assert queue.request('t:1', 1, 'host-1', 'pending', 'same-chat', 'acquire')['state'] == 'waiting'
+        assert queue.busy('t:1') == 2
+        assert host.profile_upgrade('workspace', begin)['fenced'] is False
+        with pytest.raises(ValueError, match='paused new task admission'):
+            schedule('new-task')
+        assert schedule('pending')['state'] == 'waiting'
+        schedule('first', 'release')
+        assert schedule('pending')['state'] == 'running'
+        schedule('pending', 'release')
+        assert queue.busy('t:1') == 0
+        assert host.profile_upgrade('workspace', begin)['fenced']
+        with pytest.raises(ValueError, match='paused new task admission'):
+            schedule('pending')
+    finally:
+        queue.close()
+
+
+@pytest.mark.parametrize('stopped', ['stopped', 'absent'])
+def test_profile_upgrade_accepts_registered_stopped_or_absent_host(tmp_path, monkeypatch, stopped):
+    host, _, _, containers, _, begin = upgrade_setup(tmp_path, monkeypatch)
+    if stopped == 'stopped':
+        containers['host-1']['State']['Running'] = False
+    else:
+        containers.pop('host-1')
+    host.native_activity.return_value = None
+    proof = host.profile_upgrade('workspace', begin)
+    assert proof['fenced'] and proof['image_digest'] == 'sha256:' + 'b' * 64
+
+
+def test_profile_upgrade_tokens_identity_and_stopped_containers_are_revalidated(tmp_path, monkeypatch):
+    host, _, _, containers, record, begin = upgrade_setup(tmp_path, monkeypatch)
+    proof = host.profile_upgrade('workspace', begin)
+    with pytest.raises(PermissionError):
+        host.profile_upgrade('workspace', dict(operation='complete', token='wrong'))
+    containers['host-1']['State']['Running'] = True
+    with pytest.raises(ValueError, match='remain stopped'):
+        host.profile_upgrade('workspace', dict(operation='check', token=proof['token']))
+    containers['host-1']['State']['Running'] = False
+    data = json.loads(record.read_text())
+    data['home_volume'] += '-other'
+    host._save(record, data)
+    with pytest.raises(ValueError, match='original binding changed'):
+        host.profile_upgrade('workspace', dict(operation='complete', token=proof['token']))
+
+
+def test_profile_upgrade_probes_native_work_without_holding_workspace_lock(tmp_path, monkeypatch):
+    host, _, _, _, _, begin = upgrade_setup(tmp_path, monkeypatch)
+    acquired = []
+    def activity(_):
+        def inspect():
+            obtained = host.lock('workspace').acquire(timeout=1)
+            acquired.append(obtained)
+            if obtained:
+                host.lock('workspace').release()
+        thread = threading.Thread(target=inspect)
+        thread.start()
+        thread.join(timeout=2)
+        return dict(runningAgents=0, pendingMessages=0, runningJobs=0, activeSettingsWrites=0)
+    host.native_activity.side_effect = activity
+    assert host.profile_upgrade('workspace', begin)['fenced']
+    assert acquired == [True]
+
+
+def test_profile_upgrade_resumes_an_interrupted_stop_without_unfencing(tmp_path, monkeypatch):
+    host, docker, payload, containers, record, begin = upgrade_setup(tmp_path, monkeypatch)
+    original = docker.side_effect
+    failed = []
+    def operate(*args, **kwargs):
+        if args[0] == 'stop' and args[-1] == 'sandbox-workspace' and not failed:
+            failed.append(True)
+            raise RuntimeError('stop failed')
+        return original(*args, **kwargs)
+    docker.side_effect = operate
+    with pytest.raises(RuntimeError, match='stop failed'):
+        host.profile_upgrade('workspace', begin)
+    assert json.loads(record.read_text())['state'] == 'fencing'
+    assert containers['sandbox-workspace']['State']['Running']
+    assert host.ensure('workspace', payload)['ready'] is False
+    host.admission.fence.assert_not_called()
+    proof = host.profile_upgrade('workspace', begin)
+    assert proof['phase'] == 'preparing' and proof['fenced']
+    host.admission.fence.assert_called_once()
+    assert not any(call.args[0] in {'start', 'create'} for call in docker.call_args_list)
+
+
+def test_profile_upgrade_keeps_future_schedules_and_sidebar_leases_out_of_running_work(tmp_path, monkeypatch):
+    host, _, _, _, _, begin = upgrade_setup(tmp_path, monkeypatch)
+    host.native_activity.return_value = dict(runningAgents=0, pendingMessages=0, runningJobs=0,
+                                            activeSettingsWrites=0, activeSchedules=3, activeSidebarResources=2)
+    assert host.profile_upgrade('workspace', begin)['fenced']
+
+
+def test_profile_upgrade_does_not_treat_inspection_failure_as_absence(tmp_path, monkeypatch):
+    host, docker, _, _, record, begin = upgrade_setup(tmp_path, monkeypatch)
+    proof = host.profile_upgrade('workspace', begin)
+    original = docker.side_effect
+    def unavailable(*args, **kwargs):
+        if args[0] == 'inspect':
+            return SimpleNamespace(returncode=1, stdout='', stderr='Cannot connect to the Docker daemon')
+        return original(*args, **kwargs)
+    docker.side_effect = unavailable
+    with pytest.raises(ValueError, match='could not be verified'):
+        host.profile_upgrade('workspace', dict(operation='complete', token=proof['token']))
+    data = json.loads(record.read_text())
+    assert data['state'] == 'fencing' and data['profile_upgrade']['phase'] == 'preparing'
+
+
 def test_host_fonts_are_mounted_read_only(tmp_path, monkeypatch):
     host, docker, _, payload, _ = setup(tmp_path, monkeypatch)
     monkeypatch.setenv('GXZS_HOST_FONTS_DIR', '/srv/workbench-fonts')

@@ -24,6 +24,32 @@ def server(tmp_path, monkeypatch):
     module.ADMISSION.close()
 
 
+def test_profile_upgrade_route_uses_the_registered_host_authority(server, monkeypatch):
+    key = str(uuid4())
+    expected = {'fenced': False, 'phase': 'draining'}
+    callback = Mock(return_value=expected)
+    monkeypatch.setattr(server.HOSTS, 'profile_upgrade', callback)
+    payload = {'operation': 'begin', 'owner_id': 'tenant:7', 'generation': 2, 'instance_id': 'old-host'}
+    assert server.operation(key, 'profile-upgrade', payload) == expected
+    callback.assert_called_once_with(key, payload)
+
+
+@pytest.mark.parametrize('state', ['draining', 'fencing'])
+def test_profile_upgrade_prevents_starting_a_stopped_or_missing_sandbox(server, monkeypatch, state):
+    key = str(uuid4())
+    folder = server.HOSTS.root / key
+    folder.mkdir()
+    record = dict(owner_id='tenant:7', workspace_id=key, generation=2, instance_id='old-host',
+                  home_volume='existing-home', state=state, profile_upgrade={'phase': 'preparing'})
+    (folder / 'host.json').write_text(json.dumps(record), encoding='utf-8')
+    monkeypatch.setattr(server, 'ensure_network', Mock(return_value='existing-network'))
+    docker = Mock(return_value=SimpleNamespace(returncode=1, stdout=''))
+    monkeypatch.setattr(server, 'docker', docker)
+    with pytest.raises(server.SandboxUpdatePending):
+        server.ensure(key)
+    assert not any(call.args[0] in {'start', 'create', 'volume', 'rename'} for call in docker.call_args_list)
+
+
 def test_native_settings_check_is_owner_scoped_and_serialized_with_draining(server):
     from concurrent.futures import ThreadPoolExecutor
     from email.message import Message

@@ -1,14 +1,37 @@
-import { afterEach, expect, it } from 'vitest'
-import { mkdtemp, mkdir, readFile, writeFile, rm } from 'node:fs/promises'
+import { afterEach, expect, it, vi } from 'vitest'
+import { mkdtemp, mkdir, readFile, writeFile, readdir, rm } from 'node:fs/promises'
 import { createHash } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
 import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { inheritedUserPatch, migratePlatformPatch, provisionLegacyBaseline } from '../../../scripts/migrate-platform-patch.mjs'
 
+const failure=vi.hoisted(()=>({backup:''}))
+vi.mock('node:fs/promises',async original=>{
+  const fs=await original()
+  return {...fs,open:async(...args)=>{
+    const file=await fs.open(...args)
+    if(!failure.backup || !String(args[0]).includes('.cordis.patch.before-bundle-layout-v1.yml.') || !String(args[0]).endsWith('.tmp'))return file
+    return {
+      writeFile:async content=>{
+        if(failure.backup==='write'){
+          await file.writeFile(content.slice(0,7))
+          throw Object.assign(new Error('Injected partial backup write'),{code:'ENOSPC'})
+        }
+        return file.writeFile(content)
+      },
+      sync:async()=>{
+        if(failure.backup==='sync')throw Object.assign(new Error('Injected backup flush failure'),{code:'EIO'})
+        return file.sync()
+      },
+      close:()=>file.close(),
+    }
+  }}
+})
+
 const directories=[]
 const root=resolve(fileURLToPath(new URL('../../../',import.meta.url)),'../temp/three-modules-align-20261014/profile-layer-validation')
-afterEach(async()=>{for(const directory of directories.splice(0))await rm(directory,{recursive:true,force:true})})
+afterEach(async()=>{failure.backup='';for(const directory of directories.splice(0))await rm(directory,{recursive:true,force:true})})
 async function fixture(user,baseline) {
   await mkdir(root,{recursive:true})
   const directory=await mkdtemp(join(root,'profile-'));directories.push(directory)
@@ -80,6 +103,19 @@ it('backs up the original document and completes an interrupted conversion from 
   expect(await migratePlatformPatch(directory,{ownerId:'owner'})).toMatchObject({removed:1,retained:1})
   expect(await readFile(join(directory,'.cordis.patch.before-bundle-layout-v1.yml'),'utf8')).toBe(user)
   expect(await readFile(join(directory,'cordis.patch.yml'),'utf8')).toBe(converted)
+})
+it.each(['write','sync'])('does not publish an incomplete backup after a %s failure and retries without touching the original settings',async operation=>{
+  const baseline='- id: platform\n  disabled: true\n'
+  const user=baseline+'- id: owner-model\n'
+  const directory=await fixture(user,baseline)
+  failure.backup=operation
+  await expect(migratePlatformPatch(directory,{ownerId:'owner'})).rejects.toThrow('Injected')
+  expect(await readFile(join(directory,'cordis.patch.yml'),'utf8')).toBe(user)
+  await expect(readFile(join(directory,'.cordis.patch.before-bundle-layout-v1.yml'))).rejects.toMatchObject({code:'ENOENT'})
+  expect((await readdir(directory)).filter(name=>name.endsWith('.tmp'))).toEqual([])
+  failure.backup=''
+  expect(await migratePlatformPatch(directory,{ownerId:'owner'})).toMatchObject({removed:1,retained:1})
+  expect(await readFile(join(directory,'.cordis.patch.before-bundle-layout-v1.yml'),'utf8')).toBe(user)
 })
 
 it('provisions a pinned owner baseline before migration without replacing user settings or prior proof',async()=>{

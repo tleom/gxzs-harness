@@ -12,7 +12,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-python3 "$script_dir/smoke-profile-upgrade.py" "$host_image"
+python3 "$script_dir/smoke-profile-upgrade.py" "$host_image" "$manager_image"
 docker run --rm --network none --cap-drop ALL --security-opt no-new-privileges:true \
   --memory 1g --cpus 1 --pids-limit 128 --entrypoint node "$host_image" \
   /opt/workbench/check-runtime-imports.mjs

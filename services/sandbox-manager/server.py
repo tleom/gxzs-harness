@@ -184,12 +184,17 @@ def ensure(key, *, track_activity=True):
         home_volume = None
         if record.exists():
             host = json.loads(record.read_text(encoding='utf-8'))
+            if ('profile_upgrade' in host and (host.get('state') == 'fencing'
+                    or host['profile_upgrade'].get('phase') in {'fencing', 'preparing', 'prepared'})):
+                raise SandboxUpdatePending('个人工作台正在准备配置升级；原环境保持停止')
             home_volume = host.get('home_volume')
             if host.get('workspace_id') != key or not isinstance(home_volume, str) or not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_.-]+', home_volume):
                 raise ValueError('Invalid owner attachment volume')
         attachment_mount = (['--mount', 'type=volume,source=' + home_volume
                              + ',destination=/srv/dsh/attachments,volume-subpath=attachments,readonly'] if home_volume else [])
         info = docker("inspect", name, check=False)
+        if record.exists() and 'profile_upgrade' in host and (info.returncode or not json.loads(info.stdout)[0]['State']['Running']):
+            raise SandboxUpdatePending('个人工作台正在准备配置升级；不能重启原环境')
         if not info.returncode:
             existing = json.loads(info.stdout)[0]
             attached = set((existing.get('NetworkSettings', {}).get('Networks') or {}).keys())
@@ -307,6 +312,8 @@ def operation(key, action, payload):
         return HOSTS.ensure(key, payload)
     if action == 'replace-host':
         return HOSTS.replace(key, payload)
+    if action == 'profile-upgrade':
+        return HOSTS.profile_upgrade(key, payload)
     if action == 'host-settings':
         if payload != {'operation': 'check'}:
             raise ValueError('Unsupported Host settings operation')

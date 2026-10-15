@@ -27,7 +27,7 @@ def test_scope_and_root_access_matrix(registered):
     root, headers, _ = registered
     for action in OWNER_ACTIONS:
         assert authorize(headers, 'root-test-key', root, 'workspace', action) == 'owner'
-    for action in ('ensure', 'ensure-host', 'replace-host', 'schedule', 'environment', 'global-resources', 'stop-binding', 'diagnostics'):
+    for action in ('ensure', 'ensure-host', 'replace-host', 'profile-upgrade', 'schedule', 'environment', 'global-resources', 'stop-binding', 'diagnostics'):
         with pytest.raises(PermissionError):
             authorize(headers, 'root-test-key', root, 'workspace', action)
         assert authorize({'Authorization': 'Bearer root-test-key'}, 'root-test-key', root, 'workspace', action) == 'root'

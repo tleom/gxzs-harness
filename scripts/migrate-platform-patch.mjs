@@ -1,8 +1,8 @@
 import { createRequire } from 'node:module'
-import { readFile, writeFile, mkdir } from 'node:fs/promises'
-import { createHash } from 'node:crypto'
+import { readFile, mkdir, open, link, rm } from 'node:fs/promises'
+import { createHash, randomBytes } from 'node:crypto'
 import { isDeepStrictEqual } from 'node:util'
-import { join, resolve } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const require = createRequire(new URL('../profiles/workbench/package.json',import.meta.url))
@@ -59,6 +59,29 @@ const optional = async path => {
   catch(error){if(error.code==='ENOENT')return undefined;throw error}
 }
 
+async function publishBackupOnce(filename, content) {
+  const temporary=`${filename}.${randomBytes(8).toString('hex')}.tmp`
+  let file, created=false
+  try {
+    file=await open(temporary,'wx',0o600)
+    created=true
+    await file.writeFile(content,'utf8')
+    await file.sync()
+    await file.close()
+    file=undefined
+    // A hard link publishes the complete inode atomically and refuses EEXIST.
+    // An interrupted write can never occupy the final backup path.
+    await link(temporary,filename)
+  } finally {
+    await file?.close()
+    if(created) await rm(temporary,{force:true})
+  }
+  if(process.platform!=='win32') {
+    const directory=await open(dirname(filename),'r')
+    try{await directory.sync()}finally{await directory.close()}
+  }
+}
+
 /** Internal writer for bytes extracted by prepare-profile-upgrade.py from the old image. */
 export async function provisionLegacyBaseline(profileDirectory,{ownerId,imageId,baseline,baselineSha256}={}) {
   if(!ownerId || !/^sha256:[a-f0-9]{64}$/.test(imageId ?? '')
@@ -112,7 +135,7 @@ export async function migratePlatformPatch(profileDirectory,{ownerId}={}) {
       const saved=await optional(backup)
       result=inheritedUserPatch(saved ?? user,baseline)
       if(saved!==undefined && saved!==user && user!==result.text) throw new Error('Profile changed after an interrupted layout migration')
-      if(saved===undefined) await writeFile(backup,user,{flag:'wx',mode:0o600})
+      if(saved===undefined) await publishBackupOnce(backup,user)
     } else if(user) result.text=user
     const receipt={schemaVersion:1,layout:'bundle-base',baselineSha256,
       removed:result.removed,retained:result.retained,userSha256:digest(result.text)}

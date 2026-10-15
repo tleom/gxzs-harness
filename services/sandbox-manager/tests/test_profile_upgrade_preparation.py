@@ -4,6 +4,7 @@ import importlib.util
 import io
 import json
 from pathlib import Path
+import subprocess
 import tarfile
 
 import pytest
@@ -15,6 +16,8 @@ spec.loader.exec_module(upgrade)
 OLD = 'sha256:' + '1' * 64
 NEW = 'sha256:' + '2' * 64
 CONTAINER = '3' * 64
+CANDIDATE = '4' * 64
+WORKSPACE = '00000000-0000-4000-8000-000000000001'
 BASELINE = '- id: generated-preset\n  disabled: true\n'
 
 
@@ -38,6 +41,9 @@ class DockerFixture:
         self.running = b''
         self.container_image = OLD
         self.content = archive()
+        self.candidate_failure = False
+        self.fenced = True
+        self.completed = False
 
     def __call__(self, *args, stdin=None):
         self.calls.append(args)
@@ -49,18 +55,35 @@ class DockerFixture:
             return json.dumps([{'Image': self.container_image}]).encode()
         if args[0] == 'ps':
             return self.running
+        if args[0] == 'exec':
+            assert args[:3] == ('exec', '-i', 'gxzs-sandbox-manager') and args[-1] == WORKSPACE
+            payload = json.loads(stdin)
+            if payload['operation'] != 'begin':
+                assert payload['token'] == 'fixture-fence'
+            if payload['operation'] == 'complete':
+                self.completed = True
+            return json.dumps({'fenced': self.fenced, 'phase': 'prepared' if self.completed else 'preparing',
+                               'token': 'fixture-fence', 'owner_id': self.owner, 'workspace_id': WORKSPACE,
+                               'generation': 1, 'instance_id': 'old-host', 'image_digest': OLD,
+                               'home_volume': 'test-home'}).encode()
         if args[0] == 'create':
+            if '--name' in args:
+                assert NEW in args
+                assert args[args.index('--user') + 1] == '1000:1000'
+                return CANDIDATE.encode()
             assert args[-1] == OLD
             return CONTAINER.encode()
         if args[0] == 'cp':
             assert args == ('cp', CONTAINER + ':' + upgrade.RUNTIME_PATCH, '-')
             return self.content
         if args[0] == 'rm':
-            assert args == ('rm', CONTAINER)
+            assert (args == ('rm', CONTAINER)
+                    or (args[:2] == ('rm', '-f') and args[2].startswith('gxzs-profile-upgrade-')))
             return b''
-        if args[0] == 'run':
-            assert NEW in args and '--network' in args and 'none' in args
-            assert args[args.index('--user') + 1] == '1000:1000'
+        if args[0] == 'start':
+            assert args == ('start', '--attach', '--interactive', CANDIDATE)
+            if self.candidate_failure:
+                raise subprocess.TimeoutExpired('docker start', 60)
             payload = json.loads(stdin)
             self.writes.append(payload)
             return json.dumps({**{key: payload[key] for key in ('ownerId', 'imageId', 'baselineSha256')},
@@ -70,7 +93,8 @@ class DockerFixture:
 
 def prepare(run, **kwargs):
     return upgrade.prepare_upgrade(old_image=OLD, candidate_image=NEW,
-                                   owner_id='tenant:1', home_volume='test-home', run=run, **kwargs)
+                                   owner_id='tenant:1', home_volume='test-home', workspace_id=WORKSPACE,
+                                   generation=1, instance_id='old-host', run=run, **kwargs)
 
 
 def test_extracts_runtime_and_actual_image_as_one_source_before_seeding():
@@ -79,8 +103,11 @@ def test_extracts_runtime_and_actual_image_as_one_source_before_seeding():
     assert run.writes == [{'ownerId': 'tenant:1', 'imageId': OLD, 'baseline': BASELINE,
                           'baselineSha256': hashlib.sha256(BASELINE.encode()).hexdigest()}]
     assert receipt['imageId'] == OLD
-    assert run.calls.index(('rm', CONTAINER)) < next(i for i, call in enumerate(run.calls) if call[0] == 'run')
-    assert not any(call[0] in ('start', 'exec') for call in run.calls)
+    candidate_create = next(i for i, call in enumerate(run.calls) if call[0] == 'create' and '--name' in call)
+    assert run.calls.index(('rm', CONTAINER)) < candidate_create
+    assert ('start', CONTAINER) not in run.calls
+    assert run.completed
+    assert run.calls[-2][0:2] == ('rm', '-f')
 
 
 @pytest.mark.parametrize('failure', ['foreign-owner', 'active-home', 'mismatched-image', 'static-patch', 'symlink'])
@@ -107,7 +134,27 @@ def test_rejects_mutable_image_tags_and_does_not_accept_a_caller_baseline():
     run = DockerFixture()
     with pytest.raises(ValueError):
         upgrade.prepare_upgrade(old_image='old:latest', candidate_image=NEW,
-                                owner_id='tenant:1', home_volume='test-home', run=run)
+                                owner_id='tenant:1', home_volume='test-home', workspace_id=WORKSPACE,
+                                generation=1, instance_id='old-host', run=run)
     with pytest.raises(TypeError):
         prepare(run, baseline=BASELINE)
     assert not run.calls
+
+
+def test_kills_the_identifiable_candidate_after_an_attach_timeout():
+    run = DockerFixture()
+    run.candidate_failure = True
+    with pytest.raises(subprocess.TimeoutExpired):
+        prepare(run)
+    created = next(call for call in run.calls if call[0] == 'create' and '--name' in call)
+    assert run.calls[-1] == ('rm', '-f', created[created.index('--name') + 1])
+    assert not run.completed
+
+
+def test_requires_a_durable_manager_fence_before_extracting_or_writing_home():
+    run = DockerFixture()
+    run.fenced = False
+    with pytest.raises(ValueError, match='durably fenced'):
+        prepare(run)
+    assert not run.writes
+    assert not any(call[0] in ('create', 'start') for call in run.calls)
