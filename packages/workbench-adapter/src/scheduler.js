@@ -149,7 +149,7 @@ export class TaskScheduler {
 
   hasAdmission(sessionId) {
     const lease = this.leases.get(sessionId)
-    return Boolean(lease && !this.unfencedSessions.has(sessionId) && !this.hasPendingFence(sessionId)
+    return Boolean(lease && !this.closed && !this.unfencedSessions.has(sessionId) && !this.hasPendingFence(sessionId)
       && Date.now() - lease.checkedAt < 10000)
   }
 
@@ -207,7 +207,24 @@ export class TaskScheduler {
     const chat = this.database.getChatBySession(sessionId)
     if (!chat) {
       const inherited = this.executionRun?.(sessionId)
-      return inherited?.status === 'running' ? this.admitRun(inherited, signal, next) : { kind: 'reject' }
+      if (inherited?.status !== 'running') return { kind: 'reject' }
+      const admit = () => {
+        const current = this.executionRun?.(sessionId)
+        return current?.id === inherited.id && current.status === 'running'
+          ? this.admitRun(current, signal, () => true) : { kind: 'reject' }
+      }
+      // A child can need fresh capacity while the parent answer is still pending.
+      const admitted = await (this.database.getRun(this.ownerId, inherited.id)?.status === 'waiting_input'
+        ? this.withSubmissionMutation(`input:${inherited.sessionId}`, admit) : admit())
+      if (admitted !== true) return admitted
+      // The input lock protects admission only; a model stream must not hold up
+      // the parent's answer. Recheck authority and capacity after unlocking.
+      const current = this.executionRun?.(sessionId)
+      if (current?.id !== inherited.id || current.status !== 'running') return { kind: 'reject' }
+      return this.admitRun(current, signal, () => {
+        const latest = this.executionRun?.(sessionId)
+        return latest?.id === inherited.id && latest.status === 'running' ? next() : { kind: 'reject' }
+      })
     }
     if (chat.ownerId !== this.ownerId || this.closed || this.unfencedSessions.has(sessionId)) return { kind: 'reject' }
     const run = this.database.runForTurn(sessionId, turn)
@@ -223,11 +240,13 @@ export class TaskScheduler {
 
   async admitRun(run, signal, next) {
     const sessionId = run.sessionId
-    while (!this.hasAdmission(sessionId)) {
+    while (true) {
       signal.throwIfAborted()
-      if (this.closed || this.unfencedSessions.has(sessionId)
-        || (TERMINAL.has(this.database.getRun(this.ownerId, run.id)?.status)
-          && !(run.background && this.hasOwnedWork?.(sessionId)))) return { kind: 'reject' }
+      const current = this.database.getRun(this.ownerId, run.id)
+      if (this.closed || this.unfencedSessions.has(sessionId) || !current || current.stopConfirmation?.fenced
+        || (TERMINAL.has(current.status)
+          && !(current.status === 'completed' && run.background && this.hasOwnedWork?.(sessionId, run.id)))) return { kind: 'reject' }
+      if (this.hasAdmission(sessionId)) break
       if (this.hasPendingFence(sessionId)) {
         this.retryFences()
         await delay(250, undefined, { signal })
@@ -258,7 +277,8 @@ export class TaskScheduler {
       }
       signal.throwIfAborted()
       if (ticket.state !== 'running') {
-        this.database.transitionRun(this.ownerId, run.id, 'queued')
+        if (this.database.getRun(this.ownerId, run.id)?.status === 'running')
+          this.database.transitionRun(this.ownerId, run.id, 'queued')
         await delay(250, undefined, { signal })
       }
     }
@@ -311,10 +331,10 @@ export class TaskScheduler {
         if (this.unfencedSessions.has(run.sessionId)) { await cancel(run, 'unfenced'); continue }
         if (item.dispatched) {
           const execution = this.executionRun?.(run.sessionId) ?? this.database.activeRunBySession(run.sessionId)
-          if (execution?.status === 'waiting_input') {
+          if (execution?.status === 'waiting_input' && !this.hasOwnedWork?.(run.sessionId)) {
             releasing = true
             await this.withSubmissionMutation(`input:${run.sessionId}`, async () => {
-              if (this.database.getRun(this.ownerId, execution.id)?.status !== 'waiting_input') return
+              if (this.database.getRun(this.ownerId, execution.id)?.status !== 'waiting_input' || this.hasOwnedWork?.(run.sessionId)) return
               // Keep the delivery receipt; answering reacquires this ticket
               // without redelivering the user's original message.
               await this.request(run, 'release', true)

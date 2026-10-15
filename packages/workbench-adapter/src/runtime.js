@@ -133,7 +133,8 @@ export class WorkbenchRuntime extends Service {
       if (binding) {
         const bound = this.database.getRun(this.ownerId, binding)
         const root = this.rootOf(agent)
-        if (bound && root?.id === bound.sessionId) return bound.status === 'completed' && agent.status === 'running'
+        // A parent question pauses the parent, not its already owned child work.
+        if (bound && root?.id === bound.sessionId) return ['completed', 'waiting_input'].includes(bound.status) && agent.status === 'running'
           ? { ...bound, status: 'running', background: true } : bound
       }
       const id = agent.session?.id ?? agent.id
@@ -159,7 +160,7 @@ export class WorkbenchRuntime extends Service {
     if (ownerId !== this.ownerId) return false
     const run = this.database.getRun(ownerId, runId)
     if (!run || run.stopConfirmation?.fenced) return false
-    if ((run.status === 'completed' || (run.status === 'running' && run.selection?.native_child)) && this.hasOwnedWork(run.sessionId, run.id)) {
+    if ((['completed', 'waiting_input'].includes(run.status) || (run.status === 'running' && run.selection?.native_child)) && this.hasOwnedWork(run.sessionId, run.id)) {
       return (!this.scheduler || this.scheduler.hasAdmission(run.sessionId))
         && run.mcpTools.some(resource => resource.id === resourceId && resource.version === version)
     }

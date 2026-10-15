@@ -418,6 +418,170 @@ it('releases waiting-input capacity and reacquires before continuing without ano
   expect(sessions.prompt).toHaveBeenCalledTimes(1)
 })
 
+it('renews the root ticket while an owned child runs during a parent question, then releases it when the child ends', async () => {
+  const { db, scheduler, create, permit, platform } = setup()
+  const run = create('parent question with an active child')
+  db.saveSubmission('t:1', run.id, []); permit(); await scheduler.tick()
+  db.transitionRun('t:1', run.id, 'waiting_input')
+  let activeChild = true
+  scheduler.hasOwnedWork = () => activeChild
+  scheduler.executionRun = () => db.getRun('t:1', run.id)
+  platform.json.mockClear()
+  await scheduler.tick()
+  expect(platform.json.mock.calls.map(([request]) => JSON.parse(request.body).action)).toEqual(['renew'])
+  expect(scheduler.hasAdmission('s')).toBe(true)
+  expect(db.getRun('t:1', run.id).status).toBe('waiting_input')
+  activeChild = false
+  await scheduler.tick()
+  expect(platform.json.mock.calls.map(([request]) => JSON.parse(request.body).action)).toEqual(['renew', 'release'])
+  expect(scheduler.hasAdmission('s')).toBe(false)
+  expect(db.submission('t:1', run.id).dispatched).toBe(true)
+})
+
+it('keeps the parent question pending while its owned child waits for a fresh admission', async () => {
+  const { db, scheduler, create, platform } = setup()
+  const run = create('parent question')
+  db.transitionRun('t:1', run.id, 'waiting_input')
+  db.saveSubmission('t:1', run.id, []); db.dispatchSubmission('t:1', run.id)
+  scheduler.executionRun = () => ({ ...db.getRun('t:1', run.id), status: 'running', background: true })
+  scheduler.hasOwnedWork = () => true
+  platform.json.mockResolvedValueOnce({ data: { state: 'waiting' } }).mockResolvedValueOnce({ data: { state: 'running' } })
+  const next = vi.fn(() => ({ kind: 'enter' }))
+  const admission = scheduler.admitNativeStep({ agent: { id: 'owned-child', status: 'running' }, turn: 1, signal: new AbortController().signal }, next)
+  await vi.waitFor(() => expect(platform.json).toHaveBeenCalledTimes(1))
+  const waitingStatus = db.getRun('t:1', run.id).status
+  await expect(admission).resolves.toEqual({ kind: 'enter' })
+  expect(waitingStatus).toBe('waiting_input')
+  expect(db.getRun('t:1', run.id).status).toBe('waiting_input')
+  expect(next).toHaveBeenCalledOnce()
+})
+
+it('serializes a child admission behind the parent waiting-input release already in flight', async () => {
+  const { db, scheduler, create, permit, platform } = setup()
+  const run = create('parent question')
+  db.saveSubmission('t:1', run.id, []); permit(); await scheduler.tick()
+  db.transitionRun('t:1', run.id, 'waiting_input')
+  let activeChild = false, finishRelease
+  scheduler.hasOwnedWork = () => activeChild
+  scheduler.executionRun = id => id === 'owned-child'
+    ? { ...db.getRun('t:1', run.id), status: 'running', background: true } : db.getRun('t:1', run.id)
+  platform.json.mockImplementation(async request => JSON.parse(request.body).action === 'release'
+    ? new Promise(resolve => { finishRelease = () => resolve({ data: { state: 'done' } }) })
+    : { data: { state: 'running' } })
+  platform.json.mockClear()
+  const releasing = scheduler.tick()
+  await vi.waitFor(() => expect(finishRelease).toBeTypeOf('function'))
+  activeChild = true
+  const next = vi.fn(() => ({ kind: 'enter' }))
+  const admission = scheduler.admitNativeStep({ agent: { id: 'owned-child', status: 'running' }, turn: 1, signal: new AbortController().signal }, next)
+  await Promise.resolve(); await Promise.resolve(); await Promise.resolve()
+  const actionsBeforeRelease = platform.json.mock.calls.map(([request]) => JSON.parse(request.body).action)
+  finishRelease(); await releasing; await admission
+  expect(actionsBeforeRelease).toEqual(['release'])
+  expect(scheduler.hasAdmission('s')).toBe(true)
+  expect(next).toHaveBeenCalledOnce()
+  expect(db.getRun('t:1', run.id).status).toBe('waiting_input')
+})
+
+it('accepts a parent answer while the admitted child continuation is still pending', async () => {
+  const { db, scheduler, create, permit, platform } = setup()
+  const run = create('parent question')
+  db.transitionRun('t:1', run.id, 'waiting_input')
+  db.saveSubmission('t:1', run.id, []); db.dispatchSubmission('t:1', run.id)
+  scheduler.executionRun = () => ({ ...db.getRun('t:1', run.id), status: 'running', background: true })
+  scheduler.hasOwnedWork = () => true
+  permit()
+  let finishChild, parentResumed = false, childFinished = false, answer
+  const next = vi.fn(() => new Promise(resolve => { finishChild = resolve }))
+  const child = scheduler.admitNativeStep({ agent: { id: 'owned-child', status: 'running' }, turn: 1, signal: new AbortController().signal }, next)
+    .then(value => { childFinished = true; return value })
+  try {
+    await vi.waitFor(() => expect(next).toHaveBeenCalledOnce())
+    answer = scheduler.resumeInput(db.getRun('t:1', run.id), new AbortController().signal)
+      .then(() => { parentResumed = true })
+    await vi.waitFor(() => expect(parentResumed).toBe(true))
+    expect(childFinished).toBe(false)
+    expect(scheduler.hasAdmission('s')).toBe(true)
+    expect(platform.json.mock.calls.map(([request]) => JSON.parse(request.body).action)).toEqual(['acquire'])
+  } finally {
+    finishChild?.({ kind: 'enter' })
+    await child
+    await answer
+  }
+})
+
+it('rechecks owned work inside a queued parent-question release', async () => {
+  const { db, scheduler, create, permit, platform } = setup()
+  const run = create('parent question')
+  db.saveSubmission('t:1', run.id, []); permit(); await scheduler.tick()
+  db.transitionRun('t:1', run.id, 'waiting_input')
+  let activeChild = false, unlock
+  scheduler.hasOwnedWork = () => activeChild
+  scheduler.executionRun = () => db.getRun('t:1', run.id)
+  const lock = scheduler.withSubmissionMutation('input:s', () => new Promise(resolve => { unlock = resolve }))
+  await vi.waitFor(() => expect(unlock).toBeTypeOf('function'))
+  const heldMutation = scheduler.submissionMutations.get('input:s')
+  platform.json.mockClear()
+  const releasing = scheduler.tick()
+  await vi.waitFor(() => expect(scheduler.submissionMutations.get('input:s')).not.toBe(heldMutation))
+  activeChild = true
+  unlock(); await lock; await releasing
+  expect(platform.json).not.toHaveBeenCalled()
+  expect(scheduler.hasAdmission('s')).toBe(true)
+  expect(db.getRun('t:1', run.id).status).toBe('waiting_input')
+})
+
+it.each(['completed', 'cancelled', 'failed', 'interrupted', 'discarded', 'steered'])(
+  'does not admit an unprojected terminal child authority %s', async status => {
+    const { scheduler, create, platform } = setup()
+    const run = create('ended parent')
+    scheduler.executionRun = () => ({ ...run, status })
+    const next = vi.fn()
+    await expect(scheduler.admitNativeStep({ agent: { id: 'owned-child', status: 'running' }, turn: 1, signal: new AbortController().signal }, next)).resolves.toEqual({ kind: 'reject' })
+    expect(next).not.toHaveBeenCalled(); expect(platform.json).not.toHaveBeenCalled()
+  },
+)
+
+it.each(['closed', 'unfenced'])(
+  'rejects an inherited running child authority after root admission is %s', async condition => {
+    const { db, scheduler, create, platform } = setup()
+    const run = create('revoked parent question')
+    db.transitionRun('t:1', run.id, 'waiting_input')
+    scheduler.executionRun = () => ({ ...db.getRun('t:1', run.id), status: 'running', background: true })
+    scheduler.hasOwnedWork = () => true
+    if (condition === 'closed') scheduler.close()
+    else scheduler.unfencedSessions.add('s')
+    const next = vi.fn()
+    await expect(scheduler.admitNativeStep({ agent: { id: 'owned-child', status: 'running' }, turn: 1, signal: new AbortController().signal }, next)).resolves.toEqual({ kind: 'reject' })
+    expect(next).not.toHaveBeenCalled(); expect(platform.json).not.toHaveBeenCalled()
+  },
+)
+
+it.each(['cancelled', 'cancelled while waiting', 'fenced', 'unfenced', 'closed', 'ownership lost'])(
+  'rejects a child when %s happens while fresh admission is in flight', async condition => {
+    const { db, scheduler, create, platform } = setup()
+    const run = create('parent question')
+    db.transitionRun('t:1', run.id, 'waiting_input')
+    let owned = true, finishAdmission
+    scheduler.executionRun = () => owned ? { ...db.getRun('t:1', run.id), status: 'running', background: true } : undefined
+    scheduler.hasOwnedWork = () => owned
+    platform.json.mockImplementation(() => new Promise(resolve => { finishAdmission = () => resolve({ data: { state: condition === 'cancelled while waiting' ? 'waiting' : 'running' } }) }))
+    const next = vi.fn()
+    const admission = scheduler.admitNativeStep({ agent: { id: 'owned-child', status: 'running' }, turn: 1, signal: new AbortController().signal }, next)
+    await vi.waitFor(() => expect(finishAdmission).toBeTypeOf('function'))
+    if (condition.startsWith('cancelled')) db.transitionRun('t:1', run.id, 'cancelled')
+    else if (condition === 'fenced') { db.requireRunFence('t:1', run.id); db.confirmRunFence('t:1', run.id) }
+    else if (condition === 'unfenced') scheduler.unfencedSessions.add('s')
+    else if (condition === 'closed') scheduler.close()
+    else owned = false
+    finishAdmission()
+    await expect(admission).resolves.toEqual({ kind: 'reject' })
+    expect(next).not.toHaveBeenCalled()
+    if (condition.startsWith('cancelled')) expect(db.getRun('t:1', run.id).status).toBe('cancelled')
+    if (condition === 'closed') expect(scheduler.hasAdmission('s')).toBe(false)
+  },
+)
+
 it('reacquires waiting-input capacity when the release response is lost', async () => {
   const { db, scheduler, create, permit, platform, sessions } = setup()
   const run = create('question')
