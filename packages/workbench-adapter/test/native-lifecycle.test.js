@@ -1041,7 +1041,7 @@ it('lets a native plan command steer the running turn and projects its message o
   expect(test.agent.session.snapshotEvents().filter(event => event.type === 'user/message' && event.data.content?.some(part => part.text === 'Inspect first'))).toHaveLength(1)
 })
 
-it('rejects stale steering after asynchronous preparation and leaves the pending submission intact', async () => {
+it('keeps a late steering message queued for native admission after asynchronous preparation', async () => {
   const test = await fixture(['hang'])
   const first = test.create('first'), second = test.create('steer')
   await test.scheduler.enqueue(first, [{ type: 'text', text: 'first' }])
@@ -1056,10 +1056,38 @@ it('rejects stale steering after asynchronous preparation and leaves the pending
   test.agent.cancel({ kind: 'user' }, { keepInbox: true })
   await test.agent.whenIdle()
   prepared({ receiptId: 'prepared-file' })
-  await expect(steering).rejects.toMatchObject({ status: 409, code: 'STALE_RUN' })
+  await expect(steering).resolves.toMatchObject({ status: 'queued' })
   expect(test.db.getRun('t:1', second.id).status).toBe('queued')
+  expect(test.db.getRun('t:1', second.id).selection.prompt_mode).toBe('steer')
   expect(test.db.submission('t:1', second.id).dispatched).toBe(false)
   expect(test.model.requests).toHaveLength(1)
+})
+
+it('keeps the native next turn when the prior turn finishes inside prompt admission', async () => {
+  let finishFirst, admit
+  const test = await fixture([new Promise(resolve => { finishFirst = resolve }), 'late evidence received'])
+  const first = test.create('first'), second = test.create('late evidence')
+  await test.scheduler.enqueue(first, [{ type: 'text', text: first.query }])
+  await test.scheduler.tick()
+  await vi.waitFor(() => expect(test.model.requests).toHaveLength(1))
+  test.db.saveSubmission(test.owner.ownerId, second.id, [{ type: 'text', text: second.query }])
+  test.controllerCtx.attachments.admitPromptContent = content => new Promise(resolve => { admit = () => resolve(content) })
+  const service = new WorkbenchService({ database: test.db, sessionController: test.sessions,
+    agents: test.ctx.agents, scheduler: test.scheduler })
+  const steering = service.steer(test.owner, second.id, first.id)
+  await vi.waitFor(() => expect(admit).toBeTypeOf('function'))
+  finishFirst('first answer')
+  await test.agent.whenIdle()
+  admit()
+  const receipt = await steering
+  expect(receipt.steer_target_run_id).toBeUndefined()
+  await test.agent.whenIdle()
+  expect(test.db.getRun(test.owner.ownerId, second.id)).toMatchObject({ status: 'completed', turnNumber: 2 })
+  expect(test.model.requests).toHaveLength(2)
+  expect(test.agent.session.snapshotEvents().filter(event => event.type === 'user/message' && event.data.source.rpcId === second.id)).toHaveLength(1)
+  await expect(service.steer(test.owner, second.id, first.id)).resolves.toMatchObject({ status: 'completed' })
+  await test.scheduler.tick()
+  expect(test.model.requests).toHaveLength(2)
 })
 
 
