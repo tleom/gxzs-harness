@@ -21,6 +21,7 @@ def server(tmp_path, monkeypatch):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     yield module
+    module.HOSTS.close()
     module.ADMISSION.close()
 
 

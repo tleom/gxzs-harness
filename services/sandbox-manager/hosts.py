@@ -5,13 +5,14 @@ import hmac
 import secrets
 from resource_limits import cgroup_args, owner_cgroup, pid_pressure, ResourceUnavailable
 import logging
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 import ipaddress
 import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
 import subprocess
+import threading
 import time
 from urllib.request import Request, build_opener, ProxyHandler
 from urllib.error import HTTPError
@@ -29,6 +30,11 @@ class Hosts:
         self.recoveries = {}
         self.cleanup_at = {}
         self.native_snapshots = {}
+        self._maintenance_pool = ThreadPoolExecutor(max_workers=16, thread_name_prefix='host-maintenance')
+        self._maintenance_guard = threading.Lock()
+        self._maintenance_pending = {}
+        self._maintenance_cursor = ''
+        self._maintenance_closed = False
 
     def _cleanup_superseded(self, item):
         """Remove only stopped, identity-verified predecessors after the new Host is healthy."""
@@ -529,9 +535,79 @@ class Hosts:
         return None
 
     def maintain(self):
-        # A slow or broken host must not expire every other owner's heartbeat.
-        with ThreadPoolExecutor(max_workers=16) as pool:
-            list(pool.map(self._maintain_one, self.root.glob('*/host.json')))
+        # Do not wait for a whole batch: a slow owner must not delay the next
+        # health read/heartbeat for owners whose previous check has finished.
+        # Bound both running and queued work, and never probe an owner twice.
+        with self._maintenance_guard:
+            if self._maintenance_closed:
+                return ()
+            self._reap_maintenance()
+            records = sorted(self.root.glob('*/host.json'))
+            start = next((index for index, record in enumerate(records)
+                          if record.parent.name > self._maintenance_cursor), 0)
+            for record in records[start:] + records[:start]:
+                workspace = record.parent.name
+                if workspace in self._maintenance_pending:
+                    continue
+                if len(self._maintenance_pending) >= 16:
+                    self._reap_maintenance()
+                    if len(self._maintenance_pending) >= 16:
+                        break
+                future = Future()
+                self._maintenance_pending[workspace] = future
+                try:
+                    dispatched = self._maintenance_pool.submit(self._run_maintenance, record, future)
+                    dispatched.add_done_callback(lambda done, target=future: target.cancel() if done.cancelled() else None)
+                except Exception:
+                    # submit enqueues before starting a thread. On thread-start
+                    # failure, cancel work that has not started; retain a running
+                    # owner's Future until its lifecycle operation really ends.
+                    future.cancel()
+                    self._maintenance_pool.shutdown(wait=False, cancel_futures=True)
+                    self._maintenance_pool = ThreadPoolExecutor(max_workers=16, thread_name_prefix='host-maintenance')
+                    raise
+                # Resume after the last submitted owner when capacity returns,
+                # so saturated workers cannot permanently skip later records.
+                self._maintenance_cursor = workspace
+            return tuple(self._maintenance_pending.values())
+
+    def _run_maintenance(self, record, future):
+        if not future.set_running_or_notify_cancel():
+            return
+        try:
+            self._maintain_one(record)
+        except BaseException as error:
+            future.set_exception(error)
+        else:
+            future.set_result(None)
+
+    def _reap_maintenance(self):
+        for workspace, future in list(self._maintenance_pending.items()):
+            if future.done():
+                del self._maintenance_pending[workspace]
+                if future.cancelled():
+                    continue
+                try:
+                    future.result()
+                except Exception:
+                    logging.getLogger(__name__).exception('Host maintenance worker failed for workspace %s', workspace)
+
+    def close(self):
+        with self._maintenance_guard:
+            self._maintenance_closed = True
+            pending = tuple(self._maintenance_pending.values())
+        # Let an in-flight lifecycle operation finish under its existing owner
+        # lock; queued work must not start after manager shutdown.
+        self._maintenance_pool.shutdown(wait=True, cancel_futures=True)
+        # A pool retired after a thread-start failure may still be finishing a
+        # running owner. Its Future remains the same admission fence above.
+        for future in pending:
+            try:
+                future.result()
+            except Exception:
+                pass
+        with self._maintenance_guard:
+            self._reap_maintenance()
 
     def heartbeat(self, item, state):
         request = Request(os.environ['GXZS_HOST_PLATFORM_URL'].removesuffix('/internal/workbench') + '/internal/ai/orchestration/hosts/heartbeat',
