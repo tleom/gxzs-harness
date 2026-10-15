@@ -1,6 +1,6 @@
 import { afterEach, expect, it, vi } from 'vitest'
 import { WorkbenchDatabase } from '../src/persistence.js'
-import { projectInboxClaim, reconcileNativeSessions } from '../src/projection.js'
+import { claimNeedsResources, projectInboxClaim, reconcileNativeSessions } from '../src/projection.js'
 
 const opened = []
 afterEach(() => opened.splice(0).forEach(database => database.close()))
@@ -96,4 +96,23 @@ it.each(['agent-message', 'subagent-settled'])('freezes current permissions for 
   await reconcileNativeSessions(test.database, query, test.owner, unavailable)
   expect(unavailable).toHaveBeenCalledTimes(1)
   expect(test.database.listRuns(test.owner, test.chat.id)).toHaveLength(2)
+})
+
+it.each(['agent-message', 'subagent-settled'])('ignores unowned %s notices before reading unavailable resources during recovery', async kind => {
+  const test = fixture()
+  const foreign = test.database.createChat({ ownerId: 'other-owner', sessionId: 'foreign-root', selection: {} })
+  test.database.createRun({ ownerId: foreign.ownerId, chatId: foreign.id, sessionId: foreign.sessionId,
+    query: 'foreign delegate', selection: { subagent_ids: ['foreign-child'] } })
+  const message = { ...test.message, id: 'foreign-child-notice', source: { kind, senderSessionId: 'foreign-child' } }
+  const payload = { agent: { id: test.chat.sessionId }, message, turn: 1 }
+  expect(claimNeedsResources(test.database, payload, test.owner)).toBe(false)
+  const unavailable = vi.fn(() => { throw new Error('catalog unavailable') })
+  for (const events of [
+    [{ type: 'agent/inbox/spliced', seq: 1, data: { target: 'next-turn', start: 0, removedCount: 0, inserted: [message] } }],
+    [{ type: 'turn/start', seq: 2, data: { turn: 1 } }, { type: 'user/message', seq: 3, data: message }],
+  ]) {
+    await expect(reconcileNativeSessions(test.database, { observeSession: async () => ({ events }) }, test.owner, unavailable)).resolves.toBeUndefined()
+  }
+  expect(unavailable).not.toHaveBeenCalled()
+  expect(test.database.listRuns(test.owner, test.chat.id)).toEqual([])
 })

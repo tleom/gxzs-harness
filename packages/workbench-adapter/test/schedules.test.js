@@ -31,6 +31,19 @@ it('retains native delivery names without admitting another session task or over
   expect(test.native.catalog).toHaveBeenCalledOnce()
   expect(test.db.getRun(test.owner.ownerId,run.id).selection.schedule_titles).toEqual(['提醒'])
 })
+it('backfills legacy schedule identities without replacing the captured names or appending duplicate name events', async () => {
+  const test = fixture()
+  const { run } = test.db.createRun({ ownerId: test.owner.ownerId, chatId: test.chat.id, sessionId: test.chat.sessionId,
+    query: 'reminders_json: [{"schedule_id":"task"},{"schedule_id":"foreign-task"}]',
+    selection: { native_source: 'schedule', schedule_titles: ['投递时的名称'] }, mcpTools: [{ id: 'frozen-tool' }] })
+  await test.gateway.rememberRun(run)
+  const enriched = test.db.getRun(test.owner.ownerId, run.id)
+  expect(enriched.selection).toMatchObject({ schedule_titles: ['投递时的名称'], schedule_ids: ['task'] })
+  expect(enriched.mcpTools).toEqual([{ id: 'frozen-tool' }])
+  expect(test.db.allEvents(test.owner.ownerId, run.id).filter(event => event.event === 'workbench_schedule')).toEqual([])
+  await test.gateway.rememberRun(enriched)
+  expect(test.native.catalog).toHaveBeenCalledOnce()
+})
 it('uses the owning native Session and preserves compare-and-update without accepting a body binding', async () => {
   const test = fixture(); const signal = new AbortController().signal
   await test.gateway.create(test.owner, test.chat.id, { title: '提醒', prompt: '内容', daily: { time: '08:00:00', time_zone: 'Asia/Shanghai' }, sessionId: test.foreign.sessionId }, signal)

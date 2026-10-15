@@ -206,6 +206,7 @@ export function claimNeedsResources(database, { agent, message, turn }, ownerId)
   const chat = database.getChatBySession(sessionId)
   if (!chat || chat.ownerId !== ownerId || database.getRun(ownerId, message?.id)) return false
   if (message?.source?.kind === 'schedule') return true
+  if (isNativeNotice(message) && !noticeParent(database, chat, message)) return false
   return (message?.source?.kind === 'tool-jobs' || isNativeNotice(message))
     && !database.runForTurn(sessionId, turn)
 }
@@ -297,12 +298,15 @@ function adoptJobNotice(database, chat, message, context) {
   database.adoptInboxMessage(chat.sessionId, run.id, message.id)
   return run
 }
+function noticeParent(database, chat, message) {
+  return database.listRuns(chat.ownerId, chat.id).reverse().find(run =>
+    run.selection?.subagent_ids?.includes(message.source.senderSessionId))
+}
 function adoptNativeNotice(database, chat, message, context) {
   if (chat.deletedAt || !isNativeNotice(message) || typeof message.id !== 'string') return
   const existing = database.listRuns(chat.ownerId, chat.id).find(run => run.id === message.id)
   if (existing) return existing
-  const parent = database.listRuns(chat.ownerId, chat.id).reverse().find(run =>
-    run.selection?.subagent_ids?.includes(message.source.senderSessionId))
+  const parent = noticeParent(database, chat, message)
   // The native inbox starts a new turn after the old task has settled. Retain
   // child ownership but acquire fresh permissions; never reopen its old receipt.
   if (!parent || context?.mcpCatalogReady === false) return
@@ -391,11 +395,12 @@ export async function reconcileNativeSessions(database, sessionQuery, ownerId, c
   // Only receipts that existed on entry belong to this startup interruption pass.
   const initialRunIds = startupRunIds ?? chats.flatMap(chat => database.listRuns(ownerId, chat.id).map(run => run.id))
   const queued = []
-  const resources = message => {
-    if ((!['schedule', 'tool-jobs'].includes(message?.source?.kind) && !isNativeNotice(message)) || database.getRun(ownerId, message.id)) return undefined
-    return typeof context === 'function' ? context() : context
-  }
   for (const chat of chats) {
+    const resources = message => {
+      if ((!['schedule', 'tool-jobs'].includes(message?.source?.kind) && !isNativeNotice(message)) || database.getRun(ownerId, message.id)) return undefined
+      if (isNativeNotice(message) && !noticeParent(database, chat, message)) return undefined
+      return typeof context === 'function' ? context() : context
+    }
     let observed
     try { observed = await sessionQuery.observeSession(chat.sessionId) }
     catch (error) {
