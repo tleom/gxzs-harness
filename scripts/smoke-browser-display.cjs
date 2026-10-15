@@ -1,10 +1,39 @@
 const assert = require('node:assert/strict')
 const { createServer } = require('node:http')
 const { PassThrough } = require('node:stream')
+const { execFileSync } = require('node:child_process')
 const { chromium } = require('/opt/office/node/node_modules/playwright')
 const { runWorker } = require('/opt/workbench/packages/workbench-adapter/src/browser-worker.cjs')
+const { startDisplay } = require('/opt/workbench/packages/workbench-adapter/src/browser-display.cjs')
+
+async function assertWhiteRoot() {
+  const display = await startDisplay({ width: 320, height: 240, emit: async () => {}, onExit: () => {} })
+  const probe = String.raw`import ctypes,os,json,sys
+x=ctypes.CDLL('libX11.so.6');ptr=ctypes.c_void_p;integer=ctypes.c_int;word=ctypes.c_ulong
+x.XOpenDisplay.argtypes=[ctypes.c_char_p];x.XOpenDisplay.restype=ptr
+x.XDefaultRootWindow.argtypes=[ptr];x.XDefaultRootWindow.restype=word
+x.XGetImage.argtypes=[ptr,word,integer,integer,ctypes.c_uint,ctypes.c_uint,word,integer];x.XGetImage.restype=ptr
+x.XGetPixel.argtypes=[ptr,integer,integer];x.XGetPixel.restype=word
+x.XDestroyImage.argtypes=[ptr];x.XCloseDisplay.argtypes=[ptr]
+d=x.XOpenDisplay(os.environ['DISPLAY'].encode());assert d
+try:
+ root=x.XDefaultRootWindow(d);pixels=[]
+ for px,py in [(0,0),(int(sys.argv[1])-1,int(sys.argv[2])-1)]:
+  image=x.XGetImage(d,root,px,py,1,1,word(-1).value,2);assert image
+  try:pixels.append(x.XGetPixel(image,0,0))
+  finally:x.XDestroyImage(image)
+ print(json.dumps(pixels))
+finally:x.XCloseDisplay(d)`
+  const pixels = (width, height) => JSON.parse(execFileSync('/usr/bin/python3', ['-I', '-S', '-c', probe, String(width), String(height)], { env: display.env, encoding: 'utf8' }))
+  try {
+    assert.deepEqual(pixels(640, 480), [0xffffff, 0xffffff], 'New X display root must be white')
+    await display.resize(400, 300)
+    assert.deepEqual(pixels(800, 600), [0xffffff, 0xffffff], 'Resized X display root must stay white')
+  } finally { await display.stop() }
+}
 
 async function main() {
+  await assertWhiteRoot()
   const server = createServer((_request, response) => {
     response.setHeader('content-type', 'text/html; charset=utf-8')
     response.end('<!doctype html><meta charset=utf-8><input id="value" aria-label="Value">')

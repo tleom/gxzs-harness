@@ -50,6 +50,14 @@ try {
           .replace(encoders, 'return this._handleServerVideoEncoders() !== false;')
           .replace('Log.Warn("This browser does not support multi-monitor setups.");', 'Log.Debug("Single browser display");'), resolveDir: dirname(args.path) }
       })
+      plugin.onLoad({ filter: /core[\\/]renderers[\\/]Canvas2DRenderer\.js$/ }, async args => {
+        const text = await readFile(args.path, 'utf8')
+        const alpha = 'alpha: false'
+        if (text.split(alpha).length !== 2) throw new Error('Kasm visible-canvas alpha contract changed')
+        // Let unpainted/reset pixels reveal the white viewer background. Actual
+        // webpage pixels and the upstream save/restore logic stay unchanged.
+        return { contents: text.replace(alpha, 'alpha: true'), resolveDir: dirname(args.path) }
+      })
     } }],
     banner: { js: `/* KasmVNC/noVNC ${commit}; MPL-2.0. Sources and local build adaptations: https://github.com/tleom/gxzs-harness/tree/main/services/browser-client */` },
   })

@@ -26,7 +26,7 @@ async function startDisplay({ width, height, emit, onExit }) {
   const child = spawn('/usr/bin/Xvnc', [`:${display}`, '-geometry', `${width * 2}x${height * 2}`, '-depth', '24',
     '-websocketPort', String(port), '-interface', '127.0.0.1', '-UseIPv6', '0', '-publicIP', '127.0.0.1',
     '-DisableBasicAuth', '1', '-SecurityTypes', 'None', '-sslOnly', '0', '-rfbport', '0', '-nolisten', 'tcp',
-    '-s', '0', '-dpms',
+    '-s', '0', '-dpms', '-wr',
     '-FrameRate', '20', '-AcceptSetDesktopSize', '0', '-MaxVideoResolution', '3840x2160',
     '-DLP_ClipAcceptMax', '32768', '-DLP_ClipSendMax', '32768', '-DLP_ClipTypes', 'text/plain',
     '-httpd', '/usr/share/kasmvnc/www'], { env: { ...process.env, HOME: home }, stdio: ['ignore', 'ignore', 'pipe'] })
