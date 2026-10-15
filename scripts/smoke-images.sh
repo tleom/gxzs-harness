@@ -41,6 +41,10 @@ done
 python3 "$script_dir/smoke-sandbox-ssh.py" "$container_id" "$host_image"
 docker exec -i "$container_id" node < "$script_dir/smoke-browser-observation.cjs"
 docker exec -i "$container_id" node < "$script_dir/smoke-browser-display.cjs"
+docker run --rm --network none --entrypoint node "$host_image" -e \
+  "process.stdout.write(require('node:fs').readFileSync('/opt/workbench/services/browser-client/dist/client.js'))" \
+  | docker exec -i "$container_id" sh -c 'cat > /tmp/workbench-browser-client.js'
+docker exec -i "$container_id" node < "$script_dir/smoke-browser-client.cjs"
 GXZS_SMOKE_BOOTSTRAP=1 GXZS_SMOKE_FRESH_BOOTSTRAP=1 \
   python3 "$script_dir/smoke-sandbox-ssh.py" "$container_id" "$host_image"
 GXZS_SMOKE_BOOTSTRAP=1 GXZS_SMOKE_CRASH=1 GXZS_SMOKE_RUNNING=1 GXZS_SMOKE_NATIVE_ATTACHMENTS=1 GXZS_SMOKE_LEGACY_PROFILE=1 \
