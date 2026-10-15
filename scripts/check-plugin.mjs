@@ -1,4 +1,6 @@
-const plugin = await import('../packages/workbench-adapter/src/index.js')
-if (plugin.name !== 'workbench-adapter' || typeof plugin.apply !== 'function' || !plugin.Config)
-  throw new Error('workbench adapter exports are incomplete')
-console.log('plugin-ok:', plugin.name)
+for (const name of ['workbench-adapter', 'workbench-mcp-tools', 'tool-discovery']) {
+  const plugin = await import(`../packages/${name}/src/index.js`)
+  if (plugin.name !== name || typeof plugin.apply !== 'function' || !plugin.Config)
+    throw new Error(`${name} exports are incomplete`)
+  console.log('plugin-ok:', plugin.name)
+}

@@ -18,6 +18,7 @@ import { registerDatabasePrompt } from '../src/database-prompt.js'
 import WorkbenchFileSystem from '../../workbench-sandbox-runtime/src/fs.js'
 import { registerBrowserTool } from '../src/browser-tool.js'
 import { registerTerminalTool } from '../src/terminal-tool.js'
+import { nativePresentation } from '../src/display-events.js'
 
 // Exercise the exact published DSH version installed by the production profile.
 // CI must install profiles/workbench before running this contract suite.
@@ -326,6 +327,17 @@ async function fixture(script, { scheduledClaims = false } = {}) {
     permit: value => { permitted = value } }
 }
 
+async function registerUserSkills(test, names) {
+  const [{ default: Skills }, SkillTool] = await Promise.all([native('dsh-skill'), native('dsh-tool-skill')])
+  await test.ctx.plugin(Skills)
+  await test.ctx.plugin(SkillTool)
+  for (const name of names) cleanups.push(test.ctx.skills.register({ name, description: `Skill ${name}`,
+    invocation: { userInvocable: true, modelInvocable: false }, source: 'custom',
+    provider: 'gxzs-sandbox-personal', content: `BODY_FOR_${name}` }))
+  return { skills: test.ctx.skills, workingDirectory: test.ctx.workingDirectory,
+    onGoalChanged: listener => test.ctx.on('goal/changed', listener, { prepend: true }) }
+}
+
 async function delayedScheduledCatalog(test) {
   let available = false
   const configRequests = []
@@ -552,13 +564,16 @@ it('runs background resume through the native inbox without making it a title in
 it.each(['local', 'native'])('edits and directly sends the selected %s queue item without waiting on unrelated scheduling', async placement => {
   let release
   const test = await fixture([new Promise(resolve => { release = resolve }), 'steered answer', 'queued answer'])
-  const first = test.create('original'), second = test.create('keep queued'), third = test.create('before edit')
+  const skills = await registerUserSkills(test, ['queue-helper'])
+  const first = test.create('original'), second = test.create('keep queued')
+  const third = test.db.createRun({ ownerId: test.owner.ownerId, chatId: test.chat.id, sessionId: test.agent.id,
+    query: 'before edit', selection: { resource_mentions: { skills: ['queue-helper'] } }, mcpTools: [] }).run
   await test.scheduler.enqueue(first, [{ type: 'text', text: first.query }])
   await test.scheduler.tick()
   await vi.waitFor(() => expect(test.model.requests).toHaveLength(1))
   for (const run of [second, third]) test.db.saveSubmission(test.owner.ownerId, run.id, [{ type: 'text', text: run.query }])
   if (placement === 'native') await test.scheduler.tick()
-  const service = new WorkbenchService({ database: test.db, sessionController: test.sessions, agents: test.ctx.agents, scheduler: test.scheduler })
+  const service = new WorkbenchService({ database: test.db, sessionController: test.sessions, agents: test.ctx.agents, scheduler: test.scheduler, ...skills })
   await service.editQueued(test.owner, third.id, { content: [{ type: 'text', text: 'edited supplement' }] })
   test.scheduler.pendingTick = new Promise(() => {})
   try {
@@ -571,9 +586,13 @@ it.each(['local', 'native'])('edits and directly sends the selected %s queue ite
   await test.agent.whenIdle()
   expect(test.model.requests).toHaveLength(3)
   expect(JSON.stringify(test.model.requests[1].messages)).toContain('edited supplement')
+  expect(JSON.stringify(test.model.requests[0].messages)).not.toContain('BODY_FOR_queue-helper')
+  expect(JSON.stringify(test.model.requests[1].messages)).toContain('BODY_FOR_queue-helper')
   expect(JSON.stringify(test.model.requests[1].messages)).not.toContain('keep queued')
-  const messages = test.agent.session.snapshotEvents().filter(event => event.type === 'user/message')
+  const messages = test.agent.session.snapshotEvents().filter(event => event.type === 'user/message' && event.data.source.kind === 'user')
   expect(messages.map(event => event.data.source.rpcId)).toEqual([first.id, third.id, second.id])
+  expect(test.agent.session.snapshotEvents().filter(event => event.type === 'user/message' && event.data.source.kind === 'skill-invocation')).toHaveLength(1)
+  expect(service.getRun(test.owner, third.id)).toMatchObject({ query: 'edited supplement', resource_mentions: { skills: ['queue-helper'] } })
   expect(test.db.getRun(test.owner.ownerId, third.id).status).toBe('steered')
 })
 
@@ -790,20 +809,20 @@ it('freezes a goal resource selection separately from the already running reques
   test.db.saveSubmission(test.owner.ownerId, current.id, [{ type: 'text', text: current.query }])
   await test.scheduler.tick()
   await vi.waitFor(() => expect(test.model.requests).toHaveLength(1))
+  const skills = await registerUserSkills(test, ['evidence'])
   const service = new WorkbenchService({ database: test.db, sessionController: test.sessions, agents: test.ctx.agents,
     scheduler: test.scheduler, commands: test.ctx.commands, goals: test.ctx.goals, workspace: '/workspace',
-    skills: { list: async () => [{ id: 'personal:evidence', name: 'evidence', enabled: true }] },
+    ...skills,
     fileManager: { operate: async () => ({}) },
     platformClient: { json: async () => ({ tools: [] }) } })
   const response = await service.issueCommand(test.owner, test.chat.id, { command: '/goal Audit evidence', request_key: 'active-goal',
     resource_mentions: { skills: ['personal:evidence'] } })
   expect(response.run.id).not.toBe(current.id)
   expect(test.db.getRun(test.owner.ownerId, current.id).mcpTools).toEqual(current.mcpTools)
-  expect(test.db.getRun(test.owner.ownerId, response.run.id).selection.resource_context).toContain('evidence')
+  expect(test.db.getRun(test.owner.ownerId, response.run.id).selection.resource_mentions.skills).toEqual(['personal:evidence'])
   finishCurrent('Previous request completed')
   await vi.waitFor(() => expect(test.model.requests).toHaveLength(2))
-  expect(JSON.stringify(test.model.requests[1])).toContain('用户指定技能')
-  expect(JSON.stringify(test.model.requests[1])).toContain('evidence')
+  expect(JSON.stringify(test.model.requests[1])).toContain('BODY_FOR_evidence')
   test.ctx.goals.pause(test.agent, test.ctx.goals.get(test.agent))
   test.agent.cancel({ kind: 'user' })
   await test.agent.whenIdle()
@@ -1001,9 +1020,10 @@ it('reconciles native pending inbox after restart without hiding or replaying it
 
 it('starts and pauses a real native Goal command without an unadmitted model call', async () => {
   const test = await fixture(['hang'])
+  const skills = await registerUserSkills(test, ['evidence'])
   const service = new WorkbenchService({ database: test.db, sessionController: test.sessions, agents: test.ctx.agents,
     scheduler: test.scheduler, goals: test.ctx.goals, commands: test.ctx.commands, workspace: '/workspace',
-    skills: { list: async () => [{ name: 'evidence', displayName: '证据整理', description: '整理证据' }] },
+    ...skills,
     platformClient: { json: async () => ({ data: { fenced: true } }) },
     fileManager: { operate: async () => ({}) } })
   test.permit(false)
@@ -1013,9 +1033,16 @@ it('starts and pauses a real native Goal command without an unadmitted model cal
   expect(test.model.requests).toHaveLength(0)
   test.permit(true)
   await vi.waitFor(() => expect(test.model.requests).toHaveLength(1))
-  expect(JSON.stringify(test.model.requests[0])).toContain('evidence')
+  expect(JSON.stringify(test.model.requests[0])).toContain('BODY_FOR_evidence')
   expect(result.run).toMatchObject({ command: 'goal', query: 'check command admission' })
+  expect(result.run.resource_mentions.skills).toEqual(['evidence'])
   expect(test.db.listRuns(test.owner.ownerId, test.chat.id)).toHaveLength(1)
+  const run = test.db.getRun(test.owner.ownerId, result.run.id)
+  const messages = test.agent.session.snapshotEvents().filter(event => event.type === 'user/message')
+  expect(messages.some(event => event.data.source.kind === 'user' && event.data.content[0]?.text === 'check command admission'
+    && event.data.content[1]?.text === '/evidence')).toBe(true)
+  expect(messages.flatMap(event => nativePresentation(run, event,
+    { messageRun: test.db.runForMessage(test.agent.id, event.data.id) }))).toEqual([])
   await service.stopRun(test.owner, result.run.id)
   await test.agent.whenIdle()
   expect(test.ctx.goals.get(test.agent)).toMatchObject({ phase: 'paused' })
@@ -1099,9 +1126,10 @@ it('keeps an actual owned child admitted with frozen MCP authority while its par
 
 it.each(['button', 'command'])('preserves native goal state and resource context when resuming via %s', async (entry) => {
   const test = await fixture(['hang', 'hang'])
+  const skills = await registerUserSkills(test, ['evidence'])
   const service = new WorkbenchService({ database: test.db, sessionController: test.sessions, agents: test.ctx.agents,
     scheduler: test.scheduler, goals: test.ctx.goals, commands: test.ctx.commands, workspace: '/workspace',
-    skills: { list: async () => [{ name: 'evidence', description: 'Evidence skill' }] },
+    ...skills,
     platformClient: { json: async () => ({ tools: [] }) }, fileManager: { operate: async () => ({}) } })
   await service.issueCommand(test.owner, test.chat.id, { command: '/goal Review evidence', request_key: 'native-ref', resource_mentions: { skills: ['evidence'] } })
   await vi.waitFor(() => expect(test.model.requests).toHaveLength(1))
@@ -1113,10 +1141,14 @@ it.each(['button', 'command'])('preserves native goal state and resource context
   const paused = test.ctx.goals.get(test.agent)
   await service.mutateGoal(test.owner, test.chat.id, 'edit', { ref: paused, request: { objective: 'Review all evidence' } })
   const edited = test.ctx.goals.get(test.agent)
+  expect(edited.phase).toBe('paused')
+  expect(test.agent.inbox.nextTurn).toHaveLength(0)
+  expect(test.model.requests).toHaveLength(1)
   if (entry === 'button') await service.mutateGoal(test.owner, test.chat.id, 'resume', { ref: edited })
   else await service.issueCommand(test.owner, test.chat.id, { command: '/goal resume', request_key: 'native-resume' })
   await vi.waitFor(() => expect(test.model.requests).toHaveLength(2))
-  expect(JSON.stringify(test.model.requests[1])).toContain('evidence')
+  expect(JSON.stringify(test.model.requests[1])).toContain('BODY_FOR_evidence')
+  expect(test.agent.session.snapshotEvents().filter(event => event.type === 'user/message' && event.data.source.kind === 'skill-invocation')).toHaveLength(2)
   expect((await service.getControl(test.owner, test.chat.id)).goal).toMatchObject({ phase: 'active', activation: 'armed', objective: 'Review all evidence' })
   await service.mutateGoal(test.owner, test.chat.id, 'clear', { ref: test.ctx.goals.get(test.agent) })
   test.agent.cancel({ kind: 'user' }, { keepInbox: true })
@@ -1341,6 +1373,7 @@ it.each(['local', 'native'])('direct-sends a %s queued file through DSH once', a
 function goalServiceFixture(test) {
   return new WorkbenchService({ database: test.db, sessionController: test.sessions, agents: test.ctx.agents,
     scheduler: test.scheduler, goals: test.ctx.goals, commands: test.ctx.commands, workspace: '/workspace',
+    workingDirectory: test.ctx.workingDirectory, onGoalChanged: listener => test.ctx.on('goal/changed', listener, { prepend: true }),
     platformClient: { json: async () => ({ data: { tools: [] } }) }, skills: { list: async () => [] }, fileManager: { operate: async () => ({}) } })
 }
 it('rejected duplicate creation preserves the active goal run binding', async () => {
@@ -1399,9 +1432,10 @@ it('editing objective updates selected resource context', async () => {
   const first=await s.issueCommand(t.owner,t.chat.id,{command:'/goal first objective',request_key:'first'})
   await vi.waitFor(()=>expect(t.model.requests).toHaveLength(1))
   t.ctx.goals.pause(t.agent,t.ctx.goals.get(t.agent));await t.agent.whenIdle()
-  s.skills={list:async()=>[{name:'new-skill',description:'new evidence'}]}; const content=vi.spyOn(s,'resourceContent')
+  Object.assign(s, await registerUserSkills(t, ['new-skill']))
   await s.issueCommand(t.owner,t.chat.id,{command:'/goal edit revised objective',request_key:'edit',resource_mentions:{skills:['new-skill']}})
-  expect(content).toHaveBeenCalled()
+  expect(t.model.requests).toHaveLength(1)
+  expect(t.agent.inbox.nextTurn).toHaveLength(0)
   expect(t.ctx.goals.get(t.agent).objective).toBe('revised objective')
   expect(t.db.getRun(t.owner.ownerId,first.run.id).selection.resource_mentions.skills).toEqual(['new-skill'])
 })

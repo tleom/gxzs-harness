@@ -21,10 +21,10 @@ const managerToken = 'synthetic-bootstrap-manager-token'
 const signingKey = Buffer.alloc(32, 7).toString('base64')
 const secrets = [platformToken, managerToken, signingKey]
 const fixtureTool = {
-  id: 'global:reference-smoke:lookup', runtime_name: 'global_mcp_reference_smoke_lookup',
+  id: 'global:mcp:reference-smoke:lookup', runtime_name: 'global_mcp_reference_smoke_lookup',
   version: 'v1', manifest_version: 'v1',
   scope: 'global', server_id: 'reference-smoke', tool_name: 'fixture_lookup',
-  provider: 'global:reference-smoke', provider_name: '引用测试插件',
+  provider: 'global:mcp:reference-smoke', provider_name: '引用测试插件',
   description: 'Synthetic reference lookup', inputSchema: { type: 'object', properties: {} },
 }
 const fixtureSkill = {
@@ -57,6 +57,7 @@ let titleCalls = 0
 let verifyReferenceContext = false
 let verifySkillContext = false
 let referenceContextVerified = false
+let referenceModelCalls = 0
 let pluginCalls = 0
 let verifyAttachmentContext = false
 let attachmentPaths
@@ -201,12 +202,15 @@ const model = fixture((req, res) => {
   assert.ok(tools.get('bash').parameters?.properties?.run_in_background,
     'Actual host assembly must expose native background execution')
   if (verifyReferenceContext) {
+    referenceModelCalls++
     const messages = JSON.stringify(req.fixtureBody.messages)
     assert.ok(messages.includes('Explicit recovery retry'), 'Referenced user message must reach model context')
     assert.ok(messages.includes('Restart fixture in progress'), 'Referenced assistant response must reach model context')
     assert.ok(messages.includes('用户优先指定插件') && messages.includes('引用测试插件'),
       'Explicit plugin preference must coexist with native conversation references')
-    assert.ok(tools.has('fixture_lookup'), 'The selected plugin child tool must be available to the actual model')
+    assert.ok(tools.has('tool_search'), 'Discovery must remain available to the actual model')
+    assert.equal(tools.has('fixture_lookup'), referenceModelCalls > 1,
+      'The selected plugin child tool becomes available only after discovery')
     referenceContextVerified = true
   }
   modelCalls++
@@ -236,23 +240,16 @@ const model = fixture((req, res) => {
   if (verifySkillContext) {
     assert.ok(tools.has('skill'), 'Native skill tool must be available to the actual model')
     const messages = JSON.stringify(req.fixtureBody.messages)
-    assert.ok(messages.includes('用户指定技能') && messages.includes(fixtureSkill.id))
-    if (modelCalls === 5) {
-      res.write(`data: ${JSON.stringify({ id: 'fixture-skill', object: 'chat.completion.chunk', created: 1, model: 'smoke',
-        choices: [{ index: 0, delta: { role: 'assistant', tool_calls: [{ index: 0, id: 'fixture-skill-call', type: 'function',
-          function: { name: 'skill', arguments: JSON.stringify({ name: fixtureSkill.id }) } }] }, finish_reason: null }] })}\n\n`)
-      res.write(`data: ${JSON.stringify({ id: 'fixture-skill', object: 'chat.completion.chunk', created: 1, model: 'smoke',
-        choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] })}\n\n`)
-      res.end('data: [DONE]\n\n')
-      return
-    }
+    assert.ok(messages.includes(`/${fixtureSkill.id}`), 'Selection must become a native skill gesture')
     assert.equal(modelCalls, 6)
-    assert.ok(messages.includes('synthetic-skill-body-verified'), 'Loaded native skill body must reach the next model request')
+    assert.ok(messages.includes('synthetic-skill-body-verified'), 'Native skill body must reach the first selected-skill request')
   }
-  if (verifyReferenceContext && modelCalls === 3) {
+  if (verifyReferenceContext && referenceModelCalls <= 2) {
+    const discovering = referenceModelCalls === 1
     res.write(`data: ${JSON.stringify({ id: 'fixture-tool', object: 'chat.completion.chunk', created: 1, model: 'smoke',
-      choices: [{ index: 0, delta: { role: 'assistant', tool_calls: [{ index: 0, id: 'fixture-lookup-call', type: 'function',
-        function: { name: 'fixture_lookup', arguments: '{}' } }] }, finish_reason: null }] })}\n\n`)
+      choices: [{ index: 0, delta: { role: 'assistant', tool_calls: [{ index: 0, id: discovering ? 'fixture-discovery-call' : 'fixture-lookup-call', type: 'function',
+        function: { name: discovering ? 'tool_search' : 'fixture_lookup', arguments: discovering
+          ? JSON.stringify({ query: 'fixture_lookup', plugin_id: fixtureTool.provider }) : '{}' } }] }, finish_reason: null }] })}\n\n`)
     res.write(`data: ${JSON.stringify({ id: 'fixture-tool', object: 'chat.completion.chunk', created: 1, model: 'smoke',
       choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] })}\n\n`)
     res.end('data: [DONE]\n\n')
@@ -779,7 +776,7 @@ try {
       verifyReferenceContext = true
       const submission = await signedRequest('POST', `/chats/${target.id}/runs`, {
         query: `Summarize the referenced conversation ${source.mention}`, request_key: 'reference-context-probe',
-        resource_mentions: { tools: [fixtureTool.id] },
+        resource_mentions: { plugins: [fixtureTool.provider] },
       })
       assert.equal(submission.status, 202)
       const referenceRun = (await submission.json()).data.id
@@ -794,7 +791,7 @@ try {
       assert.equal(status, 'completed', 'Cross-conversation reference run must complete')
       assert.ok(referenceContextVerified, 'Reference context must be observed in the actual model request')
       assert.equal(pluginCalls, 1, 'Selected plugin must complete one actual tool roundtrip')
-      assert.equal(modelCalls, 4, 'Task requests must contain the initial attempt, retry, plugin call and plugin result')
+      assert.equal(modelCalls, 5, 'Task requests must contain the initial attempt, retry, discovery, plugin call and plugin result')
       console.log(`PASS native conversation reference and selected plugin roundtrip; task_model_calls=${modelCalls}; title_model_calls=${titleCalls}`)
       const historyResponse = await signedRequest('GET', `/chats/${target.id}/history?native=1`)
       assert.equal(historyResponse.status, 200, 'Signed native history page must be available after tool completion')
@@ -804,10 +801,14 @@ try {
       const second = await historySnapshot(target.id)
       assert.equal(first.session_id, second.session_id, 'Reconnection must remain in the same native session')
       assert.deepEqual(first.display.events, second.display.events, 'Reopening a completed session must not duplicate or rewrite output')
-      const toolResult = second.display.events.find(item => item.run_id === referenceRun && item.event.data?.stage === 'returned')
+      const discoveryResult = second.display.events.find(item => item.run_id === referenceRun
+        && item.event.data?.stage === 'returned' && item.event.data?.tool_name === 'tool_search')
+      assert.equal(discoveryResult?.event.data?.display_name, '查找工具')
+      const toolResult = second.display.events.find(item => item.run_id === referenceRun
+        && item.event.data?.stage === 'returned' && item.event.data?.tool_name === fixtureTool.tool_name)
       assert.equal(toolResult?.event.data?.provider_name, fixtureTool.provider_name)
       assert.equal(toolResult?.event.data?.display_name, fixtureTool.tool_name)
-      assert.equal(modelCalls, 4, 'History reads and reconnects must not submit or replay a model turn')
+      assert.equal(modelCalls, 5, 'History reads and reconnects must not submit or replay a model turn')
       console.log('PASS signed native history: completed plugin result; page/run identity; reconnect baseline stable; no model replay')
       verifyReferenceContext = false
       verifySkillContext = true
@@ -824,13 +825,17 @@ try {
         if (['completed', 'failed', 'interrupted'].includes(skillStatus)) break
         await delay(100)
       }
-      assert.equal(skillStatus, 'completed', 'Named personal skill must complete through the native tool')
+      assert.equal(skillStatus, 'completed', 'Named personal skill must complete through the native gesture')
       assert.equal(modelCalls, 6)
       const skillHistory = await historySnapshot(target.id)
-      const skillCall = skillHistory.display.events.find(item => item.run_id === skillRun && item.event.data?.stage === 'started')
-      assert.equal(skillCall?.event.data?.tool_name, 'skill')
-      assert.equal(skillCall?.event.data?.display_name, '技能装配测试')
-      console.log('PASS named personal skill: native tool dispatch, skill body in model context, historical display name')
+      assert.ok(!skillHistory.display.events.some(item => item.run_id === skillRun
+        && item.event.data?.stage === 'started' && item.event.data?.tool_name === 'skill'),
+      'The native gesture must not require a redundant model skill call')
+      const skillState = (await (await signedRequest('GET', `/runs/${skillRun}?view=state`)).json()).data
+      assert.equal(skillState.query, 'Use the named skill')
+      assert.ok(skillState.mentioned_resources.some(item => item.kind === 'skills'
+        && item.id === fixtureSkill.id && item.name === '技能装配测试'))
+      console.log('PASS named personal skill: native gesture, first-request skill body, original query and resource display name')
       if (nativeAttachments) {
         verifyReferenceContext = false
         verifySkillContext = false

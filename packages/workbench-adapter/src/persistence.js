@@ -511,19 +511,35 @@ export class WorkbenchDatabase {
     return this.getPendingInput(ownerId, runId)
   }
 
-  getPendingInput(ownerId, runId) {
+  getPendingInput(ownerId, runId, requestId = null) {
     if (!this.getRun(ownerId, runId)) throw notFound('任务不存在')
     const row = this.db.prepare(`SELECT p.* FROM pending_inputs p
       JOIN runs r ON r.id = p.run_id WHERE p.run_id = ? AND r.owner_id = ?
-      ORDER BY p.created_at DESC, p.rowid DESC LIMIT 1`).get(runId, ownerId)
+        AND (? IS NULL OR p.request_id = ?)
+      ORDER BY p.created_at DESC, p.rowid DESC LIMIT 1`).get(runId, ownerId, requestId, requestId)
     return row ? decodePending(row) : null
   }
 
   listPendingInputs(ownerId, runId) {
     if (!this.getRun(ownerId, runId)) throw notFound('任务不存在')
-    return this.db.prepare(`SELECT p.* FROM pending_inputs p
+    const rows = this.db.prepare(`SELECT p.request_id, p.run_id, p.status, p.deadline_at,
+      p.interacted, p.created_at, p.settled_at,
+      CASE WHEN length(CAST(p.payload_json AS BLOB)) + length(CAST(COALESCE(p.answer_json, '') AS BLOB)) <= 8388608
+        THEN p.payload_json END AS payload_json,
+      CASE WHEN length(CAST(p.payload_json AS BLOB)) + length(CAST(COALESCE(p.answer_json, '') AS BLOB)) <= 8388608
+        THEN p.answer_json END AS answer_json FROM pending_inputs p
       JOIN runs r ON r.id = p.run_id WHERE p.run_id = ? AND r.owner_id = ?
-      ORDER BY p.created_at, p.rowid`).all(runId, ownerId).map(decodePending)
+      ORDER BY p.created_at, p.rowid`).iterate(runId, ownerId)
+    const inputs = []
+    let bytes = 0
+    for (const row of rows) {
+      bytes += row.payload_json == null ? Infinity
+        : Buffer.byteLength(row.payload_json) + Buffer.byteLength(row.answer_json ?? '')
+      if (bytes > 8 * 1024 * 1024 || inputs.length >= 10000)
+        throw Object.assign(new Error('任务交互记录超过读取大小限制'), { status: 413, code: 'RUN_METADATA_TOO_LARGE' })
+      inputs.push(decodePending(row))
+    }
+    return inputs
   }
 
   recordInputSupplement(ownerId, runId, requestId, answer) {
@@ -655,12 +671,29 @@ export class WorkbenchDatabase {
     } finally { this.flushingStream = false }
   }
 
-  eventsAfter(ownerId, runId, after, limit = 1000) {
+  eventsAfter(ownerId, runId, after, limit = 1000, present = event => event,
+    { through = Number.MAX_SAFE_INTEGER, maxBytes = 4 * 1024 * 1024 } = {}) {
     const run = this.getRun(ownerId, runId)
     if (!run) throw notFound('任务不存在')
-    return this.db.prepare(`SELECT payload_json FROM run_events
-      WHERE run_id = ? AND seq > ? ORDER BY seq LIMIT ?`)
-      .all(runId, after, limit).map((row) => JSON.parse(row.payload_json))
+    // Project each row before retaining the page. Old context events can hold
+    // large tool catalogs; collecting raw JSON first can exhaust the Host heap.
+    const events = []
+    let bytes = 0
+    // Bound a single event too, leaving room for JSON/DTO copies in the Host.
+    // Check inside SQLite so an oversized legacy row is not first copied to JS.
+    const rows = this.db.prepare(`SELECT CASE WHEN length(CAST(payload_json AS BLOB)) <= 8388608
+      THEN payload_json END AS payload_json FROM run_events
+      WHERE run_id = ? AND seq > ? AND seq <= ? ORDER BY seq LIMIT ?`)
+      .iterate(runId, after, through, limit)
+    for (const row of rows) {
+      if (row.payload_json == null) throw Object.assign(new Error('单条历史事件超过读取大小限制'), { status: 413 })
+      const event = present(JSON.parse(row.payload_json))
+      const size = Buffer.byteLength(JSON.stringify(event))
+      if (events.length && bytes + size > maxBytes) break
+      events.push(event)
+      bytes += size
+    }
+    return events
   }
 
   runTiming(ownerId, runId) {
@@ -688,27 +721,43 @@ export class WorkbenchDatabase {
 
   latestContextEvent(ownerId, runId) {
     if (!this.getRun(ownerId, runId)) throw notFound('任务不存在')
-    const row = this.db.prepare(`SELECT payload_json FROM run_events WHERE run_id = ?
+    const row = this.db.prepare(`SELECT CASE WHEN length(CAST(payload_json AS BLOB)) <= 8388608
+      THEN payload_json END AS payload_json FROM run_events WHERE run_id = ?
       AND json_extract(payload_json, '$.event') = 'workbench_context' ORDER BY seq DESC LIMIT 1`).get(runId)
+    if (row && row.payload_json == null) throw Object.assign(new Error('单条历史事件超过读取大小限制'), { status: 413 })
     return row ? JSON.parse(row.payload_json) : undefined
   }
 
-  allEvents(ownerId, runId) {
+  allEvents(ownerId, runId, present = event => event, { maxBytes = Infinity, maxEvents = Infinity } = {}) {
     const events = []
     let sequence = 0
+    let bytes = 0
     while (true) {
-      const page = this.eventsAfter(ownerId, runId, sequence, 1000)
+      const page = this.eventsAfter(ownerId, runId, sequence, 1000, present)
       if (page.length === 0) return events
+      for (const event of page) bytes += Buffer.byteLength(JSON.stringify(event))
+      if (bytes > maxBytes || events.length + page.length > maxEvents)
+        throw Object.assign(new Error('历史记录较大，请使用分段历史读取'), { status: 413, code: 'HISTORY_PAGE_REQUIRED' })
       events.push(...page)
       sequence = Number(page.at(-1)._id.split('-')[0])
     }
   }
 
-  steeringEvents(ownerId, runId) {
+  steeringEvents(ownerId, runId, through = Number.MAX_SAFE_INTEGER) {
     if (!this.getRun(ownerId, runId)) throw notFound('任务不存在')
-    return this.db.prepare(`SELECT payload_json FROM run_events WHERE run_id = ?
+    const rows = this.db.prepare(`SELECT CASE WHEN length(CAST(payload_json AS BLOB)) <= 8388608
+      THEN payload_json END AS payload_json FROM run_events WHERE run_id = ? AND seq <= ?
       AND json_extract(payload_json, '$.event') IN ('workbench_steering', 'workbench_steered') ORDER BY seq`)
-      .all(runId).map((row) => JSON.parse(row.payload_json))
+      .iterate(runId, through)
+    const events = []
+    let bytes = 0
+    for (const row of rows) {
+      bytes += row.payload_json == null ? Infinity : Buffer.byteLength(row.payload_json)
+      if (bytes > 8 * 1024 * 1024 || events.length >= 10000)
+        throw Object.assign(new Error('任务转向记录超过读取大小限制'), { status: 413, code: 'RUN_METADATA_TOO_LARGE' })
+      events.push(JSON.parse(row.payload_json))
+    }
+    return events
   }
 
   saveSubmission(ownerId, runId, content, retry = false) {

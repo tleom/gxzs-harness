@@ -22,10 +22,20 @@ function setup({ authorized = true } = {}) {
     workbenchRuntime: { ownerId: 't:1', authorizeMcp: vi.fn(() => authorized ? { ownerId: 't:1', runId: 'run-1', resource: catalogTool } : undefined) },
     on: vi.fn(), effect: vi.fn((factory) => cleanups.push(factory())), logger: { warn: vi.fn() },
   }
+  ctx.reflect = { provide: (name, service) => { ctx[name] = service } }
   return { ctx, definitions, platform }
 }
 
 describe('platform MCP proxy tools', () => {
+  for (const scope of ['global', 'personal']) it(`rejects required-task ${scope} tools through the native guard before proxy dispatch`, async () => {
+    const { ctx, definitions, platform } = setup()
+    platform.json.mockResolvedValueOnce({ tools: [{ ...catalogTool, scope, execution: { taskSupport: 'required' } }] })
+    await apply(ctx)
+    await expect(definitions.get('search').execute({ query: 'q' }, {
+      callId: 'task-required', agent: { id: 's1' }, signal: new AbortController().signal,
+    })).rejects.toThrow('requires task-based execution')
+    expect(platform.json).toHaveBeenCalledTimes(1)
+  })
   it('passes server output schemas to the native MCP definition', async () => {
     const { ctx, definitions, platform } = setup()
     const outputSchema = { type: 'object', properties: { found: { type: 'boolean' } }, required: ['found'] }
@@ -40,6 +50,7 @@ describe('platform MCP proxy tools', () => {
     expect(publicToolName('server', 'a.b')).not.toBe(publicToolName('server', 'a_b'))
     expect(publicToolName('server', 's'.repeat(70))).toHaveLength(64)
     expect(publicToolName('server', 'run_code')).not.toBe('run_code')
+    expect(publicToolName('server', 'tool_search')).not.toBe('tool_search')
     expect(platformToolName({ ...catalogTool, scope: 'global', server_id: 'global-memory', tool_name: 'stg' })).toBe('stg')
     expect(platformToolName({ ...catalogTool, server_id: 'gaode', tool_name: 'maps_direction_bicycling' })).toBe('maps_direction_bicycling')
     const other = { ...catalogTool, id: 'global:server:search', scope: 'global' }
@@ -47,6 +58,53 @@ describe('platform MCP proxy tools', () => {
     expect(names.get(catalogTool.id)).toMatch(/^search_[a-f0-9]{12}$/)
     expect(names.get(catalogTool.id)).not.toBe(names.get(other.id))
     expect([...platformToolNames([other, catalogTool])].sort()).toEqual([...names].sort())
+  })
+
+  it('keeps discovery metadata authorized while denying MCP exposure before startup and after disposal', async () => {
+    const { ctx, platform } = setup()
+    let run = { id: 'run-1', ownerId: 't:1', status: 'running', mcpTools: [catalogTool] }
+    const masks = new Set()
+    const agent = { id: 's1', ctx: { tools: { restrict: policy => {
+      masks.add(policy)
+      return () => masks.delete(policy)
+    } } } }
+    ctx.workbenchRuntime.executionRun = vi.fn(() => run)
+    ctx.workbenchRuntime.agents = { list: () => [agent] }
+    await apply(ctx, { discovery: true })
+    const bridge = ctx.toolDiscoveryCatalog
+    expect([...masks]).toEqual([{ deny: ['search'] }])
+    ctx.workbenchRuntime.executionRun.mockClear()
+    const original = bridge.snapshot(agent)
+    expect(ctx.workbenchRuntime.executionRun).toHaveBeenCalledTimes(1)
+    expect(original).toMatchObject({ ready: true, authorityKey: 't:1\0run-1',
+      tools: [{ id: catalogTool.id, name: 'search', pluginId: 'personal:mcp:server', pluginScope: 'personal' }],
+      plugins: [{ id: 'personal:mcp:server', callName: 'server' }] })
+    const listener = vi.fn()
+    const unsubscribe = bridge.subscribe(listener)
+    bridge.setDiscoveryReady(true)
+    bridge.setDiscoveryReady(true)
+    expect(listener).toHaveBeenCalledTimes(1)
+    expect(masks.size).toBe(0)
+    const assemble = ctx.on.mock.calls.find(([event]) => event === 'system-prompt/assemble')[1]
+    expect((await assemble({}, { scope: agent }, async () => ({ tools: [], sections: [] }))).sections).toEqual([])
+    platform.json.mockResolvedValueOnce({ tools: [{ ...catalogTool, description: 'Changed without version bump' }] })
+    await ctx.on.mock.calls.find(([event]) => event === 'workbench/resources-changed')[1]()
+    expect(bridge.snapshot(agent).revision).not.toBe(original.revision)
+    run = { ...run, id: 'run-2' }
+    expect(bridge.snapshot(agent).authorityKey).toBe('t:1\0run-2')
+    run = { ...run, stopConfirmation: { fenced: true } }
+    expect(bridge.snapshot(agent)).toMatchObject({ ready: false, tools: [], authorityKey: '' })
+    expect((await assemble({}, { scope: agent }, async () => ({ tools: [{ name: 'search' }], sections: [] }))).tools).toEqual([])
+    run = { ...run, stopConfirmation: undefined }
+    run = { ...run, ownerId: 'foreign' }
+    expect(bridge.snapshot(agent)).toMatchObject({ ready: false, tools: [], authorityKey: '' })
+    bridge.setDiscoveryReady(false)
+    expect([...masks]).toEqual([{ deny: ['search'] }])
+    expect(bridge.managedNames()).toEqual(['search'])
+    unsubscribe()
+    const calls = listener.mock.calls.length
+    bridge.notify()
+    expect(listener).toHaveBeenCalledTimes(calls)
   })
   it('retains registered tools on transient catalog failure and removes them only after a successful empty catalog', async () => {
     const { ctx, definitions, platform } = setup()

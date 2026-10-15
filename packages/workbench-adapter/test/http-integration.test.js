@@ -100,6 +100,30 @@ async function call(handler, key, method, route, value, authenticated = true, us
 }
 
 describe('authenticated workbench HTTP handler', () => {
+  it('pages terminal history through a fixed cursor and retains owner authorization', async () => {
+    const { handler, key, context } = setup()
+    const { database } = context.reflect.provide.mock.calls.find(([name]) => name === 'workbenchRuntime')[1]
+    const chat = database.createChat({ ownerId: 't:42', sessionId: 'page-test', selection: {} })
+    const { run } = database.createRun({ ownerId: 't:42', chatId: chat.id, sessionId: chat.sessionId, query: 'paged', selection: {} })
+    for (let index = 0; index < 300; index++) database.appendEvent('t:42', run.id, { event: 'workbench_activity', data: { index } })
+    database.transitionRun('t:42', run.id, 'completed')
+    const route = `/runs/${run.id}?after=0-0`
+    expect((await call(handler, key, 'GET', route, undefined, false)).status).toBe(401)
+    expect((await call(handler, key, 'GET', route, undefined, true, 'other')).status).toBe(403)
+    const first = await call(handler, key, 'GET', route)
+    expect(first.status).toBe(200)
+    expect(first.body.data).toMatchObject({ status: 'completed', history_complete: false,
+      events_cursor: '256-0', events_next_cursor: '256-0', events_through_cursor: '300-0' })
+    database.appendEvent('t:42', run.id, { event: 'workbench_context', used_tokens: 5 })
+    const last = await call(handler, key, 'GET', `/runs/${run.id}?after=256-0&through=300-0`)
+    expect(last.status).toBe(200)
+    expect(last.body.data).toMatchObject({ history_complete: true, events_cursor: '300-0', events_through_cursor: '300-0' })
+    expect(last.body.data.events).toHaveLength(44)
+    expect(last.body.data.events_next_cursor).toBeUndefined()
+    expect((await call(handler, key, 'GET', `/runs/${run.id}?after=300-0&through=256-0`)).status).toBe(400)
+    expect((await call(handler, key, 'GET', `/runs/${run.id}?after=bad`)).status).toBe(400)
+    expect((await call(handler, key, 'GET', `/runs/${run.id}?view=state`)).body.data).toMatchObject({ events: [], events_cursor: '301-0' })
+  })
   it('identifies catalog-blocked cold recovery and resumes in place after the dependency returns', async () => {
     const folder = mkdtempSync(join(tmpdir(), 'workbench-recovery-'))
     const databasePath = join(folder, 'state.db')
