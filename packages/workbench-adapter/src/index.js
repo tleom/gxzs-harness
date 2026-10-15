@@ -184,8 +184,9 @@ export function apply(ctx, config) {
         const claimed = projectInboxClaim(database, { agent: payload.agent, message, turn: payload.turn }, config.ownerId,
           needsResources ? { mcpTools: runtime.mcpResources?.() ?? [] } : undefined)
         if (claimed?.selection?.native_source === 'schedule') {
-          try { await schedules.rememberRun(claimed) }
-          catch { ctx.logger.warn('Scheduled delivery title enrichment deferred') }
+          void schedules.rememberRun(claimed).catch(() => {
+            ctx.logger.warn('Scheduled delivery title enrichment deferred')
+          })
         }
       }
     }
@@ -194,8 +195,9 @@ export function apply(ctx, config) {
     if (recoveryError) return { kind: 'reject' }
     const run = runtime.executionRun(payload.agent.session?.id ?? payload.agent.id)
     if (run?.selection?.native_source === 'schedule') {
-      try { await schedules.rememberRun(run) }
-      catch { ctx.logger.warn('Scheduled delivery title enrichment deferred') }
+      void schedules.rememberRun(run).catch(() => {
+        ctx.logger.warn('Scheduled delivery title enrichment deferred')
+      })
     }
     return scheduler.admitNativeStep(payload, next)
   }, { global: true, prepend: true })

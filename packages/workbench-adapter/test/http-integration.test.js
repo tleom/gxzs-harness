@@ -171,8 +171,30 @@ describe('authenticated workbench HTTP handler', () => {
     const message = { id: 'steered-schedule', source: { kind: 'schedule' }, content: [{ type: 'text', text: 'schedule_id_json: "task"' }] }
     const gate = context.on.mock.calls.find(([name]) => name === 'agent/pre-step')[1]
     await gate({ agent: { id: sessionId }, messages: [message], turn: 1, signal: new AbortController().signal }, () => {})
-    expect(db.getRun('t:42', message.id)).toMatchObject({ status: 'steered', selection: { schedule_ids: ['task'], schedule_titles: ['原计划'] } })
+    await vi.waitFor(() => expect(db.getRun('t:42', message.id)).toMatchObject({ status: 'steered', selection: { schedule_ids: ['task'], schedule_titles: ['原计划'] } }))
     expect(db.runForTurn(sessionId, 1).id).toBe(parent.id)
+  })
+  it('admits a busy turn while schedule display lookup remains pending', async () => {
+    const { handler, key, context } = setup()
+    const chat = (await call(handler, key, 'POST', '/chats', {})).body.data
+    const runtime = context.reflect.provide.mock.calls.find(([name]) => name === 'workbenchRuntime')[1]
+    const db = runtime.database, sessionId = db.getChat('t:42', chat.id).sessionId
+    runtime.mcpCatalogState = { ready: true }
+    runtime.mcpResources = () => []
+    const parent = db.createRun({ ownerId: 't:42', chatId: chat.id, sessionId, query: 'working', selection: {} }).run
+    db.bindNativeTurn(parent, 1)
+    let release
+    context.schedule = { catalog: vi.fn(() => new Promise(resolve => { release = resolve })) }
+    runtime.scheduler.admitNativeStep = vi.fn(async () => ({ kind: 'accept' }))
+    const message = { id: 'pending-schedule', source: { kind: 'schedule' }, content: [{ type: 'text', text: 'schedule_id_json: "task"' }] }
+    const gate = context.on.mock.calls.find(([name]) => name === 'agent/pre-step')[1]
+    const pending = gate({ agent: { id: sessionId }, messages: [message], turn: 1, signal: new AbortController().signal }, () => {})
+    try {
+      await vi.waitFor(() => expect(runtime.scheduler.admitNativeStep).toHaveBeenCalledOnce(), { timeout: 500 })
+      await expect(pending).resolves.toEqual({ kind: 'accept' })
+      expect(db.getRun('t:42', message.id)).toMatchObject({ status: 'steered', selection: { schedule_ids: ['task'] } })
+      expect(db.runForTurn(sessionId, 1).id).toBe(parent.id)
+    } finally { release?.([]); await pending }
   })
   it('admits an in-turn child notice without waiting for a new MCP catalog', async () => {
     const { handler, key, context } = setup()

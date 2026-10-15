@@ -44,6 +44,34 @@ it('backfills legacy schedule identities without replacing the captured names or
   await test.gateway.rememberRun(enriched)
   expect(test.native.catalog).toHaveBeenCalledOnce()
 })
+it('retains deleted native delivery IDs and keeps titles aligned with surviving tasks', async () => {
+  const test = fixture()
+  const { run } = test.db.createRun({ ownerId: test.owner.ownerId, chatId: test.chat.id, sessionId: test.chat.sessionId,
+    query: 'reminders_json: [{"schedule_id":"deleted-task"},{"schedule_id":"task"}]', selection: { native_source: 'schedule' } })
+  await test.gateway.rememberRun(run)
+  expect(test.db.getRun(test.owner.ownerId, run.id).selection).toMatchObject({
+    schedule_ids: ['deleted-task', 'task'], schedule_titles: ['定时任务', '提醒'],
+  })
+})
+
+it('records native IDs before display lookup settles and preserves later scope changes', async () => {
+  const test = fixture()
+  const { run } = test.db.createRun({ ownerId: test.owner.ownerId, chatId: test.chat.id, sessionId: test.chat.sessionId,
+    query: 'schedule_id_json: "task"', selection: { native_source: 'schedule' }, mcpTools: [{ id: 'old' }] })
+  let release
+  test.native.catalog.mockImplementation(() => new Promise(resolve => { release = resolve }))
+  const pending = test.gateway.rememberRun(run)
+  const current = test.db.getRun(test.owner.ownerId, run.id)
+  expect(current.selection.schedule_ids).toEqual(['task'])
+  test.db.updateRunResources(current, { ...current.selection, model: 'updated/model' }, [{ id: 'current' }])
+  const repeated = test.gateway.rememberRun(current)
+  expect(test.native.catalog).toHaveBeenCalledOnce()
+  release([{ id: 'task', sessionId: test.chat.sessionId, title: '提醒' }])
+  await Promise.all([pending, repeated])
+  expect(test.db.getRun(test.owner.ownerId, run.id)).toMatchObject({
+    selection: { model: 'updated/model', schedule_ids: ['task'], schedule_titles: ['提醒'] }, mcpTools: [{ id: 'current' }],
+  })
+})
 it('uses the owning native Session and preserves compare-and-update without accepting a body binding', async () => {
   const test = fixture(); const signal = new AbortController().signal
   await test.gateway.create(test.owner, test.chat.id, { title: '提醒', prompt: '内容', daily: { time: '08:00:00', time_zone: 'Asia/Shanghai' }, sessionId: test.foreign.sessionId }, signal)

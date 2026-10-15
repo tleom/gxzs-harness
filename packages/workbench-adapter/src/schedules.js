@@ -6,6 +6,7 @@ export class WorkbenchSchedules {
     this.getNative = typeof native === 'function' ? native : () => native
     this.database = database
     this.service = service
+    this.pendingNames = new Map()
   }
   get native() {
     const value = this.getNative()
@@ -20,6 +21,8 @@ export class WorkbenchSchedules {
     })
   }
   async rememberRun(run) {
+    if (this.pendingNames.has(run.id)) return this.pendingNames.get(run.id)
+    run = this.database.getRun(run.ownerId, run.id) ?? run
     const capturedTitles = Array.isArray(run.selection?.schedule_titles)
     if (capturedTitles && Array.isArray(run.selection?.schedule_ids)) return
     const ids = []
@@ -30,12 +33,27 @@ export class WorkbenchSchedules {
       if (batch) { const rows = JSON.parse(batch); if (Array.isArray(rows)) for (const row of rows)
         if (typeof row?.schedule_id === 'string') ids.push(row.schedule_id) }
     } catch { /* Older framing may not contain recoverable task identities. */ }
-    const catalog = await this.native.catalog()
-    const tasks = ids.map(id => catalog.find(task => task.id === id && task.sessionId === run.sessionId)).filter(Boolean)
-    const titles = capturedTitles ? run.selection.schedule_titles : tasks.map(task => task.title)
-    // A delivery's display names are a receipt, not another task catalog.
-    this.database.updateRunResources(run, { ...run.selection, schedule_titles: titles, schedule_ids: tasks.map(task => task.id) }, run.mcpTools)
-    if (!capturedTitles) this.database.appendEvent(run.ownerId, run.id, { event: 'workbench_schedule', titles })
+    const deliveredIds = [...new Set(ids.filter(Boolean))]
+    // Native delivery framing remains authoritative after a task is deleted.
+    // Save its identity before any best-effort display lookup can suspend.
+    this.database.updateRunResources(run, { ...run.selection, schedule_ids: deliveredIds }, run.mcpTools)
+    const lookup = (async () => {
+      const catalog = await this.native.catalog()
+      const retainedIds = deliveredIds.filter(id => {
+        const task = catalog.find(task => task.id === id)
+        return !task || task.sessionId === run.sessionId
+      })
+      const titles = capturedTitles ? run.selection.schedule_titles
+        : retainedIds.map(id => catalog.find(task => task.id === id)?.title || '定时任务')
+      const current = this.database.getRun(run.ownerId, run.id)
+      if (!current) return
+      // Preserve any scope changes made while the display lookup was pending.
+      this.database.updateRunResources(current, { ...current.selection, schedule_titles: titles, schedule_ids: retainedIds }, current.mcpTools)
+      if (!capturedTitles) this.database.appendEvent(run.ownerId, run.id, { event: 'workbench_schedule', titles })
+    })()
+    this.pendingNames.set(run.id, lookup)
+    try { await lookup }
+    finally { this.pendingNames.delete(run.id) }
   }
   async create(owner, chatId, request, signal) {
     const chat = this.service.requireChat(owner, chatId)
