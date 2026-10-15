@@ -20,6 +20,24 @@ export class WorkbenchSchedules {
       return chat ? [{ ...task, chat_id: chat.id, chat_title: chat.title, chat_deleted: chat.deletedAt != null }] : []
     })
   }
+  displayCatalog() {
+    if (this.pendingCatalog) return this.pendingCatalog.wait
+    const request = this.native.catalog()
+    let timer
+    const wait = Promise.race([
+      request,
+      new Promise(resolve => { timer = setTimeout(resolve, 250) }),
+    ]).finally(() => clearTimeout(timer))
+    const pending = { wait }
+    this.pendingCatalog = pending
+    // A timed-out native read stays shared across steps and runs until it
+    // actually settles. Only the display wait has a budget, not another read.
+    const settled = () => {
+      if (this.pendingCatalog === pending) this.pendingCatalog = undefined
+    }
+    void Promise.resolve(request).then(settled, settled)
+    return wait
+  }
   async rememberRun(run) {
     if (this.pendingNames.has(run.id)) return this.pendingNames.get(run.id)
     run = this.database.getRun(run.ownerId, run.id) ?? run
@@ -36,16 +54,10 @@ export class WorkbenchSchedules {
     const deliveredIds = [...new Set(ids.filter(Boolean))]
     // Native delivery framing remains authoritative after a task is deleted.
     // Save its identity before any best-effort display lookup can suspend.
-    this.database.updateRunResources(run, { ...run.selection, schedule_ids: deliveredIds }, run.mcpTools)
+    if (!Array.isArray(run.selection?.schedule_ids))
+      this.database.updateRunResources(run, { ...run.selection, schedule_ids: deliveredIds }, run.mcpTools)
     const lookup = (async () => {
-      let timer
-      let catalog
-      try {
-        catalog = await Promise.race([
-          this.native.catalog(),
-          new Promise(resolve => { timer = setTimeout(resolve, 250) }),
-        ])
-      } finally { clearTimeout(timer) }
+      const catalog = await this.displayCatalog()
       // Ignore late display results instead of appending after the terminal
       // event has closed the run stream. The delivery identity is already saved.
       if (!catalog) return

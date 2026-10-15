@@ -81,12 +81,22 @@ it('bounds display lookup before execution and discards metadata arriving after 
   let release
   test.native.catalog.mockImplementation(() => new Promise(resolve => { release = resolve }))
   let pending
+  const repeated = []
   try {
     let settled = false
     pending = test.gateway.rememberRun(run).then(() => { settled = true })
     await vi.advanceTimersByTimeAsync(250)
     expect(settled).toBe(true)
     await pending
+    for (let step = 0; step < 50; step++) repeated.push(test.gateway.rememberRun(run))
+    expect(test.native.catalog).toHaveBeenCalledOnce()
+    await Promise.all(repeated)
+    const another = test.db.createRun({ ownerId: test.owner.ownerId, chatId: test.chat.id, sessionId: test.chat.sessionId,
+      query: 'schedule_id_json: "task"', selection: { native_source: 'schedule' } }).run
+    await test.gateway.rememberRun(another)
+    expect(test.native.catalog).toHaveBeenCalledOnce()
+    expect(test.gateway.pendingNames.size).toBe(0)
+    expect(test.gateway.pendingCatalog).toBeDefined()
     test.db.transitionRun(test.owner.ownerId, run.id, 'completed')
     test.db.appendEvent(test.owner.ownerId, run.id, { event: 'workbench_end', status: 'completed' })
     release([{ id: 'task', sessionId: test.chat.sessionId, title: '迟到名称' }])
@@ -95,7 +105,14 @@ it('bounds display lookup before execution and discards metadata arriving after 
     expect(test.db.getRun(test.owner.ownerId, run.id).selection.schedule_titles).toBeUndefined()
     expect(test.db.allEvents(test.owner.ownerId, run.id).map(event => event.event)).toEqual(['workbench_end'])
     expect(test.gateway.pendingNames.size).toBe(0)
-  } finally { release?.([]); await pending; vi.useRealTimers() }
+    expect(test.gateway.pendingCatalog).toBeUndefined()
+  } finally {
+    release?.([])
+    await vi.advanceTimersByTimeAsync(250)
+    await Promise.allSettled(repeated)
+    await pending
+    vi.useRealTimers()
+  }
 })
 it('uses the owning native Session and preserves compare-and-update without accepting a body binding', async () => {
   const test = fixture(); const signal = new AbortController().signal
