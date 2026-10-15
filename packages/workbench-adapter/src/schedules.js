@@ -38,7 +38,17 @@ export class WorkbenchSchedules {
     // Save its identity before any best-effort display lookup can suspend.
     this.database.updateRunResources(run, { ...run.selection, schedule_ids: deliveredIds }, run.mcpTools)
     const lookup = (async () => {
-      const catalog = await this.native.catalog()
+      let timer
+      let catalog
+      try {
+        catalog = await Promise.race([
+          this.native.catalog(),
+          new Promise(resolve => { timer = setTimeout(resolve, 250) }),
+        ])
+      } finally { clearTimeout(timer) }
+      // Ignore late display results instead of appending after the terminal
+      // event has closed the run stream. The delivery identity is already saved.
+      if (!catalog) return
       const retainedIds = deliveredIds.filter(id => {
         const task = catalog.find(task => task.id === id)
         return !task || task.sessionId === run.sessionId

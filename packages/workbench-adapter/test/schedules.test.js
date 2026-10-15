@@ -72,6 +72,31 @@ it('records native IDs before display lookup settles and preserves later scope c
     selection: { model: 'updated/model', schedule_ids: ['task'], schedule_titles: ['提醒'] }, mcpTools: [{ id: 'current' }],
   })
 })
+
+it('bounds display lookup before execution and discards metadata arriving after the budget', async () => {
+  vi.useFakeTimers()
+  const test = fixture()
+  const { run } = test.db.createRun({ ownerId: test.owner.ownerId, chatId: test.chat.id, sessionId: test.chat.sessionId,
+    query: 'schedule_id_json: "task"', selection: { native_source: 'schedule' } })
+  let release
+  test.native.catalog.mockImplementation(() => new Promise(resolve => { release = resolve }))
+  let pending
+  try {
+    let settled = false
+    pending = test.gateway.rememberRun(run).then(() => { settled = true })
+    await vi.advanceTimersByTimeAsync(250)
+    expect(settled).toBe(true)
+    await pending
+    test.db.transitionRun(test.owner.ownerId, run.id, 'completed')
+    test.db.appendEvent(test.owner.ownerId, run.id, { event: 'workbench_end', status: 'completed' })
+    release([{ id: 'task', sessionId: test.chat.sessionId, title: '迟到名称' }])
+    await vi.advanceTimersByTimeAsync(1)
+    expect(test.db.getRun(test.owner.ownerId, run.id).selection).toMatchObject({ schedule_ids: ['task'] })
+    expect(test.db.getRun(test.owner.ownerId, run.id).selection.schedule_titles).toBeUndefined()
+    expect(test.db.allEvents(test.owner.ownerId, run.id).map(event => event.event)).toEqual(['workbench_end'])
+    expect(test.gateway.pendingNames.size).toBe(0)
+  } finally { release?.([]); await pending; vi.useRealTimers() }
+})
 it('uses the owning native Session and preserves compare-and-update without accepting a body binding', async () => {
   const test = fixture(); const signal = new AbortController().signal
   await test.gateway.create(test.owner, test.chat.id, { title: '提醒', prompt: '内容', daily: { time: '08:00:00', time_zone: 'Asia/Shanghai' }, sessionId: test.foreign.sessionId }, signal)

@@ -190,7 +190,7 @@ describe('authenticated workbench HTTP handler', () => {
     const gate = context.on.mock.calls.find(([name]) => name === 'agent/pre-step')[1]
     const pending = gate({ agent: { id: sessionId }, messages: [message], turn: 1, signal: new AbortController().signal }, () => {})
     try {
-      await vi.waitFor(() => expect(runtime.scheduler.admitNativeStep).toHaveBeenCalledOnce(), { timeout: 500 })
+      await vi.waitFor(() => expect(runtime.scheduler.admitNativeStep).toHaveBeenCalledOnce(), { timeout: 1000 })
       await expect(pending).resolves.toEqual({ kind: 'accept' })
       expect(db.getRun('t:42', message.id)).toMatchObject({ status: 'steered', selection: { schedule_ids: ['task'] } })
       expect(db.runForTurn(sessionId, 1).id).toBe(parent.id)

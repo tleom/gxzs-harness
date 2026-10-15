@@ -173,6 +173,14 @@ export function apply(ctx, config) {
   registerToolDisplayReceipts(ctx, { runtime, database, ownerId: config.ownerId })
   ctx.on('agent/pre-step', async (payload, next) => {
     const autonomous = payload.messages?.filter(message => ['schedule', 'tool-jobs'].includes(message.source?.kind) || isNativeNotice(message)) ?? []
+    const displays = new Map()
+    const rememberSchedule = run => {
+      if (run?.selection?.native_source === 'schedule' && !displays.has(run.id)) {
+        displays.set(run.id, schedules.rememberRun(run).catch(() => {
+          ctx.logger.warn('Scheduled delivery title enrichment deferred')
+        }))
+      }
+    }
     if (autonomous.length) {
       const needsResources = autonomous.some(message => claimNeedsResources(database,
         { agent: payload.agent, message, turn: payload.turn }, config.ownerId))
@@ -183,22 +191,14 @@ export function apply(ctx, config) {
       for (const message of autonomous) {
         const claimed = projectInboxClaim(database, { agent: payload.agent, message, turn: payload.turn }, config.ownerId,
           needsResources ? { mcpTools: runtime.mcpResources?.() ?? [] } : undefined)
-        if (claimed?.selection?.native_source === 'schedule') {
-          void schedules.rememberRun(claimed).catch(() => {
-            ctx.logger.warn('Scheduled delivery title enrichment deferred')
-          })
-        }
+        rememberSchedule(claimed)
       }
     }
     await recovery
     if (autonomous.length && recoveryError) await beginRecovery()
     if (recoveryError) return { kind: 'reject' }
-    const run = runtime.executionRun(payload.agent.session?.id ?? payload.agent.id)
-    if (run?.selection?.native_source === 'schedule') {
-      void schedules.rememberRun(run).catch(() => {
-        ctx.logger.warn('Scheduled delivery title enrichment deferred')
-      })
-    }
+    rememberSchedule(runtime.executionRun(payload.agent.session?.id ?? payload.agent.id))
+    await Promise.all(displays.values())
     return scheduler.admitNativeStep(payload, next)
   }, { global: true, prepend: true })
   ctx.on('agent/status', ({ agent, status }) => {
