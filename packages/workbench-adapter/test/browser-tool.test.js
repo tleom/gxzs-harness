@@ -42,6 +42,20 @@ it('carries its last observation revision to the next operation', async () => {
   expect(test.browser.command).toHaveBeenCalledWith({action:'element-click',selector:'#submit',expected_revision:7},test.exec.signal)
 })
 
+it('does not carry an old observation into a browser reopened with the same chat id', async () => {
+  const test = fixture()
+  test.browser.command.mockResolvedValue({ url: 'https://example.com/', title: 'Old page', revision: 7 })
+  await test.definition.execute({ action: 'snapshot' }, test.exec)
+  const replacement = { command: vi.fn(async value => {
+    if (value.expected_revision !== undefined && value.expected_revision !== 0) throw new Error('stale_observation')
+    return { url: 'https://example.com/new', title: 'New page', revision: 1 }
+  }) }
+  test.browsers.require.mockReturnValue(replacement)
+  const result = await test.definition.execute({ action: 'navigate', url: 'https://example.com/new' }, test.exec)
+  expect(result.title).toBe('New page')
+  expect(replacement.command).toHaveBeenCalledWith({ action: 'navigate', url: 'https://example.com/new' }, test.exec.signal)
+})
+
 it('uses the root chat browser and returns a fresh observation after selector input', async () => {
   const test = fixture()
   const value = await test.definition.execute({ action: 'text', selector: '#search', text: '中文' }, test.exec)
