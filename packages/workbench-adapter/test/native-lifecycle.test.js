@@ -922,6 +922,59 @@ it('inherits admission and frozen tools only through native live subagent owners
   expect(test.runtime.authorizeMcp(child.id, 'personal:server:tool', 'v1')).toBeUndefined()
 })
 
+it('keeps an actual owned child admitted with frozen MCP authority while its parent waits for a human answer', async () => {
+  const test = await fixture(['hang', 'child completed while parent waits'])
+  const run = test.create('parent question')
+  await test.scheduler.enqueue(run, [{ type: 'text', text: run.query }])
+  await test.scheduler.tick()
+  await vi.waitFor(() => expect(test.model.requests).toHaveLength(1))
+  const questionLifetime = new AbortController()
+  const bridge = new HumanInputBridge({ database: test.db, executionRun: id => test.runtime.executionRun(id),
+    resumeInput: (receipt, signal) => test.scheduler.resumeInput(receipt, signal) })
+  const answer = bridge.handleRequest({ agent: test.agent, questions: [{ id: 'continue', question: 'Continue?' }], signal: questionLifetime.signal }, () => undefined)
+  void answer.catch(() => {})
+  const childHandle = await test.ctx.agents.create({ sessionId: 'question-child', parentAgent: test.agent,
+    meta: { parentSession: test.agent.id, origin: 'subagent' }, agentOptions: { provider: 'mock', model: 'mock' } })
+  cleanups.push(async () => {
+    questionLifetime.abort(); await answer.catch(() => {})
+    test.agent.cancel({ kind: 'user' }, { keepInbox: true }); await test.agent.whenIdle()
+    await childHandle.dispose()
+  })
+  const child = childHandle.agent
+  test.runtime.bindChild(child)
+  test.scheduler.hasOwnedWork = (id, runId) => test.runtime.hasOwnedWork(id, runId)
+  let childAuthority, backendAuthority, parentAuthority
+  test.ctx.on('agent/pre-step', (payload, next) => {
+    if (payload.agent === child) {
+      childAuthority = test.runtime.authorizeMcp(child.id, 'personal:server:tool', 'v1')
+      backendAuthority = test.runtime.authorizeRunMcp(test.owner.ownerId, run.id, 'personal:server:tool', 'v1')
+      parentAuthority = test.runtime.authorizeMcp(test.agent.id, 'personal:server:tool', 'v1')
+      expect(test.runtime.authorizeMcp(child.id, 'personal:server:tool', 'v2')).toBeUndefined()
+      expect(test.runtime.authorizeMcp(child.id, 'personal:other:tool', 'v1')).toBeUndefined()
+      expect(test.runtime.authorizeRunMcp('t:other', run.id, 'personal:server:tool', 'v1')).toBe(false)
+      expect(test.runtime.authorizeRunMcp(test.owner.ownerId, run.id, 'personal:server:tool', 'v2')).toBe(false)
+      expect(test.runtime.authorizeRunMcp(test.owner.ownerId, run.id, 'personal:other:tool', 'v1')).toBe(false)
+      const lease = test.scheduler.leases.get(test.agent.id)
+      test.scheduler.leases.set(test.agent.id, { ...lease, checkedAt: Date.now() - 10001 })
+      try {
+        expect(test.runtime.authorizeMcp(child.id, 'personal:server:tool', 'v1')).toBeUndefined()
+        expect(test.runtime.authorizeRunMcp(test.owner.ownerId, run.id, 'personal:server:tool', 'v1')).toBe(false)
+      } finally { test.scheduler.leases.set(test.agent.id, lease) }
+    }
+    return next()
+  }, { global: true })
+  child.followup(createUserMessage({ content: [{ type: 'text', text: 'continue delegated work' }], source: { kind: 'user' } }))
+  await child.whenIdle()
+  expect(child.session.snapshotEvents().findLast(event => event.type === 'turn/end').data.reason.kind).toBe('completed')
+  expect(test.model.requests).toHaveLength(2)
+  expect(childAuthority).toMatchObject({ runId: run.id, ownerId: test.owner.ownerId })
+  expect(backendAuthority).toBe(true)
+  expect(parentAuthority).toBeUndefined()
+  expect(test.db.getRun(test.owner.ownerId, run.id).status).toBe('waiting_input')
+  expect(test.db.getPendingInput(test.owner.ownerId, run.id).status).toBe('pending')
+  expect(test.runtime.authorizeRunMcp(test.owner.ownerId, run.id, 'personal:server:tool', 'v1')).toBe(false)
+})
+
 it.each(['button', 'command'])('preserves native goal state and resource context when resuming via %s', async (entry) => {
   const test = await fixture(['hang', 'hang'])
   const service = new WorkbenchService({ database: test.db, sessionController: test.sessions, agents: test.ctx.agents,
