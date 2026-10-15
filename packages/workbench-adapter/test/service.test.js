@@ -49,6 +49,18 @@ function setup() {
   return { database, owner, chat, service, sessionController, agents, commands, skills, fileManager, platformClient, agent }
 }
 
+it('keeps a legacy context snapshot small on follow-up polls while retaining the durable reading', () => {
+  const { database, owner, chat, service } = setup()
+  const { run } = database.createRun({ ownerId: owner.ownerId, chatId: chat.id, sessionId: chat.sessionId, query: 'q', selection: {} })
+  database.appendEvent(owner.ownerId, run.id, { event: 'workbench_context', phase: 'usage', used_tokens: 1200,
+    window_tokens: 128000, model: 'p/m', estimated: false, mcpTools: [{ schema: 'x'.repeat(513420) }], mcpCatalogReady: true })
+  const response = service.followups(owner, chat.id, [run.id])
+  expect(response.runs[0].context_usage).toMatchObject({ used_tokens: 1200, model: 'p/m' })
+  expect('mcpTools' in response.runs[0].context_usage).toBe(false)
+  expect(Buffer.byteLength(JSON.stringify(response))).toBeLessThan(2048)
+  expect(database.latestContextEvent(owner.ownerId, run.id).mcpTools).toHaveLength(1)
+})
+
 it.each(['queue', 'steer'])('carries native %s submission through the admitted immutable receipt', async mode => {
   const test = setup()
   const body = { query: '更新材料', request_key: 'native-mode', mode }
@@ -571,6 +583,19 @@ describe('followup and control service', () => {
     const source = service.followHistory(owner, chat.id, new AbortController().signal)
     expect((await source.next()).value.control.contextPressure.projectedTokens).toBe(12000)
     await source.return()
+  })
+  it('exposes native context composition on refresh, replacement and cold read without estimating it again', async () => {
+    const { service, owner, chat } = setup()
+    const dispose = vi.fn()
+    let contextBreakdown = { systemTokens: 1700, toolsTokens: 9900, messageTokens: 3400 }
+    service.sessionQuery = { observeSession: async () => ({ projections: { values: { contextBreakdown } }, events: [], [Symbol.dispose]: dispose }) }
+    expect((await service.getControl(owner, chat.id)).contextBreakdown).toEqual(contextBreakdown)
+    contextBreakdown = { ...contextBreakdown, messageTokens: 200 }
+    const restored = new WorkbenchService({ database: service.database, sessionQuery: service.sessionQuery, agents: { get: () => undefined } })
+    expect((await restored.getControl(owner, chat.id)).contextBreakdown).toEqual(contextBreakdown)
+    contextBreakdown = undefined
+    expect((await restored.getControl(owner, chat.id)).contextBreakdown).toBeNull()
+    expect(dispose).toHaveBeenCalledTimes(3)
   })
   it('persists capacity-waiting tasks without sending them to DSH and allows cancellation', async () => {
     const { service, owner, chat, database, sessionController } = setup()

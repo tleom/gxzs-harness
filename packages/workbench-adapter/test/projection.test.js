@@ -22,6 +22,24 @@ function bind(database, chat, run, turn = 1) {
 }
 
 describe('DSH session event projection', () => {
+  it('persists only gauge fields instead of copying the frozen MCP catalog into every context reading', () => {
+    const { database, chat, run } = setup()
+    bind(database, chat, run)
+    const reading = { used_tokens: 1200, window_tokens: 128000, estimated: true, model: 'p/m' }
+    const context = { ...reading, mcpCatalogReady: true, mcpTools: [{ inputSchema: { description: 'x'.repeat(513420) } }] }
+    projectSessionEvent(database, chat.sessionId, { type: 'request/context', seq: 11, data: {} }, chat.ownerId, context)
+    projectSessionEvent(database, chat.sessionId, { type: 'assistant/message', seq: 12,
+      data: { turn: 1, step: 1, message: { content: [{ type: 'text', text: 'reply' }] } } }, chat.ownerId, context)
+    const events = database.allEvents(chat.ownerId, run.id).filter(event => event.event === 'workbench_context')
+    expect(events).toHaveLength(2)
+    for (const event of events) {
+      expect(event).toMatchObject(reading)
+      expect('mcpTools' in event).toBe(false)
+      expect('mcpCatalogReady' in event).toBe(false)
+      expect(Buffer.byteLength(JSON.stringify(event))).toBeLessThan(512)
+    }
+    expect(context.mcpTools[0].inputSchema.description.length).toBe(513420)
+  })
   it('replays a disarmed goal completion before interrupted-run recovery without live context', () => {
     const { database, chat, run } = setup()
     bind(database, chat, run)

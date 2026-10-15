@@ -30,9 +30,10 @@ export class WorkbenchSchedules {
         if (typeof row?.schedule_id === 'string') ids.push(row.schedule_id) }
     } catch { /* Older framing may not contain recoverable task identities. */ }
     const catalog = await this.native.catalog()
-    const titles = ids.map(id => catalog.find(task => task.id === id && task.sessionId === run.sessionId)?.title).filter(title => typeof title === 'string')
+    const tasks = ids.map(id => catalog.find(task => task.id === id && task.sessionId === run.sessionId)).filter(Boolean)
+    const titles = tasks.map(task => task.title)
     // A delivery's display names are a receipt, not another task catalog.
-    this.database.updateRunResources(run, { ...run.selection, schedule_titles: titles }, run.mcpTools)
+    this.database.updateRunResources(run, { ...run.selection, schedule_titles: titles, schedule_ids: tasks.map(task => task.id) }, run.mcpTools)
     this.database.appendEvent(run.ownerId, run.id, { event: 'workbench_schedule', titles })
   }
   async create(owner, chatId, request, signal) {

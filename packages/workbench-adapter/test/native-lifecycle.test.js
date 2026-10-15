@@ -52,8 +52,10 @@ it('settles two original queued Schedule turns without leaving the second receip
   expect(test.db.getRun(test.owner.ownerId, second.id)).toMatchObject({ status: 'completed' })
 })
 
-it('continues an owned background-child notice after the parent completed and replays it once', async () => {
-  const test = await fixture(['parent done', 'child result incorporated'])
+it('admits an owned child notice as a fresh turn with current permissions after the parent completed', async () => {
+  const test = await fixture(['parent done', 'child result incorporated'], { scheduledClaims: true })
+  test.runtime.mcpCatalogState = { ready: true }
+  test.runtime.mcpResources = () => [{ id: 'current-catalog' }]
   const original = test.create('delegate')
   test.db.updateRunResources(original, {subagent_ids:['owned-child']}, original.mcpTools)
   await test.scheduler.enqueue(original,[{type:'text',text:'delegate'}])
@@ -69,11 +71,29 @@ it('continues an owned background-child notice after the parent completed and re
   expect(test.model.requests).toHaveLength(2)
   expect(JSON.stringify(test.model.requests[1].messages)).toContain('child completed')
   const continued = test.db.listRuns(test.owner.ownerId,test.chat.id).find(run => run.id !== original.id)
-  expect(continued).toMatchObject({status:'completed',parentRunId:original.id,selection:{is_continuation:true,native_notice:true},mcpTools:original.mcpTools})
+  expect(continued).toMatchObject({status:'completed',parentRunId:original.id,selection:{native_source:'subagent-settled',native_notice:true},mcpTools:[{id:'current-catalog'}]})
+  expect(continued.selection.is_continuation).toBeUndefined()
   const query = {observeSession:async () => ({events:test.agent.session.snapshotEvents(),[Symbol.dispose]() {}})}
   await reconcileNativeSessions(test.db,query,test.owner.ownerId)
   expect(test.db.listRuns(test.owner.ownerId,test.chat.id)).toHaveLength(2)
   expect(test.model.requests).toHaveLength(2)
+})
+
+it.each(['cancelled', 'interrupted'])('admits a late owned child message after a %s task without reopening its receipt', async status => {
+  const test = await fixture(['new child reply'], { scheduledClaims: true })
+  test.runtime.mcpCatalogState = { ready: true }
+  test.runtime.mcpResources = () => [{ id: 'current-catalog' }]
+  const original = test.create('old task')
+  test.db.updateRunResources(original, { subagent_ids: ['owned-child'], subagent_names: { 'owned-child': '核对员' } }, original.mcpTools)
+  test.db.transitionRun(test.owner.ownerId, original.id, status)
+  const message = createUserMessage({ content: [{ type: 'text', text: 'late child result' }], source: { kind: 'agent-message', senderSessionId: 'owned-child' } })
+  test.agent.followup(message)
+  await test.agent.whenIdle()
+  expect(test.model.requests).toHaveLength(1)
+  const run = test.db.getRun(test.owner.ownerId, message.id)
+  expect(run).toMatchObject({ status: 'completed', parentRunId: original.id, mcpTools: [{ id: 'current-catalog' }], selection: { native_source: 'agent-message', subagent_names: { 'owned-child': '核对员' } } })
+  expect(test.db.getRun(test.owner.ownerId, original.id).status).toBe(status)
+  expect(test.requests.filter(item => item.action === 'acquire')).toHaveLength(1)
 })
 
 it('lets a native job completion wake an idle root and retains one admission receipt on replay', async () => {
@@ -1069,6 +1089,8 @@ it('exposes the published DSH projected occupancy immediately after a compacted 
   const { createMessage } = await native('dsh-llm')
   await test.ctx.plugin(TokenMeter)
   const session = test.agent.session
+  session.append('system/message', { message: createMessage({ role: 'system', content: [{ type: 'text', text: 'native test instructions' }] }) }, { surfaceOp: 'append' })
+  session.append('request/header', { header: { config: {}, tools: [{ name: 'inspect', description: 'inspect test artifacts', inputSchema: { type: 'object', properties: {} } }] } })
   session.append('request/context', { provider: 'mock', model: 'mock', contextWindow: 100000 })
   const first = session.append('user/message', createUserMessage({ content: [{ type: 'text', text: 'long context '.repeat(1000) }], source: { kind: 'test' } }), { surfaceOp: 'append' }).seq
   const usage = { inputTokens: 9000, outputTokens: 20 }
@@ -1080,13 +1102,20 @@ it('exposes the published DSH projected occupancy immediately after a compacted 
   session.append('step/end', { turn: 1, step: 1 })
   const service = new WorkbenchService({ database: test.db, agents: test.ctx.agents,
     sessionQuery: { observeSession: async () => ({ events: session.snapshotEvents(), projections: test.ctx.sessionProjections.snapshot(session) }) } })
-  const before = (await service.getControl(test.owner, test.chat.id)).contextPressure
+  const beforeControl = await service.getControl(test.owner, test.chat.id)
+  const before = beforeControl.contextPressure
+  expect(beforeControl.contextBreakdown).toEqual(test.ctx.sessionProjections.snapshot(session).values.contextBreakdown)
+  expect(Object.values(beforeControl.contextBreakdown).every(value => value > 0)).toBe(true)
   const nodes = test.ctx.tokenMeter.measure(session).nodes.filter(node => node.seq >= first && node.seq <= last)
   session.append('compaction/summary', { compactionId: 'compact-test', summary: [{ type: 'text', text: 'summary' }],
     shadowedRange: { start: first, end: last }, shadowedSeqs: nodes.map(node => node.seq), shadowedTokenCount: nodes.reduce((total, node) => total + node.tokens, 0), provider: 'mock', model: 'mock' })
   session.append('user/message', createUserMessage({ content: [{ type: 'text', text: 'summary' }], source: { kind: 'test' } }),
     { surfaceOp: { op: 'replace', startSeq: first, endSeq: last }, sourceEventSeqs: [first, last] })
-  const after = (await service.getControl(test.owner, test.chat.id)).contextPressure
+  const afterControl = await service.getControl(test.owner, test.chat.id)
+  const after = afterControl.contextPressure
+  expect(afterControl.contextBreakdown.systemTokens).toBe(beforeControl.contextBreakdown.systemTokens)
+  expect(afterControl.contextBreakdown.toolsTokens).toBe(beforeControl.contextBreakdown.toolsTokens)
+  expect(afterControl.contextBreakdown.messageTokens).toBeLessThan(beforeControl.contextBreakdown.messageTokens)
   expect(after.pressureTokens).toBe(before.pressureTokens)
   expect(after.projectedTokens).toBeLessThan(before.projectedTokens)
   expect(after.contextWindow).toBe(100000)

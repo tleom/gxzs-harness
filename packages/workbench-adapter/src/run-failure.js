@@ -1,3 +1,5 @@
+import { presentContextEvent } from './context-usage.js'
+
 /** Recognize provider facts, never infer content rejection from arbitrary prose. */
 export function runFailure(value) {
   if (!value) return undefined
@@ -24,6 +26,7 @@ export function runFailure(value) {
 }
 
 export function presentRunEvent(event) {
+  if (event.event === 'workbench_context') return presentContextEvent(event)
   if (!['workbench_end', 'error'].includes(event.event) || !event.error) return event
   const failure = runFailure({ message: event.error, code: event.error_code })
   return { ...event, error: failure.message, ...(failure.code ? { error_code: failure.code } : {}) }

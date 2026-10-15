@@ -829,6 +829,7 @@ export class WorkbenchService {
           rounds_started: projection.roundsStarted, last_run_id: this.database.goalRun(chat.sessionId)?.id ?? null } : null }
       }
       return { ...state, plan, contextPressure: source.projections?.values?.contextPressure ?? null,
+        contextBreakdown: source.projections?.values?.contextBreakdown ?? null,
         commands: nativeCommandRecords(source.events ?? [], this.database.listRuns(owner.ownerId, chatId)) }
     } finally { source[Symbol.dispose]?.() }
   }
@@ -1066,11 +1067,12 @@ export class WorkbenchService {
 
   inputRunDto(owner, run, events = []) {
     const inputs = this.database.listPendingInputs(owner.ownerId, run.id)
+    const context = this.database.latestContextEvent(owner.ownerId, run.id)
     const steering = events.length ? events.filter(event => event.event === 'workbench_steering' || event.event === 'workbench_steered')
       : this.database.steeringEvents(owner.ownerId, run.id)
     return {
       ...runDto({ ...run, errorCode: run.errorCode ?? (run.error ? this.database.runErrorCode(owner.ownerId, run.id) : undefined) }, events, inputs.at(-1)),
-      context_usage: this.database.latestContextEvent(owner.ownerId, run.id),
+      context_usage: context ? presentRunEvent(context) : undefined,
       ...this.database.runTiming(owner.ownerId, run.id),
       steer_target_run_id: steering.find((event) => event.event === 'workbench_steered')?.steer_target_run_id,
       steering_messages: steering.filter((event) => event.event === 'workbench_steering').map((event) => ({
@@ -1151,7 +1153,8 @@ export function runDto(run, events = [], pending = null) {
     mentioned_resources: groupPluginMentions(run.selection?.mentioned_resources ?? [], run.mcpTools ?? []),
     ...(run.selection?.command ? { command: run.selection.command } : {}),
     ...(run.selection?.silent_resume || run.selection?.is_continuation ? { is_continuation: true } : {}),
-    ...(run.selection?.native_source === 'schedule' ? { source: { kind: 'schedule', titles: run.selection.schedule_titles ?? [] } } : {}),
+    ...(run.selection?.native_source === 'schedule' ? { source: { kind: 'schedule', titles: run.selection.schedule_titles ?? [], schedule_ids: run.selection.schedule_ids ?? [] } } : {}),
+    ...(run.selection?.native_notice && run.selection.native_source !== 'tool-jobs' ? { source: { kind: run.selection.native_source ?? 'agent-message' } } : {}),
     status: run.status, error: run.error ? runFailure({ message: run.error, code: run.errorCode }).message : run.error,
     feedback: run.feedback ?? null, events: events.map(presentRunEvent), events_cursor: `${run.seq}-0`,
     stop_confirmation: run.stopConfirmation ?? null,

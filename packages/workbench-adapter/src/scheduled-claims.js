@@ -1,11 +1,12 @@
 import { setTimeout as delay } from 'node:timers/promises'
 import { projectInboxClaim } from './projection.js'
+import { isNativeNotice } from './display-events.js'
 
 /** Bind delayed Schedule/Jobs claims before rebuilding the native prompt. */
 export function registerScheduledClaims(ctx, { runtime, database, ownerId }) {
   const pending = new WeakMap()
   ctx.on('agent/inbox/claimed', payload => {
-    if (['schedule', 'tool-jobs'].includes(payload.message?.source?.kind) && !runtime.mcpCatalogState?.ready) {
+    if ((['schedule', 'tool-jobs'].includes(payload.message?.source?.kind) || isNativeNotice(payload.message)) && !runtime.mcpCatalogState?.ready) {
       const claims = pending.get(payload.agent) ?? []
       claims.push(payload)
       pending.set(payload.agent, claims)

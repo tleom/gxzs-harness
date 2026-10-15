@@ -2,6 +2,16 @@ import { expect, it } from 'vitest'
 import { runFailure, presentRunEvent, goalFailureReason, resumeGoalSelection } from '../src/run-failure.js'
 
 const rejected = '400 data: {"error":{"code":"data_inspection_failed","message":"Input text data may contain inappropriate content."},"id":"request-1"}'
+it('strips historic context payloads for SSE and history without modifying the stored event or compaction facts', () => {
+  const event = { event: 'workbench_context', _id: '10-0', workbench_run_id: 'run', phase: 'compacted',
+    used_tokens: 1200, window_tokens: 128000, estimated: true, model: 'p/m',
+    compaction_id: 'compact', before_tokens: 9000, mcpCatalogReady: true, mcpTools: [{ schema: 'x'.repeat(513420) }] }
+  const output = presentRunEvent(event)
+  expect(output).toMatchObject({ _id: '10-0', phase: 'compacted', used_tokens: 1200, compaction_id: 'compact', before_tokens: 9000 })
+  expect('mcpTools' in output).toBe(false)
+  expect(Buffer.byteLength(JSON.stringify(output))).toBeLessThan(512)
+  expect(event.mcpTools).toHaveLength(1)
+})
 it('classifies the actual provider input rejection while retaining ordinary native errors', () => {
   expect(runFailure({ code: 'INVALID_REQUEST', message: rejected })).toMatchObject({ code: 'data_inspection_failed', message: expect.stringContaining('相同上下文') })
   expect(runFailure('400 bad request')).toMatchObject({ message: '400 bad request' })

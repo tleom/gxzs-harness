@@ -27,6 +27,7 @@ import { browserClient } from './browser-client.js'
 import { registerTerminalTool } from './terminal-tool.js'
 import { WorkbenchJobs } from './jobs.js'
 import { registerScheduledClaims } from './scheduled-claims.js'
+import { isNativeNotice } from './display-events.js'
 import { registerToolDisplayReceipts } from './tool-display-receipts.js'
 import { nativeHostActivity } from './host-activity.js'
 import { WorkbenchNativeClient } from './native-client.js'
@@ -171,7 +172,7 @@ export function apply(ctx, config) {
   registerScheduledClaims(ctx, { runtime, database, ownerId: config.ownerId })
   registerToolDisplayReceipts(ctx, { runtime, database, ownerId: config.ownerId })
   ctx.on('agent/pre-step', async (payload, next) => {
-    const autonomous = payload.messages?.filter(message => ['schedule', 'tool-jobs'].includes(message.source?.kind)) ?? []
+    const autonomous = payload.messages?.filter(message => ['schedule', 'tool-jobs'].includes(message.source?.kind) || isNativeNotice(message)) ?? []
     if (autonomous.length) {
       while (!runtime.mcpCatalogState?.ready) {
         await delay(100, undefined, { signal: payload.signal })
