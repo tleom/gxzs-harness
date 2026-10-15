@@ -41,7 +41,13 @@ try {
         const text = await readFile(args.path, 'utf8')
         const declaration = 'this._supportsMultiMonitor = (typeof BroadcastChannel !== "undefined" && typeof SharedWorker !== "undefined");'
         if (text.split(declaration).length !== 2) throw new Error('Kasm single-display contract changed')
+        // The pinned handler returns undefined on success. Treat only false as
+        // incomplete input, so a coalesced ServerFence is processed immediately.
+        // Otherwise the server waits for its fence reply and sends no more pixels.
+        const encoders = 'return this._handleServerVideoEncoders();'
+        if (text.split(encoders).length !== 2) throw new Error('Kasm video-encoder dispatch contract changed')
         return { contents: text.replace(declaration, 'this._supportsMultiMonitor = false;')
+          .replace(encoders, 'return this._handleServerVideoEncoders() !== false;')
           .replace('Log.Warn("This browser does not support multi-monitor setups.");', 'Log.Debug("Single browser display");'), resolveDir: dirname(args.path) }
       })
     } }],
