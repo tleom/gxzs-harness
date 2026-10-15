@@ -511,7 +511,10 @@ class Hosts:
                 return False
         except Exception:
             return False
-        return (payload.get('live') is True and payload.get('recovery') == 'ready'
+        catalog_blocked = (payload.get('recovery') == 'ready'
+                           or (payload.get('recovery') == 'failed'
+                               and payload.get('recovery_dependency') == 'mcp_catalog'))
+        return (payload.get('live') is True and catalog_blocked
                 and payload.get('resources') == 'unavailable')
 
     def native_activity(self, endpoint):

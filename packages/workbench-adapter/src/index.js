@@ -132,7 +132,8 @@ export function apply(ctx, config) {
       await reconcileNativeSessions(database, ctx.sessionQuery, config.ownerId, () => {
         // Missing autonomous receipts need a fresh frozen catalog. Retry
         // recovery until its first verified sync; an unavailable read is not empty.
-        if (!runtime.mcpCatalogState?.ready) throw new Error('MCP catalog is not ready for native notice recovery')
+        if (!runtime.mcpCatalogState?.ready) throw Object.assign(
+          new Error('MCP catalog is not ready for native notice recovery'), { code: 'MCP_CATALOG_UNAVAILABLE' })
         return { mcpTools: runtime.mcpResources?.() ?? [] }
       }, startupRunIds)
       await scheduler.flushFences()
@@ -648,6 +649,7 @@ export function apply(ctx, config) {
       if (req.method === 'GET' && req.url === config.basePath + '/health') {
         const ready = recovered && !database.streamFlushError && runtime.mcpCatalogState?.ready === true
         sendJson(res, ready ? 200 : 503, { live: true, ready, recovery: recovered ? 'ready' : recoveryError ? 'failed' : 'recovering',
+          recovery_dependency: recoveryError?.code === 'MCP_CATALOG_UNAVAILABLE' ? 'mcp_catalog' : undefined,
           resources: runtime.mcpCatalogState?.status ?? 'initializing',
           activity: ready ? await nativeHostActivity(ctx, runtime.sidebarActivity, () => subagentSettings.activeWrites) : { protocol: 1, status: 'unknown' } })
         return

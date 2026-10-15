@@ -1,14 +1,18 @@
 import { createHash, createHmac, randomUUID } from 'node:crypto'
 import { EventEmitter } from 'node:events'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { Readable } from 'node:stream'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { apply, waitSessionActivity } from '../src/index.js'
+import { WorkbenchDatabase } from '../src/persistence.js'
 import { publishedModels } from './model-fixture.js'
 
 const cleanups = []
 afterEach(() => cleanups.splice(0).forEach((cleanup) => cleanup()))
 
-function setup() {
+function setup({ databasePath = ':memory:', configure = () => {} } = {}) {
   const key = Buffer.alloc(32, 9).toString('base64')
   vi.stubEnv('TEST_ASSERTION_KEY', key)
   const sessions = new Map()
@@ -55,8 +59,9 @@ function setup() {
     on: vi.fn(), emit: vi.fn(), reflect: { provide: vi.fn() },
     effect: (factory) => cleanups.push(factory()),
   }
+  configure(context)
   apply(context, {
-    basePath: '/ai/workbench', databasePath: ':memory:', workspace: '/workspace',
+    basePath: '/ai/workbench', databasePath, workspace: '/workspace',
     assertionIssuer: 'gxzs', assertionAudiencePath: '/console/api/workbench', assertionKeyEnv: 'TEST_ASSERTION_KEY',
     ownerId: 't:42', humanInputTimeoutSeconds: 60,
   })
@@ -95,6 +100,31 @@ async function call(handler, key, method, route, value, authenticated = true, us
 }
 
 describe('authenticated workbench HTTP handler', () => {
+  it('identifies catalog-blocked cold recovery and resumes in place after the dependency returns', async () => {
+    const folder = mkdtempSync(join(tmpdir(), 'workbench-recovery-'))
+    const databasePath = join(folder, 'state.db')
+    const database = new WorkbenchDatabase(databasePath)
+    database.createChat({ ownerId: 't:42', sessionId: 'native', selection: {} })
+    database.close()
+    const message = { id: 'cold-notice', source: { kind: 'tool-jobs', form: 'notice' }, content: [{ type: 'text', text: 'completed' }] }
+    const events = [{ type: 'turn/start', seq: 1, data: { turn: 1 } },
+      { type: 'user/message', seq: 2, data: message }]
+    const { handler, key, context } = setup({ databasePath, configure(ctx) {
+      ctx.sessionQuery = { observeSession: vi.fn(async () => ({ events, [Symbol.dispose]() {} })) }
+    } })
+    cleanups.push(() => rmSync(folder, { recursive: true, force: true }))
+    const runtime = context.reflect.provide.mock.calls.find(([name]) => name === 'workbenchRuntime')[1]
+    runtime.mcpCatalogState = { ready: false, status: 'unavailable' }
+    await vi.waitFor(async () => expect((await call(handler, key, 'GET', '/health', undefined, false)).body)
+      .toMatchObject({ live: true, ready: false, recovery: 'failed', recovery_dependency: 'mcp_catalog', resources: 'unavailable' }))
+    expect(runtime.database.getRun('t:42', message.id)).toBeUndefined()
+    runtime.mcpCatalogState = { ready: true, status: 'ready' }
+    runtime.mcpResources = () => [{ id: 'current-tool' }]
+    await vi.waitFor(async () => expect(await call(handler, key, 'GET', '/health', undefined, false))
+      .toMatchObject({ status: 200, body: { recovery: 'ready' } }), { timeout: 2500 })
+    expect(runtime.database.getRun('t:42', message.id).mcpTools).toEqual([{ id: 'current-tool' }])
+    expect((await call(handler, key, 'GET', '/health', undefined, false)).body.recovery_dependency).toBeUndefined()
+  })
   it('cancels the owner file read when its response connection closes', async () => {
     const { handler, key, context } = setup()
     const previous = context.workbenchFileManager.operate.getMockImplementation()
