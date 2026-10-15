@@ -70,11 +70,11 @@ export function registerBrowserTool(ctx, { browsers, runtime, database, ownerId 
       const browser = browsers.require(owner, id)
       database.appendEvent(ownerId, run.id, { event: 'workbench_browser_open', chat_id: chat.id, browser_id: id })
       const previous = observations.get(exec.agent)
-      if (action.action !== 'snapshot' && previous?.browserId === id && Number.isSafeInteger(previous.revision))
+      if (action.action !== 'snapshot' && previous?.browser.deref() === browser && previous.browserId === id && Number.isSafeInteger(previous.revision))
         action.expected_revision = previous.revision
       const observed = await browser.command(action, exec.signal)
       const content = action.action === 'snapshot' ? observed : await browser.command({ action: 'snapshot' }, exec.signal)
-      observations.set(exec.agent, { browserId: id, revision: content.revision })
+      observations.set(exec.agent, { browser: new WeakRef(browser), browserId: id, revision: content.revision })
       let image_attachment
       if (args.action === 'screenshot') {
         const config = exec.agent.session?.requestHeader?.()?.config

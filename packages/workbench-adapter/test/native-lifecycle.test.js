@@ -17,6 +17,7 @@ import { registerScheduledClaims } from '../src/scheduled-claims.js'
 import { registerDatabasePrompt } from '../src/database-prompt.js'
 import WorkbenchFileSystem from '../../workbench-sandbox-runtime/src/fs.js'
 import { registerBrowserTool } from '../src/browser-tool.js'
+import { registerTerminalTool } from '../src/terminal-tool.js'
 
 // Exercise the exact published DSH version installed by the production profile.
 // CI must install profiles/workbench before running this contract suite.
@@ -147,6 +148,66 @@ class FakeModel extends LlmAdapter {
     yield { type: 'finish', reason: { kind: 'stop' } }
   }
 }
+
+it.each(['terminal', 'browser'])('lets the original Agent handle a manually closed %s and explicitly reopen it', async name => {
+  const test = await fixture([])
+  const id = '12345678-1234-1234-1234-123456789abc'
+  let rejectActive, opened = false, closes = 0
+  const pending = new Promise((_, reject) => { rejectActive = reject })
+  const script = name === 'terminal'
+    ? [{ action: 'read', terminal_id: id, wait_ms: 0 }, { action: 'open', wait_ms: 0 }, 'reopened and continued']
+    : [{ action: 'snapshot' }, { action: 'navigate', url: 'https://example.com/new' }, 'reopened and continued']
+  test.model.stream = async function* (options) {
+    this.requests.push(options)
+    const value = script.shift()
+    if (typeof value === 'object') {
+      yield { type: 'tool-call-delta', index: 0, id: `resource-call-${this.requests.length}`, name, argumentsDelta: JSON.stringify(value) }
+      yield { type: 'finish', reason: { kind: 'tool-calls' } }
+    } else {
+      if (value === undefined) throw new Error('resource recovery model script exhausted')
+      yield { type: 'text-delta', index: 0, text: value }
+      yield { type: 'finish', reason: { kind: 'stop' } }
+    }
+  }
+  let manualClose
+  if (name === 'terminal') {
+    let info = { id, title: 'bash', state: 'running' }
+    let inspecting = false
+    const native = {
+      list: () => info ? [info] : [],
+      create: async (_agent, request) => { opened = true; return info = { id: request.id, title: 'bash', state: 'running' } },
+      inspectForAgent: async () => {
+        if (!opened) { inspecting = true; return pending }
+        return { info, screen: 'new shell ready', truncated: false }
+      },
+      close: async () => { closes++; info = undefined; rejectActive(new Error('Terminal closed by user')) },
+    }
+    registerTerminalTool(test.ctx, { native, runtime: test.runtime, database: test.db, ownerId: test.owner.ownerId })
+    manualClose = async () => { await vi.waitFor(() => expect(inspecting).toBe(true)); await native.close() }
+  } else {
+    let acting = false
+    const oldBrowser = { command: async () => { acting = true; return pending } }
+    const replacement = { command: async () => ({ url: 'https://example.com/new', title: 'new page', revision: 1 }) }
+    let current = oldBrowser
+    const browsers = {
+      create: async () => { if (!current) { opened = true; current = replacement } },
+      require: () => current,
+    }
+    registerBrowserTool(test.ctx, { browsers, runtime: test.runtime, database: test.db, ownerId: test.owner.ownerId })
+    manualClose = async () => { await vi.waitFor(() => expect(acting).toBe(true)); closes++; current = undefined; rejectActive(new Error('Browser closed by user')) }
+  }
+  const run = test.create(`Operate ${name}`)
+  await test.scheduler.enqueue(run, [{ type: 'text', text: run.query }])
+  await test.scheduler.tick()
+  await manualClose()
+  await test.agent.whenIdle()
+  expect(closes).toBe(1)
+  expect(opened).toBe(true)
+  expect(test.model.requests).toHaveLength(3)
+  expect(JSON.stringify(test.model.requests[1].messages)).toContain('closed by user')
+  expect(test.db.getRun(test.owner.ownerId, run.id)).toMatchObject({ status: 'completed' })
+  expect(test.agent.session.snapshotEvents().filter(event => event.type === 'turn/end').map(event => event.data.reason.kind)).toEqual(['completed'])
+})
 
 async function fixture(script, { scheduledClaims = false } = {}) {
   const ctx = new Context()
