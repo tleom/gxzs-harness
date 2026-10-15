@@ -1,14 +1,18 @@
 import { createHash, createHmac, randomUUID } from 'node:crypto'
 import { EventEmitter } from 'node:events'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { Readable } from 'node:stream'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { apply, waitSessionActivity } from '../src/index.js'
+import { WorkbenchDatabase } from '../src/persistence.js'
 import { publishedModels } from './model-fixture.js'
 
 const cleanups = []
 afterEach(() => cleanups.splice(0).forEach((cleanup) => cleanup()))
 
-function setup() {
+function setup({ databasePath = ':memory:', configure = () => {} } = {}) {
   const key = Buffer.alloc(32, 9).toString('base64')
   vi.stubEnv('TEST_ASSERTION_KEY', key)
   const sessions = new Map()
@@ -55,8 +59,9 @@ function setup() {
     on: vi.fn(), emit: vi.fn(), reflect: { provide: vi.fn() },
     effect: (factory) => cleanups.push(factory()),
   }
+  configure(context)
   apply(context, {
-    basePath: '/ai/workbench', databasePath: ':memory:', workspace: '/workspace',
+    basePath: '/ai/workbench', databasePath, workspace: '/workspace',
     assertionIssuer: 'gxzs', assertionAudiencePath: '/console/api/workbench', assertionKeyEnv: 'TEST_ASSERTION_KEY',
     ownerId: 't:42', humanInputTimeoutSeconds: 60,
   })
@@ -95,6 +100,55 @@ async function call(handler, key, method, route, value, authenticated = true, us
 }
 
 describe('authenticated workbench HTTP handler', () => {
+  it('pages terminal history through a fixed cursor and retains owner authorization', async () => {
+    const { handler, key, context } = setup()
+    const { database } = context.reflect.provide.mock.calls.find(([name]) => name === 'workbenchRuntime')[1]
+    const chat = database.createChat({ ownerId: 't:42', sessionId: 'page-test', selection: {} })
+    const { run } = database.createRun({ ownerId: 't:42', chatId: chat.id, sessionId: chat.sessionId, query: 'paged', selection: {} })
+    for (let index = 0; index < 300; index++) database.appendEvent('t:42', run.id, { event: 'workbench_activity', data: { index } })
+    database.transitionRun('t:42', run.id, 'completed')
+    const route = `/runs/${run.id}?after=0-0`
+    expect((await call(handler, key, 'GET', route, undefined, false)).status).toBe(401)
+    expect((await call(handler, key, 'GET', route, undefined, true, 'other')).status).toBe(403)
+    const first = await call(handler, key, 'GET', route)
+    expect(first.status).toBe(200)
+    expect(first.body.data).toMatchObject({ status: 'completed', history_complete: false,
+      events_cursor: '256-0', events_next_cursor: '256-0', events_through_cursor: '300-0' })
+    database.appendEvent('t:42', run.id, { event: 'workbench_context', used_tokens: 5 })
+    const last = await call(handler, key, 'GET', `/runs/${run.id}?after=256-0&through=300-0`)
+    expect(last.status).toBe(200)
+    expect(last.body.data).toMatchObject({ history_complete: true, events_cursor: '300-0', events_through_cursor: '300-0' })
+    expect(last.body.data.events).toHaveLength(44)
+    expect(last.body.data.events_next_cursor).toBeUndefined()
+    expect((await call(handler, key, 'GET', `/runs/${run.id}?after=300-0&through=256-0`)).status).toBe(400)
+    expect((await call(handler, key, 'GET', `/runs/${run.id}?after=bad`)).status).toBe(400)
+    expect((await call(handler, key, 'GET', `/runs/${run.id}?view=state`)).body.data).toMatchObject({ events: [], events_cursor: '301-0' })
+  })
+  it('identifies catalog-blocked cold recovery and resumes in place after the dependency returns', async () => {
+    const folder = mkdtempSync(join(tmpdir(), 'workbench-recovery-'))
+    const databasePath = join(folder, 'state.db')
+    const database = new WorkbenchDatabase(databasePath)
+    database.createChat({ ownerId: 't:42', sessionId: 'native', selection: {} })
+    database.close()
+    const message = { id: 'cold-notice', source: { kind: 'tool-jobs', form: 'notice' }, content: [{ type: 'text', text: 'completed' }] }
+    const events = [{ type: 'turn/start', seq: 1, data: { turn: 1 } },
+      { type: 'user/message', seq: 2, data: message }]
+    const { handler, key, context } = setup({ databasePath, configure(ctx) {
+      ctx.sessionQuery = { observeSession: vi.fn(async () => ({ events, [Symbol.dispose]() {} })) }
+    } })
+    cleanups.push(() => rmSync(folder, { recursive: true, force: true }))
+    const runtime = context.reflect.provide.mock.calls.find(([name]) => name === 'workbenchRuntime')[1]
+    runtime.mcpCatalogState = { ready: false, status: 'unavailable' }
+    await vi.waitFor(async () => expect((await call(handler, key, 'GET', '/health', undefined, false)).body)
+      .toMatchObject({ live: true, ready: false, recovery: 'failed', recovery_dependency: 'mcp_catalog', resources: 'unavailable' }))
+    expect(runtime.database.getRun('t:42', message.id)).toBeUndefined()
+    runtime.mcpCatalogState = { ready: true, status: 'ready' }
+    runtime.mcpResources = () => [{ id: 'current-tool' }]
+    await vi.waitFor(async () => expect(await call(handler, key, 'GET', '/health', undefined, false))
+      .toMatchObject({ status: 200, body: { recovery: 'ready' } }), { timeout: 2500 })
+    expect(runtime.database.getRun('t:42', message.id).mcpTools).toEqual([{ id: 'current-tool' }])
+    expect((await call(handler, key, 'GET', '/health', undefined, false)).body.recovery_dependency).toBeUndefined()
+  })
   it('cancels the owner file read when its response connection closes', async () => {
     const { handler, key, context } = setup()
     const previous = context.workbenchFileManager.operate.getMockImplementation()
@@ -157,6 +211,65 @@ describe('authenticated workbench HTTP handler', () => {
     expect(runtime.scheduler.admitNativeStep).toHaveBeenCalledOnce()
     expect(runtime.database.getRun('t:42', 'live-schedule').mcpTools).toEqual([{ id: 'verified', version: 'v1' }])
   })
+  it('enriches the steered schedule receipt rather than the active target at pre-step', async () => {
+    const { handler, key, context } = setup()
+    const chat = (await call(handler, key, 'POST', '/chats', {})).body.data
+    const runtime = context.reflect.provide.mock.calls.find(([name]) => name === 'workbenchRuntime')[1]
+    const db = runtime.database, sessionId = db.getChat('t:42', chat.id).sessionId
+    runtime.mcpCatalogState = { ready: true }
+    runtime.mcpResources = () => []
+    const parent = db.createRun({ ownerId: 't:42', chatId: chat.id, sessionId, query: 'working', selection: {} }).run
+    db.bindNativeTurn(parent, 1)
+    context.schedule = { catalog: async () => [{ id: 'task', sessionId, title: '原计划' }] }
+    runtime.scheduler.admitNativeStep = vi.fn(async () => ({ kind: 'accept' }))
+    const message = { id: 'steered-schedule', source: { kind: 'schedule' }, content: [{ type: 'text', text: 'schedule_id_json: "task"' }] }
+    const gate = context.on.mock.calls.find(([name]) => name === 'agent/pre-step')[1]
+    await gate({ agent: { id: sessionId }, messages: [message], turn: 1, signal: new AbortController().signal }, () => {})
+    await vi.waitFor(() => expect(db.getRun('t:42', message.id)).toMatchObject({ status: 'steered', selection: { schedule_ids: ['task'], schedule_titles: ['原计划'] } }))
+    expect(db.runForTurn(sessionId, 1).id).toBe(parent.id)
+  })
+  it('admits a busy turn while schedule display lookup remains pending', async () => {
+    const { handler, key, context } = setup()
+    const chat = (await call(handler, key, 'POST', '/chats', {})).body.data
+    const runtime = context.reflect.provide.mock.calls.find(([name]) => name === 'workbenchRuntime')[1]
+    const db = runtime.database, sessionId = db.getChat('t:42', chat.id).sessionId
+    runtime.mcpCatalogState = { ready: true }
+    runtime.mcpResources = () => []
+    const parent = db.createRun({ ownerId: 't:42', chatId: chat.id, sessionId, query: 'working', selection: {} }).run
+    db.bindNativeTurn(parent, 1)
+    let release
+    context.schedule = { catalog: vi.fn(() => new Promise(resolve => { release = resolve })) }
+    runtime.scheduler.admitNativeStep = vi.fn(async () => ({ kind: 'accept' }))
+    const message = { id: 'pending-schedule', source: { kind: 'schedule' }, content: [{ type: 'text', text: 'schedule_id_json: "task"' }] }
+    const gate = context.on.mock.calls.find(([name]) => name === 'agent/pre-step')[1]
+    const pending = gate({ agent: { id: sessionId }, messages: [message], turn: 1, signal: new AbortController().signal }, () => {})
+    try {
+      await vi.waitFor(() => expect(runtime.scheduler.admitNativeStep).toHaveBeenCalledOnce(), { timeout: 1000 })
+      await expect(pending).resolves.toEqual({ kind: 'accept' })
+      expect(db.getRun('t:42', message.id)).toMatchObject({ status: 'steered', selection: { schedule_ids: ['task'] } })
+      expect(db.runForTurn(sessionId, 1).id).toBe(parent.id)
+    } finally { release?.([]); await pending }
+  })
+  it('admits an in-turn child notice without waiting for a new MCP catalog', async () => {
+    const { handler, key, context } = setup()
+    const chat = (await call(handler, key, 'POST', '/chats', {})).body.data
+    const runtime = context.reflect.provide.mock.calls.find(([name]) => name === 'workbenchRuntime')[1]
+    const db = runtime.database, sessionId = db.getChat('t:42', chat.id).sessionId
+    const parent = db.createRun({ ownerId: 't:42', chatId: chat.id, sessionId, query: 'working', selection: {} }).run
+    db.bindNativeTurn(parent, 1)
+    runtime.mcpCatalogState = { ready: false }
+    runtime.mcpResources = vi.fn(() => { throw new Error('catalog unavailable') })
+    runtime.scheduler.admitNativeStep = vi.fn(async () => ({ kind: 'accept' }))
+    const message = { id: 'busy-child', source: { kind: 'agent-message', senderSessionId: 'owned-child' }, content: [] }
+    const gate = context.on.mock.calls.find(([name]) => name === 'agent/pre-step')[1]
+    const controller = new AbortController()
+    const pending = gate({ agent: { id: sessionId }, messages: [message], turn: 1, signal: controller.signal }, () => {})
+    try {
+      await vi.waitFor(() => expect(runtime.scheduler.admitNativeStep).toHaveBeenCalledOnce())
+      await expect(pending).resolves.toEqual({ kind: 'accept' })
+      expect(runtime.mcpResources).not.toHaveBeenCalled()
+    } finally { controller.abort(); await pending.catch(() => {}) }
+  })
   it.each(['PATCH', 'DELETE'])('cancels a pending native schedule %s mutation on response disconnect', async method => {
     const { handler, key, context } = setup()
     const chat = (await call(handler, key, 'POST', '/chats', {})).body.data
@@ -176,13 +289,15 @@ describe('authenticated workbench HTTP handler', () => {
     expect(response.listenerCount('close')).toBe(0)
   })
   it('cancels a scheduled pre-step while waiting for the first MCP catalog', async () => {
-    const { context } = setup()
+    const { handler, key, context } = setup()
+    const chat = (await call(handler, key, 'POST', '/chats', {})).body.data
     const runtime = context.reflect.provide.mock.calls.find(([name]) => name === 'workbenchRuntime')[1]
+    const sessionId = runtime.database.getChat('t:42', chat.id).sessionId
     runtime.mcpCatalogState = { ready: false }
     runtime.scheduler.admitNativeStep = vi.fn()
     const gate = context.on.mock.calls.find(([name]) => name === 'agent/pre-step')[1]
     const abort = new AbortController()
-    const rejected = gate({ agent: { id: 'native' }, turn: 1, messages: [{ id: 'scheduled', source: { kind: 'schedule' } }], signal: abort.signal }, () => {})
+    const rejected = gate({ agent: { id: sessionId }, turn: 1, messages: [{ id: 'scheduled', source: { kind: 'schedule' } }], signal: abort.signal }, () => {})
     abort.abort()
     await expect(rejected).rejects.toMatchObject({ name: 'AbortError' })
     expect(runtime.scheduler.admitNativeStep).not.toHaveBeenCalled()

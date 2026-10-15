@@ -34,6 +34,19 @@ function entries(res) {
 }
 
 describe('durable SSE transport', () => {
+  it('replays legacy context readings as small frames with unchanged durable cursors', async () => {
+    const { database, ownerId, run, res, stream } = setup()
+    database.appendEvent(ownerId, run.id, { event: 'workbench_context', phase: 'usage', used_tokens: 1200,
+      window_tokens: 128000, model: 'p/m', estimated: false, mcpTools: [{ schema: 'x'.repeat(513420) }] })
+    database.transitionRun(ownerId, run.id, 'completed')
+    database.appendEvent(ownerId, run.id, { event: 'workbench_end', status: 'completed' })
+    stream()
+    await expect.poll(() => res.ended).toBe(true)
+    expect(entries(res).map(event => event._id)).toEqual(['1-0', '2-0'])
+    expect(entries(res)[0]).toMatchObject({ used_tokens: 1200, phase: 'usage' })
+    expect('mcpTools' in entries(res)[0]).toBe(false)
+    expect(res.frames.every(frame => Buffer.byteLength(frame) < 512)).toBe(true)
+  })
   it('replays more than 10000 entries without truncation and yields between pages', async () => {
     const { database, ownerId, run, res, stream } = setup()
     for (let index = 0; index < 10_050; index++) database.appendEvent(ownerId, run.id, { event: 'text', text: String(index) })

@@ -31,6 +31,89 @@ it('retains native delivery names without admitting another session task or over
   expect(test.native.catalog).toHaveBeenCalledOnce()
   expect(test.db.getRun(test.owner.ownerId,run.id).selection.schedule_titles).toEqual(['提醒'])
 })
+it('backfills legacy schedule identities without replacing the captured names or appending duplicate name events', async () => {
+  const test = fixture()
+  const { run } = test.db.createRun({ ownerId: test.owner.ownerId, chatId: test.chat.id, sessionId: test.chat.sessionId,
+    query: 'reminders_json: [{"schedule_id":"task"},{"schedule_id":"foreign-task"}]',
+    selection: { native_source: 'schedule', schedule_titles: ['投递时的名称'] }, mcpTools: [{ id: 'frozen-tool' }] })
+  await test.gateway.rememberRun(run)
+  const enriched = test.db.getRun(test.owner.ownerId, run.id)
+  expect(enriched.selection).toMatchObject({ schedule_titles: ['投递时的名称'], schedule_ids: ['task'] })
+  expect(enriched.mcpTools).toEqual([{ id: 'frozen-tool' }])
+  expect(test.db.allEvents(test.owner.ownerId, run.id).filter(event => event.event === 'workbench_schedule')).toEqual([])
+  await test.gateway.rememberRun(enriched)
+  expect(test.native.catalog).toHaveBeenCalledOnce()
+})
+it('retains deleted native delivery IDs and keeps titles aligned with surviving tasks', async () => {
+  const test = fixture()
+  const { run } = test.db.createRun({ ownerId: test.owner.ownerId, chatId: test.chat.id, sessionId: test.chat.sessionId,
+    query: 'reminders_json: [{"schedule_id":"deleted-task"},{"schedule_id":"task"}]', selection: { native_source: 'schedule' } })
+  await test.gateway.rememberRun(run)
+  expect(test.db.getRun(test.owner.ownerId, run.id).selection).toMatchObject({
+    schedule_ids: ['deleted-task', 'task'], schedule_titles: ['定时任务', '提醒'],
+  })
+})
+
+it('records native IDs before display lookup settles and preserves later scope changes', async () => {
+  const test = fixture()
+  const { run } = test.db.createRun({ ownerId: test.owner.ownerId, chatId: test.chat.id, sessionId: test.chat.sessionId,
+    query: 'schedule_id_json: "task"', selection: { native_source: 'schedule' }, mcpTools: [{ id: 'old' }] })
+  let release
+  test.native.catalog.mockImplementation(() => new Promise(resolve => { release = resolve }))
+  const pending = test.gateway.rememberRun(run)
+  const current = test.db.getRun(test.owner.ownerId, run.id)
+  expect(current.selection.schedule_ids).toEqual(['task'])
+  test.db.updateRunResources(current, { ...current.selection, model: 'updated/model' }, [{ id: 'current' }])
+  const repeated = test.gateway.rememberRun(current)
+  expect(test.native.catalog).toHaveBeenCalledOnce()
+  release([{ id: 'task', sessionId: test.chat.sessionId, title: '提醒' }])
+  await Promise.all([pending, repeated])
+  expect(test.db.getRun(test.owner.ownerId, run.id)).toMatchObject({
+    selection: { model: 'updated/model', schedule_ids: ['task'], schedule_titles: ['提醒'] }, mcpTools: [{ id: 'current' }],
+  })
+})
+
+it('bounds display lookup before execution and discards metadata arriving after the budget', async () => {
+  vi.useFakeTimers()
+  const test = fixture()
+  const { run } = test.db.createRun({ ownerId: test.owner.ownerId, chatId: test.chat.id, sessionId: test.chat.sessionId,
+    query: 'schedule_id_json: "task"', selection: { native_source: 'schedule' } })
+  let release
+  test.native.catalog.mockImplementation(() => new Promise(resolve => { release = resolve }))
+  let pending
+  const repeated = []
+  try {
+    let settled = false
+    pending = test.gateway.rememberRun(run).then(() => { settled = true })
+    await vi.advanceTimersByTimeAsync(250)
+    expect(settled).toBe(true)
+    await pending
+    for (let step = 0; step < 50; step++) repeated.push(test.gateway.rememberRun(run))
+    expect(test.native.catalog).toHaveBeenCalledOnce()
+    await Promise.all(repeated)
+    const another = test.db.createRun({ ownerId: test.owner.ownerId, chatId: test.chat.id, sessionId: test.chat.sessionId,
+      query: 'schedule_id_json: "task"', selection: { native_source: 'schedule' } }).run
+    await test.gateway.rememberRun(another)
+    expect(test.native.catalog).toHaveBeenCalledOnce()
+    expect(test.gateway.pendingNames.size).toBe(0)
+    expect(test.gateway.pendingCatalog).toBeDefined()
+    test.db.transitionRun(test.owner.ownerId, run.id, 'completed')
+    test.db.appendEvent(test.owner.ownerId, run.id, { event: 'workbench_end', status: 'completed' })
+    release([{ id: 'task', sessionId: test.chat.sessionId, title: '迟到名称' }])
+    await vi.advanceTimersByTimeAsync(1)
+    expect(test.db.getRun(test.owner.ownerId, run.id).selection).toMatchObject({ schedule_ids: ['task'] })
+    expect(test.db.getRun(test.owner.ownerId, run.id).selection.schedule_titles).toBeUndefined()
+    expect(test.db.allEvents(test.owner.ownerId, run.id).map(event => event.event)).toEqual(['workbench_end'])
+    expect(test.gateway.pendingNames.size).toBe(0)
+    expect(test.gateway.pendingCatalog).toBeUndefined()
+  } finally {
+    release?.([])
+    await vi.advanceTimersByTimeAsync(250)
+    await Promise.allSettled(repeated)
+    await pending
+    vi.useRealTimers()
+  }
+})
 it('uses the owning native Session and preserves compare-and-update without accepting a body binding', async () => {
   const test = fixture(); const signal = new AbortController().signal
   await test.gateway.create(test.owner, test.chat.id, { title: '提醒', prompt: '内容', daily: { time: '08:00:00', time_zone: 'Asia/Shanghai' }, sessionId: test.foreign.sessionId }, signal)
@@ -63,7 +146,7 @@ it('adopts one native scheduled delivery for admission without re-enqueuing it o
   projectInboxClaim(db, { agent: { id: chat.sessionId }, message, turn: 1 }, owner.ownerId, context)
   expect(db.listRuns(owner.ownerId, chat.id)).toHaveLength(1)
 })
-it('rejects unknown or already-fenced native child notifications', () => {
+it('rejects unknown child notifications and gives an owned late message a fresh receipt after the old fence', () => {
   const {db,chat,owner} = fixture()
   const {run} = db.createRun({ownerId:owner.ownerId,chatId:chat.id,sessionId:chat.sessionId,query:'task',selection:{subagent_ids:['child']},mcpTools:[]})
   db.transitionRun(owner.ownerId,run.id,'running')
@@ -71,8 +154,11 @@ it('rejects unknown or already-fenced native child notifications', () => {
   expect(projectInboxClaim(db,{agent:{id:chat.sessionId},message:message('foreign'),turn:2},owner.ownerId)).toBeUndefined()
   db.requireRunFence(owner.ownerId,run.id)
   db.confirmRunFence(owner.ownerId,run.id,{fenced:true})
-  expect(projectInboxClaim(db,{agent:{id:chat.sessionId},message:message('child'),turn:2},owner.ownerId)).toBeUndefined()
-  expect(db.listRuns(owner.ownerId,chat.id)).toHaveLength(1)
+  const fresh = projectInboxClaim(db,{agent:{id:chat.sessionId},message:message('child'),turn:2},owner.ownerId, { mcpTools: [{ id: 'current' }] })
+  expect(fresh).toMatchObject({ id: 'notice-child', parentRunId: run.id, mcpTools: [{ id: 'current' }] })
+  expect(db.getRun(owner.ownerId, fresh.id).status).toBe('running')
+  expect(db.getRun(owner.ownerId, run.id).stopConfirmation.fenced).toBe(true)
+  expect(db.listRuns(owner.ownerId,chat.id)).toHaveLength(2)
 })
 it('replays an acknowledged scheduled turn after restart without generating another delivery', async () => {
   const { db, chat, owner } = fixture()

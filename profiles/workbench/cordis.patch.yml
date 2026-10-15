@@ -128,5 +128,9 @@
         humanInputTimeoutSeconds: 60
     - id: gxzs-workbench-mcp-tools
       name: '@gxzs/dsh-workbench-mcp-tools'
+      config:
+        discovery: true
+    - id: gxzs-tool-discovery
+      name: '@gxzs/dsh-tool-discovery'
     - id: gxzs-native-schedule
       name: '@deepseek-ai/dsh-schedule'

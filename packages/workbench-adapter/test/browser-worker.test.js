@@ -39,7 +39,7 @@ function worker(displayFactory) {
   const input = new PassThrough(), output = new PassThrough(), frames = [], exit = vi.fn()
   output.on('data',chunk=>frames.push(JSON.parse(String(chunk))))
   const launch=vi.fn(async()=>browser)
-  const runtime = runWorker({chromium:{launch},input,output,exit,displayFactory})
+  const runtime = runWorker({chromium:{launch},input,output,exit,displayFactory:displayFactory ?? null})
   const command = async (id,action,extra={}) => {
     input.write(JSON.stringify({id,action,...extra})+'\n')
     await vi.waitFor(()=>expect(frames.some(frame=>frame.type==='result' && frame.id===id)).toBe(true))

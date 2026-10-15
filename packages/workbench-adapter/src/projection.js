@@ -3,6 +3,7 @@ export { nativePresentation, fileToolPreparation } from './display-events.js'
 import { nativeCommandRun } from './native-command.js'
 import { runPromptId } from './native-prompt.js'
 import { presentRunEvent } from './run-failure.js'
+import { contextUsage } from './context-usage.js'
 
 const END_STATUS = {
   completed: 'completed', aborted: 'cancelled', error: 'failed',
@@ -113,11 +114,12 @@ function projectEvent(database, sessionId, event, expectedOwnerId, context) {
     })
   }
 
-  if (event.type === 'request/context' && context) {
+  const reading = contextUsage(context)
+  if (event.type === 'request/context' && reading) {
     const run = database.activeRun(chat.ownerId, chat.id)
     if (!run) return undefined
     return database.appendEvent(chat.ownerId, run.id, {
-      event: 'workbench_context', workbench_run_id: run.id, phase: 'request', ...context,
+      event: 'workbench_context', workbench_run_id: run.id, phase: 'request', ...reading,
     })
   }
 
@@ -184,9 +186,9 @@ function projectEvent(database, sessionId, event, expectedOwnerId, context) {
         streamed: database.isStreamedStep(chat.ownerId, run.id, event.data.turn, event.data.step),
       })) append(payload)
       const usage = event.data?.usage
-      if (context || usage) return append({
+      if (reading || usage) return append({
         event: 'workbench_context', workbench_run_id: run.id, phase: 'usage',
-        ...(context ?? {
+        ...(reading ?? {
           used_tokens: usage.totalTokens ?? (usage.inputTokens ?? 0) + (usage.outputTokens ?? 0),
           window_tokens: null, estimated: false, model: '',
         }),
@@ -196,6 +198,17 @@ function projectEvent(database, sessionId, event, expectedOwnerId, context) {
     default:
       return undefined
   }
+}
+
+/** Only a fresh autonomous receipt needs a new frozen MCP catalog. */
+export function claimNeedsResources(database, { agent, message, turn }, ownerId) {
+  const sessionId = agent?.session?.id ?? agent?.id
+  const chat = database.getChatBySession(sessionId)
+  if (!chat || chat.ownerId !== ownerId || database.getRun(ownerId, message?.id)) return false
+  if (message?.source?.kind === 'schedule') return true
+  if (isNativeNotice(message) && !noticeParent(database, chat, message)) return false
+  return (message?.source?.kind === 'tool-jobs' || isNativeNotice(message))
+    && !database.runForTurn(sessionId, turn)
 }
 
 /** Shared, side-effect-free display projection for live events and native history pages. */
@@ -213,7 +226,7 @@ export function projectInboxClaim(database, { agent, message, turn }, expectedOw
     if (run) run = database.bindNativeTurn(run, turn)
   }
   if (isNativeNotice(message)) {
-    run = database.runForTurn(sessionId, turn) ?? adoptNativeNotice(database, chat, message)
+    run = database.runForTurn(sessionId, turn) ?? adoptNativeNotice(database, chat, message, context)
     if (run) run = database.bindNativeTurn(run, turn)
   }
   if (message.source?.kind === 'schedule') {
@@ -285,20 +298,23 @@ function adoptJobNotice(database, chat, message, context) {
   database.adoptInboxMessage(chat.sessionId, run.id, message.id)
   return run
 }
-function adoptNativeNotice(database, chat, message) {
+function noticeParent(database, chat, message) {
+  return database.listRuns(chat.ownerId, chat.id).reverse().find(run =>
+    run.selection?.subagent_ids?.includes(message.source.senderSessionId))
+}
+function adoptNativeNotice(database, chat, message, context) {
   if (chat.deletedAt || !isNativeNotice(message) || typeof message.id !== 'string') return
   const existing = database.listRuns(chat.ownerId, chat.id).find(run => run.id === message.id)
   if (existing) return existing
-  const parent = database.listRuns(chat.ownerId, chat.id).reverse().find(run =>
-    run.selection?.subagent_ids?.includes(message.source.senderSessionId))
-  // Bind only notifications from a child previously registered by the native
-  // owner graph. A stopped or failed task cannot be woken by a late notice.
-  if (!parent || !['completed', 'running'].includes(parent.status) || parent.stopConfirmation?.fenced
-    || database.pendingRunFences(chat.ownerId).some(run => run.id === parent.id)) return
+  const parent = noticeParent(database, chat, message)
+  // The native inbox starts a new turn after the old task has settled. Retain
+  // child ownership but acquire fresh permissions; never reopen its old receipt.
+  if (!parent || context?.mcpCatalogReady === false) return
   const { run } = database.createRun({ ownerId: chat.ownerId, chatId: chat.id, sessionId: chat.sessionId,
     id: message.id, requestKey: `native-notice:${message.id}`, query: contentText(message.content),
-    parentRunId: parent.id, selection: { ...parent.selection, native_child: false, subagent_ids: [], native_notice: true,
-      is_continuation: true, silent_resume: true }, mcpTools: parent.mcpTools })
+    parentRunId: parent.id, selection: { ...chat.selection, native_child: false, subagent_ids: [], native_notice: true,
+      native_source: message.source.kind, native_sender_session_id: message.source.senderSessionId,
+      subagent_names: parent.selection?.subagent_names ?? {}, silent_resume: true }, mcpTools: context?.mcpTools ?? [] })
   database.adoptInboxMessage(chat.sessionId, run.id, message.id)
   return run
 }
@@ -379,11 +395,12 @@ export async function reconcileNativeSessions(database, sessionQuery, ownerId, c
   // Only receipts that existed on entry belong to this startup interruption pass.
   const initialRunIds = startupRunIds ?? chats.flatMap(chat => database.listRuns(ownerId, chat.id).map(run => run.id))
   const queued = []
-  const resources = message => {
-    if (!['schedule', 'tool-jobs'].includes(message?.source?.kind) || database.getRun(ownerId, message.id)) return undefined
-    return typeof context === 'function' ? context() : context
-  }
   for (const chat of chats) {
+    const resources = message => {
+      if ((!['schedule', 'tool-jobs'].includes(message?.source?.kind) && !isNativeNotice(message)) || database.getRun(ownerId, message.id)) return undefined
+      if (isNativeNotice(message) && !noticeParent(database, chat, message)) return undefined
+      return typeof context === 'function' ? context() : context
+    }
     let observed
     try { observed = await sessionQuery.observeSession(chat.sessionId) }
     catch (error) {
@@ -406,7 +423,7 @@ export async function reconcileNativeSessions(database, sessionQuery, ownerId, c
           const message = event.data
           const admitted = message.source?.kind === 'schedule' ? adoptMessage(database, chat.sessionId, message, resources(message))
             : message.source?.kind === 'tool-jobs' ? (database.runForTurn(chat.sessionId, turn) ?? adoptJobNotice(database, chat, message, resources(message)))
-            : isNativeNotice(message) ? (database.runForTurn(chat.sessionId, turn) ?? adoptNativeNotice(database, chat, message))
+            : isNativeNotice(message) ? (database.runForTurn(chat.sessionId, turn) ?? adoptNativeNotice(database, chat, message, resources(message)))
             : database.listRuns(chat.ownerId, chat.id).find(item => item.messageId === message.id)
           if (isNativeNotice(message) && admitted) database.bindNativeTurn(admitted, turn)
           if (message.source?.kind === 'tool-jobs' && admitted) database.bindNativeTurn(admitted, turn)
@@ -446,7 +463,7 @@ export async function reconcileNativeSessions(database, sessionQuery, ownerId, c
         const run = requestId ? database.getRun(ownerId, requestId)
           : message.source?.kind === 'schedule' ? adoptMessage(database, chat.sessionId, message, resources(message))
           : message.source?.kind === 'tool-jobs' ? adoptJobNotice(database, chat, message, resources(message))
-          : isNativeNotice(message) ? adoptNativeNotice(database, chat, message)
+          : isNativeNotice(message) ? adoptNativeNotice(database, chat, message, resources(message))
           : database.listRuns(chat.ownerId, chat.id).find(item => item.messageId === message.id)
         if (run && run.sessionId === chat.sessionId) {
           queued.push(run.id)

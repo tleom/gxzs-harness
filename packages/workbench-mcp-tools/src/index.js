@@ -1,15 +1,19 @@
 import { createMcpToolDefinition } from '@deepseek-ai/dsh-mcp-client'
 import { adaptInputSchema } from './schema.js'
 import { platformToolNames } from './names.js'
+import { ToolDiscoveryCatalog } from './discovery-catalog.js'
+import z from '@deepseek-ai/schemastery'
+import { createHash } from 'node:crypto'
 
 export const name = 'workbench-mcp-tools'
 export const inject = ['tools', 'workbenchPlatformClient', 'workbenchRuntime']
+export const Config = z.object({ discovery: z.boolean().default(false) })
 
 // Java and the manager reject absolute deadlines more than 350 seconds ahead
 // of their own clocks. Reserve clock skew inside that limit, not above it.
 const MCP_CALL_TIMEOUT_MS = 350_000 - 5_000
 
-export async function apply(ctx) {
+export async function apply(ctx, config = {}) {
   const registrations = new Map()
   ctx.workbenchRuntime.mcpResources = () => [...registrations.values()].map(({ tool }) => ({ ...tool }))
   const restrictions = new Map()
@@ -18,10 +22,13 @@ export async function apply(ctx) {
   let inFlight
   let pending = false
   let timer
+  let discoveryReady = false
+  let discoveryCatalog
   const lifetime = new AbortController()
   const state = (ready, error) => {
     ctx.workbenchRuntime.mcpCatalogState = { ready, status: error && ready ? 'degraded' : ready ? 'ready' : 'unavailable', updatedAt: Date.now(),
       ...(error ? { errorCode: error.code ?? `HTTP_${error.status ?? 502}` } : {}) }
+    discoveryCatalog?.notify()
   }
   const clear = () => {
     for (const restriction of restrictions.values()) restriction.dispose()
@@ -29,29 +36,42 @@ export async function apply(ctx) {
     for (const registration of registrations.values()) registration.dispose()
     registrations.clear()
   }
-  const allowedNames = (agent) => {
+  const allowedNames = (agent, currentRun) => {
     const allowed = new Set()
     if (!ctx.workbenchRuntime.mcpCatalogState?.ready) return allowed
-    const run = ctx.workbenchRuntime.executionRun?.(agent?.session?.id ?? agent?.id)
-    if (!run || run.ownerId !== ctx.workbenchRuntime.ownerId || !['queued', 'running', 'waiting_input'].includes(run.status)) return allowed
+    const run = currentRun ?? ctx.workbenchRuntime.executionRun?.(agent?.session?.id ?? agent?.id)
+    if (!run || run.ownerId !== ctx.workbenchRuntime.ownerId || run.stopConfirmation?.fenced
+      || !['queued', 'running', 'waiting_input'].includes(run.status)) return allowed
+    const resources = new Map((run.mcpTools ?? []).map(resource => [resource.id, resource]))
     for (const { tool } of registrations.values()) {
-      if ((run.mcpTools ?? []).some(resource => resource.id === tool.id && resource.version === tool.version
-        && (resource.manifest_version ?? '') === tool.manifest_version)) allowed.add(tool.public_name)
+      const resource = resources.get(tool.id)
+      if (resource?.version === tool.version && (resource.manifest_version ?? '') === tool.manifest_version)
+        allowed.add(tool.public_name)
     }
     return allowed
   }
   const restrictAgent = (agent) => {
     if (!agent?.ctx?.tools?.restrict) return
-    const allowed = allowedNames(agent)
+    const allowed = config.discovery && !discoveryReady ? new Set() : allowedNames(agent)
     const deny = [...registrations.values()].map(({ tool }) => tool.public_name).filter(name => !allowed.has(name)).sort()
     const stamp = JSON.stringify(deny)
     const previous = restrictions.get(agent)
     if (previous?.stamp === stamp) return
+    const replacement = deny.length ? { stamp, dispose: agent.ctx.tools.restrict({ deny }) } : undefined
     previous?.dispose()
     restrictions.delete(agent)
-    if (deny.length) restrictions.set(agent, { stamp, dispose: agent.ctx.tools.restrict({ deny }) })
+    if (replacement) restrictions.set(agent, replacement)
   }
+  discoveryCatalog = new ToolDiscoveryCatalog(ctx, { registrations, authorizedNames: allowedNames,
+    setReady: ready => {
+      if (discoveryReady === ready) return
+      discoveryReady = ready
+      for (const agent of ctx.workbenchRuntime.agents?.list?.() ?? []) restrictAgent(agent)
+      discoveryCatalog.notify()
+    } })
   ctx.workbenchRuntime.restrictMcpScope = restrictAgent
+  const toolForName = name => [...registrations.values()].find(item => item.tool.public_name === name)?.tool
+  ctx.workbenchRuntime.mcpToolForName = toolForName
   state(false)
   const sync = async () => {
     let payload
@@ -66,6 +86,8 @@ export async function apply(ctx) {
       // Bootstrap can precede platform host registration. Keep the plugin alive
       // to recover after registration, but never retain tools on denied access.
       if ([401, 403].includes(error?.status)) { catalogLoaded = false; clear() }
+      for (const agent of ctx.workbenchRuntime.agents?.list?.() ?? []) restrictAgent(agent)
+      discoveryCatalog.notify()
       if ([401, 403].includes(error?.status) || transient) return
       throw error
     }
@@ -95,6 +117,7 @@ export async function apply(ctx) {
         description: tool.description,
         inputSchema: tool.inputSchema,
         outputSchema: tool.outputSchema,
+        taskRequired: tool.execution?.taskSupport === 'required',
         call: (args, exec) => callProxy(ctx, tool, args, exec),
       })
       registrations.set(tool.runtime_name, { tool, definition, dispose: ctx.tools.register(definition) })
@@ -102,6 +125,7 @@ export async function apply(ctx) {
     catalogLoaded = true
     state(true)
     for (const agent of ctx.workbenchRuntime.agents?.list?.() ?? []) restrictAgent(agent)
+    discoveryCatalog.notify()
   }
   const synchronize = () => {
     if (disposed) return Promise.resolve()
@@ -136,6 +160,7 @@ export async function apply(ctx) {
     const mcpNames = new Set([...registrations.values()].map(({ tool }) => tool.public_name))
     const providers = new Map()
     for (const { tool } of registrations.values()) {
+      if (config.discovery) break
       if (!allowed.has(tool.public_name)) continue
       const key = `${tool.scope}:${tool.server_id}`
       if (!providers.has(key)) providers.set(key, {
@@ -159,6 +184,7 @@ export async function apply(ctx) {
   ctx.effect(() => () => {
     disposed = true
     if (ctx.workbenchRuntime.restrictMcpScope === restrictAgent) ctx.workbenchRuntime.restrictMcpScope = undefined
+    if (ctx.workbenchRuntime.mcpToolForName === toolForName) ctx.workbenchRuntime.mcpToolForName = undefined
     lifetime.abort()
     clearTimeout(timer)
     clear()
@@ -216,6 +242,9 @@ function normalizeCatalog(value) {
     return { ...tool, definitionStamp: JSON.stringify(tool), inputSchema: adapted.schema, validateArguments: adapted.validate, manifest_version: tool.manifest_version ?? '' }
   })
   const names = platformToolNames(tools)
-  return tools.map(tool => ({ ...tool, public_name: names.get(tool.id),
-    definitionStamp: JSON.stringify([tool.definitionStamp, names.get(tool.id)]) }))
+  return tools.map(tool => {
+    const definitionStamp = JSON.stringify([tool.definitionStamp, names.get(tool.id)])
+    return { ...tool, public_name: names.get(tool.id), definitionStamp,
+      discoveryStamp: createHash('sha256').update(definitionStamp).digest('hex') }
+  })
 }

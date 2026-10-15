@@ -7,7 +7,7 @@ import { streamRunEvents } from './sse.js'
 import { streamHistoryEvents, streamNativeEvents } from './history-events.js'
 import { WorkbenchDatabase } from './persistence.js'
 import { resolveWorkspacePath } from './paths.js'
-import { createAssistantStreamProjector, projectInboxClaim, projectSessionEvent, reconcileNativeSessions, settleNativeIdle } from './projection.js'
+import { claimNeedsResources, createAssistantStreamProjector, projectInboxClaim, projectSessionEvent, reconcileNativeSessions, settleNativeIdle } from './projection.js'
 import { WorkbenchRuntime } from './runtime.js'
 import { WorkbenchService } from './service.js'
 import { TaskScheduler } from './scheduler.js'
@@ -27,6 +27,7 @@ import { browserClient } from './browser-client.js'
 import { registerTerminalTool } from './terminal-tool.js'
 import { WorkbenchJobs } from './jobs.js'
 import { registerScheduledClaims } from './scheduled-claims.js'
+import { isNativeNotice } from './display-events.js'
 import { registerToolDisplayReceipts } from './tool-display-receipts.js'
 import { nativeHostActivity } from './host-activity.js'
 import { WorkbenchNativeClient } from './native-client.js'
@@ -35,7 +36,7 @@ import { WorkbenchSubagentSettings } from './settings.js'
 import { setTimeout as delay } from 'node:timers/promises'
 
 export const name = 'workbench-adapter'
-export const inject = ['webServer', 'sessionController', 'workspaceController', 'sessionReferenceResolver', 'fileReferences', 'workspaceChanges', 'agents', 'commands', 'skills', 'systemPrompt', 'tokenMeter', 'workbenchFileManager', 'workbenchPlatformClient', 'sessionQuery', 'sessionProjections', 'agentPresets', 'agentDefaultModel', 'settings', 'attachments', 'fileUploads', 'goals', 'terminalController', 'subagents', 'subprocess', 'jobs', 'jobController', 'tools']
+export const inject = ['webServer', 'sessionController', 'workspaceController', 'sessionReferenceResolver', 'fileReferences', 'workspaceChanges', 'workingDirectory', 'agents', 'commands', 'skills', 'systemPrompt', 'tokenMeter', 'workbenchFileManager', 'workbenchPlatformClient', 'sessionQuery', 'sessionProjections', 'agentPresets', 'agentDefaultModel', 'settings', 'attachments', 'fileUploads', 'goals', 'terminalController', 'subagents', 'subprocess', 'jobs', 'jobController', 'tools']
 
 export const Config = z.object({
   basePath: z.string().default('/ai/workbench'),
@@ -81,6 +82,8 @@ export function apply(ctx, config) {
   scheduler.executionRun = (sessionId) => runtime.executionRun(sessionId)
   const service = new WorkbenchService({ database, sessionController: ctx.sessionController, agents: ctx.agents, commands: ctx.commands, skills: ctx.skills, fileManager: ctx.workbenchFileManager, platformClient: ctx.workbenchPlatformClient, workspace: config.workspace, sessionQuery: ctx.sessionQuery, agentPresets: ctx.agentPresets, agentDefaultModel: ctx.agentDefaultModel, modelSettings: ctx.settings, scheduler, attachments: ctx.attachments, goals: ctx.goals, fileUploads: ctx.fileUploads, nativeFileAttachments: process.env.GXZS_NATIVE_FILE_ATTACHMENTS === '1' })
   service.workspaceChanges = ctx.workspaceChanges
+  service.workingDirectory = ctx.workingDirectory
+  service.onGoalChanged = listener => ctx.on('goal/changed', listener, { prepend: true })
   service.workspaces = workspaces
   service.sessionReferences = ctx.sessionReferenceResolver
   service.fileReferences = ctx.fileReferences
@@ -131,7 +134,8 @@ export function apply(ctx, config) {
       await reconcileNativeSessions(database, ctx.sessionQuery, config.ownerId, () => {
         // Missing autonomous receipts need a fresh frozen catalog. Retry
         // recovery until its first verified sync; an unavailable read is not empty.
-        if (!runtime.mcpCatalogState?.ready) throw new Error('MCP catalog is not ready for native notice recovery')
+        if (!runtime.mcpCatalogState?.ready) throw Object.assign(
+          new Error('MCP catalog is not ready for native notice recovery'), { code: 'MCP_CATALOG_UNAVAILABLE' })
         return { mcpTools: runtime.mcpResources?.() ?? [] }
       }, startupRunIds)
       await scheduler.flushFences()
@@ -171,24 +175,34 @@ export function apply(ctx, config) {
   registerScheduledClaims(ctx, { runtime, database, ownerId: config.ownerId })
   registerToolDisplayReceipts(ctx, { runtime, database, ownerId: config.ownerId })
   ctx.on('agent/pre-step', async (payload, next) => {
-    const autonomous = payload.messages?.filter(message => ['schedule', 'tool-jobs'].includes(message.source?.kind)) ?? []
+    const autonomous = payload.messages?.filter(message => ['schedule', 'tool-jobs'].includes(message.source?.kind) || isNativeNotice(message)) ?? []
+    const displays = new Map()
+    const rememberSchedule = run => {
+      if (run?.selection?.native_source === 'schedule' && !displays.has(run.id)) {
+        displays.set(run.id, schedules.rememberRun(run).catch(() => {
+          ctx.logger.warn('Scheduled delivery title enrichment deferred')
+        }))
+      }
+    }
     if (autonomous.length) {
-      while (!runtime.mcpCatalogState?.ready) {
+      const needsResources = autonomous.some(message => claimNeedsResources(database,
+        { agent: payload.agent, message, turn: payload.turn }, config.ownerId))
+      while (needsResources && !runtime.mcpCatalogState?.ready) {
         await delay(100, undefined, { signal: payload.signal })
       }
       payload.signal?.throwIfAborted()
-      for (const message of autonomous) projectInboxClaim(database, { agent: payload.agent, message, turn: payload.turn }, config.ownerId,
-        { mcpTools: runtime.mcpResources?.() ?? [] })
+      for (const message of autonomous) {
+        const claimed = projectInboxClaim(database, { agent: payload.agent, message, turn: payload.turn }, config.ownerId,
+          needsResources ? { mcpTools: runtime.mcpResources?.() ?? [] } : undefined)
+        rememberSchedule(claimed)
+      }
     }
     await recovery
     if (autonomous.length && recoveryError) await beginRecovery()
     if (recoveryError) return { kind: 'reject' }
-    const run = runtime.executionRun(payload.agent.session?.id ?? payload.agent.id)
-    if (run?.selection?.native_source === 'schedule') {
-      try { await schedules.rememberRun(run) }
-      catch { ctx.logger.warn('Scheduled delivery title enrichment deferred') }
-    }
-    return scheduler.admitNativeStep(payload, next)
+    rememberSchedule(runtime.executionRun(payload.agent.session?.id ?? payload.agent.id))
+    await Promise.all(displays.values())
+    return scheduler.admitNativeStep(payload, () => service.guardSkillInvocations(payload, next))
   }, { global: true, prepend: true })
   ctx.on('agent/status', ({ agent, status }) => {
     if (status === 'idle') {
@@ -219,10 +233,10 @@ export function apply(ctx, config) {
       { ...context, mcpCatalogReady: runtime.mcpCatalogState?.ready === true, mcpTools: runtime.mcpResources?.() ?? [] })
   }, { global: true })
 
-  const buildCatalog = async (owner, modelsOnly = false) => {
+  const buildCatalog = async (owner, modelsOnly = false, chatId) => {
     const [catalog, mcpTools, skills] = await Promise.all([
       databaseModelCatalog(ctx.workbenchPlatformClient, ctx.sessionController, owner, ctx.settings),
-      modelsOnly ? [] : service.mcpCatalog(owner), modelsOnly ? [] : service.listSkills(),
+      modelsOnly ? [] : service.mcpCatalog(owner), modelsOnly ? [] : service.catalogSkills(owner, chatId),
     ])
     const models = (catalog.groups ?? []).flatMap((group) => (group.models ?? []).map((model) => ({
       id: `${group.id}/${model.id}`, name: model.name || model.id, provider: group.id, description: model.description,
@@ -234,7 +248,7 @@ export function apply(ctx, config) {
       ...(ctx.get('clientModules') ? { native_client_protocol: 1, native_session_client_protocol: 2, native_schedule_client_protocol: 1,
         ...(ctx.sessionReferenceResolver.listSessionCandidates && ctx.get('fileReferences')?.listObserved ? { native_subagent_reference_protocol: 1 } : {}),
         ...(ctx.get('settingsController') ? { native_subagent_settings_protocol: 1, native_prompt_mode_protocol: 1 } : {}) } : {}),
-      control_protocol: 1, goal_events_protocol: 1, compact_events_protocol: 1, resources_protocol: 1, command_resources_protocol: 1, submission_control_protocol: 1,
+      control_protocol: 1, goal_events_protocol: 1, compact_events_protocol: 1, resources_protocol: 1, command_resources_protocol: 1, plugin_mentions_protocol: 1, scoped_skills_protocol: 1, submission_control_protocol: 1,
       default_selection: { model: catalog.default ? `${catalog.default.provider}/${catalog.default.model}` : models[0]?.id ?? '', tools: [], skills: [], knowledge: [], model_parameters: {}, tool_parameters: {} },
       models, tools: mcpTools.map((tool) => ({
         id: tool.id, name: tool.name, display_name: tool.display_name,
@@ -342,7 +356,7 @@ export function apply(ctx, config) {
       user: { id: owner.userId, name: owner.name, email: '' }, workspaceId: owner.tenantId,
       workspaces: [{ id: owner.tenantId, name: owner.tenantId, current: true }],
     })],
-    ['GET', /^\/catalog$/, async ({ owner, url }, res) => sendJson(res, 200, { data: await buildCatalog(owner, url.searchParams.get('view') === 'models') })],
+    ['GET', /^\/catalog$/, async ({ owner, url }, res) => sendJson(res, 200, { data: await buildCatalog(owner, url.searchParams.get('view') === 'models', url.searchParams.get('chat_id')) })],
     ['GET', /^\/native\/settings$/, async (_context, res) => sendJson(res, 200, { data: subagentSettings.describe() })],
     ['POST', /^\/native\/settings\/mutate$/, async ({ owner, body }, res) => sendJson(res, 200, { data: await subagentSettings.mutate(owner, parseJson(body)) })],
     ['GET', /^\/native\/models$/, async ({ owner }, res) => sendJson(res, 200, { data: await databaseModelCatalog(ctx.workbenchPlatformClient, ctx.sessionController, owner, ctx.settings) })],
@@ -520,7 +534,10 @@ export function apply(ctx, config) {
       sendJson(res, 202, { data: await service.submitRun(owner, match[1], json) })],
     ['POST', /^\/chats\/([\w-]+)\/runs\/stop$/, async ({ owner, json }, res, match) =>
       sendJson(res, 200, { data: await service.stopSubmission(owner, match[1], json.request_key) })],
-    ['GET', /^\/runs\/([\w-]+)$/, async ({ owner, url }, res, match) => sendJson(res, 200, { data: service.getRun(owner, match[1], url.searchParams.get('view') !== 'state') })],
+    ['GET', /^\/runs\/([\w-]+)$/, async ({ owner, url }, res, match) => sendJson(res, 200, {
+      data: service.getRun(owner, match[1], url.searchParams.get('view') !== 'state',
+        url.searchParams.has('after') ? { after: url.searchParams.get('after'), through: url.searchParams.get('through') } : undefined),
+    })],
     ['GET', /^\/runs\/([\w-]+)\/mcp-authorization$/, async ({ owner, url }, res, match) =>
       sendJson(res, 200, { data: { authorized: runtime.authorizeRunMcp(owner.ownerId, match[1], url.searchParams.get('resource_id'), url.searchParams.get('version')) } })],
     ['POST', /^\/runs\/([\w-]+)\/fork$/, async ({ owner, json }, res, match) =>
@@ -637,6 +654,7 @@ export function apply(ctx, config) {
       if (req.method === 'GET' && req.url === config.basePath + '/health') {
         const ready = recovered && !database.streamFlushError && runtime.mcpCatalogState?.ready === true
         sendJson(res, ready ? 200 : 503, { live: true, ready, recovery: recovered ? 'ready' : recoveryError ? 'failed' : 'recovering',
+          recovery_dependency: recoveryError?.code === 'MCP_CATALOG_UNAVAILABLE' ? 'mcp_catalog' : undefined,
           resources: runtime.mcpCatalogState?.status ?? 'initializing',
           activity: ready ? await nativeHostActivity(ctx, runtime.sidebarActivity, () => subagentSettings.activeWrites) : { protocol: 1, status: 'unknown' } })
         return

@@ -535,7 +535,10 @@ def test_live_unready_host_accumulates_failure_without_state_regression(tmp_path
         assert host.heartbeat.call_args.args[1] == state
 
 
-def test_external_catalog_degradation_pauses_admission_without_restarting_pair(tmp_path, monkeypatch):
+@pytest.mark.parametrize('recovery', ['ready', 'failed'])
+def test_external_catalog_degradation_pauses_admission_without_restarting_pair(tmp_path, monkeypatch, recovery):
+    from io import BytesIO
+    from urllib.error import HTTPError
     host, docker, _, payload, _ = setup(tmp_path, monkeypatch)
     host.ensure('workspace', payload)
     record = host.root / 'workspace' / 'host.json'
@@ -544,7 +547,11 @@ def test_external_catalog_degradation_pauses_admission_without_restarting_pair(t
     record.write_text(json.dumps(item))
     host.healthy.return_value = False
     host.alive = Mock(return_value=True)
-    host.dependency_degraded.return_value = True
+    health = {'live': True, 'ready': False, 'recovery': recovery,
+              'resources': 'unavailable', 'recovery_dependency': 'mcp_catalog'}
+    host.opener.open = Mock(side_effect=lambda *_args, **_kwargs: (_ for _ in ()).throw(HTTPError(
+        'http://host/health', 503, 'degraded', {}, BytesIO(json.dumps(health).encode()))))
+    del host.dependency_degraded
     host.failures['host-1'] = 0
     host.recoveries['host-1'] = {'attempts': 3, 'next_retry_at': 0}
     host.heartbeat.reset_mock()
@@ -1007,16 +1014,24 @@ def test_liveness_accepts_initializing_503(tmp_path, monkeypatch):
     assert host.alive('http://host')
 
 
-def test_dependency_degradation_requires_live_recovered_host_and_unavailable_resources(tmp_path, monkeypatch):
+@pytest.mark.parametrize('payload,expected', [
+    ({'live': True, 'recovery': 'ready', 'resources': 'unavailable'}, True),
+    ({'live': True, 'recovery': 'failed', 'recovery_dependency': 'mcp_catalog', 'resources': 'unavailable'}, True),
+    ({'live': True, 'recovery': 'failed', 'resources': 'unavailable'}, False),
+    ({'live': True, 'recovery': 'failed', 'recovery_dependency': 'mcp_catalog', 'resources': 'ready'}, False),
+    ({'live': False, 'recovery': 'failed', 'recovery_dependency': 'mcp_catalog', 'resources': 'unavailable'}, False),
+    ({'live': True, 'recovery': 'recovering', 'resources': 'unavailable'}, False),
+])
+def test_dependency_degradation_requires_live_host_with_verified_catalog_blockage(tmp_path, monkeypatch, payload, expected):
     from io import BytesIO
     from urllib.error import HTTPError
     host, _, _, _, _ = setup(tmp_path, monkeypatch)
     host.opener.open = Mock(side_effect=HTTPError(
         'http://host/health', 503, 'degraded', {},
-        BytesIO(b'{"live":true,"ready":false,"recovery":"ready","resources":"unavailable"}')))
+        BytesIO(json.dumps(payload).encode())))
     # Exercise the implementation rather than setup's default mock.
     del host.dependency_degraded
-    assert Hosts.dependency_degraded(host, 'http://host')
+    assert Hosts.dependency_degraded(host, 'http://host') is expected
 
 
 def test_ssh_installs_keys_as_sandbox_owner_without_chown(tmp_path, monkeypatch):

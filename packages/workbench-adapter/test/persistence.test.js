@@ -22,6 +22,19 @@ function seed(database, ownerId = 'user-a') {
 }
 
 describe('workbench durable projection', () => {
+  it('returns the newest question when consecutive inputs share the same millisecond', () => {
+    const database = open()
+    const { chat, ownerId } = seed(database)
+    const { run } = database.createRun({ ownerId, chatId: chat.id, sessionId: chat.sessionId, query: 'q', selection: {}, now: 2 })
+    database.createPendingInput(ownerId, run.id, { requestId: 'old', payload: { tool_name: 'ask_user_question' } }, 100)
+    database.settlePendingInput(ownerId, run.id, 'old', 'skipped', undefined, 100)
+    database.createPendingInput(ownerId, run.id, { requestId: 'new', payload: { tool_name: 'ask_user_question' } }, 100)
+    expect(database.getPendingInput(ownerId, run.id)).toMatchObject({ requestId: 'new', status: 'pending' })
+    expect(database.listPendingInputs(ownerId, run.id).map(input => input.requestId)).toEqual(['old', 'new'])
+    database.settlePendingInput(ownerId, run.id, 'new', 'submitted', { answers: [] }, 101)
+    expect(database.getPendingInput(ownerId, run.id)).toMatchObject({ requestId: 'new', status: 'submitted' })
+  })
+
   it('isolates chats and runs by owner', () => {
     const database = open()
     const { chat } = seed(database)

@@ -71,7 +71,7 @@ export class TaskScheduler {
       const rawCode = code ?? error?.code
       const generation = String(this.generation)
       console.warn(JSON.stringify({ event: 'workbench_scheduler',
-        operation: ['request_failed', 'renew_rejected', 'dispatch_failed', 'cancel_execution'].includes(operation) ? operation : 'unknown',
+        operation: ['request_failed', 'renew_rejected', 'dispatch_failed', 'cancel_execution', 'tick_failed'].includes(operation) ? operation : 'unknown',
         reason: DIAGNOSTIC_REASONS.has(reason) ? reason : 'unknown',
         action: DIAGNOSTIC_ACTIONS.has(action) ? action : 'unknown',
         status: Number.isInteger(error?.status) && error.status >= 400 && error.status <= 599 ? error.status : null,
@@ -292,7 +292,13 @@ export class TaskScheduler {
 
   tick() {
     if (this.closed) return Promise.resolve()
-    if (!this.pendingTick) this.pendingTick = this.dispatch().finally(() => { this.pendingTick = null })
+    if (!this.pendingTick) {
+      this.pendingTick = this.dispatch().finally(() => { this.pendingTick = null })
+      // Timer/enqueue callers intentionally detach. A storage failure outside
+      // the per-run handler must not become an unhandled rejection and exit
+      // the Host. Keep the original rejection for callers explicitly awaiting it.
+      void this.pendingTick.catch(error => this.diagnostic(undefined, 'tick_failed', 'dispatch_error', { action: 'dispatch', error }))
+    }
     return this.pendingTick
   }
 
@@ -308,9 +314,13 @@ export class TaskScheduler {
     const pending = [...groups.values()]
     // Session-local order stays serial; a stalled platform call cannot hold
     // every owner's conversation or lease renewal behind it.
-    await Promise.all(Array.from({ length: Math.min(4, pending.length) }, async () => {
+    const results = await Promise.allSettled(Array.from({ length: Math.min(4, pending.length) }, async () => {
       while (pending.length && !this.closed) await this.dispatchItems(pending.shift())
     }))
+    // An early worker failure must not release pendingTick while another
+    // worker still holds a native prompt or admission request in flight.
+    const failure = results.find(result => result.status === 'rejected')
+    if (failure) throw failure.reason
   }
 
   async dispatchItems(items) {

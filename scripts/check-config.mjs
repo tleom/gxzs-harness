@@ -9,7 +9,7 @@ const profileTarget = path.join(home, 'profiles/workbench')
 const packages = [
   'workbench-adapter', 'workbench-control-commands', 'workbench-file-manager',
   'workbench-platform-client', 'workbench-sandbox-skills', 'workbench-mcp-tools',
-  'workbench-sandbox-runtime',
+  'workbench-sandbox-runtime', 'tool-discovery',
 ]
 rmSync(root, { recursive: true, force: true })
 mkdirSync(path.dirname(profileTarget), { recursive: true })
@@ -58,5 +58,7 @@ if (!(result.stdout || '').includes('@gxzs/dsh-workbench-adapter'))
   throw new Error('workbench adapter row is missing')
 if (!(result.stdout || '').includes('@gxzs/dsh-workbench-mcp-tools'))
   throw new Error('workbench MCP proxy row is missing')
+if (!(result.stdout || '').includes('@gxzs/dsh-tool-discovery'))
+  throw new Error('tool discovery plugin row is missing')
 if (!(result.stdout || '').includes('@gxzs/dsh-workbench-sandbox-runtime/fs'))
   throw new Error('workbench attachment filesystem mapping row is missing')

@@ -94,6 +94,9 @@ export function nativePresentation(run, event, { streamed = false, toolName = ''
 }
 
 function toolPresentation(run, call) {
+  const receipt = run.selection?.tool_presentations?.[run.sessionId]?.[call.callId]
+  if (receipt) return { provider_name: receipt.provider_name, display_name: receipt.display_name }
+  if (call.name === 'tool_search') return { display_name: '查找工具' }
   const title = run.selection?.tool_titles?.[call.callId]
   if (call.name === 'schedule_delete' && typeof title === 'string') return { display_name: title }
 

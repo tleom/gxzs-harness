@@ -46,8 +46,44 @@ function setup() {
   const publishedClient = { json: (request) => request.route === 'workbench/config' ? publishedModels()
     : request.route === 'mcp/cancel' ? Promise.resolve({ data: { fenced: true } }) : platformClient.json(request) }
   const service = new WorkbenchService({ database, sessionController, agents, commands, skills, fileManager, platformClient: publishedClient, workspace: '/workspace' })
+  service.workingDirectory = { ensure: vi.fn(async () => '/workspace/current') }
+  service.onGoalChanged = vi.fn(() => vi.fn())
   return { database, owner, chat, service, sessionController, agents, commands, skills, fileManager, platformClient, agent }
 }
+
+it('keeps a legacy context snapshot small on follow-up polls while retaining the durable reading', () => {
+  const { database, owner, chat, service } = setup()
+  const { run } = database.createRun({ ownerId: owner.ownerId, chatId: chat.id, sessionId: chat.sessionId, query: 'q', selection: {} })
+  database.appendEvent(owner.ownerId, run.id, { event: 'workbench_context', phase: 'usage', used_tokens: 1200,
+    window_tokens: 128000, model: 'p/m', estimated: false, mcpTools: [{ schema: 'x'.repeat(513420) }], mcpCatalogReady: true })
+  const response = service.followups(owner, chat.id, [run.id])
+  expect(response.runs[0].context_usage).toMatchObject({ used_tokens: 1200, model: 'p/m' })
+  expect('mcpTools' in response.runs[0].context_usage).toBe(false)
+  expect(Buffer.byteLength(JSON.stringify(response))).toBeLessThan(2048)
+  expect(database.latestContextEvent(owner.ownerId, run.id).mcpTools).toHaveLength(1)
+})
+
+it('keeps steering metadata complete across history pages and frozen at the upper cursor', () => {
+  const { database, owner, chat, service } = setup()
+  const { run } = database.createRun({ ownerId: owner.ownerId, chatId: chat.id, sessionId: chat.sessionId, query: 'q', selection: {} })
+  for (let index = 0; index < 256; index++) database.appendEvent(owner.ownerId, run.id,
+    { event: 'workbench_activity', data: { stage: 'returned', tool_name: 'read', output: 'ok' } })
+  database.appendEvent(owner.ownerId, run.id,
+    { event: 'workbench_steering', steering_id: 'first-steer', query: '补充说明', attachments: [], created_at: 123 })
+  database.appendEvent(owner.ownerId, run.id, { event: 'workbench_steered', steer_target_run_id: 'target-run' })
+  const first = service.getRun(owner, run.id, true, { after: '0-0' })
+  expect(first.events).toHaveLength(256)
+  expect(first.events_next_cursor).toBe('256-0')
+  expect(first.steering_messages).toEqual([{ id: 'first-steer', query: '补充说明', attachments: [], created_at: 123 }])
+  expect(first.steer_target_run_id).toBe('target-run')
+  database.appendEvent(owner.ownerId, run.id,
+    { event: 'workbench_steering', steering_id: 'later-steer', query: '快照之后', attachments: [], created_at: 456 })
+  const last = service.getRun(owner, run.id, true, { after: first.events_next_cursor, through: first.events_through_cursor })
+  expect(last.steering_messages).toEqual(first.steering_messages)
+  expect(last.steer_target_run_id).toBe(first.steer_target_run_id)
+  expect(last.events.map(event => event._id)).toEqual(['257-0', '258-0'])
+  expect(service.getRun(owner, run.id).steering_messages).toHaveLength(2)
+})
 
 it.each(['queue', 'steer'])('carries native %s submission through the admitted immutable receipt', async mode => {
   const test = setup()
@@ -87,7 +123,7 @@ function activateNative(test, runId, queued = []) {
   service.scheduler = { ...service.scheduler, hasAdmission: () => true }
 }
 
-it('returns state-only chat and mutation receipts while retaining full history for explicit readers', async () => {
+it('returns state-only receipts and pages full large history without an oversized legacy response', async () => {
   const { service, owner, chat, database } = setup()
   const run = await service.submitRun(owner, chat.id, { query: 'large history' })
   const large = 'x'.repeat(1024 * 1024)
@@ -99,9 +135,19 @@ it('returns state-only chat and mutation receipts while retaining full history f
   expect(Buffer.byteLength(JSON.stringify(state))).toBeLessThan(32768)
   expect(state.runs[0]).toMatchObject({ id: run.id, query: 'large history', events: [], history_complete: false })
   expect(service.getRun(owner, run.id)).toMatchObject({ events: [], history_complete: false })
-  const explicit = service.getRun(owner, run.id, true)
-  expect(Buffer.byteLength(JSON.stringify(explicit))).toBeGreaterThan(30 * 1024 * 1024)
-  expect(explicit.history_complete).toBe(true)
+  expect(() => service.getRun(owner, run.id, true)).toThrow(expect.objectContaining({ status: 413, code: 'HISTORY_PAGE_REQUIRED' }))
+  let after = '0-0', through, total = 0, textEvents = 0
+  do {
+    const page = service.getRun(owner, run.id, true, { after, through })
+    const bytes = Buffer.byteLength(JSON.stringify(page))
+    expect(bytes).toBeLessThan(4 * 1024 * 1024 + 32768)
+    total += bytes
+    textEvents += page.events.filter(event => event.data?.text === large).length
+    through ??= page.events_through_cursor
+    after = page.events_next_cursor
+  } while (after)
+  expect(total).toBeGreaterThan(30 * 1024 * 1024)
+  expect(textEvents).toBe(32)
 })
 
 it('shows one badge per MCP provider while preserving its complete tool scope and distinct same-name providers', async () => {
@@ -494,6 +540,14 @@ describe('followup and control service', () => {
     await expect(service.submitRun(owner, chat.id, { silent_resume: true, continue_run_id: 'old', files: [{ path: 'file' }] })).rejects.toMatchObject({ status: 400 })
   })
 
+  it('keeps new explicit skill invocations on a human message instead of background Continue', async () => {
+    const { owner, chat, service, database, sessionController } = setup()
+    await expect(service.submitRun(owner, chat.id, { silent_resume: true, continue_run_id: 'old',
+      resource_mentions: { skills: ['manual'] } })).rejects.toMatchObject({ status: 400, message: expect.stringContaining('新增技能引用') })
+    expect(database.listRuns(owner.ownerId, chat.id)).toEqual([])
+    expect(sessionController.prompt).not.toHaveBeenCalled()
+  })
+
   it('only stops the owning Goal between native rounds', async () => {
     const test = setup()
     const { database, owner, chat, service, sessionController, agent } = test
@@ -571,6 +625,19 @@ describe('followup and control service', () => {
     const source = service.followHistory(owner, chat.id, new AbortController().signal)
     expect((await source.next()).value.control.contextPressure.projectedTokens).toBe(12000)
     await source.return()
+  })
+  it('exposes native context composition on refresh, replacement and cold read without estimating it again', async () => {
+    const { service, owner, chat } = setup()
+    const dispose = vi.fn()
+    let contextBreakdown = { systemTokens: 1700, toolsTokens: 9900, messageTokens: 3400 }
+    service.sessionQuery = { observeSession: async () => ({ projections: { values: { contextBreakdown } }, events: [], [Symbol.dispose]: dispose }) }
+    expect((await service.getControl(owner, chat.id)).contextBreakdown).toEqual(contextBreakdown)
+    contextBreakdown = { ...contextBreakdown, messageTokens: 200 }
+    const restored = new WorkbenchService({ database: service.database, sessionQuery: service.sessionQuery, agents: { get: () => undefined } })
+    expect((await restored.getControl(owner, chat.id)).contextBreakdown).toEqual(contextBreakdown)
+    contextBreakdown = undefined
+    expect((await restored.getControl(owner, chat.id)).contextBreakdown).toBeNull()
+    expect(dispose).toHaveBeenCalledTimes(3)
   })
   it('persists capacity-waiting tasks without sending them to DSH and allows cancellation', async () => {
     const { service, owner, chat, database, sessionController } = setup()
@@ -708,6 +775,8 @@ describe('followup and control service', () => {
       { request_id: 'question', status: 'submitted', answers: [{ id: 'q', selected: [], custom: 'answer' }], supplement_run_id: accepted.id },
     ])
     await expect(service.supplement(owner, run.id, { ...body, request_id: 'missing' })).rejects.toMatchObject({ status: 404 })
+    await expect(service.supplement(owner, run.id, { ...body, request_id: undefined })).rejects.toMatchObject({ status: 404 })
+    await expect(service.supplement(owner, run.id, { ...body, request_id: null })).rejects.toMatchObject({ status: 404 })
   })
   it.each(['running', 'completed'])('admits a historical answer through native prompt when the task is %s', async (status) => {
     const test = setup()
@@ -1253,7 +1322,8 @@ describe('followup and control service', () => {
   })
 
   it.each(['resume', 'RESUME'])('preserves the goal resource snapshot with native %s', async control => {
-    const { owner, chat, service, database, commands, agent } = setup()
+    const { owner, chat, service, database, commands, agent, skills } = setup()
+    skills.list.mockResolvedValue([{ name: 'evidence', invocation: { userInvocable: true, modelInvocable: false } }])
     const selection = { command: 'goal', resource_context: 'Use the selected evidence skill and sandbox file.',
       resource_mentions: { skills: ['evidence'], tools: [] }, mentioned_resources: [{ kind: 'skills', name: '旧展示名' }] }
     const attachments = [{ name: 'evidence.txt', path: 'evidence.txt', version: 'v1' }]
@@ -1267,12 +1337,37 @@ describe('followup and control service', () => {
     const result = await service.issueCommand(owner, chat.id, { command: `/goal ${control}`, request_key: 'resume-command' })
     const resumed = database.getRun(owner.ownerId, result.run.id)
     expect(resumed.id).not.toBe(previous.id)
-    expect(resumed.selection).toEqual({ ...previous.selection, model: chat.selection.model, model_parameters: {}, silent_resume: false, is_continuation: true })
+    expect(resumed.selection).toEqual({ ...previous.selection, model: chat.selection.model, model_parameters: {}, silent_resume: false, is_continuation: true,
+      skill_invocations: [{ name: 'evidence' }] })
     expect(result.run).toMatchObject({ is_continuation: true, parent_run_id: previous.id })
     expect(resumed.attachments).toEqual(attachments)
     expect(resumed.mcpTools).toEqual(mcpTools)
     expect(freeze).not.toHaveBeenCalled()
     expect(commands.execute).toHaveBeenCalledWith(agent, `/goal ${control}`, [], expect.any(AbortSignal))
+  })
+
+  it.each([undefined, {}, { skills: [], tools: [], knowledge: [] }, { skills: ['evidence'] }])('resumes the stored selection with compatible control input %j', async resource_mentions => {
+    const { owner, chat, service, database, skills } = setup()
+    skills.list.mockResolvedValue([{ name: 'evidence', invocation: { userInvocable: true, modelInvocable: false } }])
+    const previous = database.createRun({ ownerId: owner.ownerId, chatId: chat.id, sessionId: chat.sessionId,
+      query: 'Review evidence', selection: { command: 'goal', resource_mentions: { skills: ['evidence'] } }, mcpTools: [] }).run
+    database.setGoalRun(chat.sessionId, previous.id)
+    service.goals = { get: () => ({ id: 'g', revision: 2, phase: 'paused', objective: previous.query }) }
+    const result = await service.issueCommand(owner, chat.id, { command: '/goal resume', request_key: 'resume', resource_mentions })
+    expect(result.run.resource_mentions.skills).toEqual(['evidence'])
+  })
+
+  it('rejects a changed nonempty selection on goal resume before native mutation or a new receipt', async () => {
+    const { owner, chat, service, database, commands } = setup()
+    const previous = database.createRun({ ownerId: owner.ownerId, chatId: chat.id, sessionId: chat.sessionId,
+      query: 'Review evidence', selection: { command: 'goal', resource_mentions: { skills: ['evidence'] } }, mcpTools: [] }).run
+    database.setGoalRun(chat.sessionId, previous.id)
+    service.goals = { get: () => ({ id: 'g', revision: 2, phase: 'paused', objective: previous.query }) }
+    await expect(service.issueCommand(owner, chat.id, { command: '/goal resume', request_key: 'resume',
+      resource_mentions: { skills: ['other'] } })).rejects.toMatchObject({ status: 409, message: expect.stringContaining('沿用原资源引用') })
+    expect(commands.execute).not.toHaveBeenCalled()
+    expect(database.goalRun(chat.sessionId).id).toBe(previous.id)
+    expect(database.listRuns(owner.ownerId, chat.id)).toHaveLength(1)
   })
 
   it('shows provider rejection in historical Goal state and resumes with current model preferences', async () => {
@@ -1315,13 +1410,13 @@ describe('followup and control service', () => {
 
   it('admits a plan task once and persists its mode, title and resource labels', async () => {
     const { owner, chat, service, database, commands, sessionController, skills } = setup()
-    skills.list.mockResolvedValue([{ name: 'evidence', displayName: '证据整理', description: '整理材料' }])
+    skills.list.mockResolvedValue([{ name: 'evidence', displayName: '证据整理', description: '整理材料', invocation: { userInvocable: true, modelInvocable: false } }])
     const body = { command: '/plan 调查证据', request_key: 'one-plan', resource_mentions: { skills: ['evidence'] } }
     const first = await service.issueCommand(owner, chat.id, body)
     const replay = await service.issueCommand(owner, chat.id, body)
     expect(replay.run.id).toBe(first.run.id)
     expect(commands.execute).toHaveBeenCalledOnce()
-    expect(commands.execute.mock.calls[0][1]).toBe('/plan 调查证据')
+    expect(commands.execute.mock.calls[0][1]).toBe('/plan 调查证据\n/evidence')
     expect(sessionController.prompt).not.toHaveBeenCalled()
     expect(database.listRuns(owner.ownerId, chat.id)).toHaveLength(1)
     expect(database.getChat(owner.ownerId, chat.id).title).toBe('新会话')
@@ -1402,13 +1497,13 @@ describe('explicit resource mentions', () => {
     expect(hint).not.toContain('maps_direction_driving')
   })
 
-  it('sends a skill preference only when the skill is model-invocable', async () => {
-    const { service, owner, chat, sessionController, skills } = setup()
-    skills.list.mockResolvedValue([{ name: 'manual', invocation: { modelInvocable: true, userInvocable: false } }])
-    await service.submitRun(owner, chat.id, { query: 'run', resource_mentions: { skills: ['manual'] } })
-    expect(sessionController.prompt.mock.calls[0][0].content.at(-1).text).toContain('manual')
-    expect(sessionController.prompt.mock.calls[0][0].content.at(-1).text).not.toContain('/manual')
+  it('sends a native skill gesture only when the skill is user-invocable', async () => {
+    const { service, owner, chat, sessionController, skills, agent } = setup()
     skills.list.mockResolvedValue([{ name: 'manual', invocation: { modelInvocable: false, userInvocable: true } }])
+    await service.submitRun(owner, chat.id, { query: 'run', resource_mentions: { skills: ['manual'] } })
+    expect(sessionController.prompt.mock.calls[0][0].content.at(-1).text).toBe('/manual')
+    expect(skills.list).toHaveBeenCalledWith(expect.objectContaining({ scope: agent, cwd: '/workspace/current' }))
+    skills.list.mockResolvedValue([{ name: 'manual', invocation: { modelInvocable: true, userInvocable: false } }])
     await expect(service.submitRun(owner, chat.id, { query: 'run again', resource_mentions: { skills: ['manual'] } })).rejects.toMatchObject({ status: 409 })
   })
 
@@ -1416,8 +1511,8 @@ describe('explicit resource mentions', () => {
     const { service, owner, chat, database, sessionController, skills } = setup()
     const tool = { id: 'law', runtime_name: 'global_law_search', provider: 'global:mcp:law', provider_name: '法律检索', name: '检索' }
     vi.spyOn(service, 'freezeMcpTools').mockResolvedValue([tool])
-    skills.list.mockResolvedValue([{ name: 'legal-review', description: '审查' }])
-    const mentions = { tools: ['law'], skills: ['legal-review'], knowledge: [] }
+    skills.list.mockResolvedValue([{ name: 'legal-review', description: '审查', invocation: { userInvocable: true, modelInvocable: true } }])
+    const mentions = { tools: ['law'], plugins: [], skills: ['legal-review'], knowledge: [] }
     const run = await service.submitRun(owner, chat.id, { query: '融资租赁', resource_mentions: mentions })
     expect(run.query).toBe('融资租赁')
     expect(run.resource_mentions).toEqual(mentions)
@@ -1425,9 +1520,9 @@ describe('explicit resource mentions', () => {
     const content = sessionController.prompt.mock.calls[0][0].content
     expect(content[0].text).toBe('融资租赁')
     expect(content[1].text).toContain('法律检索')
-    expect(content[1].text).toContain('legal-review')
+    expect(content[2].text).toBe('/legal-review')
     expect(content[1].text).not.toContain('global_law_search')
-    expect(content).toHaveLength(2)
+    expect(content).toHaveLength(3)
     database.bindRunMessage(chat.sessionId, run.id, 1, 'm1')
     database.transitionRun(owner.ownerId, run.id, 'completed')
     database.setRunSourceSeq(owner.ownerId, run.id, 'source_end_seq', 9)
@@ -1438,7 +1533,7 @@ describe('explicit resource mentions', () => {
 
   it('returns the original mentions on receipt replay and preserves them on an explicit retry', async () => {
     const { service, owner, chat, sessionController, skills } = setup()
-    skills.list.mockResolvedValue([{ name: 'legal-review' }])
+    skills.list.mockResolvedValue([{ name: 'legal-review', invocation: { userInvocable: true, modelInvocable: true } }])
     sessionController.prompt.mockRejectedValueOnce(new Error('offline'))
     const body = { query: '核对', request_key: 'mention-retry', resource_mentions: { skills: ['legal-review'] } }
     const failed = await service.submitRun(owner, chat.id, body)
@@ -1455,7 +1550,7 @@ describe('explicit resource mentions', () => {
   it('does not turn available resources into explicit requests and rejects unavailable mentions', async () => {
     const { service, owner, chat, sessionController } = setup()
     const ordinary = await service.submitRun(owner, chat.id, { query: '你好' })
-    expect(ordinary.resource_mentions).toEqual({ tools: [], skills: [], knowledge: [] })
+    expect(ordinary.resource_mentions).toEqual({ tools: [], plugins: [], skills: [], knowledge: [] })
     expect(sessionController.prompt.mock.calls[0][0].content).toEqual([{ type: 'text', text: '你好' }])
     await expect(service.submitRun(owner, chat.id, { query: '检索', resource_mentions: { tools: ['missing'] } })).rejects.toMatchObject({ status: 409 })
     await expect(service.submitRun(owner, chat.id, { query: '审查', resource_mentions: { skills: ['missing'] } })).rejects.toMatchObject({ status: 409 })
@@ -1718,13 +1813,19 @@ describe('forked conversations', () => {
 })
 
 describe('native queue edit', () => {
-  it('retains frozen resource hints when editing text with selected resources', async () => {
-    const { service, database, owner, chat } = setup()
+  it('rebuilds native skill gestures when editing text with selected resources', async () => {
+    const { service, database, owner, chat, skills } = setup()
+    skills.list.mockResolvedValue([{ name: 'selected', invocation: { userInvocable: true, modelInvocable: false } }])
     const { run } = database.createRun({ ownerId: owner.ownerId, chatId: chat.id, sessionId: chat.sessionId, query: 'before', selection: { resource_mentions: { skills: ['selected'] } } })
-    const hint = { type: 'text', text: 'frozen resource instructions' }
+    const hint = { type: 'text', text: '/selected' }
     database.saveSubmission(owner.ownerId, run.id, [{ type: 'text', text: 'before' }, hint])
     await service.editQueued(owner, run.id, { content: [{ type: 'text', text: 'after' }] })
     expect(database.submission(owner.ownerId, run.id).content).toEqual([{ type: 'text', text: 'after' }, hint])
+    await service.editQueued(owner, run.id, { content: [{ type: 'text', text: 'after /selected' }] })
+    expect(database.submission(owner.ownerId, run.id).content).toEqual([{ type: 'text', text: 'after /selected' }])
+    skills.list.mockResolvedValue([{ name: 'selected', invocation: { userInvocable: false, modelInvocable: true } }])
+    await expect(service.editQueued(owner, run.id, { content: [{ type: 'text', text: 'rejected' }] })).rejects.toMatchObject({ status: 409 })
+    expect(database.getRun(owner.ownerId, run.id).query).toBe('after /selected')
   })
   it('edits durable admission content before the native inbox exists and retains the ticket', async () => {
     const { service, database, owner, chat, sessionController } = setup()
@@ -1796,8 +1897,8 @@ it('saves global skill capabilities and submits only the explicitly mentioned sk
   expect(database.getRun(owner.ownerId, run.id).selection.skills).toEqual(names)
   expect(run.resource_mentions.skills).toEqual(['humanizer-zh'])
   const prompt = sessionController.prompt.mock.calls.at(-1)[0]
-  expect(prompt.content).toContainEqual({ type: 'text', text: expect.stringContaining('用户指定技能：["humanizer-zh"]') })
-  expect(prompt.content.map(block => block.text ?? '').join('\n')).not.toContain('用户指定技能：["docx"')
+  expect(prompt.content).toContainEqual({ type: 'text', text: '/humanizer-zh' })
+  expect(prompt.content.map(block => block.text ?? '').join('\n')).not.toContain('/docx')
 })
 
 it('rejects unsupported knowledge independently of configured skills', async () => {

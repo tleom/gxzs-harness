@@ -50,9 +50,9 @@ export function streamRunEvents({ database, eventBus, ownerId, runId, cursor, re
     if (closed || blocked || pumping) return
     pumping = true
     try {
-      const page = database.eventsAfter(ownerId, runId, sequence, Math.max(1, Math.min(pageSize, 1000)))
+      const page = database.eventsAfter(ownerId, runId, sequence, Math.max(1, Math.min(pageSize, 1000)), presentRunEvent)
       for (const entry of page) {
-        const accepted = res.write(encodeSse(presentRunEvent(entry)))
+        const accepted = res.write(encodeSse(entry))
         sequence = decodeCursor(entry._id)
         if (closed) return
         if (accepted === false) { pause(); return }
