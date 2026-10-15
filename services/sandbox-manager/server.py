@@ -783,4 +783,7 @@ if __name__ == "__main__":
         raise ValueError("Manager token must contain at least 32 characters")
     threading.Thread(target=reap, daemon=True).start()
     threading.Thread(target=maintain_hosts, daemon=True).start()
-    BoundedHTTPServer(("0.0.0.0", 5010), Handler).serve_forever()
+    try:
+        BoundedHTTPServer(("0.0.0.0", 5010), Handler).serve_forever()
+    finally:
+        HOSTS.close()

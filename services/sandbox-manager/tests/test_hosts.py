@@ -11,6 +11,24 @@ from hosts import Hosts
 from resource_limits import ResourceUnavailable
 
 
+@pytest.fixture(autouse=True)
+def close_maintenance_workers(monkeypatch):
+    instances = []
+    initialize = Hosts.__init__
+    def track(instance, *args, **kwargs):
+        initialize(instance, *args, **kwargs)
+        instances.append(instance)
+    monkeypatch.setattr(Hosts, '__init__', track)
+    yield
+    for instance in instances:
+        instance.close()
+
+
+def maintain(host):
+    for future in host.maintain():
+        future.result(timeout=5)
+
+
 def test_missing_host_port_has_a_stable_startup_error(tmp_path, monkeypatch):
     host, control, _, payload, created = setup(tmp_path, monkeypatch)
     created.update(State={'Running':False,'ExitCode':1},NetworkSettings={'Ports':{}})
@@ -110,7 +128,7 @@ def test_profile_upgrade_fences_durably_and_only_replace_can_resume(tmp_path, mo
     host.admission.fence.assert_called_once_with('t:1', 'host-1')
     docker.reset_mock()
     assert host.ensure('workspace', payload)['ready'] is False
-    host.maintain()
+    maintain(host)
     assert not docker.called
     again = Hosts(tmp_path, docker, host.ensure_sandbox, host.identity, host.lock, host.admission, host.ensure_network)
     assert again.profile_upgrade('workspace', begin) == proof
@@ -137,7 +155,7 @@ def test_profile_upgrade_unknown_or_busy_native_work_stays_draining(tmp_path, mo
     assert result['fenced'] is False and 'token' not in result
     assert json.loads(record.read_text())['state'] == 'draining'
     assert host.ensure('workspace', payload)['ready'] is False
-    host.maintain()
+    maintain(host)
     assert not any(call.args[0] in {'start', 'create', 'stop'} for call in docker.call_args_list)
 
 
@@ -342,7 +360,7 @@ def test_idle_shutdown_fences_before_reporting_stopped(tmp_path, monkeypatch):
     activity = tmp_path / 'workspace'
     activity.touch()
     os.utime(activity, (1, 1))
-    host.maintain()
+    maintain(host)
     stops = [call.args[-1] for call in docker.call_args_list if call.args[0] == 'stop']
     assert stops == ['host-1', 'sandbox-workspace']
     host.admission.fence.assert_called_once_with('t:1', 'host-1')
@@ -356,7 +374,7 @@ def test_idle_stopped_pair_is_not_recovered_by_maintenance(tmp_path, monkeypatch
     activity = tmp_path / 'workspace'
     activity.touch()
     os.utime(activity, (1, 1))
-    host.maintain()
+    maintain(host)
     record = host.root / 'workspace' / 'host.json'
     assert json.loads(record.read_text())['state'] == 'stopped'
     created['State']['Running'] = False
@@ -364,7 +382,7 @@ def test_idle_stopped_pair_is_not_recovered_by_maintenance(tmp_path, monkeypatch
     host.heartbeat.reset_mock()
     docker.reset_mock()
 
-    host.maintain()
+    maintain(host)
 
     assert not any(call.args[0] in {'stop', 'start', 'create', 'rename'} for call in docker.call_args_list)
     host.heartbeat.assert_not_called()
@@ -379,7 +397,7 @@ def test_stopped_record_reconciles_stale_running_pair_after_admission_is_idle(tm
     host.heartbeat.reset_mock()
     docker.reset_mock()
 
-    host.maintain()
+    maintain(host)
 
     stops = [call.args[-1] for call in docker.call_args_list if call.args[0] == 'stop']
     assert stops == ['host-1', 'sandbox-workspace']
@@ -397,7 +415,7 @@ def test_stopped_record_with_busy_admission_does_not_stop_stale_pair(tmp_path, m
     host.admission.busy.return_value = 1
     docker.reset_mock()
 
-    host.maintain()
+    maintain(host)
 
     assert not any(call.args[0] == 'stop' for call in docker.call_args_list)
     host.admission.fence.assert_not_called()
@@ -410,7 +428,7 @@ def test_active_task_prevents_idle_shutdown(tmp_path, monkeypatch):
     (tmp_path / 'workspace').touch()
     os.utime(tmp_path / 'workspace', (1, 1))
     host.admission.busy.return_value = 1
-    host.maintain()
+    maintain(host)
     assert not any(call.args[0] == 'stop' for call in docker.call_args_list)
     assert host.heartbeat.call_args.args[1] == 'ready'
 
@@ -422,7 +440,7 @@ def test_native_activity_prevents_idle_shutdown_without_platform_admission(tmp_p
     (tmp_path / 'workspace').touch()
     os.utime(tmp_path / 'workspace', (1, 1))
     host.native_activity.return_value = None
-    host.maintain()
+    maintain(host)
     assert not any(call.args[0] == 'stop' for call in docker.call_args_list)
     host.admission.fence.assert_not_called()
     assert host.heartbeat.call_args.args[1] == 'ready'
@@ -467,10 +485,10 @@ def test_real_native_work_refreshes_idle_clock_and_keeps_recently_closed_work_al
     activity.touch()
     os.utime(activity, (1, 1))
     host.native_activity.return_value[key] = 1
-    host.maintain()
+    maintain(host)
     assert activity.stat().st_mtime > time.time() - 5
     host.native_activity.return_value = {field: 0 for field in host.native_activity.return_value}
-    host.maintain()
+    maintain(host)
     assert not any(call.args[0] == 'stop' for call in docker.call_args_list)
     assert json.loads((host.root / 'workspace' / 'host.json').read_text())['state'] == 'ready'
 
@@ -481,14 +499,14 @@ def test_empty_and_unknown_probes_do_not_extend_idle_clock_or_erase_known_activi
     host.ensure('workspace', payload)
     activity = tmp_path / 'workspace'
     activity.touch()
-    host.maintain()
+    maintain(host)
     host.native_activity.return_value = None
     os.utime(activity, (1, 1))
-    host.maintain()
+    maintain(host)
     assert activity.stat().st_mtime == 1
     assert not any(call.args[0] == 'stop' for call in docker.call_args_list)
     host.native_activity.return_value = dict(runningAgents=0, pendingMessages=0, runningJobs=0, activeSchedules=0, activeSidebarResources=0, activeSettingsWrites=0)
-    host.maintain()
+    maintain(host)
     assert any(call.args[0] == 'stop' for call in docker.call_args_list)
     assert activity.stat().st_mtime == 1
 
@@ -506,7 +524,7 @@ def test_live_unready_host_accumulates_failure_without_state_regression(tmp_path
     host.failures['host-1'] = time.time()
     host.admission.busy.return_value = 1
     host.heartbeat.reset_mock()
-    host.maintain()
+    maintain(host)
     assert not any(call.args[0] == 'stop' for call in docker.call_args_list)
     host.admission.fence.assert_not_called()
     assert 'host-1' in host.failures
@@ -531,7 +549,7 @@ def test_external_catalog_degradation_pauses_admission_without_restarting_pair(t
     host.recoveries['host-1'] = {'attempts': 3, 'next_retry_at': 0}
     host.heartbeat.reset_mock()
 
-    host.maintain()
+    maintain(host)
 
     assert not any(call.args[0] == 'stop' for call in docker.call_args_list)
     host.admission.fence.assert_not_called()
@@ -552,11 +570,11 @@ def test_current_pid_pressure_pauses_admission_and_recovers_without_restart(tmp_
     host.failures['host-1'] = 0
     monkeypatch.setattr('hosts.pid_pressure', lambda info: True)
     docker.reset_mock()
-    host.maintain()
+    maintain(host)
     assert not any(call.args[0] in ('stop','rename','create') for call in docker.call_args_list)
     assert json.loads(record.read_text())['ready'] is False
     monkeypatch.setattr('hosts.pid_pressure', lambda info: False)
-    host.maintain()
+    maintain(host)
     assert json.loads(record.read_text())['ready'] is True
 
 
@@ -574,7 +592,7 @@ def test_dead_host_pair_is_fenced_and_restarted_after_liveness_grace(tmp_path, m
     host.heartbeat.reset_mock()
     sandbox.reset_mock()
     host._ssh.reset_mock()
-    host.maintain()
+    maintain(host)
     assert [call.args[-1] for call in docker.call_args_list if call.args[0] == 'stop'] == ['host-1', 'sandbox-workspace']
     host.admission.fence.assert_called_once_with('t:1', 'host-1')
     sandbox.assert_called_once_with('workspace')
@@ -595,7 +613,7 @@ def test_healthy_recovery_removes_only_verified_stopped_predecessor(tmp_path, mo
     host.healthy.return_value = False
     host.alive = Mock(return_value=False)
     host.failures['host-1'] = 0
-    host.maintain()
+    maintain(host)
 
     original = docker.side_effect
     old_name = 'host-1-previous-' + 'c' * 12
@@ -610,7 +628,7 @@ def test_healthy_recovery_removes_only_verified_stopped_predecessor(tmp_path, mo
         return original(*args, **kwargs)
     docker.side_effect = with_predecessors
     host.healthy.return_value = True
-    host.maintain()
+    maintain(host)
     assert [call.args for call in docker.call_args_list if call.args[0] == 'rm'] == [('rm', old_name)]
 
 
@@ -625,7 +643,7 @@ def test_slow_predecessor_cleanup_does_not_hold_admission_lock(tmp_path, monkeyp
     host._cleanup_superseded = Mock(side_effect=slow_cleanup)
     host.admission.request.return_value = {'state': 'running'}
     with ThreadPoolExecutor(max_workers=2) as pool:
-        pending = pool.submit(host.maintain)
+        pending = pool.submit(maintain, host)
         try:
             assert entered.wait(2)
             request = {**payload, 'run_id': 'r', 'chat_id': 'c', 'action': 'acquire'}
@@ -645,7 +663,7 @@ def test_predecessor_cleanup_skips_changed_host_identity(tmp_path, monkeypatch):
         record.write_text(json.dumps(current))
     host.heartbeat = Mock(side_effect=changed_identity)
     host._cleanup_superseded = Mock()
-    host.maintain()
+    maintain(host)
     host._cleanup_superseded.assert_not_called()
 
 
@@ -663,7 +681,7 @@ def test_missing_host_container_is_recreated_from_durable_owner_state(tmp_path, 
     sandbox.reset_mock()
     host._ssh.reset_mock()
 
-    host.maintain()
+    maintain(host)
 
     creates = [call.args for call in docker.call_args_list if call.args[0] == 'create']
     assert len(creates) == 2
@@ -681,10 +699,10 @@ def test_missing_host_uses_short_debounce_before_recovery(tmp_path, monkeypatch)
     host.alive = Mock(return_value=False)
     host.failures['host-1'] = time.time() - 4
     creates = len([call for call in docker.call_args_list if call.args[0] == 'create'])
-    host.maintain()
+    maintain(host)
     assert len([call for call in docker.call_args_list if call.args[0] == 'create']) == creates
     host.failures['host-1'] = time.time() - 6
-    host.maintain()
+    maintain(host)
     assert len([call for call in docker.call_args_list if call.args[0] == 'create']) == creates + 1
 
 
@@ -706,7 +724,7 @@ def test_unhealthy_sandbox_restarts_pair_even_when_host_health_endpoint_is_ready
     host.alive = Mock(return_value=True)
     host.failures['host-1'] = 0
     sandbox.reset_mock()
-    host.maintain()
+    maintain(host)
     assert [call.args[-1] for call in docker.call_args_list if call.args[0] == 'stop'] == ['host-1', 'sandbox-workspace']
     sandbox.assert_called_once_with('workspace')
     assert host.recoveries['host-1']['attempts'] == 1
@@ -749,7 +767,7 @@ def test_maintenance_and_admission_share_workspace_lock(tmp_path, monkeypatch):
     host.healthy = lambda endpoint: (entered.set(), original(endpoint))[1]
     with ThreadPoolExecutor(max_workers=1) as pool:
         with host.lock('workspace'):
-            pending = pool.submit(host.maintain)
+            pending = pool.submit(maintain, host)
             assert not entered.wait(0.1)
         pending.result(timeout=5)
     assert entered.is_set()
@@ -826,7 +844,7 @@ def test_health_probe_does_not_hold_workspace_lock(tmp_path, monkeypatch):
                     return True
             return pool.submit(callback).result(timeout=1)
     host.healthy = healthy
-    host.maintain()
+    maintain(host)
     result = json.loads((host.root / 'workspace' / 'host.json').read_text())
     assert result['ready']
     assert host.heartbeat.call_args.args[1] == 'ready'
@@ -843,7 +861,7 @@ def test_platform_heartbeat_does_not_block_task_admission(tmp_path, monkeypatch)
     host.heartbeat = stalled_heartbeat
     host.admission.request.return_value = {'state': 'running'}
     with ThreadPoolExecutor(max_workers=2) as pool:
-        pending = pool.submit(host.maintain)
+        pending = pool.submit(maintain, host)
         try:
             assert entered.wait(2)
             request = {**payload, 'run_id': 'r', 'chat_id': 'c', 'action': 'acquire'}
@@ -860,7 +878,7 @@ def test_draining_keeps_heartbeat_and_existing_admission(tmp_path, monkeypatch):
     request = {**payload, 'generation': 2, 'instance_id': 'host-2', 'expected_generation': 1, 'expected_instance_id': 'host-1'}
     result = host.replace('workspace', request)
     assert result['state'] == 'draining' and result['generation'] == 1
-    host.maintain()
+    maintain(host)
     assert host.heartbeat.call_args.args[1] == 'draining'
     schedule = {**payload, 'run_id': 'r', 'chat_id': 'c'}
     with pytest.raises(ValueError, match='draining'):
