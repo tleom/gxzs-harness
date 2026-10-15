@@ -96,3 +96,166 @@ def test_corrupt_cache_does_not_disable_valid_plugin(ops, tmp_path):
     item = ops.personal_mcp({"operation": "mcp_list"}, str(tmp_path))["mcp"][0]
     assert item["enabled"] is True
     assert item["status"] == "unverified"
+
+
+def test_rename_keeps_assets_settings_and_cached_tools(ops, tmp_path):
+    saved = ops.personal_mcp({"operation": "mcp_save", "name": "demo", "content": config()}, str(tmp_path))
+    tools = [{"name": "lookup", "description": "lookup", "inputSchema": {"type": "object"}, "outputSchema": {"type": "object"}}]
+    ops.personal_mcp({"operation": "mcp_cache", "name": "demo", "version": saved["version"], "tools": tools}, str(tmp_path))
+    ops.personal_mcp({"operation": "mcp_toggle", "name": "demo", "enabled": False}, str(tmp_path))
+    ops.personal_mcp({"operation": "mcp_pin", "name": "demo", "pinned": True}, str(tmp_path))
+    (tmp_path / "mcp/demo/server.py").write_text("# local tool", encoding="utf-8")
+    result = ops.personal_mcp({"operation": "mcp_save", "name": "demo", "new_name": "renamed",
+                               "version": saved["version"], "content": config(name="renamed")}, str(tmp_path))
+    assert result["id"] == "renamed"
+    assert not (tmp_path / "mcp/demo").exists()
+    assert (tmp_path / "mcp/renamed/server.py").read_text() == "# local tool"
+    item = ops.personal_mcp({"operation": "mcp_list"}, str(tmp_path))["mcp"][0]
+    assert item["id"] == item["call_name"] == "renamed"
+    assert item["enabled"] is False and item["pinned"] is True
+    assert item["tools"] == tools and item["status"] == "ready"
+    assert not (tmp_path / "mcp/.cache/demo.json").exists()
+    assert (tmp_path / "mcp/.cache/renamed.json").exists()
+
+
+@pytest.mark.parametrize("target", ["../escape", "/absolute", "UPPER", "a/b", ""])
+def test_invalid_rename_does_not_change_original(ops, tmp_path, target):
+    saved = ops.personal_mcp({"operation": "mcp_save", "name": "demo", "content": config()}, str(tmp_path))
+    with pytest.raises(ValueError):
+        ops.personal_mcp({"operation": "mcp_save", "name": "demo", "new_name": target,
+                          "version": saved["version"], "content": config()}, str(tmp_path))
+    assert (tmp_path / "mcp/demo/mcp.json").read_text() == config()
+
+
+def test_rename_conflict_and_missing_source_do_not_replace_anything(ops, tmp_path):
+    saved = ops.personal_mcp({"operation": "mcp_save", "name": "demo", "content": config()}, str(tmp_path))
+    outside = tmp_path / "other"
+    outside.mkdir()
+    (tmp_path / "mcp/taken").symlink_to(outside, target_is_directory=True)
+    for target in ("taken", "demo"):
+        result = ops.personal_mcp({"operation": "mcp_save", "name": "demo", "new_name": target,
+                                   "version": "stale", "content": config(name=target)}, str(tmp_path))
+        assert result == {"conflict": True}
+    result = ops.personal_mcp({"operation": "mcp_save", "name": "demo", "new_name": "taken",
+                               "version": saved["version"], "content": config(name="taken")}, str(tmp_path))
+    assert result == {"conflict": True}
+    assert (tmp_path / "mcp/taken").is_symlink() and not list(outside.iterdir())
+    with pytest.raises(FileNotFoundError):
+        ops.personal_mcp({"operation": "mcp_save", "name": "missing", "new_name": "renamed",
+                          "content": config(name="renamed")}, str(tmp_path))
+    assert not (tmp_path / "mcp/missing").exists()
+    assert not (tmp_path / "mcp/renamed").exists()
+    assert (tmp_path / "mcp/demo/mcp.json").read_text() == config()
+
+
+@pytest.mark.parametrize("failure", ["mcp.json", ".pins.json", "renamed.json"])
+@pytest.mark.parametrize("transport", ["streamable-http", "stdio"])
+def test_rename_rolls_back_config_settings_and_cache_on_save_failure(ops, tmp_path, monkeypatch, failure, transport):
+    content = config() if transport == "streamable-http" else json.dumps({
+        "name": "demo", "transport": "stdio", "command": "python",
+        "args": ["/workspace/mcp/demo/server.py"], "cwd": "/workspace/mcp/demo"})
+    saved = ops.personal_mcp({"operation": "mcp_save", "name": "demo", "content": content}, str(tmp_path))
+    ops.personal_mcp({"operation": "mcp_cache", "name": "demo", "version": saved["version"],
+                      "tools": [{"name": "lookup", "inputSchema": {"type": "object"}}]}, str(tmp_path))
+    ops.personal_mcp({"operation": "mcp_toggle", "name": "demo", "enabled": False}, str(tmp_path))
+    ops.personal_mcp({"operation": "mcp_pin", "name": "demo", "pinned": True}, str(tmp_path))
+    paths = ["demo/mcp.json", ".settings.json", ".pins.json", ".cache/demo.json"]
+    previous = {path: (tmp_path / "mcp" / path).read_bytes() for path in paths}
+    original_write = ops.atomic_write
+    injected = False
+
+    def fail_once(fd, filename, data):
+        nonlocal injected
+        if not injected and filename == failure:
+            injected = True
+            raise OSError("injected save failure")
+        return original_write(fd, filename, data)
+
+    monkeypatch.setattr(ops, "atomic_write", fail_once)
+    if transport == "stdio" and failure == "renamed.json":
+        original_unlink = ops.os.unlink
+
+        def fail_cache_removal(filename, *args, **kwargs):
+            nonlocal injected
+            if not injected and filename == "demo.json":
+                injected = True
+                raise OSError("injected save failure")
+            return original_unlink(filename, *args, **kwargs)
+
+        monkeypatch.setattr(ops.os, "unlink", fail_cache_removal)
+    with pytest.raises(OSError, match="injected"):
+        ops.personal_mcp({"operation": "mcp_save", "name": "demo", "new_name": "renamed",
+                          "version": saved["version"], "content": json.dumps({**json.loads(content), "name": "renamed"})}, str(tmp_path))
+    assert injected
+    assert not (tmp_path / "mcp/renamed").exists()
+    assert not (tmp_path / "mcp/.cache/renamed.json").exists()
+    assert {path: (tmp_path / "mcp" / path).read_bytes() for path in paths} == previous
+
+
+def test_old_client_save_and_rename_connection_change(ops, tmp_path):
+    saved = ops.personal_mcp({"operation": "mcp_save", "name": "demo", "content": config()}, str(tmp_path))
+    # Older callers store the display label in name and do not send new_name.
+    updated = ops.personal_mcp({"operation": "mcp_save", "name": "demo", "version": saved["version"],
+                                "content": config(name="旧展示名")}, str(tmp_path))
+    ops.personal_mcp({"operation": "mcp_cache", "name": "demo", "version": updated["version"],
+                      "tools": [{"name": "lookup", "inputSchema": {"type": "object"}}]}, str(tmp_path))
+    result = ops.personal_mcp({"operation": "mcp_save", "name": "demo", "new_name": "renamed",
+                               "version": updated["version"], "content": config(name="renamed", url="https://other.example.com/mcp")}, str(tmp_path))
+    assert result["id"] == "renamed"
+    item = ops.personal_mcp({"operation": "mcp_list"}, str(tmp_path))["mcp"][0]
+    assert item["status"] == "unverified" and item["tools"] == []
+
+
+def test_stdio_rename_relocates_only_literal_paths_inside_own_package(ops, tmp_path):
+    content = json.dumps({"name": "demo", "transport": "stdio", "command": "/workspace/mcp/demo/python",
+                          "args": ["/workspace/mcp/demo/server.py", "/workspace/mcp/demo-other/server.py", "server.py",
+                                   "-c", "print('/workspace/mcp/demo/server.py')", "/workspace/mcp/demo/server.py --flag"],
+                          "cwd": "/workspace/mcp/demo", "env": {"EXAMPLE": "/workspace/mcp/demo/data"}})
+    saved = ops.personal_mcp({"operation": "mcp_save", "name": "demo", "content": content}, str(tmp_path))
+    package = tmp_path / "mcp/demo"
+    (package / "server.py").write_text("# tool", encoding="utf-8")
+    (package / "python").write_text("# launcher", encoding="utf-8")
+    renamed_content = json.dumps({**json.loads(content), "name": "new-name"})
+    result = ops.personal_mcp({"operation": "mcp_save", "name": "demo", "new_name": "new-name",
+                               "version": saved["version"], "content": renamed_content}, str(tmp_path))
+    read = ops.personal_mcp({"operation": "mcp_read", "name": "new-name"}, str(tmp_path))
+    assert read["version"] == result["version"]
+    value = json.loads(read["content"])
+    assert value["name"] == "new-name"
+    assert value["command"] == "/workspace/mcp/new-name/python"
+    assert value["cwd"] == "/workspace/mcp/new-name"
+    assert value["args"][0] == "/workspace/mcp/new-name/server.py"
+    assert value["args"][1:] == json.loads(content)["args"][1:]
+    assert value["env"] == json.loads(content)["env"]
+    assert (tmp_path / value["args"][0].removeprefix("/workspace/")).read_text() == "# tool"
+
+
+def test_stdio_rename_preserves_real_paths_with_spaces_and_does_not_follow_links(ops, tmp_path):
+    content = json.dumps({"name": "demo", "transport": "stdio", "command": "/workspace/mcp/demo/python launcher",
+                          "args": ["/workspace/mcp/demo/server file.py", "/workspace/mcp/demo/tool data/", "/workspace/mcp/demo/",
+                                   "/workspace/mcp/demo/server file.py --mode test", "echo /workspace/mcp/demo/server file.py",
+                                   "/workspace/mcp/demo-other/server file.py", "server file.py",
+                                   "/workspace/mcp/demo/missing.py", "/workspace/mcp/demo/external/file.py",
+                                   "/workspace/mcp/demo/file-link.py"],
+                          "cwd": "/workspace/mcp/demo/tool data/", "env": {"EXAMPLE": "/workspace/mcp/demo/server file.py"}})
+    saved = ops.personal_mcp({"operation": "mcp_save", "name": "demo", "content": content}, str(tmp_path))
+    package = tmp_path / "mcp/demo"
+    (package / "python launcher").write_text("# launcher", encoding="utf-8")
+    (package / "server file.py").write_text("# real tool", encoding="utf-8")
+    (package / "tool data").mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "file.py").write_text("# external", encoding="utf-8")
+    (package / "external").symlink_to(outside, target_is_directory=True)
+    (package / "file-link.py").symlink_to(outside / "file.py")
+    ops.personal_mcp({"operation": "mcp_save", "name": "demo", "new_name": "renamed",
+                      "version": saved["version"], "content": json.dumps({**json.loads(content), "name": "renamed"})}, str(tmp_path))
+    read = ops.personal_mcp({"operation": "mcp_read", "name": "renamed"}, str(tmp_path))
+    value = json.loads(read["content"])
+    assert value["command"] == "/workspace/mcp/renamed/python launcher"
+    assert value["cwd"] == "/workspace/mcp/renamed/tool data/"
+    assert value["args"][:3] == ["/workspace/mcp/renamed/server file.py", "/workspace/mcp/renamed/tool data/", "/workspace/mcp/renamed/"]
+    assert value["args"][3:] == json.loads(content)["args"][3:]
+    assert value["env"] == json.loads(content)["env"]
+    assert (tmp_path / value["args"][0].removeprefix("/workspace/")).read_text() == "# real tool"
+    assert (outside / "file.py").read_text() == "# external"

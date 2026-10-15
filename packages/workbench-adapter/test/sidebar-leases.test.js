@@ -45,3 +45,18 @@ it('validates every resource ownership before applying a partial update',async()
   expect(f.leases.windows.size).toBe(0)
   await expect(f.leases.update(owner,{window_id,resources:Array(129).fill({})})).rejects.toMatchObject({status:400})
 })
+it('retains more than 128 existing terminals without a terminal quantity cap',async()=>{
+  let retained=0
+  const resources=Array.from({length:129},(_,index)=>({kind:'terminal',chat_id:chat,id:`12345678-1234-1234-1234-${index.toString(16).padStart(12,'0')}`}))
+  const native={list:()=>resources,async *retain(_session,_id,signal){
+    retained++
+    try{yield{type:'retained'};await new Promise(resolve=>{
+      signal.addEventListener('abort',resolve,{once:true});if(signal.aborted)resolve()
+    })}finally{retained--}
+  }}
+  const leases=new SidebarLeases({browsers:{},terminals:{native,knownSessions:new Set()},service:{requireChat:()=>({sessionId:'session'})}})
+  expect((await leases.update(owner,{window_id,resources})).held).toHaveLength(129)
+  expect(retained).toBe(129)
+  leases.dispose()
+  await vi.waitFor(()=>expect(retained).toBe(0))
+})

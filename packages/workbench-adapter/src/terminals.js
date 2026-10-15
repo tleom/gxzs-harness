@@ -35,26 +35,24 @@ export class WorkbenchTerminals {
     if (!uuid.test(request.id)) throw httpError(400, '终端标识无效')
     const agent = await this.agent(owner, chatId)
     signal.throwIfAborted()
-    const key = `${owner.ownerId}/${chatId}`
+    const existing = this.native.list(agent.session.id).find(info => info.id === request.id)
+    if (existing) return existing
+    const key = `${owner.ownerId}/${chatId}/${request.id}`
     let allocation = this.creating.get(key)
     if (allocation?.controller.signal.aborted) {
       await waitFor(allocation.promise.catch(() => {}), signal)
       return this.create(owner, chatId, request, signal)
     }
     if (!allocation) {
-      const retained = this.native.list(agent.session.id)
-      const running = retained.findLast(info => info.state === 'running')
-      if (running) return running
       allocation = { controller: new AbortController(), waiters: 0, settled: false }
       const current = allocation
       current.promise = (async () => {
-        for (const info of retained) await this.native.close(agent, info.id)
         current.controller.signal.throwIfAborted()
         try {
           return await this.native.create(agent, { id: request.id, cols: request.cols, rows: request.rows,
             ...(request.shellPath ? { shellPath: request.shellPath } : {}) }, current.controller.signal)
         } catch (error) {
-          if (error?.code === 'terminal/limit-reached') throw httpError(409, '当前对话已有终端，请打开已有标签')
+          if (error?.code === 'terminal/limit-reached') throw httpError(409, '终端数量达到配置上限')
           throw error
         }
       })().finally(() => {

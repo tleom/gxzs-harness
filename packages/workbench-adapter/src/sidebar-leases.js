@@ -10,7 +10,7 @@ export class SidebarLeases {
     this.serial = new Map()
   }
   async update(owner, request) {
-    if (!uuid.test(request.window_id) || !Array.isArray(request.resources) || request.resources.length > 128)
+    if (!uuid.test(request.window_id) || !Array.isArray(request.resources))
       throw httpError(400, '侧栏窗口参数无效')
     const resources = new Map()
     for (const item of request.resources) {

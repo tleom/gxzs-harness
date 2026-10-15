@@ -58,22 +58,36 @@ it('keeps browser actions inside the owner binding and explicit controller lease
   await gateway.close({ownerId:'owner'}, id)
   expect(browser.dispose).toHaveBeenCalledOnce()
 })
-it('allows one browser per chat and independent browsers in other chats', async () => {
-  const worker={closed:false,closedPages:new Set(),command:vi.fn(async()=>{}),publish:vi.fn(),dispose:vi.fn(),done:new Promise(()=>{})}
-  let created=0
-  const gateway=new WorkbenchBrowsers({create:()=>created++ ? {...worker,command:vi.fn(async()=>{}),dispose:vi.fn()} : worker,service:{requireChat:vi.fn()}})
-  const root='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',child='bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb',third='cccccccc-cccc-cccc-cccc-cccccccccccc'
+it('replaces only the same owner browser across chats, leaving other users isolated', async () => {
+  const workers=[]
+  const gateway=new WorkbenchBrowsers({create:()=> {
+    let finish
+    const worker={closed:false,command:vi.fn(async()=>{}),done:new Promise(resolve=>{finish=resolve}),
+      dispose:vi.fn(function(){this.closed=true;finish()})}
+    workers.push(worker);return worker
+  },service:{requireChat:vi.fn()}})
+  const root='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',next='bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb'
   await gateway.create({ownerId:'owner'},{id:root,chat_id:id},signal())
-  expect(worker.onPageOpen).toBeUndefined()
-  await expect(gateway.create({ownerId:'owner'},{id:third,chat_id:id},signal())).rejects.toMatchObject({status:409})
-  await gateway.create({ownerId:'owner'},{id:child,chat_id:child},signal())
-  expect(gateway.currentId({ownerId:'owner'},id)).toBe(root)
-  expect(gateway.require({ownerId:'owner'},root)).toBe(worker)
-  expect(gateway.count('owner',id)).toBe(1)
-  expect(gateway.count('owner',child)).toBe(1)
-  for (const chatId of [third, 'dddddddd-dddd-dddd-dddd-dddddddddddd'])
-    await gateway.create({ownerId:'owner'},{id:chatId,chat_id:chatId},signal())
-  expect(created).toBe(4)
+  await gateway.create({ownerId:'foreign'},{id:root,chat_id:id},signal())
+  await gateway.create({ownerId:'owner'},{id:next,chat_id:next},signal())
+  expect(workers[0].dispose).toHaveBeenCalledOnce()
+  expect(workers[1].dispose).not.toHaveBeenCalled()
+  expect(gateway.currentId({ownerId:'owner'},id)).toBeUndefined()
+  expect(gateway.currentId({ownerId:'owner'},next)).toBe(next)
+  expect(gateway.count('owner',id)).toBe(0)
+  expect(gateway.require({ownerId:'foreign'},root)).toBe(workers[1])
+  expect(()=>gateway.require({ownerId:'owner'},root)).toThrow()
+  await gateway.close({ownerId:'owner'},root)
+  expect(workers[2].dispose).not.toHaveBeenCalled()
+  gateway.dispose()
+})
+it('never recreates a missing restored browser or replaces the current one while attaching', async()=>{
+  const worker={closed:false,command:vi.fn(async()=>{}),dispose:vi.fn(),done:new Promise(()=>{})}
+  const create=vi.fn(()=>worker),gateway=new WorkbenchBrowsers({create})
+  await gateway.create({ownerId:'owner'},{id},signal())
+  await expect(gateway.create({ownerId:'owner'},{id:'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',existing:true},signal())).rejects.toMatchObject({status:404})
+  expect(create).toHaveBeenCalledOnce()
+  expect(worker.dispose).not.toHaveBeenCalled()
 })
 it('joins the initializing browser when the agent opens the same chat', async()=>{
   let ready
@@ -81,6 +95,7 @@ it('joins the initializing browser when the agent opens the same chat', async()=
   const create=vi.fn(()=>browser),gateway=new WorkbenchBrowsers({create,service:{requireChat:vi.fn()}})
   const chatId='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
   const first=gateway.create({ownerId:'owner'},{id,chat_id:chatId},signal())
+  await vi.waitFor(()=>expect(gateway.currentId({ownerId:'owner'},chatId)).toBe(id))
   const current=gateway.currentId({ownerId:'owner'},chatId)
   expect(current).toBe(id)
   const second=gateway.create({ownerId:'owner'},{id:current,chat_id:chatId},signal())
@@ -98,6 +113,7 @@ it('does not remove a replacement browser when an earlier initialization fails',
   let count = 0
   const gateway = new WorkbenchBrowsers({create:()=>count++ === 0 ? first : second})
   const pending = gateway.create({ownerId:'owner'},{id},signal())
+  await vi.waitFor(()=>expect(rejectFirst).toBeTypeOf('function'))
   first.dispose()
   await first.done
   await gateway.create({ownerId:'owner'},{id},signal())
@@ -116,6 +132,7 @@ it('keeps shared initialization alive when its first browser caller disconnects'
   const a=new AbortController(),b=new AbortController(),chatId='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
   const first=gateway.create({ownerId:'owner'},{id,chat_id:chatId},a.signal)
   const second=gateway.create({ownerId:'owner'},{id,chat_id:chatId},b.signal)
+  await vi.waitFor(()=>expect(browser.command).toHaveBeenCalledOnce())
   a.abort(new Error('first disconnected'))
   await expect(first).rejects.toThrow('first disconnected')
   expect(browser.lifetime.signal.aborted).toBe(false)
@@ -178,24 +195,24 @@ it('propagates a fatal worker error to the active stream and invalidates the bro
   await browser.done
 })
 
-it('counts closing subprocesses until done before admitting replacement browsers', async () => {
-  const exits=[], workers=[]
-  const gateway=new WorkbenchBrowsers({create:()=> {
-    const value={closed:false,command:async()=>{},dispose(){this.closed=true},done:new Promise(resolve=>exits.push(resolve))}
-    workers.push(value)
-    return value
+it('waits for actual process exit before admitting a replacement and serializes competing opens', async()=>{
+  const exits=[],workers=[]
+  const gateway=new WorkbenchBrowsers({create:()=>{
+    const worker={closed:false,command:async()=>{},dispose(){this.closed=true},done:new Promise(resolve=>exits.push(resolve))}
+    workers.push(worker);return worker
   }})
-  for(let index=0;index<1;index++) {
-    const browserId=`12345678-1234-1234-1234-123456789ab${index}`
-    await gateway.create({ownerId:'owner'},{id:browserId},signal())
-    workers[index].dispose()
-  }
-  await expect(gateway.create({ownerId:'owner'},{id},signal())).rejects.toMatchObject({status:409})
+  const a='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',b='bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb'
+  await gateway.create({ownerId:'owner'},{id:a,chat_id:a},signal())
+  const next=gateway.create({ownerId:'owner'},{id:b,chat_id:b},signal())
+  await vi.waitFor(()=>expect(workers[0].closed).toBe(true))
   expect(workers).toHaveLength(1)
-  exits[0](); await Promise.resolve()
-  await gateway.create({ownerId:'owner'},{id},signal())
+  exits[0]()
+  await expect(next).resolves.toEqual({id:b})
   expect(workers).toHaveLength(2)
-  gateway.dispose(); for(const exit of exits) exit()
+  const cancelled=new AbortController();cancelled.abort(new Error('cancelled open'))
+  await expect(gateway.create({ownerId:'owner'},{id,chat_id:id},cancelled.signal)).rejects.toThrow('cancelled open')
+  expect(workers[1].closed).toBe(false)
+  gateway.dispose();for(const exit of exits)exit()
 })
 
 it('reconciles watch state after a queued disable overlaps a replacement stream and a full action queue', async () => {

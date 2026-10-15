@@ -46,9 +46,19 @@ try {
         // Otherwise the server waits for its fence reply and sends no more pixels.
         const encoders = 'return this._handleServerVideoEncoders();'
         if (text.split(encoders).length !== 2) throw new Error('Kasm video-encoder dispatch contract changed')
+        const frameHook = 'this._display.onflush = this._onFlush.bind(this);'
+        if (text.split(frameHook).length !== 2) throw new Error('Kasm frame observer contract changed')
         return { contents: text.replace(declaration, 'this._supportsMultiMonitor = false;')
           .replace(encoders, 'return this._handleServerVideoEncoders() !== false;')
+          .replace(frameHook, frameHook + '\n        this._display.onframe = () => this.dispatchEvent(new CustomEvent("frame"));')
           .replace('Log.Warn("This browser does not support multi-monitor setups.");', 'Log.Debug("Single browser display");'), resolveDir: dirname(args.path) }
+      })
+      plugin.onLoad({ filter: /core[\\/]display\.js$/ }, async args => {
+        const text = await readFile(args.path, 'utf8')
+        const painted = 'this._flipCnt += 1;'
+        if (text.split(painted).length !== 2) throw new Error('Kasm rendered-frame contract changed')
+        return { contents: text.replace(painted,
+          painted + '\n            if (primaryScreenRects > 0) this.onframe?.();'), resolveDir: dirname(args.path) }
       })
       plugin.onLoad({ filter: /core[\\/]renderers[\\/]Canvas2DRenderer\.js$/ }, async args => {
         const text = await readFile(args.path, 'utf8')

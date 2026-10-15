@@ -33,31 +33,35 @@ it('reads child references from a disposable native observation without waking e
   await expect(gateway.references(owner,chat.id,'grandchild','',signal)).rejects.toThrow('provider failed')
   expect(disposed).toHaveBeenCalledTimes(3)
 })
-it('shares a terminal allocation within one chat while other chats remain independent', async () => {
-  const terminalId = '22345678-1234-1234-1234-123456789abc'
-  const retained = new Map()
-  let settle
-  const native = {
-    list: sessionId => retained.get(sessionId) || [],
-    create: vi.fn((agent, request) => agent.session.id === 'chat'
-      ? new Promise(resolve => { settle = () => { const terminal = { id: request.id, state:'running' }; retained.set('chat', [terminal]); resolve(terminal) } })
-      : Promise.resolve({ id: request.id })),
-  }
-  const gateway = new WorkbenchTerminals({ native,
-    service: { requireChat: (who, id) => { if (who.ownerId !== owner.ownerId) throw Object.assign(new Error('missing'), {status:404}); return {sessionId:id} } },
-    sessions: { resolveAgent: async id => ({agent:{session:{id}}}) },
-  })
-  const signal = new AbortController().signal
-  const first = gateway.create(owner, 'chat', {id:attachment}, signal)
-  const second = gateway.create(owner, 'chat', {id:terminalId}, signal)
-  await vi.waitFor(() => expect(native.create).toHaveBeenCalledOnce())
-  settle()
+it('allocates multiple terminals per chat and across chats, joining only retries of the same id', async () => {
+  const retained=new Map(),pending=new Map()
+  const native={list:sessionId=>retained.get(sessionId)||[],close:vi.fn(),create:vi.fn((agent,request)=>new Promise(resolve=>{
+    pending.set(request.id,()=>{
+      const info={id:request.id,state:'running'}
+      retained.set(agent.session.id,[...(retained.get(agent.session.id)||[]),info]);resolve(info)
+    })
+  }))}
+  const gateway=new WorkbenchTerminals({native,service:{requireChat:(who,id)=>{
+    if(who.ownerId!==owner.ownerId) throw Object.assign(new Error('missing'),{status:404})
+    return {sessionId:id}
+  }},sessions:{resolveAgent:async id=>({agent:{session:{id}}})}})
+  const secondId='22345678-1234-1234-1234-123456789abc',signal=new AbortController().signal
+  const first=gateway.create(owner,'chat',{id:attachment},signal)
+  const duplicate=gateway.create(owner,'chat',{id:attachment},signal)
+  const second=gateway.create(owner,'chat',{id:secondId},signal)
+  await vi.waitFor(()=>expect(native.create).toHaveBeenCalledTimes(2))
+  pending.get(attachment)();pending.get(secondId)()
   expect(await first).toEqual({id:attachment,state:'running'})
-  expect(await second).toEqual({id:attachment,state:'running'})
-  expect(await gateway.create(owner, 'chat', {id:terminalId}, signal)).toEqual({id:attachment,state:'running'})
-  expect(native.create).toHaveBeenCalledOnce()
-  for (const id of ['chat2','chat3','chat4']) await gateway.create(owner,id,{id:terminalId},signal)
-  expect(native.create).toHaveBeenCalledTimes(4)
+  expect(await duplicate).toEqual(await first)
+  expect(await second).toEqual({id:secondId,state:'running'})
+  expect(await gateway.create(owner,'chat',{id:attachment},signal)).toEqual(await first)
+  expect(native.create).toHaveBeenCalledTimes(2)
+  expect(native.close).not.toHaveBeenCalled()
+  for(const chatId of ['chat2','chat3','chat4']){
+    const request=gateway.create(owner,chatId,{id:secondId},signal)
+    await vi.waitFor(()=>expect(native.create).toHaveBeenCalledTimes(Number(chatId.at(-1))+1))
+    pending.get(secondId)();await request
+  }
 })
 it.each([false,true])('shares allocation cancellation across connected terminal callers: all disconnected %s', async all => {
   let complete, lifetime
@@ -66,7 +70,7 @@ it.each([false,true])('shares allocation cancellation across connected terminal 
   }))}
   const gateway=new WorkbenchTerminals({native,service,sessions:{resolveAgent:async()=>({agent:{session:{id:'root'}}})}})
   const a=new AbortController(),b=new AbortController()
-  const first=gateway.create(owner,chat.id,{id:attachment},a.signal), second=gateway.create(owner,chat.id,{id:'22345678-1234-1234-1234-123456789abc'},b.signal)
+  const first=gateway.create(owner,chat.id,{id:attachment},a.signal), second=gateway.create(owner,chat.id,{id:attachment},b.signal)
   await vi.waitFor(()=>expect(native.create).toHaveBeenCalledOnce())
   a.abort(new Error('first disconnected'))
   await expect(first).rejects.toThrow('first disconnected')
@@ -74,13 +78,12 @@ it.each([false,true])('shares allocation cancellation across connected terminal 
   if(all){b.abort(new Error('all disconnected')); await expect(second).rejects.toThrow('all disconnected'); expect(lifetime.aborted).toBe(true)}
   else {complete(); await expect(second).resolves.toMatchObject({id:attachment,state:'running'})}
 })
-it('closes exited retained terminals before allocating a usable shell', async () => {
+it('preserves other exited terminal tabs while allocating a usable shell', async () => {
   const native={list:()=>[{id:attachment,state:'exited'}],close:vi.fn(async()=>{}),create:vi.fn(async(_agent,request)=>({id:request.id,state:'running'}))}
   const gateway=new WorkbenchTerminals({native,service,sessions:{resolveAgent:async()=>({agent:{session:{id:'root'}}})}})
   const id='22345678-1234-1234-1234-123456789abc'
   await expect(gateway.create(owner,chat.id,{id},new AbortController().signal)).resolves.toEqual({id,state:'running'})
-  expect(native.close).toHaveBeenCalledWith(expect.anything(),attachment)
-  expect(native.close.mock.invocationCallOrder[0]).toBeLessThan(native.create.mock.invocationCallOrder[0])
+  expect(native.close).not.toHaveBeenCalled()
 })
 it('waits for cancelled terminal cleanup before allocating for a reconnecting caller', async () => {
   let finishCleanup, lifetime
@@ -96,7 +99,7 @@ it('waits for cancelled terminal cleanup before allocating for a reconnecting ca
   firstAbort.abort(new Error('disconnected'))
   await expect(first).rejects.toThrow('disconnected')
   expect(lifetime.aborted).toBe(true)
-  const id='22345678-1234-1234-1234-123456789abc'
+  const id=attachment
   const replacement=gateway.create(owner,chat.id,{id},new AbortController().signal)
   await Promise.resolve(); await Promise.resolve()
   expect(native.create).toHaveBeenCalledOnce()
