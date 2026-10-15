@@ -8,11 +8,12 @@ All file traversal follows the same no-symlink contract as personal skills.
 import json
 import os
 import re
+import stat
 import time
 import uuid
 from urllib.parse import urlsplit
 
-from file_ops import read_file, version
+from file_ops import parent_fd, read_file, version
 from resource_ops import SETTINGS, PINS, atomic_write, directory, resource_directory
 
 MAX_CONFIG = 65536
@@ -104,6 +105,36 @@ def connection_configuration(config):
     """Presentation metadata does not change the tools exposed by a connection."""
     return {key: value for key, value in config.items()
             if key not in {"name", "display_name", "description"}}
+
+
+def relocated_configuration(config, name, target_name, package_fd):
+    """Relocate literal package paths when its owning directory is renamed."""
+    if config.get("transport") != "stdio" or name == target_name:
+        return config
+    source, target = "/workspace/mcp/" + name, "/workspace/mcp/" + target_name
+
+    def relocate(value):
+        if not isinstance(value, str):
+            return value
+        if value.rstrip("/") == source:
+            return target + value[len(source):]
+        if not value.startswith(source + "/"):
+            return value
+        try:
+            parent, leaf = parent_fd(package_fd, value[len(source) + 1:].rstrip("/"))
+            try:
+                info = os.stat(leaf, dir_fd=parent, follow_symlinks=False)
+                if stat.S_ISDIR(info.st_mode) or (stat.S_ISREG(info.st_mode) and not value.endswith("/")):
+                    return target + value[len(source):]
+            finally:
+                os.close(parent)
+        except (ValueError, OSError):
+            pass
+        return value
+
+    return {**config, "command": relocate(config["command"]),
+            "args": [relocate(value) for value in config["args"]],
+            "cwd": relocate(config["cwd"])}
 
 
 def connection_fingerprint(config):
@@ -263,7 +294,9 @@ def personal_mcp(payload, root="/workspace"):
         if operation == "mcp_list":
             return snapshot(rootfd, payload.get('name'))
         name = server_name(payload.get("name"))
+        target_name = name
         if operation == "mcp_save":
+            target_name = server_name(payload.get("new_name", name))
             content = payload.get("content")
             if not isinstance(content, str):
                 raise ValueError("缺少 MCP 配置")
@@ -289,7 +322,7 @@ def personal_mcp(payload, root="/workspace"):
         try:
             fd = (
                 directory(mcpfd, name)
-                if operation == "mcp_save"
+                if operation == "mcp_save" and target_name == name
                 else os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=mcpfd)
             )
             try:
@@ -305,8 +338,16 @@ def personal_mcp(payload, root="/workspace"):
                         raise ValueError("缺少 MCP 配置")
                     data = content.encode("utf-8")
                     config = configuration(data)
-                    if raw is None and config.get("name", name) != name:
-                        raise ValueError("新插件 JSON 中的 name 必须与调用名称一致")
+                    renamed = target_name != name
+                    if (raw is None or renamed) and config.get("name", target_name) != target_name:
+                        raise ValueError("插件 JSON 中的 name 必须与调用名称一致")
+                    if renamed and raw is None:
+                        raise ValueError("原插件配置不存在")
+                    relocated = relocated_configuration(config, name, target_name, fd)
+                    if relocated != config:
+                        config = relocated
+                        data = json.dumps(config, ensure_ascii=False, indent=2).encode("utf-8")
+                        config = configuration(data)
                     cached = None
                     if raw is not None:
                         try:
@@ -330,16 +371,79 @@ def personal_mcp(payload, root="/workspace"):
                             atomic_write(backups, name + "-" + uuid.uuid4().hex + ".json", raw)
                         finally:
                             os.close(backups)
-                    atomic_write(fd, "mcp.json", data)
-                    if cached is not None:
-                        cachefd = directory(statefd, ".cache")
+                    if renamed:
                         try:
-                            atomic_write(cachefd, name + ".json", json.dumps({
-                                **cached, "version": version(data)
-                            }).encode())
-                        finally:
+                            os.mkdir(target_name, 0o700, dir_fd=mcpfd)
+                        except FileExistsError:
+                            return {"conflict": True}
+                        try:
+                            os.rename(name, target_name, src_dir_fd=mcpfd, dst_dir_fd=mcpfd)
+                        except BaseException:
+                            os.rmdir(target_name, dir_fd=mcpfd)
+                            raise
+                    changed_settings = []
+                    changed_cache = []
+                    cachefd = None
+                    try:
+                        atomic_write(fd, "mcp.json", data)
+                        if renamed:
+                            for filename in (SETTINGS, PINS):
+                                previous = read_file(statefd, filename)
+                                if previous is None:
+                                    continue
+                                values = json.loads(previous)
+                                if not isinstance(values, dict):
+                                    raise ValueError("MCP 设置文件格式无效")
+                                if name in values:
+                                    values[target_name] = values.pop(name)
+                                    changed_settings.append((filename, previous))
+                                    atomic_write(statefd, filename, json.dumps(values).encode())
+                        if cached is not None or renamed:
+                            cachefd = directory(statefd, ".cache")
+                            target_cache = target_name + ".json"
+                            changed_cache.append((target_cache, read_file(cachefd, target_cache)))
+                            if cached is not None:
+                                atomic_write(cachefd, target_cache, json.dumps({
+                                    **cached, "version": version(data)
+                                }).encode())
+                            else:
+                                try:
+                                    os.unlink(target_cache, dir_fd=cachefd)
+                                except FileNotFoundError:
+                                    pass
+                            if renamed:
+                                old_cache = name + ".json"
+                                changed_cache.append((old_cache, read_file(cachefd, old_cache)))
+                                try:
+                                    os.unlink(old_cache, dir_fd=cachefd)
+                                except FileNotFoundError:
+                                    pass
+                        os.fsync(mcpfd)
+                    except BaseException:
+                        if renamed:
+                            os.rename(target_name, name, src_dir_fd=mcpfd, dst_dir_fd=mcpfd)
+                        if raw is not None:
+                            atomic_write(fd, "mcp.json", raw)
+                        else:
+                            try:
+                                os.unlink("mcp.json", dir_fd=fd)
+                            except FileNotFoundError:
+                                pass
+                        for filename, previous in changed_settings:
+                            atomic_write(statefd, filename, previous)
+                        for filename, previous in reversed(changed_cache):
+                            if previous is None:
+                                try:
+                                    os.unlink(filename, dir_fd=cachefd)
+                                except FileNotFoundError:
+                                    pass
+                            else:
+                                atomic_write(cachefd, filename, previous)
+                        raise
+                    finally:
+                        if cachefd is not None:
                             os.close(cachefd)
-                    return {"id": name, "version": version(data)}
+                    return {"id": target_name, "version": version(data)}
                 if operation == "mcp_delete":
                     backups = directory(statefd, ".backups")
                     try:

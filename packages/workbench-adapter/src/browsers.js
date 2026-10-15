@@ -276,11 +276,12 @@ export class SandboxBrowser {
 }
 
 export class WorkbenchBrowsers {
-  constructor({ subprocess, service, create = () => new SandboxBrowser(subprocess) }) { this.items = new Map(); this.workers = new Set(); this.current = new Map(); this.slots = new Map(); this.createBrowser = create; this.service = service }
+  constructor({ subprocess, service, create = () => new SandboxBrowser(subprocess) }) { this.items = new Map(); this.workers = new Set(); this.current = new Map(); this.slots = new Map(); this.allocating = new Map(); this.createBrowser = create; this.service = service }
   count(ownerId, chatId) { return [...this.slots.values()].filter(slot => slot.ownerId === ownerId && slot.chatId === chatId).length }
   activity() { return [...this.workers].filter(worker => !worker.closed && (worker.listeners?.size || worker.pending?.size || worker.windowHolds?.size)).length }
   async create(owner, request, signal) {
     signal.throwIfAborted()
+    if (this.disposed) throw httpError(410, '浏览器服务已经关闭')
     if (!uuid.test(request.id)) throw httpError(400, '浏览器标识无效')
     if (request.chat_id !== undefined) {
       this.service?.requireChat(owner, request.chat_id)
@@ -288,11 +289,43 @@ export class WorkbenchBrowsers {
     const key = `${owner.ownerId}/${request.id}`
     let browser = this.items.get(key)
     if (browser && request.chat_id && browser.chatId !== request.chat_id) throw httpError(403, '浏览器不属于当前对话')
-    if (browser?.closed) { this.items.delete(key); browser = undefined }
+    if (browser?.closed) browser = undefined
     if (!browser) {
-      for (const [id, item] of this.items) if (item.closed) this.items.delete(id)
-      if (this.count(owner.ownerId, request.chat_id) >= 1) throw httpError(409, '当前对话已有浏览器，请打开已有标签')
-      browser = this.createBrowser()
+      if (request.existing === true) throw httpError(404, '浏览器已经关闭')
+      browser = await this.allocate(owner, request, signal)
+    }
+    let abort
+    const cancelled = new Promise((_, reject) => {
+      abort = () => reject(signal.reason || new Error('Browser request cancelled'))
+      signal.addEventListener('abort', abort, { once: true })
+      if (signal.aborted) abort()
+    })
+    try {
+      await Promise.race([browser.ready, cancelled]); signal.throwIfAborted()
+      if (browser.closed) throw browser.failure || httpError(410, '浏览器已经关闭')
+    }
+    finally { signal.removeEventListener('abort', abort) }
+    this.current.set(`${owner.ownerId}/${request.chat_id}`, request.id)
+    return { id: request.id }
+  }
+  allocate(owner, request, signal) {
+    const previous = this.allocating.get(owner.ownerId)
+    const pending = (previous || Promise.resolve()).catch(() => {}).then(async () => {
+      signal.throwIfAborted()
+      if (this.disposed) throw httpError(410, '浏览器服务已经关闭')
+      const key = `${owner.ownerId}/${request.id}`
+      const existing = this.items.get(key)
+      if (existing && !existing.closed) {
+        if (request.chat_id && existing.chatId !== request.chat_id) throw httpError(403, '浏览器不属于当前对话')
+        return existing
+      }
+      // Keep closing workers counted until their actual subprocess exit; never
+      // overlap two Chromium instances or touch another owner's resources.
+      for (const [key, slot] of this.slots) if (slot.ownerId === owner.ownerId)
+        await this.close(owner, key.slice(owner.ownerId.length + 1))
+      signal.throwIfAborted()
+      if (this.disposed) throw httpError(410, '浏览器服务已经关闭')
+      const browser = this.createBrowser()
       browser.rootPageId = request.id
       browser.id = request.id
       browser.chatId = request.chat_id
@@ -311,21 +344,17 @@ export class WorkbenchBrowsers {
       this.current.set(`${owner.ownerId}/${request.chat_id}`, request.id)
       browser.ready = browser.command({ action: 'init', browser_id: request.id, width: 1000, height: 700 },
         browser.lifetime?.signal || new AbortController().signal).then(value => { browser.display = value?.display; browser.inputProtocol = value?.input_protocol }).catch(error => {
-        worker.dispose()
+        worker.dispose(error)
         if (this.items.get(key) === worker) this.items.delete(key)
         throw error
       })
-    }
-    let abort
-    const cancelled = new Promise((_, reject) => {
-      abort = () => reject(signal.reason || new Error('Browser request cancelled'))
-      signal.addEventListener('abort', abort, { once: true })
-      if (signal.aborted) abort()
+      browser.ready.catch(() => {})
+      return browser
     })
-    try { await Promise.race([browser.ready, cancelled]); signal.throwIfAborted() }
-    finally { signal.removeEventListener('abort', abort) }
-    this.current.set(`${owner.ownerId}/${request.chat_id}`, request.id)
-    return { id: request.id }
+    this.allocating.set(owner.ownerId, pending)
+    return pending.finally(() => {
+      if (this.allocating.get(owner.ownerId) === pending) this.allocating.delete(owner.ownerId)
+    })
   }
   currentId(owner, chatId) {
     const id = this.current.get(`${owner.ownerId}/${chatId}`)
@@ -368,11 +397,13 @@ export class WorkbenchBrowsers {
     return browser.command({ action: 'display-write', connection: request.connection, data: request.data }, signal)
   }
   async close(owner, id) {
-    const key = `${owner.ownerId}/${id}`, browser = this.items.get(key)
+    const key = `${owner.ownerId}/${id}`, browser = this.items.get(key) || this.slots.get(key)?.worker
     if (!browser) return
     browser.dispose(); await browser.done
     if (this.items.get(key) === browser) this.items.delete(key)
-    this.slots.delete(key)
+    if (this.slots.get(key)?.worker === browser) this.slots.delete(key)
+    const currentKey = `${owner.ownerId}/${browser.chatId}`
+    if (this.current.get(currentKey) === id && !this.items.has(key)) this.current.delete(currentKey)
   }
-  dispose() { for (const worker of this.workers) worker.dispose(); this.items.clear(); this.current.clear() }
+  dispose() { this.disposed = true; for (const worker of this.workers) worker.dispose(); this.items.clear(); this.current.clear() }
 }

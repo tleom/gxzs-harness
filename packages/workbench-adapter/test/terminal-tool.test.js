@@ -37,10 +37,21 @@ it('creates one bounded native PTY when no terminal exists and returns its actua
 it('reopens an exited terminal as a usable shell for the model', async()=>{
   const test=fixture();test.native.list.mockReturnValue([{id,title:'bash',state:'exited'}])
   const result=await test.definition.execute({action:'open',wait_ms:0},test.exec)
-  expect(test.native.close).toHaveBeenCalledWith(test.agent,id)
+  expect(test.native.close).not.toHaveBeenCalled()
   expect(test.native.create).toHaveBeenCalledOnce()
   expect(result.terminal_id).not.toBe(id)
   expect(result.state).toBe('running')
+})
+it('opens additional terminals and reuses only an explicitly selected terminal id', async()=>{
+  const test=fixture()
+  const first=await test.definition.execute({action:'open',wait_ms:0},test.exec)
+  const second=await test.definition.execute({action:'open',wait_ms:0},test.exec)
+  expect(first.terminal_id).not.toBe(second.terminal_id)
+  expect(test.native.create).toHaveBeenCalledTimes(2)
+  expect(test.native.close).not.toHaveBeenCalled()
+  const attached=await test.definition.execute({action:'open',terminal_id:id,wait_ms:0},test.exec)
+  expect(attached.terminal_id).toBe(id)
+  expect(test.native.create).toHaveBeenCalledTimes(2)
 })
 it('rejects foreign terminal IDs and invalid input before allocating, writing or opening a tab', async () => {
   for (const args of [{action:'write'}, {action:'key',key:'__proto__'}, {action:'read',wait_ms:2001}, {action:'read',terminal_id:'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'}]) {
@@ -107,4 +118,9 @@ it('keeps the native UI attachment writable while the Agent observes and writes 
   b.terminals.delete('other')
   await TerminalController.prototype.create.call(controller,{}, {id:'new',cols:80,rows:24},signal)
   expect(controller.spawn).toHaveBeenCalledOnce()
+  controller.config.maxTerminals=0
+  for(let i=0;i<12;i++) b.terminals.set(`existing-${i}`,{})
+  await TerminalController.prototype.create.call(controller,{}, {id:'unlimited',cols:80,rows:24},signal)
+  expect(controller.spawn).toHaveBeenCalledTimes(2)
+  expect(patched).toContain('maxTerminals: z.number().step(1).min(0).default(0)')
 })
