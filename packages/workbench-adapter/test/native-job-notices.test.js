@@ -75,3 +75,25 @@ it('recovers a pending native inbox notice without redelivering or editing the n
   expect(test.database.getRun(test.owner, test.message.id)).toMatchObject({ status: 'queued', messageId: test.message.id })
   expect(JSON.stringify(events)).toBe(before)
 })
+
+it.each(['agent-message', 'subagent-settled'])('freezes current permissions for a recovered queued %s before its live claim', async kind => {
+  const test = fixture()
+  const parent = test.database.createRun({ ownerId: test.owner, chatId: test.chat.id, sessionId: test.chat.sessionId,
+    query: 'delegate', selection: { subagent_ids: ['owned-child'] }, mcpTools: [{ id: 'revoked' }] }).run
+  test.database.transitionRun(test.owner, parent.id, 'completed')
+  const message = { ...test.message, id: 'queued-child', source: { kind, senderSessionId: 'owned-child' } }
+  const events = [{ type: 'agent/inbox/spliced', seq: 1,
+    data: { target: 'next-turn', start: 0, removedCount: 0, inserted: [message] } }]
+  const query = { observeSession: async () => ({ events }) }
+  const unavailable = vi.fn(() => { throw new Error('catalog unavailable') })
+  await expect(reconcileNativeSessions(test.database, query, test.owner, unavailable)).rejects.toThrow('catalog unavailable')
+  expect(test.database.getRun(test.owner, message.id)).toBeUndefined()
+  await reconcileNativeSessions(test.database, query, test.owner, () => test.resources)
+  expect(test.database.getRun(test.owner, message.id)).toMatchObject({ status: 'queued', mcpTools: test.resources.mcpTools })
+  const claimed = projectInboxClaim(test.database, { agent: { id: test.chat.sessionId }, message, turn: 2 }, test.owner,
+    { mcpCatalogReady: true, mcpTools: [{ id: 'later-catalog' }] })
+  expect(claimed.mcpTools).toEqual(test.resources.mcpTools)
+  await reconcileNativeSessions(test.database, query, test.owner, unavailable)
+  expect(unavailable).toHaveBeenCalledTimes(1)
+  expect(test.database.listRuns(test.owner, test.chat.id)).toHaveLength(2)
+})

@@ -448,7 +448,7 @@ export async function reconcileNativeSessions(database, sessionQuery, ownerId, c
         const run = requestId ? database.getRun(ownerId, requestId)
           : message.source?.kind === 'schedule' ? adoptMessage(database, chat.sessionId, message, resources(message))
           : message.source?.kind === 'tool-jobs' ? adoptJobNotice(database, chat, message, resources(message))
-          : isNativeNotice(message) ? adoptNativeNotice(database, chat, message)
+          : isNativeNotice(message) ? adoptNativeNotice(database, chat, message, resources(message))
           : database.listRuns(chat.ownerId, chat.id).find(item => item.messageId === message.id)
         if (run && run.sessionId === chat.sessionId) {
           queued.push(run.id)
