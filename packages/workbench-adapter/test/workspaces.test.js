@@ -11,7 +11,7 @@ function fixture() {
   const closed = vi.fn()
   const controller = Object.fromEntries(['create', 'rename', 'delete', 'insertBefore', 'insertSessionBefore', 'archiveSession', 'unarchiveSession', 'pinSession', 'unpinSession'].map(name => [name, vi.fn()]))
   controller.follow = vi.fn(async function* (signal) { try { yield { type: 'baseline', value: baseline } } finally { closed(signal.aborted) } })
-  const database = { listChats: vi.fn(() => chats), getChat: vi.fn((owner, id) => owner === 'owner-a' ? chats.find(chat => chat.id === id) : undefined) }
+  const database = { chatCompletions: () => new Map(), listChats: vi.fn(() => chats), getChat: vi.fn((owner, id) => owner === 'owner-a' ? chats.find(chat => chat.id === id) : undefined) }
   const fileManager = { operate: vi.fn(async ({ operation, path }) => {
     if (path === 'conversations' && operation !== 'list') throw new Error('The workspace root can only be listed')
     return { entries: [{ name: 'case-a', kind: 'directory' }, { name: 'file.txt', kind: 'file' }] }
@@ -151,4 +151,12 @@ describe('native workspace boundary', () => {
     controller.archiveSession.mockRejectedValue(error)
     await expect(bridge.mutate(owner, { operation: 'archiveSession', chatId: 'chat-a' })).rejects.toBe(error)
   })
+})
+
+it('advances scheduled-reply recency and projects failure independently of observing its running frame', async () => {
+  const { bridge, owner } = fixture()
+  bridge.sessions = { list: async () => ({ items: [{ sessionId: 'session-a', updatedAt: 100, running: false, projections: { asOfSeq: 3 } }] }) }
+  bridge.database.chatCompletions = () => new Map([['session-a', { id: 'scheduled-run', status: 'failed', at: 300 }], ['foreign-session', { id: 'foreign', status: 'failed', at: 500 }]])
+  const value = await bridge.baseline(owner)
+  expect(value.sessions).toEqual([{ sessionId: 'session-a', updatedAt: 300, running: false, projections: { asOfSeq: 3 }, completion: { id: 'scheduled-run', status: 'failed', at: 300 } }])
 })

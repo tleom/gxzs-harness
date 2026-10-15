@@ -430,6 +430,25 @@ export class WorkbenchDatabase {
       .all(ownerId, chatId).map(decodeRun)
   }
 
+  // Read existing native completion receipts; this is a display projection,
+  // not a second task lifecycle. Feedback/config edits cannot advance its time.
+  chatCompletions(ownerId) {
+    const rows = this.db.prepare(`WITH receipts AS (
+      SELECT r.id, r.chat_id, r.session_id, r.status, r.queue_order,
+        COALESCE((SELECT COALESCE(json_extract(e.payload_json, '$.occurred_at'), e.created_at)
+          FROM run_events e WHERE e.run_id=r.id
+          AND json_extract(e.payload_json, '$.event') IN ('workbench_end','workbench_status')
+          AND json_extract(e.payload_json, '$.status') IN ('completed','failed','cancelled','interrupted')
+          ORDER BY e.seq DESC LIMIT 1), r.created_at) AS at
+      FROM runs r WHERE r.owner_id=? AND r.status IN ('completed','failed','cancelled','interrupted')
+    ), latest AS (
+      SELECT *, ROW_NUMBER() OVER (PARTITION BY chat_id ORDER BY at DESC, queue_order DESC) AS position FROM receipts
+    ) SELECT * FROM latest WHERE position=1`).all(ownerId)
+    return new Map(rows.map(row => [row.session_id, {
+      id: row.id, status: row.status, at: row.at,
+    }]))
+  }
+
   latestRunStatus(ownerId, chatId) {
     return this.db.prepare('SELECT status FROM runs WHERE owner_id = ? AND chat_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1')
       .get(ownerId, chatId)?.status

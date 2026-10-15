@@ -26,10 +26,16 @@ export class WorkbenchWorkspaces {
       const projected = this.project(owner, first.value.value)
       if (this.sessions) {
         const { items } = await this.sessions.list({}, abort.signal)
-        // Keep native list ordering, timestamps, blank flags and projection
-        // watermarks. The platform boundary removes foreign sessions and cwd.
+        // Keep native ordering, blank flags and watermarks; enrich display recency
+        // with the existing completion receipt and remove foreign sessions/cwd.
+        const completions = this.database.chatCompletions(owner.ownerId)
         projected.sessions = items.filter(item => projected.chatIds[item.sessionId])
-          .map(({ cwd, ...item }) => item)
+          .map(({ cwd, ...item }) => {
+            const completion = completions.get(item.sessionId)
+            return { ...item, ...(completion ? {
+              updatedAt: Math.max(item.updatedAt, completion.at), completion,
+            } : {}) }
+          })
       }
       if (includeSchedules && this.schedules) projected.schedules = await this.schedules.catalog(owner)
       return projected

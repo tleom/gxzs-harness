@@ -1,3 +1,4 @@
+import { HumanInputBridge } from '../src/human-input.js'
 import { afterEach, expect, it, vi } from 'vitest'
 import { createRequire } from 'node:module'
 import { pathToFileURL } from 'node:url'
@@ -1271,4 +1272,41 @@ it.each(['approve', 'discuss'])('settles native plan review through the Workbenc
     expect(result.isError).not.toBe(true)
     expect(t.ctx.planMode.get(t.agent)).toMatchObject({active:true,pending:false})
   }
+})
+
+it('accepts an old answer while a newer native question has released admission, skipping only the newer question', async () => {
+  let release
+  const test = await fixture([new Promise(resolve => { release = resolve }), 'updated with old answer'])
+  const first = test.create('working')
+  await test.scheduler.enqueue(first, [{ type: 'text', text: first.query }])
+  await test.scheduler.tick()
+  await vi.waitFor(() => expect(test.model.requests).toHaveLength(1))
+  const bridge = new HumanInputBridge({ database: test.db, executionRun: id => test.runtime.executionRun(id),
+    resumeInput: (run, signal) => test.scheduler.resumeInput(run, signal) })
+  const question = text => bridge.handleRequest({ agent: test.agent, questions: [{ id: text, question: text }], signal: new AbortController().signal }, () => { throw new Error('unexpected fallback') })
+  const oldAnswer = question('old-question')
+  const oldId = test.db.getPendingInput(test.owner.ownerId, first.id).requestId
+  bridge.skip(test.owner.ownerId, first.id, oldId)
+  await oldAnswer
+  const newAnswer = question('new-question')
+  await test.scheduler.tick()
+  expect(test.scheduler.hasAdmission(test.agent.id)).toBe(false)
+  const service = new WorkbenchService({ database: test.db, sessionController: test.sessions, agents: test.ctx.agents,
+    scheduler: test.scheduler })
+  service.humanInput = bridge
+  const invalid = { request_id: oldId, answers: [{ id: 'wrong', selected: [], custom: 'invalid' }] }
+  await expect(service.supplement(test.owner, first.id, invalid)).rejects.toMatchObject({ status: 400 })
+  expect(test.db.getPendingInput(test.owner.ownerId, first.id).status).toBe('pending')
+  const body = { request_id: oldId, answers: [{ id: 'old-question', selected: [], custom: 'new evidence' }] }
+  const accepted = await service.supplement(test.owner, first.id, body)
+  expect(await newAnswer).toEqual({ answers: [{ id: 'new-question', selected: [] }] })
+  expect(test.db.listPendingInputs(test.owner.ownerId, first.id).map(input => input.status)).toEqual(['submitted', 'skipped'])
+  const repeated = await service.supplement(test.owner, first.id, body)
+  expect(repeated.id).toBe(accepted.id)
+  await test.scheduler.tick()
+  release('original answer')
+  await test.agent.whenIdle()
+  expect(test.model.requests).toHaveLength(2)
+  expect(JSON.stringify(test.model.requests[1].messages)).toContain('new evidence')
+  expect(test.agent.session.snapshotEvents().filter(event => event.type === 'user/message' && event.data.source?.rpcId === accepted.id)).toHaveLength(1)
 })

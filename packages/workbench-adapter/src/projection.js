@@ -164,7 +164,7 @@ function projectEvent(database, sessionId, event, expectedOwnerId, context) {
         return append({ event: 'workbench_status', status: 'running', turn, goal_round_complete: true })
       }
       database.transitionRun(chat.ownerId, run.id, status, error)
-      return append(presentRunEvent({ event: 'workbench_end', status, error,
+      return append(presentRunEvent({ event: 'workbench_end', status, error, occurred_at: event.time,
         ...(event.data?.reason?.error?.code ? { error_code: event.data.reason.error.code } : {}) }))
     }
     case 'deliverables/presented':

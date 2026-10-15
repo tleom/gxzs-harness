@@ -27,6 +27,7 @@ import { browserClient } from './browser-client.js'
 import { registerTerminalTool } from './terminal-tool.js'
 import { WorkbenchJobs } from './jobs.js'
 import { registerScheduledClaims } from './scheduled-claims.js'
+import { registerToolDisplayReceipts } from './tool-display-receipts.js'
 import { nativeHostActivity } from './host-activity.js'
 import { WorkbenchNativeClient } from './native-client.js'
 import { WorkbenchNativeSessions } from './native-sessions.js'
@@ -66,7 +67,10 @@ export async function waitSessionActivity(ctx, sessionId, { timeoutMs = 30_000, 
 export function apply(ctx, config) {
   if (!config.ownerId || !config.assertionIssuer) throw new Error('workbench host owner and assertion issuer are required')
   const eventBus = new RunEventBus()
-  const database = new WorkbenchDatabase(config.databasePath, { onEvent: (runId, event) => eventBus.publish(runId, event) })
+  const database = new WorkbenchDatabase(config.databasePath, { onEvent: (runId, event) => {
+    eventBus.publish(runId, event)
+    if (event.event === 'workbench_end') ctx.emit('workbench/completion')
+  } })
   const runtime = new WorkbenchRuntime(ctx, database, config.ownerId)
   const workspaces = new WorkbenchWorkspaces({ controller: ctx.workspaceController, database, root: resolveWorkspacePath(config.workspace, 'conversations'), fileManager: ctx.workbenchFileManager, sessions: ctx.sessionController })
   const scheduler = new TaskScheduler({ database, sessions: ctx.sessionController, platformClient: ctx.workbenchPlatformClient, ownerId: config.ownerId, agents: ctx.agents, modelSettings: ctx.settings, goals: ctx.goals,
@@ -147,6 +151,7 @@ export function apply(ctx, config) {
   beginRecovery()
   const humanInput = new HumanInputBridge({ database, timeoutSeconds: config.humanInputTimeoutSeconds,
     executionRun: sessionId => runtime.executionRun(sessionId), resumeInput: (run, signal) => scheduler.resumeInput(run, signal) })
+  service.humanInput = humanInput
   const verifier = new AssertionVerifier({
     issuer: config.assertionIssuer,
     signingKey: process.env[config.assertionKeyEnv],
@@ -164,6 +169,7 @@ export function apply(ctx, config) {
     if (child) runtime.bindChild(child, { activation: true })
   }, { global: true, prepend: true })
   registerScheduledClaims(ctx, { runtime, database, ownerId: config.ownerId })
+  registerToolDisplayReceipts(ctx, { runtime, database, ownerId: config.ownerId })
   ctx.on('agent/pre-step', async (payload, next) => {
     const autonomous = payload.messages?.filter(message => ['schedule', 'tool-jobs'].includes(message.source?.kind)) ?? []
     if (autonomous.length) {
@@ -467,7 +473,7 @@ export function apply(ctx, config) {
     }],
     ['GET', /^\/workspaces\/events$/, async ({ owner }, res) => streamWorkspaceEvents({ workspaces, owner, res,
       subscribe: changed => {
-        const stops = ['api-session/added', 'api-session/removed', 'api-session/status', 'api-session/activity', 'schedule/changed'].map(event => ctx.on(event, changed))
+        const stops = ['api-session/added', 'api-session/removed', 'api-session/status', 'api-session/activity', 'schedule/changed', 'workbench/completion'].map(event => ctx.on(event, changed))
         return () => stops.forEach(stop => stop())
       },
     })],
