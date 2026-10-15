@@ -515,7 +515,7 @@ export class WorkbenchDatabase {
     if (!this.getRun(ownerId, runId)) throw notFound('任务不存在')
     const row = this.db.prepare(`SELECT p.* FROM pending_inputs p
       JOIN runs r ON r.id = p.run_id WHERE p.run_id = ? AND r.owner_id = ?
-      ORDER BY p.created_at DESC LIMIT 1`).get(runId, ownerId)
+      ORDER BY p.created_at DESC, p.rowid DESC LIMIT 1`).get(runId, ownerId)
     return row ? decodePending(row) : null
   }
 
