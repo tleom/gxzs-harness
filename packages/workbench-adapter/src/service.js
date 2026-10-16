@@ -130,7 +130,16 @@ export class WorkbenchService {
     }
     if (header && header.cwd !== cwd)
       throw httpError(409, '会话工作目录与当前配置不一致，请新建对话')
-    if (!live) await this.sessions.create({ sessionId: chat.sessionId, cwd })
+    if (!live) {
+      if (header) {
+        // Share the native resume promise with history and projection readers.
+        // create() has a separate adoption path and can race their writer lease.
+        const resolved = await this.sessions.resolveAgent(chat.sessionId)
+        if ('error' in resolved) throw resolved.error
+        if (resolved.agent.session.header.cwd !== cwd)
+          throw httpError(409, '会话工作目录与当前配置不一致，请新建对话')
+      } else await this.sessions.create({ sessionId: chat.sessionId, cwd })
+    }
     return chat
   }
 

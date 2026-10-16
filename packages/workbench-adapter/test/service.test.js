@@ -63,6 +63,50 @@ it('keeps a legacy context snapshot small on follow-up polls while retaining the
   expect(database.latestContextEvent(owner.ownerId, run.id).mcpTools).toHaveLength(1)
 })
 
+it('joins a pending native resume when listing scoped skills for a persisted cold session', async () => {
+  const { service, owner, chat, agents, agent, sessionController, skills } = setup()
+  const header = { id: chat.sessionId, cwd: service.chatDirectory(chat.id) }
+  const dispose = vi.fn()
+  service.sessionQuery = { observeSession: vi.fn(async () => ({ header, [Symbol.dispose]: dispose })) }
+  agents.get.mockReturnValue(undefined)
+  agent.session = { header }
+  const resumed = Promise.withResolvers()
+  sessionController.resolveAgent = vi.fn(() => resumed.promise)
+  const nativeReader = sessionController.resolveAgent(chat.sessionId)
+  const catalog = service.catalogSkills(owner, chat.id)
+  await vi.waitFor(() => expect(sessionController.resolveAgent).toHaveBeenCalledTimes(2))
+  expect(skills.list).not.toHaveBeenCalled()
+  agents.get.mockReturnValue(agent)
+  resumed.resolve({ agent })
+  await expect(Promise.all([nativeReader, catalog])).resolves.toEqual([{ agent }, []])
+  expect(sessionController.create).not.toHaveBeenCalled()
+  expect(skills.list).toHaveBeenCalledWith({ cwd: '/workspace/current', scope: agent })
+  expect(dispose).toHaveBeenCalledOnce()
+})
+
+it('preserves a real native writer conflict instead of recreating a persisted session', async () => {
+  const { service, owner, chat, agents, sessionController, skills } = setup()
+  service.sessionQuery = { observeSession: async () => ({ header: { cwd: service.chatDirectory(chat.id) } }) }
+  agents.get.mockReturnValue(undefined)
+  const error = Object.assign(new Error('writer held'), { code: 'session/writer-held' })
+  sessionController.resolveAgent = vi.fn(async () => ({ error }))
+  await expect(service.catalogSkills(owner, chat.id)).rejects.toBe(error)
+  expect(sessionController.create).not.toHaveBeenCalled()
+  expect(skills.list).not.toHaveBeenCalled()
+})
+
+it.each(['observed', 'resolved'])('rejects a mismatching %s cwd while restoring a cold session', async stage => {
+  const { service, owner, chat, agents, sessionController, skills } = setup()
+  const cwd = service.chatDirectory(chat.id)
+  service.sessionQuery = { observeSession: async () => ({ header: { cwd: stage === 'observed' ? '/other' : cwd } }) }
+  agents.get.mockReturnValue(undefined)
+  sessionController.resolveAgent = vi.fn(async () => ({ agent: { session: { header: { cwd: '/other' } } } }))
+  await expect(service.catalogSkills(owner, chat.id)).rejects.toMatchObject({ status: 409 })
+  expect(sessionController.resolveAgent).toHaveBeenCalledTimes(stage === 'observed' ? 0 : 1)
+  expect(sessionController.create).not.toHaveBeenCalled()
+  expect(skills.list).not.toHaveBeenCalled()
+})
+
 it('keeps steering metadata complete across history pages and frozen at the upper cursor', () => {
   const { database, owner, chat, service } = setup()
   const { run } = database.createRun({ ownerId: owner.ownerId, chatId: chat.id, sessionId: chat.sessionId, query: 'q', selection: {} })

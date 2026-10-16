@@ -718,6 +718,24 @@ try {
       await delay(50)
     }
     assert.ok(sessions.some(name => name.endsWith('.zstd')), 'Native session must be persisted')
+    // Keep independent persisted sessions cold across restart, including the
+    // active-turn recovery fixture which resumes its own session automatically.
+    const coldChats = []
+    const persistedBefore = sessions.filter(name => name.endsWith('.zstd')).length
+    for (let index = 0; index < 3; index++) {
+      const created = await signedRequest('POST', '/chats')
+      assert.equal(created.status, 201)
+      const cold = (await created.json()).data
+      assert.equal((await signedRequest('PATCH', `/chats/${cold.id}`, { title: `Cold catalog fixture ${index}` })).status, 200)
+      coldChats.push(cold)
+    }
+    const coldDeadline = Date.now() + 5000
+    while (Date.now() < coldDeadline) {
+      sessions = await readdir(path.join(env.DSH_HOME, 'sessions'), { recursive: true })
+      if (sessions.filter(name => name.endsWith('.zstd')).length >= persistedBefore + coldChats.length) break
+      await delay(50)
+    }
+    assert.ok(sessions.filter(name => name.endsWith('.zstd')).length >= persistedBefore + coldChats.length)
     let runningId
     if (runningRestart) {
       const submitted = await signedRequest('POST', `/chats/${chat.id}/runs`, { query: 'Synthetic recovery probe', request_key: 'crash-probe' })
@@ -741,6 +759,18 @@ try {
     for (const stream of [child.stdout, child.stderr]) stream.on('data', chunk => { hostLogs = (hostLogs + chunk.toString()).slice(-24_000) })
     await waitForHealth((status, body) => status === 200 && body.ready === true, 'restarted host with native session', 30_000)
     await restoreNativeSettings(nativeSettingsProof, { restarted: true })
+    const callsBeforeColdReads = modelCalls
+    for (const cold of coldChats) {
+      const [catalog, history] = await Promise.all([
+        signedRequest('GET', `/catalog?chat_id=${cold.id}`), historySnapshot(cold.id),
+      ])
+      assert.equal(catalog.status, 200, 'Cold scoped catalog must share the native history resume')
+      assert.ok((await catalog.json()).data.skills.some(skill =>
+        skill.id === `personal:${fixtureSkill.id}` && skill.name === fixtureSkill.id && skill.scope === 'personal'))
+      assert.ok(history.session_id)
+    }
+    assert.equal(modelCalls, callsBeforeColdReads, 'Concurrent cold reads must not submit model turns')
+    console.log('PASS concurrent cold catalog and history: three persisted sessions; scoped skills; no writer conflict or model replay')
     if (runningRestart) {
       const recovered = await signedRequest('GET', `/runs/${runningId}`)
       assert.equal((await recovered.json()).data.status, 'interrupted', 'In-flight native turn must not stay falsely running')
