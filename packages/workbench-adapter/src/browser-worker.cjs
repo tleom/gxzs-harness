@@ -3,6 +3,7 @@ const { createInterface } = require('node:readline')
 const { randomUUID } = require('node:crypto')
 const { createScreencast } = require('./browser-screencast.cjs')
 const { startDisplay, displayAvailable } = require('./browser-display.cjs')
+const partialNavigationNotice = '页面已打开，但尚未完成加载；请根据当前页面内容继续操作'
 /** Prefer lossless text at 2x scale; bound photographic frames without low-quality encoding. */
 function createImageCapture({ now = Date.now, budgetMs = 8000 } = {}) {
   const formats = [{type:'png'}, ...[95,90,85].map(quality => ({type:'jpeg',quality}))]
@@ -109,7 +110,7 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
   }
   async function observeOnce() {
     const baseline = revision
-    const result = { ...await page.evaluate(observePage), page_id: pageId, revision }
+    const result = { ...await page.evaluate(observePage), page_id: pageId, revision, ...(notice ? { notice } : {}) }
     if (typeof page.locator === 'function') {
       try { result.accessibility = (await page.locator('body').ariaSnapshot({ timeout: 1500 })).slice(0, 16000) } catch {}
     }
@@ -278,6 +279,9 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
     target.setDefaultNavigationTimeout(20000)
     target.on('dialog', dialog => { notice = '网页弹窗已关闭'; void dialog.dismiss().catch(() => {}) })
     target.on('download', download => { notice = '请在系统浏览器中下载文件'; void download.cancel().catch(() => {}) })
+    target.on('domcontentloaded', () => {
+      if (target === page && notice === partialNavigationNotice) notice = ''
+    })
     target.on('framenavigated', main => {
       if (main !== target.mainFrame() || target !== page) return
       navigation++
@@ -429,6 +433,7 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
     revision++
     const moves = ['navigate', 'reload', 'back', 'forward'].includes(action)
     if (moves) { navigation++; navigating = true }
+    const navigationPage = page, navigationStart = navigation
     try { switch (action) {
       case 'navigate': await page.goto(validUrl(value.url), { waitUntil: 'domcontentloaded' }); break
       case 'reload': await page.reload({ waitUntil: 'domcontentloaded' }); break
@@ -487,7 +492,23 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
       case 'text': await page.keyboard.insertText(value.text); break
       case 'key': await page.keyboard.press(value.key); break
       default: throw new Error('invalid_action')
-    } } finally { if (moves) { navigation++; navigating = false } }
+    } } catch (error) {
+      // A slow page may have committed a readable document while its load event
+      // still waits on site resources. Preserve that observation without replaying
+      // navigation or claiming the page finished loading. Pre-commit failures stay errors.
+      if (!moves || error.name !== 'TimeoutError' || page !== navigationPage
+        || navigation === navigationStart || page.isClosed()) throw error
+      assertCurrent(value)
+      try { validUrl(page.url()) } catch { throw error }
+      let readDeadline
+      const readableDocument = await Promise.race([
+        page.evaluate(() => ({ url: location.href, hasBody: Boolean(document.body) })).catch(() => undefined),
+        new Promise(resolve => { readDeadline = setTimeout(resolve, 1000) }),
+      ]).finally(() => clearTimeout(readDeadline))
+      assertCurrent(value)
+      if (!readableDocument?.hasBody || page !== navigationPage || page.url() !== readableDocument.url) throw error
+      notice = partialNavigationNotice
+    } finally { if (moves) { navigation++; navigating = false } }
     if (moves && streams.get(page)?.active) await streams.get(page).resize()
     if (pendingPopup) { const pending = pendingPopup; await pending; if (pendingPopup === pending) pendingPopup = undefined }
     if (moves && capturing) await captureFinished
