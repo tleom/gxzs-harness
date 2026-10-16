@@ -280,7 +280,11 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
     target.on('dialog', dialog => { notice = '网页弹窗已关闭'; void dialog.dismiss().catch(() => {}) })
     target.on('download', download => { notice = '请在系统浏览器中下载文件'; void download.cancel().catch(() => {}) })
     target.on('domcontentloaded', () => {
-      if (target === page && notice === partialNavigationNotice) notice = ''
+      if (target === page && notice === partialNavigationNotice) {
+        notice = ''
+        // Metadata can change without a compositor frame (for example, an empty script).
+        void captureFinished.then(() => { if (target === page) return frame() })
+      }
     })
     target.on('framenavigated', main => {
       if (main !== target.mainFrame() || target !== page) return
@@ -433,12 +437,14 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
     revision++
     const moves = ['navigate', 'reload', 'back', 'forward'].includes(action)
     if (moves) { navigation++; navigating = true }
-    const navigationPage = page, navigationStart = navigation
+    const navigationPage = page, navigationDeadline = Date.now() + 20000
+    let navigationResponse, navigationCommitted = false, navigationLoaded = false
+    const loaded = () => { navigationLoaded = true }
     try { switch (action) {
-      case 'navigate': await page.goto(validUrl(value.url), { waitUntil: 'domcontentloaded' }); break
-      case 'reload': await page.reload({ waitUntil: 'domcontentloaded' }); break
-      case 'back': await page.goBack({ waitUntil: 'domcontentloaded' }); break
-      case 'forward': await page.goForward({ waitUntil: 'domcontentloaded' }); break
+      case 'navigate': navigationResponse = await page.goto(validUrl(value.url), { waitUntil: 'commit' }); break
+      case 'reload': navigationResponse = await page.reload({ waitUntil: 'commit' }); break
+      case 'back': navigationResponse = await page.goBack({ waitUntil: 'commit' }); break
+      case 'forward': navigationResponse = await page.goForward({ waitUntil: 'commit' }); break
       case 'resize':
         navigation++
         if (display) {
@@ -492,23 +498,33 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
       case 'text': await page.keyboard.insertText(value.text); break
       case 'key': await page.keyboard.press(value.key); break
       default: throw new Error('invalid_action')
-    } } catch (error) {
+    }
+      if (moves && navigationResponse) {
+        // Only the requested navigation's response proves a new document committed.
+        // Hash/history changes emit framenavigated too, but do not prove that commit.
+        navigationCommitted = true
+        navigationPage.on('domcontentloaded', loaded)
+        await navigationPage.waitForLoadState('domcontentloaded', { timeout: Math.max(1, navigationDeadline - Date.now()) })
+      }
+    } catch (error) {
       // A slow page may have committed a readable document while its load event
       // still waits on site resources. Preserve that observation without replaying
       // navigation or claiming the page finished loading. Pre-commit failures stay errors.
-      if (!moves || error.name !== 'TimeoutError' || page !== navigationPage
-        || navigation === navigationStart || page.isClosed()) throw error
+      if (!navigationCommitted || error.name !== 'TimeoutError' || page !== navigationPage || page.isClosed()) throw error
       assertCurrent(value)
       try { validUrl(page.url()) } catch { throw error }
       let readDeadline
       const readableDocument = await Promise.race([
-        page.evaluate(() => ({ url: location.href, hasBody: Boolean(document.body) })).catch(() => undefined),
+        page.evaluate(() => ({ url: location.href, hasBody: Boolean(document.body), readyState: document.readyState })).catch(() => undefined),
         new Promise(resolve => { readDeadline = setTimeout(resolve, 1000) }),
       ]).finally(() => clearTimeout(readDeadline))
       assertCurrent(value)
       if (!readableDocument?.hasBody || page !== navigationPage || page.url() !== readableDocument.url) throw error
-      notice = partialNavigationNotice
-    } finally { if (moves) { navigation++; navigating = false } }
+      notice = navigationLoaded || readableDocument.readyState === 'complete' ? '' : partialNavigationNotice
+    } finally {
+      navigationPage.off('domcontentloaded', loaded)
+      if (moves) { navigation++; navigating = false }
+    }
     if (moves && streams.get(page)?.active) await streams.get(page).resize()
     if (pendingPopup) { const pending = pendingPopup; await pending; if (pendingPopup === pending) pendingPopup = undefined }
     if (moves && capturing) await captureFinished
