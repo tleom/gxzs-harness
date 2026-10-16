@@ -12,6 +12,7 @@ import { WorkbenchRuntime } from './runtime.js'
 import { WorkbenchService } from './service.js'
 import { TaskScheduler } from './scheduler.js'
 import { registerDatabasePrompt } from './database-prompt.js'
+import { registerModelToolCallGuard } from './model-tool-call-guard.js'
 import { databaseModelCatalog } from './database-models.js'
 import { registerRunResourceContext } from './resource-mentions.js'
 import { prepareNativeFiles } from './attachments.js'
@@ -67,6 +68,7 @@ export async function waitSessionActivity(ctx, sessionId, { timeoutMs = 30_000, 
 
 export function apply(ctx, config) {
   if (!config.ownerId || !config.assertionIssuer) throw new Error('workbench host owner and assertion issuer are required')
+  registerModelToolCallGuard(ctx)
   const eventBus = new RunEventBus()
   const database = new WorkbenchDatabase(config.databasePath, { onEvent: (runId, event) => {
     eventBus.publish(runId, event)
