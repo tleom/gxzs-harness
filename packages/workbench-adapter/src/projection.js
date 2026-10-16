@@ -385,7 +385,7 @@ export function settleNativeIdle(database, sessionId, goal) {
 }
 
 /** Replay native facts before declaring readiness; never wake a recovered agent. */
-export async function reconcileNativeSessions(database, sessionQuery, ownerId, context, startupRunIds) {
+export async function reconcileNativeSessions(database, sessionQuery, ownerId, context, startupRunIds, archivedSessionIds = () => []) {
   const chats = database.listChats(ownerId)
   // Native timers may deliver while asynchronous cold history reads are pending.
   // Only receipts that existed on entry belong to this startup interruption pass.
@@ -401,6 +401,13 @@ export async function reconcileNativeSessions(database, sessionQuery, ownerId, c
     try { observed = await sessionQuery.observeSession(chat.sessionId) }
     catch (error) {
       if (error?.code === 'SESSION_QUERY_SESSION_NOT_FOUND') continue
+      // Archival prevents native execution and retains the original history.
+      // A damaged, settled archive must not deny this owner's healthy chats.
+      // Read current archival state after the async query; never infer it from
+      // a failed task or ignore unreadable history needed by unfinished work.
+      if (error?.code === 'SESSION_QUERY_CORRUPT_SESSION'
+        && archivedSessionIds().includes(chat.sessionId)
+        && !database.activeRun(ownerId, chat.id)) continue
       throw error
     }
     try {
