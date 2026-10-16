@@ -27,6 +27,47 @@ function setup({ authorized = true } = {}) {
 }
 
 describe('platform MCP proxy tools', () => {
+  it('keeps recovered plugin metadata visible without expanding the current frozen run authorization', async () => {
+    const { ctx, platform } = setup()
+    const agent = { id: 's1', ctx: { tools: { restrict: () => () => {} } } }
+    let run = { id: 'r1', ownerId: 't:1', status: 'running', mcpTools: [] }
+    ctx.workbenchRuntime.executionRun = () => run
+    ctx.workbenchRuntime.agents = { list: () => [agent] }
+    const plugin = { id: 'personal:mcp:server', name: 'server', scope: 'personal', available: false }
+    platform.json.mockResolvedValueOnce({ tools: [], plugins: [plugin] })
+    await apply(ctx, { discovery: true })
+    platform.json.mockResolvedValueOnce({ tools: [catalogTool], plugins: [{ ...plugin, available: true }] })
+    await ctx.on.mock.calls.find(([event]) => event === 'workbench/resources-changed')[1]()
+    expect(ctx.toolDiscoveryCatalog.snapshot(agent)).toMatchObject({ tools: [], plugins: [
+      { name: 'server', available: false, unavailableReason: 'run_authorization_required' },
+    ] })
+    run = { ...run, id: 'r2', mcpTools: [catalogTool] }
+    expect(ctx.toolDiscoveryCatalog.snapshot(agent).tools).toHaveLength(1)
+    expect(ctx.toolDiscoveryCatalog.snapshot(agent).plugins[0].unavailableReason).toBeUndefined()
+    run = { ...run, ownerId: 'other-owner' }
+    expect(ctx.toolDiscoveryCatalog.snapshot(agent).plugins).toEqual([])
+  })
+  it('keeps empty and unavailable plugin metadata owner-scoped and refreshes its revision', async () => {
+    const { ctx, platform } = setup()
+    const agent = { id: 's1', ctx: { tools: { restrict: () => () => {} } } }
+    let run = { id: 'r1', ownerId: 't:1', status: 'running', mcpTools: [] }
+    ctx.workbenchRuntime.executionRun = () => run
+    ctx.workbenchRuntime.agents = { list: () => [agent] }
+    const plugins = [
+      { id: 'global:mcp:empty', name: 'empty', displayName: '空插件', scope: 'global', available: true },
+      { id: 'personal:mcp:offline', name: 'offline', displayName: '离线插件', scope: 'personal', available: false },
+    ]
+    platform.json.mockResolvedValueOnce({ tools: [], plugins })
+    await apply(ctx, { discovery: true })
+    const first = ctx.toolDiscoveryCatalog.snapshot(agent)
+    expect(first).toMatchObject({ ready: true, tools: [], plugins })
+    platform.json.mockResolvedValueOnce({ tools: [], plugins: [{ ...plugins[0], description: '更新说明' }, plugins[1]] })
+    await ctx.on.mock.calls.find(([event]) => event === 'workbench/resources-changed')[1]()
+    expect(ctx.toolDiscoveryCatalog.snapshot(agent).revision).not.toBe(first.revision)
+    run = { ...run, ownerId: 'another-owner' }
+    expect(ctx.toolDiscoveryCatalog.snapshot(agent)).toMatchObject({ ready: false, tools: [], plugins: [] })
+  })
+
   for (const scope of ['global', 'personal']) it(`rejects required-task ${scope} tools through the native guard before proxy dispatch`, async () => {
     const { ctx, definitions, platform } = setup()
     platform.json.mockResolvedValueOnce({ tools: [{ ...catalogTool, scope, execution: { taskSupport: 'required' } }] })
@@ -78,7 +119,7 @@ describe('platform MCP proxy tools', () => {
     expect(ctx.workbenchRuntime.executionRun).toHaveBeenCalledTimes(1)
     expect(original).toMatchObject({ ready: true, authorityKey: 't:1\0run-1',
       tools: [{ id: catalogTool.id, name: 'search', pluginId: 'personal:mcp:server', pluginScope: 'personal' }],
-      plugins: [{ id: 'personal:mcp:server', callName: 'server' }] })
+      plugins: [{ id: 'personal:mcp:server', name: 'server' }] })
     const listener = vi.fn()
     const unsubscribe = bridge.subscribe(listener)
     bridge.setDiscoveryReady(true)

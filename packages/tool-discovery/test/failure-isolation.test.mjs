@@ -25,7 +25,7 @@ for (const mode of ['native', 'ptc']) for (const budget of ['count', 'bytes']) {
     assert.deepEqual(h.executions, [])
     assert.equal(h.adapter.requests.length, 3)
     assert.equal(h.ctx.tools.get('lookup_0', agent), undefined)
-    assert.match(JSON.stringify(h.adapter.requests[0].messages), /超出发现预算/)
+    assert.match(JSON.stringify(h.adapter.requests[0].messages), /工具发现目录超过/)
     assert.ok(agent.session.snapshotEvents().some(event => event.type === 'tool/result'
       && JSON.stringify(event.data).includes('unavailable')))
     h.bridge.rows = rows.slice(0, 1); h.bridge.notify()
@@ -84,7 +84,7 @@ test('a scoped search replacement does not receive plugin discovery instructions
   agent.ctx.tools.register({ name: 'tool_search', description: 'Search local notebook', parameters: { type: 'object', properties: {} },
     output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] }, execute: async () => 'note' })
   await h.send(agent)
-  assert.equal(h.adapter.requests[0].tools[0].description, 'Search local notebook')
+  assert.equal(h.adapter.requests[0].tools.find(tool => tool.name === 'tool_search').description, 'Search local notebook')
   assert.doesNotMatch(JSON.stringify(h.adapter.requests[0].messages), /需要插件能力时先调用/)
-  assert.match(JSON.stringify(h.adapter.requests[0].messages), /当前会话策略未允许/)
+  assert.match(JSON.stringify(h.adapter.requests[0].messages), /当前会话未允许 tool_search/)
 })

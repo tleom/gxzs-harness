@@ -4,7 +4,6 @@ import { Session, appendPluginRecord } from '@deepseek-ai/dsh-session'
 import { createScope, bindScopeParent } from '@deepseek-ai/dsh-scope'
 import { ACTIVE_EVENT, PROJECTION_KEY } from '../src/projection.js'
 import { mount, row, call, response } from './helpers.mjs'
-import { bytes } from '../src/catalog.js'
 
 vi.mock('@deepseek-ai/dsh-session', async importOriginal => {
   const actual = await importOriginal()
@@ -27,10 +26,10 @@ for (const mode of ['native', 'ptc']) test(`${mode}: discovery stages activation
   assert.equal(records[0].ignorable, true)
   assert.equal(h.adapter.requests.length, 3)
   if (mode === 'native') {
-    assert.deepEqual(h.adapter.requests[0].tools.map(t => t.name), ['tool_search'])
-    assert.deepEqual(h.adapter.requests[1].tools.map(t => t.name), ['case_lookup', 'tool_search'])
+    assert.deepEqual(h.adapter.requests[0].tools.map(t => t.name), ['mcp', 'tool_search'])
+    assert.deepEqual(h.adapter.requests[1].tools.map(t => t.name), ['case_lookup', 'mcp', 'tool_search'])
   } else {
-    assert.deepEqual(h.ctx.ptcRuntime.observations[0], ['tool_search'])
+    assert.deepEqual(h.ctx.ptcRuntime.observations[0].sort(), ['mcp', 'tool_search'])
     assert.ok(h.ctx.ptcRuntime.observations[1].includes('case_lookup'))
     assert.ok(!JSON.stringify(h.adapter.requests[0]).includes('case_lookup'))
   }
@@ -51,7 +50,7 @@ test('normalized post-execute failure does not activate a prepared definition', 
   h.ctx.on('tools/post-execute', async (exec, _result, next) => exec.name === 'tool_search' ? { kind: 'block', feedback: [{ type: 'text', text: 'Fixture denied final result' }] } : next())
   const agent = await h.create(); await h.send(agent)
   assert.equal(h.ctx.sessionProjections.stateOf(agent.session, PROJECTION_KEY).tools.length, 0)
-  assert.deepEqual(h.adapter.requests[1].tools.map(t => t.name), ['tool_search'])
+  assert.deepEqual(h.adapter.requests[1].tools.map(t => t.name), ['mcp', 'tool_search'])
 })
 
 test('native cancellation after successful discovery settlement does not commit at unconditional step/end', async t => {
@@ -96,7 +95,7 @@ test('same-preset Agent scopes load independently and new run authority resets t
   h.bridge.run = 'run-2'; h.bridge.notify()
   assert.equal(h.ctx.tools.get('case_lookup', parent), undefined)
   await h.send(child)
-  assert.deepEqual(h.adapter.requests.at(-1).tools.map(t => t.name), ['tool_search'])
+  assert.deepEqual(h.adapter.requests.at(-1).tools.map(t => t.name), ['mcp', 'tool_search'])
 })
 
 test('native projection replays and checkpoints active hints; current bridge invalidates revoked versions', async t => {
@@ -178,7 +177,7 @@ test('replace_active releases the old working set only after a successful replac
   const agent = await h.create(); await h.send(agent)
   assert.deepEqual(h.executions, ['lookup_beta'])
   assert.ok(h.adapter.requests[2].tools.some(t => t.name === 'lookup_alpha'))
-  assert.deepEqual(h.adapter.requests[3].tools.map(t => t.name), ['lookup_beta', 'tool_search'])
+  assert.deepEqual(h.adapter.requests[3].tools.map(t => t.name), ['lookup_beta', 'mcp', 'tool_search'])
   assert.deepEqual(h.ctx.sessionProjections.stateOf(agent.session, PROJECTION_KEY).tools.map(t => t.name), ['lookup_beta'])
   const results = agent.session.snapshotEvents().filter(e => e.type === 'tool/result')
   assert.match(JSON.stringify(results[1]), /active_tool_limit/)
@@ -218,7 +217,7 @@ test('fresh native Agent from replayed history enforces reduced configuration bu
   assert.ok(h.ctx.tools.get('lookup_alpha', handle.agent))
   assert.equal(h.ctx.tools.get('lookup_beta', handle.agent), undefined)
   await h.send(handle.agent)
-  assert.deepEqual(h.adapter.requests[0].tools.map(t => t.name), ['lookup_alpha', 'tool_search'])
+  assert.deepEqual(h.adapter.requests[0].tools.map(t => t.name), ['lookup_alpha', 'mcp', 'tool_search'])
 })
 
 test('native owned child and sibling roots have independent activation sets', async () => {
@@ -241,26 +240,27 @@ test('pre-schema guard picks up unnotified catalog changes and rejects changes a
   const agent = await h.create(); await h.send(agent)
   h.bridge.rows[0] = { ...h.bridge.rows[0], version: 'v2' }; h.bridge.revision++
   const assembly = await h.ctx.systemPrompt.assemble({ scope: agent })
-  assert.deepEqual(assembly.tools.map(t => t.name), ['tool_search'])
+  assert.deepEqual(assembly.tools.map(t => t.name), ['mcp', 'tool_search'])
   h.ctx.on('agent/pre-step', (payload, next) => { h.bridge.revision++; return next() })
   await h.send(agent)
   assert.equal(h.adapter.requests.length, 2, 'changed request never reached provider')
 })
 
-test('browse paginates without activation; bounded results and definition budgets report actionable statuses', async () => {
+test('browse returns the whole directory without activation and definition budgets report actionable statuses', async () => {
   const rows = Array.from({ length: 12 }, (_, index) => row(`r${index}`, `record_${index}`, 'global', '案件记录检索'.repeat(35)))
   rows.push(row('huge', 'huge_schema', 'global', 'large definition', { parameters: { type: 'object', properties: { query: { type: 'string', description: 'x'.repeat(3000) } } } }))
-  const h = await mount({ rows, config: { maxResultBytes: 1024, maxToolDefinitionBytes: 2048 }, script: [
-    call('tool_search', { plugin_id: 'global:mcp:records' }), call('tool_search', { query: '案件' }),
+  const h = await mount({ rows, config: { maxToolDefinitionBytes: 2048 }, script: [
+    call('mcp', { name: 'records' }), call('tool_search', { query: '案件' }),
     call('tool_search', { query: 'huge_schema' }), response(),
   ] })
   cleanups.push(() => h.close())
   const agent = await h.create(); await h.send(agent)
-  assert.deepEqual(h.adapter.requests[1].tools.map(t => t.name), ['tool_search'])
+  assert.deepEqual(h.adapter.requests[1].tools.map(t => t.name), ['mcp', 'tool_search'])
   const results = agent.session.snapshotEvents().filter(e => e.type === 'tool/result').map(e => JSON.parse(e.data.message.content[0].text))
-  assert.ok(results[0].next_cursor)
+  assert.equal(results[0].items.length, rows.length)
+  assert.equal(results[0].items[0].description, rows[0].description)
+  assert.equal(results[0].next_cursor, undefined)
   assert.equal(results[0].status, 'browse')
-  assert.ok(results.every(value => bytes(value) <= 1024))
   assert.equal(results[2].items[0].reason, 'definition_too_large')
   assert.equal(h.ctx.tools.get('huge_schema', agent), undefined)
 })

@@ -30,8 +30,15 @@ class ManifestError(ValueError):
 
 
 def server_name(value):
-    if not isinstance(value, str) or not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?", value):
-        raise ValueError("MCP 标识需为 1–64 位小写字母、数字或连字符")
+    # Legacy digit-leading folders remain readable so users can rename them.
+    if not isinstance(value, str) or not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", value):
+        raise ValueError("MCP 标识需为 1–64 位小写字母、数字、下划线或连字符")
+    return value
+
+
+def plugin_name(value):
+    if not isinstance(value, str) or not re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", value):
+        raise ValueError("插件调用名须以小写字母开头，只含小写字母、数字、下划线或连字符，最多 64 位")
     return value
 
 
@@ -172,12 +179,17 @@ def tool_manifest(tools):
                     pending.append(value)
             elif isinstance(part, list):
                 pending.extend(part)
-        description = tool.get("description") or name
+        description = tool.get("description", "")
         if not isinstance(description, str) or len(description) > 16000:
             raise ManifestError("MCP 工具说明过长或无效")
         declaration = {"name": name, "description": description, "inputSchema": schema}
         if output_schema is not None:
             declaration["outputSchema"] = output_schema
+        for key in ("annotations", "execution"):
+            if key in tool:
+                if not isinstance(tool[key], dict):
+                    raise ManifestError("MCP 工具元数据必须是对象")
+                declaration[key] = tool[key]
         result.append(declaration)
         seen.add(name)
     if len(json.dumps(result).encode()) > MAX_MANIFEST:
@@ -296,7 +308,7 @@ def personal_mcp(payload, root="/workspace"):
         name = server_name(payload.get("name"))
         target_name = name
         if operation == "mcp_save":
-            target_name = server_name(payload.get("new_name", name))
+            target_name = plugin_name(payload.get("new_name", name))
             content = payload.get("content")
             if not isinstance(content, str):
                 raise ValueError("缺少 MCP 配置")
@@ -310,6 +322,8 @@ def personal_mcp(payload, root="/workspace"):
                 "enabled": mapping(statefd, SETTINGS).get(name, True),
             }
         if operation in {"mcp_toggle", "mcp_pin"}:
+            if operation == "mcp_toggle" and payload.get("enabled") is True:
+                plugin_name(name)
             load(rootfd, name)
             field, filename = ("enabled", SETTINGS) if operation == "mcp_toggle" else ("pinned", PINS)
             if not isinstance(payload.get(field), bool):

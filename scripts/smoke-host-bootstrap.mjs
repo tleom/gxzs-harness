@@ -27,6 +27,8 @@ const fixtureTool = {
   provider: 'global:mcp:reference-smoke', provider_name: '引用测试插件',
   description: 'Synthetic reference lookup', inputSchema: { type: 'object', properties: {} },
 }
+const fixturePlugin = { id: fixtureTool.provider, name: fixtureTool.server_id,
+  displayName: fixtureTool.provider_name, description: 'Synthetic reference plugin', scope: 'global', available: true }
 const fixtureSkill = {
   id: 'bootstrap-skill', version: 'v1', enabled: true,
   content: '---\nname: bootstrap-skill\ndescription: Synthetic skill for assembly validation\nmetadata:\n  display-name: 技能装配测试\n---\nsynthetic-skill-body-verified',
@@ -109,13 +111,13 @@ const platform = fixture((req, res) => {
   if (req.method === 'POST' && req.url === '/internal/workbench/mcp/cancel') {
     respond(res, 200, { data: { fenced: true } }); return
   }
-  if (req.method === 'GET' && req.url === '/internal/workbench/mcp/catalog') {
+  if (req.method === 'GET' && ['/internal/workbench/mcp/catalog', '/internal/workbench/mcp/plugins'].includes(req.url)) {
     if (!registered) {
       deniedCatalogs += 1
       respond(res, 401, { code: 'HOST_NOT_REGISTERED', message: 'Synthetic host registration pending' })
     } else {
       acceptedCatalogs += 1
-      respond(res, 200, { data: { tools: [fixtureTool] } })
+      respond(res, 200, { data: { tools: [fixtureTool], plugins: [fixturePlugin] } })
     }
     return
   }
@@ -209,6 +211,7 @@ const model = fixture((req, res) => {
     assert.ok(messages.includes('用户优先指定插件') && messages.includes('引用测试插件'),
       'Explicit plugin preference must coexist with native conversation references')
     assert.ok(tools.has('tool_search'), 'Discovery must remain available to the actual model')
+    assert.ok(tools.has('mcp'), 'Plugin browsing must remain available to the actual model')
     assert.equal(tools.has('fixture_lookup'), referenceModelCalls > 1,
       'The selected plugin child tool becomes available only after discovery')
     referenceContextVerified = true
@@ -249,7 +252,7 @@ const model = fixture((req, res) => {
     res.write(`data: ${JSON.stringify({ id: 'fixture-tool', object: 'chat.completion.chunk', created: 1, model: 'smoke',
       choices: [{ index: 0, delta: { role: 'assistant', tool_calls: [{ index: 0, id: discovering ? 'fixture-discovery-call' : 'fixture-lookup-call', type: 'function',
         function: { name: discovering ? 'tool_search' : 'fixture_lookup', arguments: discovering
-          ? JSON.stringify({ query: 'fixture_lookup', plugin_id: fixtureTool.provider }) : '{}' } }] }, finish_reason: null }] })}\n\n`)
+          ? JSON.stringify({ query: 'fixture_lookup', name: fixtureTool.server_id }) : '{}' } }] }, finish_reason: null }] })}\n\n`)
     res.write(`data: ${JSON.stringify({ id: 'fixture-tool', object: 'chat.completion.chunk', created: 1, model: 'smoke',
       choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] })}\n\n`)
     res.end('data: [DONE]\n\n')

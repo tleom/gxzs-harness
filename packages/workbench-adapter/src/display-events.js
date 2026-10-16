@@ -31,6 +31,12 @@ export function fileToolPreparation(run, calls, chunk) {
 
 export function nativePresentation(run, event, { streamed = false, toolName = '', messageRun } = {}) {
   switch (event.type) {
+    case 'turn/start':
+    case 'turn/end':
+      if (!Number.isFinite(event.time) || !Number.isSafeInteger(event.data?.turn)) return []
+      return [{ event: 'workbench_turn', turn: event.data.turn,
+        phase: event.type === 'turn/start' ? 'start' : 'end', at: event.time / 1000,
+        ...(event.type === 'turn/end' ? { reason: event.data.reason?.kind } : {}) }]
     case 'user/message': {
       const source = event.data?.source
       if (isNativeNotice(event.data)) {
@@ -97,6 +103,13 @@ function toolPresentation(run, call) {
   const receipt = run.selection?.tool_presentations?.[run.sessionId]?.[call.callId]
   if (receipt) return { provider_name: receipt.provider_name, display_name: receipt.display_name }
   if (call.name === 'tool_search') return { display_name: '查找工具' }
+  if (call.name === 'mcp' && call.arguments !== undefined) {
+    try {
+      const args = typeof call.arguments === 'string' ? JSON.parse(call.arguments) : call.arguments
+      const tool = run.mcpTools?.find(item => (item.provider_call_name ?? item.server_id) === args?.name)
+      return { display_name: args?.name ? tool?.provider_name ?? args.name : '插件目录' }
+    } catch { return {} }
+  }
   const title = run.selection?.tool_titles?.[call.callId]
   if (call.name === 'schedule_delete' && typeof title === 'string') return { display_name: title }
 

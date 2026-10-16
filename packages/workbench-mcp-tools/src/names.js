@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto'
 // identity; never parse a model-facing name to choose an upstream tool.
 export function publicToolName(serverName, rawName) {
   const normalized = rawName.replace(/[^A-Za-z0-9_-]/g, '_')
-  if (normalized === rawName && normalized.length > 0 && normalized.length <= 64 && !['run_code', 'tool_search'].includes(normalized)) return normalized
+  if (normalized === rawName && normalized.length > 0 && normalized.length <= 64 && !['run_code', 'tool_search', 'mcp'].includes(normalized)) return normalized
   const hash = createHash('sha256').update(`${serverName}\0${rawName}`).digest('hex').slice(0, 12)
   return `${normalized.slice(0, 51)}_${hash}`
 }

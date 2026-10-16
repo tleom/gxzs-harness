@@ -234,9 +234,9 @@ export function apply(ctx, config) {
   }, { global: true })
 
   const buildCatalog = async (owner, modelsOnly = false, chatId) => {
-    const [catalog, mcpTools, skills] = await Promise.all([
+    const [catalog, mcpCatalog, skills] = await Promise.all([
       databaseModelCatalog(ctx.workbenchPlatformClient, ctx.sessionController, owner, ctx.settings),
-      modelsOnly ? [] : service.mcpCatalog(owner), modelsOnly ? [] : service.catalogSkills(owner, chatId),
+      modelsOnly ? { tools: [], plugins: [] } : service.mcpCatalog(owner, { includePlugins: true }), modelsOnly ? [] : service.catalogSkills(owner, chatId),
     ])
     const models = (catalog.groups ?? []).flatMap((group) => (group.models ?? []).map((model) => ({
       id: `${group.id}/${model.id}`, name: model.name || model.id, provider: group.id, description: model.description,
@@ -248,9 +248,9 @@ export function apply(ctx, config) {
       ...(ctx.get('clientModules') ? { native_client_protocol: 1, native_session_client_protocol: 2, native_schedule_client_protocol: 1,
         ...(ctx.sessionReferenceResolver.listSessionCandidates && ctx.get('fileReferences')?.listObserved ? { native_subagent_reference_protocol: 1 } : {}),
         ...(ctx.get('settingsController') ? { native_subagent_settings_protocol: 1, native_prompt_mode_protocol: 1 } : {}) } : {}),
-      control_protocol: 1, goal_events_protocol: 1, compact_events_protocol: 1, resources_protocol: 1, command_resources_protocol: 1, plugin_mentions_protocol: 1, scoped_skills_protocol: 1, submission_control_protocol: 1,
+      control_protocol: 1, goal_events_protocol: 1, compact_events_protocol: 1, resources_protocol: 1, command_resources_protocol: 1, plugin_mentions_protocol: 2, scoped_skills_protocol: 1, submission_control_protocol: 1,
       default_selection: { model: catalog.default ? `${catalog.default.provider}/${catalog.default.model}` : models[0]?.id ?? '', tools: [], skills: [], knowledge: [], model_parameters: {}, tool_parameters: {} },
-      models, tools: mcpTools.map((tool) => ({
+      models, plugins: mcpCatalog.plugins, tools: mcpCatalog.tools.map((tool) => ({
         id: tool.id, name: tool.name, display_name: tool.display_name,
         description: tool.description, scope: tool.scope,
         group: tool.group, provider: tool.provider, provider_name: tool.provider_name,
@@ -493,9 +493,9 @@ export function apply(ctx, config) {
     })],
     ['POST', /^\/workspaces$/, async ({ owner, json }, res) => sendJson(res, 200, { data: await workspaces.mutate(owner, json) })],
     ['GET', /^\/models\/parameters$/, async ({ url, owner }, res) => sendJson(res, 200, { data: await service.modelParameters(url.searchParams.get('model'), owner) })],
-    ['GET', /^\/resources$/, async (_context, res) => sendJson(res, 200, { data: await service.resources() })],
-    ['POST', /^\/resources$/, async ({ json }, res) => {
-      const result = await service.mutateResource(json)
+    ['GET', /^\/resources$/, async ({ owner }, res) => sendJson(res, 200, { data: await service.resources(owner) })],
+    ['POST', /^\/resources$/, async ({ owner, json }, res) => {
+      const result = await service.mutateResource(json, owner)
       if (json.operation !== 'skill_inspect' && json.operation !== 'mcp_read') ctx.emit('workbench/resources-changed')
       sendJson(res, 200, { data: result })
     }],

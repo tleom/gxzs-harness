@@ -66,7 +66,7 @@ class Model extends LlmAdapter {
 const catalog = ['case_lookup', 'unused_lookup'].map((name, index) => ({
   id: `${index ? 'personal' : 'global'}:mcp:records:${name}`, scope: index ? 'personal' : 'global',
   runtime_name: `${index ? 'personal' : 'global'}_${name}`, server_id: 'records', tool_name: name,
-  provider_name: index ? '个人档案' : '全局档案', version: 'v1', manifest_version: 'm1',
+  provider_name: index ? '个人档案' : '全局档案', provider_call_name: index ? 'my_records' : 'records', version: 'v1', manifest_version: 'm1',
   description: name === 'case_lookup' ? '查询案件档案' : 'Unused capability', inputSchema: { type: 'object', properties: {} },
 }))
 const until = async (predicate, text) => { const deadline = Date.now() + 6000; while (!predicate()) { if (Date.now() > deadline) throw new Error(`Timed out: ${text}`); await new Promise(resolve => setTimeout(resolve, 10)) } }
@@ -142,7 +142,7 @@ test.each([false, true])('scheduled inbox retries catalog and starts each run wi
     const second = createUserMessage({ source: { kind: 'schedule' }, content: [{ type: 'text', text: 'Check next scheduled records' }] })
     h.agent.followup(second); await h.agent.whenIdle()
     assert.equal(h.model.requests.length, 6)
-    assert.deepEqual(names(h.model.requests[0]), ['tool_search']); assert.deepEqual(names(h.model.requests[3]), ['tool_search'])
+    assert.deepEqual(names(h.model.requests[0]), ['mcp', 'tool_search']); assert.deepEqual(names(h.model.requests[3]), ['mcp', 'tool_search'])
     assert.ok(names(h.model.requests[1]).includes('case_lookup')); assert.ok(!names(h.model.requests[1]).includes('unused_lookup'))
     assert.deepEqual(h.calls.map(call => call.run_id), [first.id, second.id])
     for (const id of [first.id, second.id]) assert.equal(h.db.getRun(h.owner.ownerId, id).status, 'completed')
@@ -163,7 +163,7 @@ test.each([false, true])('Goal rounds retain activation and resume revalidates i
     const resumed = await h.service.mutateGoal(h.owner, h.chat.id, 'resume', { ref: h.ctx.goals.get(h.agent) })
     await until(() => h.model.requests.length === (changed ? 7 : 8), 'resumed Goal request')
     assert.notEqual(resumed.run.id, created.run.id)
-    assert.deepEqual(names(h.model.requests[5]), ['tool_search'])
+    assert.deepEqual(names(h.model.requests[5]), ['mcp', 'tool_search'])
     assert.equal(h.calls.length, changed ? 2 : 3)
     if (!changed) assert.equal(h.calls[2].run_id, resumed.run.id)
     await h.service.mutateGoal(h.owner, h.chat.id, 'pause', { ref: h.ctx.goals.get(h.agent) })
@@ -177,6 +177,8 @@ test('native compaction and fork preserve history but revalidate new run authori
     const original = h.create('Large history '.repeat(1000))
     await h.scheduler.enqueue(original, [{ type: 'text', text: original.query }]); await h.scheduler.tick(); await h.agent.whenIdle(); await h.scheduler.tick()
     assert.equal(h.calls.length, 1)
+    const priorCatalogs = h.agent.session.snapshotEvents().filter(event => event.type === 'user/message' && event.data.source?.kind === 'mcp-catalog')
+    assert.equal(priorCatalogs.length, 1)
     const activation = h.agent.session.snapshotEvents().find(event => event.type === ACTIVE_EVENT)
     assert.ok(activation)
     class ProbeCompaction extends BasicCompaction {
@@ -196,9 +198,12 @@ test('native compaction and fork preserve history but revalidate new run authori
     h.model.script.push(toolCall('case_lookup'), 'fork done')
     const forkRun = h.create('Continue fork with changed permissions', fork, chat, [])
     await h.scheduler.enqueue(forkRun, [{ type: 'text', text: forkRun.query }]); await h.scheduler.tick(); await fork.whenIdle()
-    assert.deepEqual(names(h.model.requests[3]), ['tool_search'])
+    assert.deepEqual(names(h.model.requests[3]), ['mcp', 'tool_search'])
     assert.equal(h.calls.length, 1)
     assert.ok(fork.session.snapshotEvents().some(event => event.type === 'tool/result' && event.data.message.isError))
+    const forkCatalogs = fork.session.snapshotEvents().filter(event => event.type === 'user/message' && event.data.source?.kind === 'mcp-catalog')
+    assert.ok(forkCatalogs.length > priorCatalogs.length)
+    assert.match(forkCatalogs.at(-1).data.content[0].text, /当前没有可用插件/)
   } finally { await h.close() }
 })
 
@@ -248,7 +253,7 @@ test('tool-jobs notice wakes an idle root with current discovery and one durable
       source: { kind: 'tool-jobs', form: 'notice', summary: 'Background job completed' } })
     h.agent.followup(notice); await h.agent.whenIdle()
     assert.equal(h.model.requests.length, 6)
-    assert.deepEqual(names(h.model.requests[3]), ['tool_search'])
+    assert.deepEqual(names(h.model.requests[3]), ['mcp', 'tool_search'])
     assert.ok(names(h.model.requests[4]).includes('unused_lookup'))
     assert.ok(!names(h.model.requests[4]).includes('case_lookup'))
     assert.deepEqual(h.calls.map(call => [call.run_id, call.resource_id]),
@@ -281,7 +286,7 @@ test('owned child discovery stays scoped and its settled notice reopens only a f
     assert.equal(h.ctx.agents.isOwnedBy(child.id, h.agent), true)
     child.followup(createUserMessage({ content: [{ type: 'text', text: 'Read the delegated records' }], source: { kind: 'user' } }))
     await child.whenIdle()
-    assert.deepEqual(names(h.model.requests[3]), ['tool_search'])
+    assert.deepEqual(names(h.model.requests[3]), ['mcp', 'tool_search'])
     assert.ok(names(h.model.requests[4]).includes('unused_lookup'))
     assert.ok(!names(h.model.requests[4]).includes('case_lookup'))
     assert.ok(h.ctx.tools.get('case_lookup', h.agent))
@@ -294,7 +299,7 @@ test('owned child discovery stays scoped and its settled notice reopens only a f
       source: { kind: 'subagent-settled', senderSessionId: child.id, form: 'notice', summary: 'Completed' } })
     h.agent.followup(notice); await h.agent.whenIdle()
     assert.equal(h.model.requests.length, 9)
-    assert.deepEqual(names(h.model.requests[6]), ['tool_search'])
+    assert.deepEqual(names(h.model.requests[6]), ['mcp', 'tool_search'])
     assert.ok(names(h.model.requests[7]).includes('case_lookup'))
     assert.ok(!names(h.model.requests[7]).includes('unused_lookup'))
     assert.deepEqual(h.calls.map(call => call.run_id), [original.id, original.id, notice.id])
@@ -323,7 +328,7 @@ test('ordinary Continue uses the native resume inbox and revalidates discovery f
     const resumed = await h.service.submitRun(h.owner, h.chat.id, body)
     await h.scheduler.tick(); await h.agent.whenIdle()
     assert.equal(h.model.requests.length, 6)
-    assert.deepEqual(names(h.model.requests[3]), ['tool_search'])
+    assert.deepEqual(names(h.model.requests[3]), ['mcp', 'tool_search'])
     assert.ok(names(h.model.requests[4]).includes('unused_lookup'))
     assert.ok(!names(h.model.requests[4]).includes('case_lookup'))
     assert.deepEqual(h.calls.map(call => [call.run_id, call.resource_id]),

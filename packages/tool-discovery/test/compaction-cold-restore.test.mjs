@@ -86,7 +86,7 @@ beforeAll(async () => {
   try {
     originalAgent = await h.ctx.agentLoop.create(sessionId, { provider: 'fixture', model: 'conversation' }, { cwd: originalRoot })
     await h.send(originalAgent, OLD_HISTORY)
-    assert.deepEqual(h.model.requests[0].tools.map(item => item.name), ['tool_search'])
+    assert.deepEqual(h.model.requests[0].tools.map(item => item.name), ['mcp', 'tool_search'])
     assert.deepEqual(h.ctx.sessionProjections.stateOf(originalAgent.session, 'toolDiscovery').tools.map(item => item.name), ['case_lookup'])
     const before = JSON.stringify(originalAgent.session.deriveMessages())
     const result = await h.ctx.compaction.compactNow(originalAgent, new AbortController().signal)

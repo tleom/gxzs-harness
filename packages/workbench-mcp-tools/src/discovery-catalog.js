@@ -35,29 +35,41 @@ export class ToolDiscoveryCatalog extends Service {
     const stamps = []
     const preferred = new Set(run?.selection?.resource_mentions?.plugins ?? [])
     const selectedTools = new Set(run?.selection?.resource_mentions?.tools ?? [])
+    if (ready) {
+      const providersWithTools = new Set([...this.registrations.values()].map(({ tool }) => `${tool.scope}:mcp:${tool.server_id}`))
+      for (const plugin of runtime.mcpPlugins?.() ?? []) {
+        // Installation metadata survives recovery even when this run's frozen
+        // authorization excludes the recovered tools. This grants no capability.
+        const requiresAuthorization = plugin.available !== false && providersWithTools.has(plugin.id)
+        plugins.set(plugin.id, { ...plugin,
+          ...(requiresAuthorization ? { available: false, unavailableReason: 'run_authorization_required' } : {}),
+          preferred: preferred.has(plugin.id) || preferred.has(plugin.name) })
+      }
+    }
     for (const { tool } of this.registrations.values())
       if (selectedTools.has(tool.id)) preferred.add(`${tool.scope}:mcp:${tool.server_id}`)
     for (const { tool, definition } of this.registrations.values()) {
       if (!allowed.has(tool.public_name)) continue
       const pluginId = `${tool.scope}:mcp:${tool.server_id}`
       plugins.set(pluginId, {
-        id: pluginId, name: tool.provider_name ?? tool.server_id,
-        callName: tool.provider_call_name ?? tool.server_id,
+        id: pluginId, name: tool.provider_call_name ?? tool.server_id,
+        displayName: tool.provider_name ?? tool.server_id,
         scope: tool.scope, description: tool.provider_description ?? '',
-        preferred: preferred.has(pluginId),
+        preferred: preferred.has(pluginId) || preferred.has(tool.provider_call_name ?? tool.server_id),
       })
-      tools.push({ id: tool.id, name: tool.public_name, pluginId,
+      tools.push({ id: tool.id, name: tool.public_name, rawName: tool.tool_name, pluginId,
         pluginName: tool.provider_name ?? tool.server_id, pluginCallName: tool.provider_call_name ?? tool.server_id,
         pluginScope: tool.scope, description: tool.description,
         version: tool.version, manifestVersion: tool.manifest_version,
-        parameters: definition.parameters, outputSchema: tool.outputSchema,
+        parameters: definition.parameters, inputSchema: tool.sourceInputSchema,
+        outputSchema: tool.outputSchema, annotations: tool.annotations, execution: tool.execution,
         ...(tool.execution?.taskSupport === 'required' ? { unavailableReason: 'task_execution_required' } : {}) })
       stamps.push([tool.id, tool.discoveryStamp])
     }
     tools.sort((a, b) => a.id.localeCompare(b.id))
     const authorityKey = validRun ? `${runtime.ownerId}\0${run.id}` : ''
     stamps.sort((a, b) => a[0].localeCompare(b[0]))
-    const revision = createHash('sha256').update(JSON.stringify([authorityKey, ready, stamps, [...preferred].sort()]))
+    const revision = createHash('sha256').update(JSON.stringify([authorityKey, ready, stamps, [...preferred].sort(), [...plugins.values()]]))
       .digest('hex')
     return { authorityKey, revision, ready, tools, plugins: [...plugins.values()] }
   }

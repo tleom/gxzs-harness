@@ -29,15 +29,15 @@ for (const mode of ['native', 'ptc']) test(`${mode}: 600 tools in 3 global/perso
         measurements[label] = { adapterOptions: size(request), messages: size(request.messages), wireSchemas: size(request.tools), wireToolCount: request.tools.length }
       }
       if (!eager && mode === 'native') {
-        assert.equal(h.adapter.requests[0].tools.length, 3)
-        assert.equal(h.adapter.requests[1].tools.length, 11)
+        assert.equal(h.adapter.requests[0].tools.length, 4)
+        assert.equal(h.adapter.requests[1].tools.length, 12)
       }
-      if (!eager && mode === 'ptc') assert.equal(h.ctx.ptcRuntime.observations[0].length, 3)
+      if (!eager && mode === 'ptc') assert.equal(h.ctx.ptcRuntime.observations[0].length, 4)
     } finally { await h.close() }
   }
   assert.ok(measurements.initial.adapterOptions.bytes < measurements.eager.adapterOptions.bytes * 0.08)
   assert.ok(measurements.activated8.adapterOptions.bytes < measurements.eager.adapterOptions.bytes * 0.15)
-  console.info(JSON.stringify({ fixture: '600 MCP definitions plus 2 native definitions; lazy adds tool_search; no tokenizer estimate', mode, measurements }))
+  console.info(JSON.stringify({ fixture: '600 MCP definitions plus 2 native definitions; lazy adds mcp and tool_search; no tokenizer estimate', mode, measurements }))
 })
 
 for (const mode of ['native', 'ptc']) test(`${mode}: global and personal catalog sizes 1, 50, 600 and 1000 keep unused definitions out of requests`, async () => {
@@ -50,7 +50,7 @@ for (const mode of ['native', 'ptc']) test(`${mode}: global and personal catalog
         }))
       const target = catalog[0]
       const h = await mount({ rows: catalog, mode, script: [
-        call('tool_search', { query: target.name, plugin_id: target.pluginId }, mode),
+        call('tool_search', { query: target.name, name: target.pluginCallName ?? target.pluginId.split(':').at(-1) }, mode),
         call(target.name, { query: '合成只读记录' }, mode), response(),
       ] })
       try {
@@ -65,11 +65,11 @@ for (const mode of ['native', 'ptc']) test(`${mode}: global and personal catalog
         assert.ok(!loadedText.includes('SCHEMA_MARKER_1'))
         assert.deepEqual(h.executions, [target.name])
         if (mode === 'native') {
-          assert.deepEqual(initial.tools.map(tool => tool.name), ['tool_search'])
-          assert.equal(loaded.tools.length, 2)
+          assert.deepEqual(initial.tools.map(tool => tool.name), ['mcp', 'tool_search'])
+          assert.equal(loaded.tools.length, 3)
         } else {
-          assert.equal(h.ctx.ptcRuntime.observations[0].length, 1)
-          assert.equal(h.ctx.ptcRuntime.observations[1].length, 2)
+          assert.equal(h.ctx.ptcRuntime.observations[0].length, 2)
+          assert.equal(h.ctx.ptcRuntime.observations[1].length, 3)
         }
       } finally { await h.close() }
     }
