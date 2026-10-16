@@ -1,4 +1,4 @@
-import { expect, it } from 'vitest'
+import { expect, it, vi } from 'vitest'
 import { readFile } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { dirname, join } from 'node:path'
@@ -8,6 +8,21 @@ const run={id:'run',selection:{},mcpTools:[{runtime_name:'mcp__search',server_id
 const snapshot=(records=[],assistantStream={revision:0})=>({type:'snapshot',records,assistantStream})
 const durable=(seq,type,data)=>({type:'event',event:{seq,type,data,surfaceOp:'append'}})
 const frame=value=>({type:'assistant-stream',frame:value})
+it('resolves each turn once during a large reconnect snapshot and refreshes on the next frame', () => {
+  let current = run
+  const resolve = vi.fn(turn => turn === 3 ? undefined : current)
+  const view = new HistoryPresentation('session', resolve)
+  const records = Array.from({ length: 1200 }, (_, index) => durable(index + 1, 'assistant/message', {
+    turn: Math.floor(index / 400) + 1, step: index + 1, message: { content: [{ type: 'text', text: 'retained' }] },
+  }))
+  const result = view.accept(snapshot(records))
+  expect(resolve).toHaveBeenCalledTimes(3)
+  expect(result.events.filter(item => item.event.data?.text === 'retained')).toHaveLength(800)
+  current = { ...run, id: 'replacement' }
+  expect(view.accept(durable(1201, 'assistant/message', { turn: 1, step: 1201,
+    message: { content: [{ type: 'text', text: 'latest' }] } })).events[0].run_id).toBe('replacement')
+  expect(resolve).toHaveBeenCalledTimes(4)
+})
 it('shows file preparation immediately and updates its native KB counter before tool execution', () => {
   const view = new HistoryPresentation('session', () => run)
   view.accept(snapshot())

@@ -51,6 +51,42 @@ it('commits a whole delta batch before publishing any cursor, without changing e
   expect(test.database.db.prepare('PRAGMA synchronous').get().synchronous).toBe(2)
 })
 
+it('reads only the current stream binding instead of decoding large resource snapshots per token', () => {
+  const test = fixture({ streamBatchBytes: 1024 * 1024 })
+  const fullChat = vi.spyOn(test.database, 'getChatBySession')
+  const fullRun = vi.spyOn(test.database, 'runForTurn')
+  test.database.db.prepare('UPDATE runs SET mcp_tools_json=? WHERE id=?')
+    .run(JSON.stringify([{ description: 'x'.repeat(2 * 1024 * 1024) }]), test.run.id)
+  for (let i = 0; i < 1000; i++) test.delta('x')
+  expect(fullChat).not.toHaveBeenCalled()
+  expect(fullRun).not.toHaveBeenCalled()
+  test.database.flushStreamEvents()
+  expect(test.database.db.prepare('SELECT COUNT(*) AS n FROM run_events WHERE run_id=?').get(test.run.id).n).toBe(1000)
+  // Recheck live ownership/deletion on every chunk, rather than retaining an
+  // authority-bearing object for the lifetime of a model response.
+  test.database.db.prepare('UPDATE chats SET deleted_at=1 WHERE id=?').run(test.chat.id)
+  test.delta('must not publish')
+  test.database.flushStreamEvents()
+  expect(test.database.db.prepare('SELECT COUNT(*) AS n FROM run_events WHERE run_id=?').get(test.run.id).n).toBe(1000)
+})
+
+it('rejects cross-owner stream bindings and observes a changed run binding immediately', () => {
+  const test = fixture()
+  const foreign = createAssistantStreamProjector(test.database, 'another-owner')
+  foreign({ agent: test.agent, frame: { type: 'start', attemptId: 'other', turn: 1, step: 1 } })
+  foreign({ agent: test.agent, frame: { type: 'chunk', attemptId: 'other', chunk: { type: 'text-delta', text: 'wrong owner' } } })
+  test.delta('original')
+  test.database.flushStreamEvents()
+  test.database.db.prepare("UPDATE runs SET status='steered' WHERE id=?").run(test.run.id)
+  const replacement = test.database.createRun({ ownerId: test.chat.ownerId, chatId: test.chat.id,
+    sessionId: test.chat.sessionId, query: 'new', selection: {} }).run
+  test.database.bindRunMessage(test.chat.sessionId, replacement.id, 1, 'replacement')
+  test.delta('replacement')
+  test.database.flushStreamEvents()
+  expect(test.database.eventsAfter(test.chat.ownerId, test.run.id, 0).map(event => event.data.text)).toEqual(['original'])
+  expect(test.database.eventsAfter(test.chat.ownerId, replacement.id, 0).map(event => event.data.text)).toEqual(['replacement'])
+})
+
 it('flushes by deadline and byte limit, and getters expose the latest committed cursor', async () => {
   vi.useFakeTimers()
   const test = fixture({ streamFlushMs: 20, streamBatchBytes: 1024 })

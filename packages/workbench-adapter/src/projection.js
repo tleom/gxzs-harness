@@ -4,6 +4,7 @@ import { nativeCommandRun } from './native-command.js'
 import { runPromptId } from './native-prompt.js'
 import { presentRunEvent } from './run-failure.js'
 import { contextUsage } from './context-usage.js'
+import { goalMentionResources } from './resource-mentions.js'
 
 const END_STATUS = {
   completed: 'completed', aborted: 'cancelled', error: 'failed',
@@ -14,42 +15,36 @@ export function createAssistantStreamProjector(database, expectedOwnerId) {
   const attempts = new Map()
   return ({ agent, frame }) => {
     const sessionId = agent?.session?.id ?? agent?.id
-    const chat = database.getChatBySession(sessionId)
-    if (!chat || (expectedOwnerId && chat.ownerId !== expectedOwnerId)) return undefined
     if (frame.type === 'start') {
       attempts.set(String(frame.attemptId), { sessionId, turn: frame.turn, step: frame.step, tools: new Map() })
       return undefined
     }
     const attempt = attempts.get(String(frame.attemptId))
     if (!attempt || attempt.sessionId !== sessionId) return undefined
+    if (frame.type === 'end') attempts.delete(String(frame.attemptId))
+    const run = database.streamRunForTurn(sessionId, attempt.turn)
+    if (!run || (expectedOwnerId && run.ownerId !== expectedOwnerId)) return undefined
     if (frame.type === 'end') {
       database.flushStreamEvents()
-      attempts.delete(String(frame.attemptId))
       if (frame.outcome?.kind !== 'abandoned') return undefined
-      const run = database.runForTurn(sessionId, attempt.turn)
-      if (!run) return undefined
-      database.clearStreamedStep(chat.ownerId, run.id, attempt.turn, attempt.step)
-      return database.appendEvent(chat.ownerId, run.id, {
+      database.clearStreamedStep(run.ownerId, run.id, attempt.turn, attempt.step)
+      return database.appendEvent(run.ownerId, run.id, {
         event: 'workbench_stream_reset',
         segment_prefix: `t${attempt.turn}s${attempt.step}a${String(frame.attemptId)}:`,
       })
     }
     const chunk = frame.chunk
     if (chunk?.type === 'tool-call-delta') {
-      const run = database.runForTurn(sessionId, attempt.turn)
-      if (!run) return undefined
       const data = fileToolPreparation(run, attempt.tools, chunk)
       if (!data) return undefined
-      return database.appendStreamEvent(chat.ownerId, run.id, {
+      return database.appendStreamEvent(run.ownerId, run.id, {
         event: 'workbench_activity', backend_run_id: run.id,
         data: { ...data, segment_id: `t${attempt.turn}s${attempt.step}a${String(frame.attemptId)}:b${chunk.index}` },
       }, attempt.turn, attempt.step)
     }
     if (chunk?.type !== 'text-delta' && chunk?.type !== 'reasoning-delta') return undefined
     if (!chunk.text) return undefined
-    const run = database.runForTurn(sessionId, attempt.turn)
-    if (!run) return undefined
-    return database.appendStreamEvent(chat.ownerId, run.id, {
+    return database.appendStreamEvent(run.ownerId, run.id, {
       event: 'workbench_activity', backend_run_id: run.id,
       data: {
         kind: chunk.type === 'text-delta' ? 'text' : 'reasoning', workbench_run_id: run.id,
@@ -352,6 +347,7 @@ function projectControlEvent(database, chat, sessionId, event) {
       id: goal.id,
       revision: goal.revision,
       objective: goal.objective,
+      mentioned_resources: goalMentionResources(database.goalRun(sessionId), goal.objective),
       phase: goal.phase,
       activation: goal.activation,
       reason: goal.blockedReason?.message ?? null,

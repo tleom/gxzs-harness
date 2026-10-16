@@ -5,7 +5,7 @@ import path from 'node:path'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { decodeSessionReferenceUri, formatSessionReferenceMention } from '@deepseek-ai/dsh-session-reference'
 import { admitSandboxAttachments, prepareNativeFiles } from './attachments.js'
-import { normalizeResourceMentions, appendResourceInstructions, pluginId, pluginName, resolvePlugin, positionResourceMentions, resourceTextHash } from './resource-mentions.js'
+import { normalizeResourceMentions, appendResourceInstructions, pluginId, pluginName, resolvePlugin, positionResourceMentions, resourceTextHash, goalMentionResources } from './resource-mentions.js'
 import { appendSkillInvocations, assertSkillInvocationClaims, resolveSkillInvocations, skillGestureNames, skillInvocationClaims } from './skill-invocations.js'
 import { httpError } from './http.js'
 import { decodeCursor } from './cursor.js'
@@ -105,7 +105,9 @@ export class WorkbenchService {
     const allowed = ownedSessionRoots(this.database.listChats(owner.ownerId), metadata, archived)
     return [
       ...files.map(item => ({ ...item, group: 'files', label: item.path })),
-      ...candidates.filter(item => allowed.has(item.sessionId) && (!byIdentity || item.sessionId === sessionQuery))
+      ...candidates.filter(item => allowed.has(item.sessionId) && (byIdentity
+        ? item.sessionId === sessionQuery
+        : allowed.get(item.sessionId).rootSessionId === item.sessionId))
         .slice(0, this.sessionReferences.config.candidateLimit)
         .map(({ cwd, ...item }) => ({ ...item, chatId: allowed.get(item.sessionId).chatId,
           ...(allowed.get(item.sessionId).rootSessionId !== item.sessionId ? {
@@ -986,6 +988,8 @@ export class WorkbenchService {
 
   async getControl(owner, chatId) {
     const chat = this.requireChat(owner, chatId)
+    const withGoalResources = value => value.goal ? { ...value, goal: { ...value.goal,
+      mentioned_resources: goalMentionResources(this.database.goalRun(chat.sessionId), value.goal.objective) } } : value
     let state = this.database.getControl(owner.ownerId, chatId)
     const agent = this.agents.get(chat.sessionId)
     if (!agent && state.goal) state = { ...state, goal: { ...state.goal, activation: 'disarmed' } }
@@ -994,7 +998,7 @@ export class WorkbenchService {
       state = { ...state, goal: goal ? { ...goal, reason: goalFailureReason(goal, this.database.goalRun(chat.sessionId)),
         max_rounds: goal.maxGoalRounds, rounds_started: goal.roundsStarted, last_run_id: this.database.goalRun(chat.sessionId)?.id ?? null } : null }
     }
-    if (!this.sessionQuery) return state
+    if (!this.sessionQuery) return withGoalResources(state)
     const source = await this.sessionQuery.observeSession(chat.sessionId)
     try {
       const plan = source.projections?.values?.plan ?? { active: false, pending: false }
@@ -1005,9 +1009,9 @@ export class WorkbenchService {
           reason: goalFailureReason({ ...goal, activation: 'disarmed' }, this.database.goalRun(chat.sessionId)), max_rounds: goal.maxGoalRounds,
           rounds_started: projection.roundsStarted, last_run_id: this.database.goalRun(chat.sessionId)?.id ?? null } : null }
       }
-      return { ...state, plan, contextPressure: source.projections?.values?.contextPressure ?? null,
+      return withGoalResources({ ...state, plan, contextPressure: source.projections?.values?.contextPressure ?? null,
         contextBreakdown: source.projections?.values?.contextBreakdown ?? null,
-        commands: nativeCommandRecords(source.events ?? [], this.database.listRuns(owner.ownerId, chatId)) }
+        commands: nativeCommandRecords(source.events ?? [], this.database.listRuns(owner.ownerId, chatId)) })
     } finally { source[Symbol.dispose]?.() }
   }
 

@@ -19,11 +19,17 @@ export class HistoryPresentation {
 
   accept(frame) {
     const display = { replace: frame.type === 'snapshot', events: [], retire_attempts: [] }
+    // A reconnect snapshot can replay thousands of chunks from the same turn.
+    // Resolve its immutable view once per frame, not once per chunk. Keeping the
+    // map local also re-observes changed bindings/presentation on the next frame.
+    const runs = new Map()
     const project = entry => {
       const event = entry.event
       if (event.type === 'compaction/summary') this.compactions.set(event.data.compactionId, event.data)
       if (Number.isInteger(event.data?.turn)) this.turn = event.data.turn
-      const run = this.resolveRun(event.data?.turn ?? this.turn)
+      const turn = event.data?.turn ?? this.turn
+      if (!runs.has(turn)) runs.set(turn, this.resolveRun(turn))
+      const run = runs.get(turn)
       if (!run) return
       const checkpoint = event.type === 'user/message' && event.surfaceOp?.op === 'replace' ? event.data.source : undefined
       if (checkpoint?.kind === 'compact-checkpoint' && !checkpoint.sourceCommandId) {

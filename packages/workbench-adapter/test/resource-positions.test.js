@@ -1,5 +1,14 @@
 import { expect, it } from 'vitest'
-import { positionResourceMentions, runResourceContext, resourceTextHash } from '../src/resource-mentions.js'
+import { positionResourceMentions, runResourceContext, resourceTextHash, goalMentionResources } from '../src/resource-mentions.js'
+
+it('keeps goal display positions only for their captured objective and never mutates the durable snapshot', () => {
+  const resources = [{ kind: 'skills', id: 'official-docx', name: '公文排版', offset: 2 }]
+  const run = { selection: { mentioned_resources: resources, resource_position_hash: resourceTextHash('排版用这个') } }
+  expect(goalMentionResources(run, '排版用这个')).toEqual(resources)
+  expect(goalMentionResources(run, '重新整理报告')).toEqual([{ kind: 'skills', id: 'official-docx', name: '公文排版' }])
+  expect(resources[0].offset).toBe(2)
+  expect(goalMentionResources(undefined, '目标')).toEqual([])
+})
 
 it('retains inline order and offsets using only server-owned resource names and scope', () => {
   const resources = [{ kind: 'skills', id: 'legal', name: '法律研究' }, { kind: 'tools', id: 'global:mcp:law:lookup', name: '法律检索' }]

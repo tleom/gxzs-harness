@@ -18,13 +18,13 @@ const catalog = ['global', 'personal'].map(scope => ({
 
 async function setup(mode = 'native') {
   const names = platformToolNames(catalog), calls = []
-  let available = catalog, run = { id: 'run-1', ownerId: 'owner-a', status: 'running', mcpTools: catalog }
+  let available = catalog, plugins = [], run = { id: 'run-1', ownerId: 'owner-a', status: 'running', mcpTools: catalog }
   const personalName = names.get(catalog[1].id)
   const h = await mount({ rows: [], mode, mountDiscovery: false,
     script: [call('tool_search', { query: '档案', name: 'my_records' }, mode), call(personalName, { query: 'one' }, mode), response()],
     bridgeFactory: async ctx => {
       ctx.provide('workbenchPlatformClient', { json: async request => {
-        if (request.route === 'mcp/catalog') return { tools: available }
+        if (request.route === 'mcp/catalog') return { tools: available, plugins }
         calls.push(JSON.parse(request.body.toString()))
         return { data: { result: { result: { content: [{ type: 'text', text: 'fixture archived record' }] } } } }
       } })
@@ -43,8 +43,31 @@ async function setup(mode = 'native') {
   return { ...h, names, calls, personalName,
     setRun: value => { run = value }, getRun: () => run,
     setAvailable: async value => { available = value; await h.ctx.parallel('workbench/resources-changed') },
+    setPlugins: async value => { plugins = value; await h.ctx.parallel('workbench/resources-changed') },
   }
 }
+
+for (const mode of ['native', 'ptc']) test(`${mode}: unrelated plugin refreshes do not interrupt a multi-step task`, async () => {
+  const h = await setup(mode); await h.remount()
+  const agent = await h.create()
+  let executed = 0
+  h.ctx.tools.register({ name: 'local_probe', description: 'Local operation without MCP', parameters: { type: 'object', properties: {} },
+    output: { schema: { type: 'string' }, render: () => [{ type: 'text', text: 'ok' }] },
+    execute: async () => { executed++; return 'ok' },
+  })
+  h.adapter.script = [call('local_probe', {}, mode), call('tool_search', { query: '档案', name: 'my_records' }, mode),
+    ...Array.from({ length: 32 }, () => call('local_probe', {}, mode)), call(h.personalName, { query: 'one' }, mode), response()]
+  h.ctx.on('agent/pre-step', async ({ step }, next) => {
+    if (step > 1) await h.setPlugins([{ id: 'global:mcp:weather', name: 'weather', displayName: '天气', scope: 'global',
+      description: `Metadata refresh ${step}`, available: step % 2 === 0 }])
+    return next()
+  })
+  await h.send(agent)
+  assert.equal(h.adapter.requests.length, 36)
+  assert.equal(executed, 33, 'completed operations are never replayed')
+  assert.equal(h.calls.length, 1)
+  assert.equal(agent.session.snapshotEvents().at(-1).data.reason.kind, 'completed')
+})
 
 for (const mode of ['native', 'ptc']) test(`${mode}: actual MCP bridge startup, discovery, authorized proxy dispatch and HMR stay fail closed`, async () => {
   const h = await setup(mode), agent = await h.create()

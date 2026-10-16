@@ -77,6 +77,7 @@ def test_first_use_creates_once_and_reuses_workspace(tmp_path, monkeypatch):
     assert first == second
     assert first['ready'] is False
     assert first['state'] == 'provisioning'
+    assert first['initial_creation'] is True
     assert len([call for call in docker.call_args_list if call.args[0] == 'create']) == 1
     assert sandbox.call_count == 2
     assert 'platform_token' not in first
@@ -87,6 +88,49 @@ def test_first_use_creates_once_and_reuses_workspace(tmp_path, monkeypatch):
     assert create[create.index('--network') + 1] == 'owner-network'
     assert 'sandbox-workspace-files:/workspace:ro' in create
     assert not any(value.endswith(':/workspace') for value in create)
+
+
+def test_existing_sandbox_without_host_is_not_first_creation(tmp_path, monkeypatch):
+    host, docker, _, payload, _ = setup(tmp_path, monkeypatch)
+    original = docker.side_effect
+    def operate(*args, **kwargs):
+        if args[:2] == ('ps', '-a'):
+            return SimpleNamespace(returncode=0, stdout='sandbox-workspace\n')
+        return original(*args, **kwargs)
+    docker.side_effect = operate
+    assert host.ensure('workspace', payload)['initial_creation'] is False
+
+
+def test_first_creation_finishes_once_and_recovery_does_not_reuse_the_hint(tmp_path, monkeypatch):
+    host, _, _, payload, _ = setup(tmp_path, monkeypatch)
+    assert host.ensure('workspace', payload)['initial_creation'] is True
+    maintain(host)
+    record = host.root / 'workspace' / 'host.json'
+    item = json.loads(record.read_text())
+    assert item['ready'] is True and item['initial_creation'] is False
+    assert host.ensure('workspace', payload)['initial_creation'] is False
+
+
+def test_unknown_container_inventory_does_not_claim_first_creation(tmp_path, monkeypatch):
+    host, docker, _, payload, _ = setup(tmp_path, monkeypatch)
+    original = docker.side_effect
+    def operate(*args, **kwargs):
+        if args[:2] == ('ps', '-a'):
+            return SimpleNamespace(returncode=1, stdout='')
+        return original(*args, **kwargs)
+    docker.side_effect = operate
+    assert host.ensure('workspace', payload)['initial_creation'] is False
+
+
+@pytest.mark.parametrize('state', ['ready', 'stopped'])
+def test_existing_generation_restart_does_not_claim_initial_creation(tmp_path, monkeypatch, state):
+    host, _, _, payload, _ = setup(tmp_path, monkeypatch)
+    host.ensure('workspace', payload)
+    record = host.root / 'workspace' / 'host.json'
+    item = json.loads(record.read_text())
+    item.update(state=state, ready=True)
+    host._save(record, item)
+    assert host.ensure('workspace', payload)['initial_creation'] is False
 
 
 def upgrade_setup(tmp_path, monkeypatch):
@@ -521,6 +565,7 @@ def test_live_unready_host_accumulates_failure_without_state_regression(tmp_path
     record.write_text(json.dumps(item))
     host.healthy.return_value = False
     host.alive = Mock(return_value=True)
+    host.native_activity.return_value = None
     host.failures['host-1'] = time.time()
     host.admission.busy.return_value = 1
     host.heartbeat.reset_mock()
@@ -547,6 +592,7 @@ def test_external_catalog_degradation_pauses_admission_without_restarting_pair(t
     record.write_text(json.dumps(item))
     host.healthy.return_value = False
     host.alive = Mock(return_value=True)
+    host.native_activity.return_value = None
     health = {'live': True, 'ready': False, 'recovery': recovery,
               'resources': 'unavailable', 'recovery_dependency': 'mcp_catalog'}
     host.opener.open = Mock(side_effect=lambda *_args, **_kwargs: (_ for _ in ()).throw(HTTPError(
@@ -586,12 +632,13 @@ def test_current_pid_pressure_pauses_admission_and_recovers_without_restart(tmp_
 
 
 def test_dead_host_pair_is_fenced_and_restarted_after_liveness_grace(tmp_path, monkeypatch):
-    host, docker, sandbox, payload, _ = setup(tmp_path, monkeypatch)
+    host, docker, sandbox, payload, created = setup(tmp_path, monkeypatch)
     host.ensure('workspace', payload)
     record = host.root / 'workspace' / 'host.json'
     item = json.loads(record.read_text())
     item.update(state='ready', ready=True)
     record.write_text(json.dumps(item))
+    created['State']['Running'] = False
     host.healthy.return_value = False
     host.alive = Mock(return_value=False)
     host.failures['host-1'] = 0
@@ -747,10 +794,66 @@ def test_recovering_ready_host_rejects_new_acquire_without_regressive_ensure(tmp
     assert host.ensure('workspace', payload) == current
     host.heartbeat.assert_not_called()
     request = {**payload, 'run_id': 'r', 'chat_id': 'c'}
-    with pytest.raises(ValueError, match='not ready'):
+    with pytest.raises(ResourceUnavailable) as error:
         host.schedule('workspace', {**request, 'action': 'acquire'})
+    assert error.value.code == 'HOST_NOT_READY'
+    assert error.value.retry_after == 2
     host.schedule('workspace', {**request, 'action': 'renew'})
     assert host.admission.request.call_args.args[5] == 'renew'
+    current['ready'] = True
+    record.write_text(json.dumps(current))
+    host.admission.request.return_value = {'state': 'running'}
+    assert host.schedule('workspace', {**request, 'action': 'acquire'}) == {'state': 'running'}
+
+
+@pytest.mark.parametrize('alive,busy', [(True, 1), (False, 1), (True, 0), (False, 0)])
+def test_probe_outage_cannot_kill_running_pair_after_recovery_grace(tmp_path, monkeypatch, alive, busy):
+    host, docker, _, payload, _ = setup(tmp_path, monkeypatch)
+    host.ensure('workspace', payload)
+    record = host.root / 'workspace' / 'host.json'
+    item = json.loads(record.read_text())
+    item.update(state='ready', ready=True)
+    record.write_text(json.dumps(item))
+    host.healthy.return_value = False
+    host.alive = Mock(return_value=alive)
+    host.native_activity.return_value = None
+    host.admission.busy.return_value = busy
+    host.failures['host-1'] = 0
+    docker.reset_mock()
+    for _ in range(3):
+        maintain(host)
+    assert not any(call.args[0] in ('stop', 'rename', 'create') for call in docker.call_args_list)
+    host.admission.fence.assert_not_called()
+    assert json.loads(record.read_text()) == {**item, 'ready': False}
+    host.healthy.return_value = True
+    maintain(host)
+    assert json.loads(record.read_text()) == item
+
+
+def test_later_complete_activity_response_recovers_readiness_without_restart(tmp_path, monkeypatch):
+    host, docker, _, payload, _ = setup(tmp_path, monkeypatch)
+    host.ensure('workspace', payload)
+    host.healthy.return_value = False
+    host.alive = Mock(return_value=True)
+    host.failures['host-1'] = 0
+    host.native_activity.return_value['runningAgents'] = 1
+    docker.reset_mock()
+    maintain(host)
+    assert not any(call.args[0] in ('stop', 'rename', 'create') for call in docker.call_args_list)
+    assert json.loads((host.root / 'workspace' / 'host.json').read_text())['ready'] is True
+
+
+def test_unhealthy_sandbox_does_not_interrupt_admitted_work(tmp_path, monkeypatch):
+    host, docker, _, payload, created = setup(tmp_path, monkeypatch)
+    host.ensure('workspace', payload)
+    host.admission.busy.return_value = 1
+    created['State']['Health'] = {'Status': 'unhealthy'}
+    host.alive = Mock(return_value=True)
+    host.failures['host-1'] = 0
+    docker.reset_mock()
+    maintain(host)
+    assert not any(call.args[0] in ('stop', 'rename', 'create') for call in docker.call_args_list)
+    host.admission.fence.assert_not_called()
 
 
 def test_schedule_validates_owner_and_stopped_host(tmp_path, monkeypatch):

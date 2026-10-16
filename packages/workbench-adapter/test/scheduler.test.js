@@ -221,6 +221,27 @@ it('keeps a goal active across a renewal timeout without fencing its tools', asy
   expect(scheduler.hasAdmission('s')).toBe(true)
 })
 
+it('keeps the same queued task across Host readiness loss and dispatches it once after recovery', async () => {
+  const { db, scheduler, create, permit, platform, sessions } = setup()
+  const run = create('recovering host')
+  db.saveSubmission('t:1', run.id, [{ type: 'text', text: 'one task' }])
+  const ticket = db.submission('t:1', run.id).ticketId
+  const request = platform.json.getMockImplementation()
+  platform.json.mockRejectedValue(Object.assign(new Error('个人工作环境正在恢复，任务等待准入'),
+    { status: 503, code: 'HOST_NOT_READY', retryAfter: 2 }))
+  for (let i = 0; i < 3; i++) await scheduler.tick()
+  expect(db.getRun('t:1', run.id).status).toBe('queued')
+  expect(db.submission('t:1', run.id).ticketId).toBe(ticket)
+  expect(sessions.prompt).not.toHaveBeenCalled()
+  expect(sessions.cancel).not.toHaveBeenCalled()
+  platform.json.mockImplementation(request)
+  permit()
+  await scheduler.tick()
+  await scheduler.tick()
+  expect(sessions.prompt).toHaveBeenCalledTimes(1)
+  expect(db.submission('t:1', run.id).ticketId).toBe(ticket)
+})
+
 it('uses a new durable ticket for an explicit failed-run retry', async () => {
   const { db, sessions, scheduler, create, permit, platform, agent } = setup()
   const run = create('retry')

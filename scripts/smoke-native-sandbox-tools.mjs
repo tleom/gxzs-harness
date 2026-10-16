@@ -114,7 +114,8 @@ try {
       callbacks.get('session/event')(session,{type:'turn/start',data:{turn:1}})
       const actor={agent:{session},name:'write',arguments:{file_path:source,content:'after\n'}}
       await callbacks.get('tools/pre-execute')(actor,async()=>{
-        await callbacks.get('fs/write-intent')(source,actor,()=>undefined)
+        const target=await ctx.fs.resolve(source)
+        await callbacks.get('fs/write-intent')(target,actor,()=>undefined)
         return execute('write',{file_path:source,content:'after\n'})
       })
       callbacks.get('session/event')(session,{type:'tool/result',seq:10,data:{turn:1}})
