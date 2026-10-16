@@ -409,6 +409,16 @@ export class WorkbenchDatabase {
     return row ? decodeRun(row) : undefined
   }
 
+  /** Streaming needs only the current binding, never the frozen MCP schemas. */
+  streamRunForTurn(sessionId, turn) {
+    this.streamRunStatement ??= this.db.prepare(`SELECT r.id, r.owner_id AS ownerId FROM runs r
+      JOIN chats c ON c.id=r.chat_id AND c.session_id=r.session_id AND c.owner_id=r.owner_id
+      LEFT JOIN run_turns t ON t.run_id=r.id
+      WHERE r.session_id=? AND (t.turn_number=? OR r.turn_number=?) AND c.deleted_at IS NULL
+      AND r.status NOT IN ('steered', 'discarded') ORDER BY r.queue_order LIMIT 1`)
+    return this.streamRunStatement.get(sessionId, turn, turn)
+  }
+
   runForMessage(sessionId, messageId) {
     if (typeof messageId !== 'string') return undefined
     const row = this.db.prepare('SELECT * FROM runs WHERE session_id=? AND message_id=?').get(sessionId, messageId)

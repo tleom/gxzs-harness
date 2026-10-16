@@ -3,6 +3,13 @@ import { createHash } from 'node:crypto'
 
 export const resourceTextHash = text => createHash('sha256').update(text).digest('hex')
 
+/** Display positions belong to the exact objective they were captured from. */
+export function goalMentionResources(run, objective) {
+  const resources = run?.selection?.mentioned_resources ?? []
+  return run?.selection?.resource_position_hash && run.selection.resource_position_hash !== resourceTextHash(objective)
+    ? resources.map(({ offset: _offset, ...resource }) => resource) : resources
+}
+
 export function runResourceContext(run, objective) {
   const text = run?.selection?.resource_context
   if (run?.selection?.command !== 'goal' || typeof objective !== 'string'

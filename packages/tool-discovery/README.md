@@ -48,12 +48,14 @@ readiness before releasing them. This protects initialization and hot reload.
 
 ## Discovery lifecycle
 
-- Initial prompt: Markdown plugin summaries in a native user `system-reminder`
-  message and the two discovery tools. Summaries contain only name, display name,
-  full description and tool count. They are refreshed after changes or when no
-  longer visible after compaction; internal IDs and scopes stay host-side.
-- `mcp({})`: list installed, authorized plugins, including empty or unavailable
-  providers. An unavailable provider has an unknown (`null`) tool count.
+- Initial prompt: Markdown plugin summaries inside `<available_plugins>` in a
+  native user `system-reminder`, followed by usage rules, matching the skill
+  catalog structure. Each available, authorized plugin has its name, display name,
+  full description and tool count. Unavailable or unauthorized plugins and their
+  diagnostic status lines are omitted. Summaries refresh after visible changes
+  or when no longer visible after compaction; internal IDs and scopes stay host-side.
+- `mcp({})`: list the same available, authorized plugins as the session summaries.
+  An available plugin with an empty tool directory has a count of zero.
 - `mcp({name})`: all tool names and full descriptions for that plugin, without
   pagination or a 64 KiB result cap. This does not activate any tools.
 - `mcp({name, tools: ["first", "second"]})`: exact batch inspection and loading.
@@ -70,6 +72,11 @@ readiness before releasing them. This protects initialization and hot reload.
   DSH controls disk flushing; this does not promise fsync before the request. Lost
   hints only require rediscovery. A synchronous system-prompt variable
   refreshes the mask before native schema and PTC SDK generation.
+- Request consistency compares this Agent's loaded definitions and authority,
+  not the entire inventory revision or unloaded-tool mask. Unrelated plugin
+  refreshes do not abort native work. Preview assemblies cannot replace the
+  native request's snapshot; changed loaded definitions or authorization still
+  block that step before it reaches the provider.
 - Restore: intersect persisted hints with current authorization, exact definitions
   and current budgets. A different authority starts without loaded tools.
 
@@ -89,8 +96,9 @@ Activation byte budgets count the callable `name`, `description` and `parameters
 The full source metadata still counts toward the index budget and definition
 fingerprint. `inputSchema` is returned separately only when it differs from
 `parameters`, preserving source constraints without duplicating an identical schema.
-Installed plugin metadata remains visible after recovery even if the current
-run's frozen authorization excludes its tools; discovery reports
+The complete installed inventory is retained internally after recovery, including
+plugins excluded by the run's frozen authorization. Model-facing directories
+filter those entries; an explicit call naming an unauthorized plugin still reports
 `run_authorization_required` and never grants new capabilities itself.
 
 Use `replace_active: true` with a query to replace the loaded set at the next

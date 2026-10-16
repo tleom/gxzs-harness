@@ -25,7 +25,8 @@ for (const mode of ['native', 'ptc']) for (const budget of ['count', 'bytes']) {
     assert.deepEqual(h.executions, [])
     assert.equal(h.adapter.requests.length, 3)
     assert.equal(h.ctx.tools.get('lookup_0', agent), undefined)
-    assert.match(JSON.stringify(h.adapter.requests[0].messages), /工具发现目录超过/)
+    assert.match(JSON.stringify(h.adapter.requests[0].messages), /当前没有可用插件/)
+    assert.doesNotMatch(JSON.stringify(h.adapter.requests[0].messages), /工具发现目录超过/)
     assert.ok(agent.session.snapshotEvents().some(event => event.type === 'tool/result'
       && JSON.stringify(event.data).includes('unavailable')))
     h.bridge.rows = rows.slice(0, 1); h.bridge.notify()
@@ -35,13 +36,14 @@ for (const mode of ['native', 'ptc']) for (const budget of ['count', 'bytes']) {
   })
 }
 
-test('a missing discovery allowlist entry produces an accurate policy notice', async () => {
+test('a missing discovery allowlist entry leaves an empty catalog without policy status lines', async () => {
   const h = await mount({ script: [response()] }); cleanups.push(() => h.close())
   const agent = await h.create()
   agent.ctx.tools.restrict({ allow: ['case_lookup'] })
   await h.send(agent)
   assert.deepEqual(h.adapter.requests[0].tools ?? [], [])
-  assert.match(JSON.stringify(h.adapter.requests[0].messages), /当前会话策略未允许/)
+  assert.match(JSON.stringify(h.adapter.requests[0].messages), /当前没有可用插件/)
+  assert.doesNotMatch(JSON.stringify(h.adapter.requests[0].messages), /当前会话策略未允许/)
   assert.doesNotMatch(JSON.stringify(h.adapter.requests[0].messages), /需要插件能力时先调用/)
 })
 
@@ -54,7 +56,7 @@ for (const mode of ['native', 'ptc']) test(`${mode}: independently denied candid
   const agent = await h.create(); agent.ctx.tools.restrict({ deny: ['lookup_denied'] })
   await h.send(agent)
   assert.deepEqual(h.executions, ['lookup_allowed'])
-  assert.match(JSON.stringify(h.adapter.requests[1].messages), /最近一次准备有 1 项未获当前会话策略许可/)
+  assert.doesNotMatch(JSON.stringify(h.adapter.requests[1].messages), /最近一次准备.*未获当前会话策略许可/)
   assert.deepEqual(h.ctx.sessionProjections.stateOf(agent.session, PROJECTION_KEY).tools.map(tool => tool.name), ['lookup_allowed'])
   assert.ok(!agent.session.snapshotEvents().filter(event => event.type === ACTIVE_EVENT)
     .some(event => JSON.stringify(event.data).includes('lookup_denied')))
@@ -66,7 +68,7 @@ test('a snapshot failure remains fail closed without aborting native conversatio
   const agent = await h.create(); await h.send(agent)
   assert.equal(h.adapter.requests.length, 1)
   assert.equal(h.ctx.tools.get('case_lookup', agent), undefined)
-  assert.match(JSON.stringify(h.adapter.requests[0].messages), /插件目录暂不可用/)
+  assert.match(JSON.stringify(h.adapter.requests[0].messages), /当前没有可用插件/)
 })
 
 for (const snapshot of [null, undefined, []]) test(`invalid snapshot ${String(snapshot)} leaves native conversation usable`, async () => {
@@ -75,7 +77,7 @@ for (const snapshot of [null, undefined, []]) test(`invalid snapshot ${String(sn
   const agent = await h.create(); await h.send(agent)
   assert.equal(h.adapter.requests.length, 1)
   assert.equal(h.ctx.tools.get('case_lookup', agent), undefined)
-  assert.match(JSON.stringify(h.adapter.requests[0].messages), /插件目录暂不可用/)
+  assert.match(JSON.stringify(h.adapter.requests[0].messages), /当前没有可用插件/)
 })
 
 test('a scoped search replacement does not receive plugin discovery instructions', async () => {
@@ -86,5 +88,5 @@ test('a scoped search replacement does not receive plugin discovery instructions
   await h.send(agent)
   assert.equal(h.adapter.requests[0].tools.find(tool => tool.name === 'tool_search').description, 'Search local notebook')
   assert.doesNotMatch(JSON.stringify(h.adapter.requests[0].messages), /需要插件能力时先调用/)
-  assert.match(JSON.stringify(h.adapter.requests[0].messages), /当前会话未允许 tool_search/)
+  assert.doesNotMatch(JSON.stringify(h.adapter.requests[0].messages), /tool_search 搜索并加载工具/)
 })

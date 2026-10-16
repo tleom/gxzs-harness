@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from 'vitest'
 import { WorkbenchDatabase } from '../src/persistence.js'
 import { createAssistantStreamProjector, projectInboxClaim, projectSessionEvent } from '../src/projection.js'
+import { resourceTextHash } from '../src/resource-mentions.js'
 
 const opened = []
 afterEach(() => opened.splice(0).forEach((database) => database.close()))
@@ -22,6 +23,20 @@ function bind(database, chat, run, turn = 1) {
 }
 
 describe('DSH session event projection', () => {
+  it('carries goal tag positions through native control events and drops stale positions after an objective edit', () => {
+    const { database, chat, run } = setup()
+    const mentions = [{ kind: 'skills', id: 'official-docx', name: '公文排版', offset: 2 }]
+    database.updateRunResources(run, { command: 'goal', mentioned_resources: mentions, resource_position_hash: resourceTextHash('排版用这个') }, [])
+    database.setGoalRun(chat.sessionId, run.id)
+    const change = objective => projectSessionEvent(database, chat.sessionId, { type: 'goal/change', data: {
+      operation: 'edit', goal: { id: 'goal', revision: 1, phase: 'paused', objective },
+    } })
+    change('排版用这个')
+    expect(database.getControl(chat.ownerId, chat.id).goal.mentioned_resources).toEqual(mentions)
+    change('新的目标内容')
+    expect(database.getControl(chat.ownerId, chat.id).goal.mentioned_resources)
+      .toEqual([{ kind: 'skills', id: 'official-docx', name: '公文排版' }])
+  })
   it('persists only gauge fields instead of copying the frozen MCP catalog into every context reading', () => {
     const { database, chat, run } = setup()
     bind(database, chat, run)

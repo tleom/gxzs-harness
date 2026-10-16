@@ -114,13 +114,21 @@ class Hosts:
                     # Restart only after fencing any surviving tool processes.
                     self.docker('stop', '--time', '10', sandbox)
                     self._fence(workspace, owner, instance)
+            # Only a new owner with neither container receives the first-use UI.
+            # Retain that fact across bootstrap retries; recovery of an existing
+            # pair (including stopped or migrated containers) is ordinary loading.
+            initial_creation = generation == 1 and current.get('initial_creation') is True and current.get('state') == 'provisioning'
+            if not current and generation == 1 and info.returncode:
+                existing_sandbox = self.docker('ps', '-a', '--filter', 'name=^/' + sandbox + '$',
+                                               '--format', '{{.Names}}', check=False)
+                initial_creation = existing_sandbox.returncode == 0 and not existing_sandbox.stdout.strip()
             # Persist ownership before provisioning, including failed starts.
             # A replacement inherits the original volume, including adopted
             # instance-home names. Fresh hosts use a stable workspace volume.
             home_volume = current.get('home_volume') or (instance + '-home' if not info.returncode else 'gxzs-dsh-' + workspace + '-home')
             current.update(owner_id=owner, workspace_id=workspace, generation=generation,
                            instance_id=instance, ready=False, state='provisioning', home_volume=home_volume,
-                           desired_image_digest=desired_digest)
+                           desired_image_digest=desired_digest, initial_creation=initial_creation)
             temporary = record.with_suffix('.tmp')
             temporary.write_text(json.dumps(current))
             temporary.replace(record)
@@ -663,7 +671,7 @@ class Hosts:
                 if not info['State']['Running']:
                     raise ValueError('Scheduling host is stopped')
             if managed and payload['action'] == 'acquire' and item.get('ready') is not True and not draining_ticket:
-                raise ValueError('Host is not ready; new task admission is paused')
+                raise ResourceUnavailable('个人工作环境正在恢复，任务等待准入', 'HOST_NOT_READY', 2)
             (self.root.parent / workspace).touch()
             return self.admission.request(payload['owner_id'], int(payload['generation']), payload['instance_id'],
                                           payload.get('ticket_id') or payload['run_id'], payload['chat_id'], payload['action'], bool(payload.get('retry')))
@@ -715,7 +723,10 @@ class Hosts:
                                        and self.dependency_degraded(item['endpoint']))
             process_pressure = bool(host_running and sandbox_running and
                                     (pid_pressure(info) or pid_pressure(sandbox_info)))
-            native_activity = self.native_activity(item['endpoint']) if healthy else None
+            native_activity = self.native_activity(item['endpoint']) if healthy or alive else None
+            # A later complete readiness/activity response supersedes an earlier
+            # timed-out probe. Do not recover a Host that has already caught up.
+            healthy = healthy or (sandbox_healthy and native_activity is not None)
             with self.lock(record.parent.name):
                 item = json.loads(record.read_text())
                 if item != observed:
@@ -750,6 +761,8 @@ class Hosts:
                     if item.get('state') == 'draining':
                         heartbeats.append((dict(item), 'draining'))
                         return
+                    if item.get('state') == 'provisioning' and item.get('initial_creation') is True:
+                        item['initial_creation'] = False
                     item.update(state='ready', ready=True)
                     self._save(record, item)
                     heartbeats.append((dict(item), 'ready'))
@@ -786,6 +799,15 @@ class Hosts:
                          (180 if item.get('state') == 'provisioning' else 60))
                 recovery = self.recoveries.get(item['instance_id'], {})
                 if now - since <= grace or now < recovery.get('next_retry_at', 0):
+                    return
+                # A timed-out HTTP probe does not prove a running process is
+                # dead. Preserve admitted/native work, including when the busy
+                # event loop cannot answer the activity read. A stopped/missing
+                # container remains definitive evidence and can be recovered.
+                if host_running and sandbox_running and (self.admission.busy(item['owner_id'])
+                        or (item.get('state') != 'provisioning' and (native_activity is None
+                            or any(native_activity[key] for key in
+                                   ('runningAgents', 'pendingMessages', 'runningJobs', 'activeSettingsWrites'))))):
                     return
                 attempts = int(recovery.get('attempts', 0)) + 1
                 reason = ('host_missing' if info is None else

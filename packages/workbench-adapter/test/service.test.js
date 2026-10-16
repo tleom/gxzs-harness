@@ -7,6 +7,7 @@ import { publishedModels } from './model-fixture.js'
 import { Context } from '@deepseek-ai/cordis'
 import SessionReferences from '@deepseek-ai/dsh-session-reference'
 import { goalFailureReason } from '../src/run-failure.js'
+import { resourceTextHash } from '../src/resource-mentions.js'
 
 function referenceResolver(test, candidates) {
   test.service.sessionQuery = { listSessions: vi.fn(async () => candidates),
@@ -50,6 +51,25 @@ function setup() {
   service.onGoalChanged = vi.fn(() => vi.fn())
   return { database, owner, chat, service, sessionController, agents, commands, skills, fileManager, platformClient, agent }
 }
+
+it.each([true, false])('includes durable positioned tags in %s live goal controls without relying on loaded history', async live => {
+  const { service, owner, chat, database, agents } = setup()
+  const goal = { id: 'goal', objective: '排版用这个', revision: 1, phase: 'paused' }
+  const mentions = [{ kind: 'skills', id: 'official-docx', name: '公文排版', offset: 2 }]
+  const { run } = database.createRun({ ownerId: owner.ownerId, chatId: chat.id, sessionId: chat.sessionId,
+    query: goal.objective, selection: { command: 'goal', resource_position_hash: resourceTextHash(goal.objective), mentioned_resources: mentions } })
+  database.setGoalRun(chat.sessionId, run.id)
+  service.goals = { get: () => goal }
+  const dispose = vi.fn()
+  service.sessionQuery = { observeSession: async () => ({ projections: { values: { goal: { goal } } }, events: [], [Symbol.dispose]: dispose }) }
+  if (!live) agents.get.mockReturnValue(undefined)
+  expect((await service.getControl(owner, chat.id)).goal.mentioned_resources).toEqual(mentions)
+  goal.objective = '新的目标内容'
+  expect((await service.getControl(owner, chat.id)).goal.mentioned_resources)
+    .toEqual([{ kind: 'skills', id: 'official-docx', name: '公文排版' }])
+  expect(database.goalRun(chat.sessionId).selection.mentioned_resources).toEqual(mentions)
+  expect(dispose).toHaveBeenCalledTimes(2)
+})
 
 it('keeps a legacy context snapshot small on follow-up polls while retaining the durable reading', () => {
   const { database, owner, chat, service } = setup()
@@ -488,7 +508,7 @@ describe('followup and control service', () => {
     archivedSessionIds = []
     expect((await service.referenceCandidates(owner, chat.id)).at(-1)).toMatchObject({ chatId: source.id })
   })
-  it('keeps native descendant references attached to their visible platform root and excludes archived ancestry', async () => {
+  it('hides descendants from picker searches while resolving existing references and excluding archived ancestry', async () => {
     const test = setup()
     const { service, owner, chat } = test
     referenceResolver(test, [{ sessionId: 'child', label: '子任务', cwd: '/workspace/private' }, { sessionId: 'grandchild', label: '孙任务' }, { sessionId: 'foreign-child', label: '外部' }])
@@ -496,15 +516,20 @@ describe('followup and control service', () => {
       { header: { id: chat.sessionId } }, { header: { id: 'child', parentSession: chat.sessionId } },
       { header: { id: 'grandchild', parentSession: 'child' } }, { header: { id: 'foreign-child', parentSession: 'foreign' } },
     ])
-    const candidates = await service.referenceCandidates(owner, chat.id)
-    expect(candidates.map(item => item.sessionId)).toEqual(['child', 'grandchild'])
-    expect(candidates[0]).toMatchObject({ chatId: chat.id, origin: 'subagent', parentSessionId: chat.sessionId })
-    expect(candidates[1]).toMatchObject({ chatId: chat.id, origin: 'subagent', parentSessionId: 'child' })
-    expect(candidates[0]).not.toHaveProperty('cwd')
+    expect(await service.referenceCandidates(owner, chat.id)).toEqual([])
+    expect(await service.referenceCandidates(owner, chat.id, '子任务')).toEqual([])
+    const uri = id => `dsh-session:${Buffer.from(JSON.stringify(id)).toString('base64url')}`
+    const child = await service.referenceCandidates(owner, chat.id, uri('child'))
+    expect(child).toHaveLength(1)
+    expect(child[0]).toMatchObject({ chatId: chat.id, origin: 'subagent', parentSessionId: chat.sessionId })
+    expect(child[0]).not.toHaveProperty('cwd')
+    expect(await service.referenceCandidates(owner, chat.id, uri('grandchild')))
+      .toMatchObject([{ chatId: chat.id, origin: 'subagent', parentSessionId: 'child' }])
     service.workspaces = { baseline: vi.fn(async () => ({ archivedSessionIds: [chat.sessionId] })) }
     expect(await service.referenceCandidates(owner, chat.id)).toEqual([])
+    expect(await service.referenceCandidates(owner, chat.id, uri('child'))).toEqual([])
   })
-  it('applies native candidate limits after archive and ownership filtering, resolving renamed mentions by native URI', async () => {
+  it('applies native candidate limits after archive, ownership and subagent filtering, resolving renamed mentions by native URI', async () => {
     const { service, owner, chat, database, agent } = setup()
     const records = [], archivedSessionIds = []
     const cwd = service.chatDirectory(chat.id)
@@ -519,6 +544,8 @@ describe('followup and control service', () => {
       database.createChat({ ownerId: owner.ownerId, sessionId, selection: {} })
       records.push({ header: { id: sessionId, cwd, createdAt: 55 + index }, projections: { sessionTitle: { title: '新标题' } } })
     }
+    for (let index = 0; index < 55; index++)
+      records.push({ header: { id: `child-${index}`, parentSession: chat.sessionId, cwd, createdAt: 110 + index } })
     const ctx = new Context()
     try {
       ctx.provide('sessionQuery', { listSessions: vi.fn(async () => records) })

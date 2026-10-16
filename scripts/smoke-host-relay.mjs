@@ -74,7 +74,7 @@ try {
   }
   assert.equal(requests.length, 12)
   for (const [index, { headers }] of requests.entries()) {
-    assert.equal(headers.connection, 'keep-alive', 'The upstream owns its own reusable connection')
+    assert.equal(headers.connection, 'close', 'Each upstream request uses its own connection')
     assert.equal(headers['x-downstream-hop'], undefined)
     assert.equal(headers['last-event-id'], index % 3 === 1 ? '1-0' : undefined)
     assert.equal(headers['x-gxzs-assertion'], 'synthetic-assertion')

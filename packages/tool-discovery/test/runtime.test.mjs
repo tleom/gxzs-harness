@@ -234,7 +234,7 @@ test('native owned child and sibling roots have independent activation sets', as
   assert.equal(h.ctx.agents.get('owned-child'), undefined)
 })
 
-test('pre-schema guard picks up unnotified catalog changes and rejects changes after assembly', async () => {
+test('pre-schema guard picks up unnotified definition changes and tolerates inventory-only revisions', async () => {
   const h = await mount({ script: [call('tool_search', { query: '案件' }), response(), response()] })
   cleanups.push(() => h.close())
   const agent = await h.create(); await h.send(agent)
@@ -243,7 +243,45 @@ test('pre-schema guard picks up unnotified catalog changes and rejects changes a
   assert.deepEqual(assembly.tools.map(t => t.name), ['mcp', 'tool_search'])
   h.ctx.on('agent/pre-step', (payload, next) => { h.bridge.revision++; return next() })
   await h.send(agent)
-  assert.equal(h.adapter.requests.length, 2, 'changed request never reached provider')
+  assert.equal(h.adapter.requests.length, 3, 'inventory-only changes do not invalidate assembled schemas')
+})
+
+for (const mode of ['native', 'ptc']) for (const change of ['definition', 'authorization', 'run', 'availability'])
+  test(`${mode}: request guard rejects active ${change} changes even after a preview assembly`, async () => {
+    const h = await mount({ mode, script: [call('tool_search', { query: '案件' }, mode), response()] })
+    cleanups.push(() => h.close())
+    const agent = await h.create()
+    h.ctx.on('agent/pre-step', async ({ step }, next) => {
+      if (step === 2) {
+        if (change === 'definition') h.bridge.rows[0] = { ...h.bridge.rows[0], version: 'v2' }
+        if (change === 'authorization') h.bridge.rows = []
+        if (change === 'run') h.bridge.run = 'other-run'
+        if (change === 'availability') h.bridge.ready = false
+        h.bridge.notify()
+        await h.ctx.systemPrompt.assemble({ scope: agent })
+      }
+      return next()
+    })
+    await h.send(agent)
+    assert.equal(h.adapter.requests.length, 1, 'a preview cannot replace the original request snapshot')
+    assert.match(agent.session.snapshotEvents().at(-1).data.reason.error.message, /已加载的插件工具权限或定义/)
+    assert.equal(h.executions.length, 0)
+  })
+
+for (const mode of ['native', 'ptc']) test(`${mode}: adding an unloaded tool during preparation keeps it hidden without interrupting native work`, async () => {
+  const h = await mount({ mode })
+  cleanups.push(() => h.close())
+  const agent = await h.create()
+  h.ctx.on('agent/pre-step', (_payload, next) => {
+    const item = row('new', 'new_lookup')
+    h.bridge.rows.push(item); h.register(item); h.bridge.notify()
+    return next()
+  })
+  await h.send(agent)
+  assert.equal(h.adapter.requests.length, 1)
+  assert.ok(!JSON.stringify(h.adapter.requests[0]).includes('new_lookup'))
+  assert.equal(h.ctx.tools.get('new_lookup', agent), undefined)
+  assert.equal(agent.session.snapshotEvents().at(-1).data.reason.kind, 'completed')
 })
 
 test('browse returns the whole directory without activation and definition budgets report actionable statuses', async () => {

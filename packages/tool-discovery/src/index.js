@@ -2,7 +2,7 @@ import z from '@deepseek-ai/schemastery'
 import { appendPluginRecord } from '@deepseek-ai/dsh-session'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import {
-  MCP_NAME, TOOL_SEARCH_NAME, activationEntry, buildCatalog, hash, matchesEntry, pluginSummary, renderCatalog, search,
+  MCP_NAME, TOOL_SEARCH_NAME, activationEntry, availablePlugins, buildCatalog, hash, matchesEntry, pluginSummary, renderCatalog, search,
 } from './catalog.js'
 import { ACTIVE_EVENT, PROJECTION_KEY, discoveryProjection } from './projection.js'
 
@@ -113,6 +113,13 @@ export function apply(ctx, supplied = {}) {
     return new Map([...entries].filter(([, entry]) => visible.has(entry.name)))
   }
 
+  // Inventory revisions include unloaded plugins, labels and availability. Only
+  // the definitions exposed in this Agent's request can invalidate its schemas.
+  function requestSnapshot(state) {
+    const entries = state.catalog.ready ? visibleEntries(state, state.active) : new Map()
+    return JSON.stringify([state.authorityKey, [...entries.values()].sort((a, b) => a.id.localeCompare(b.id))])
+  }
+
   function refreshAll() {
     for (const agent of ctx.agents.list()) refresh(agent)
   }
@@ -203,7 +210,7 @@ export function apply(ctx, supplied = {}) {
       || args.tools.some(name => typeof name !== 'string' || !name))) throw new Error('tools 必须是非空工具名称数组')
     if (args.name === undefined) {
       if (args.tools !== undefined) throw new Error('加载工具时必须提供插件 name')
-      return { status: 'plugins', items: catalog.plugins.map(pluginSummary) }
+      return { status: 'plugins', items: availablePlugins(catalog).map(pluginSummary) }
     }
     const plugin = findPlugin(catalog, args.name)
     if (!plugin) return { status: 'not_found', items: [], message: `插件未找到或当前不可用：${args.name}；可调用 mcp({}) 查看当前目录。` }
@@ -352,21 +359,25 @@ export function apply(ctx, supplied = {}) {
   // rendering the PTC SDK. No interpolation is needed for this host-only guard.
   ctx.systemPrompt.variable('tool_discovery_snapshot', context => {
     const state = context.scope?.session ? refresh(context.scope) : undefined
-    if (state) state.assembled = { catalogKey: state.catalogKey, maskStamp: state.maskStamp }
+    // Catalog/preview assemblies may run concurrently with native assembly.
+    // They refresh their own view but cannot overwrite the in-flight guard.
+    if (state && context.agent === context.scope && context.signal)
+      state.assembled = { snapshot: requestSnapshot(state), signal: context.signal }
     return undefined
   })
-  ctx.on('agent/request', (payload, next) => {
+  ctx.on('agent/request', async (payload, next) => {
+    const config = await next()
     const state = refresh(payload.agent)
     payload.signal.throwIfAborted()
-    if (state.assembled?.catalogKey !== state.catalogKey || state.assembled?.maskStamp !== state.maskStamp)
-      throw new Error('插件目录在请求准备期间变化，请重试；本次请求尚未发送。')
+    if (state.assembled?.signal !== payload.signal || state.assembled?.snapshot !== requestSnapshot(state))
+      throw new Error('本步骤已加载的插件工具权限或定义发生变化，请重新提交任务；本步骤尚未发送。')
     if (state.unpersisted) {
       // Session forbids append from inside its event publication. This native
       // request hook runs after step/end and before the provider sees schemas.
       appendPluginRecord(state.agent.session, ACTIVE_EVENT, { version: 1, authorityKey: state.authorityKey, tools: [...state.active.values()] })
       state.unpersisted = false
     }
-    return next()
+    return config
   }, { global: true })
   ctx.systemPrompt.section({
     name: 'tools:discovery-rules', order: ctx.systemPrompt.getSectionOrder('TOOLS_SDK') - 1,
