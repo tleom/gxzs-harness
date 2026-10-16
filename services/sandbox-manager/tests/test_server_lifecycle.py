@@ -461,6 +461,67 @@ def test_http_body_framing_is_enforced_before_dispatch_on_a_real_socket(server, 
         worker.join(timeout=3)
 
 
+def test_short_control_request_burst_drains_without_exceeding_worker_limit(server, monkeypatch):
+    import concurrent.futures
+    import http.client
+    import threading
+    import time
+    from http.server import BaseHTTPRequestHandler
+
+    monkeypatch.setenv('WORKBENCH_MANAGER_MAX_REQUESTS', '4')
+    guard = threading.Lock()
+    active = maximum = 0
+
+    class ShortRequest(BaseHTTPRequestHandler):
+        def do_GET(self):
+            nonlocal active, maximum
+            with guard:
+                active += 1
+                maximum = max(maximum, active)
+            try:
+                time.sleep(.02)
+                self.send_response(200)
+                self.send_header('Content-Length', '2')
+                self.end_headers()
+                self.wfile.write(b'{}')
+            finally:
+                with guard:
+                    active -= 1
+
+        def log_message(self, *_):
+            pass
+
+    listener = server.BoundedHTTPServer(('127.0.0.1', 0), ShortRequest)
+    worker = threading.Thread(target=listener.serve_forever, daemon=True)
+    worker.start()
+    barrier = threading.Barrier(48)
+
+    def submit(_):
+        connection = http.client.HTTPConnection(*listener.server_address, timeout=5)
+        try:
+            barrier.wait(timeout=5)
+            connection.request('GET', '/')
+            response = connection.getresponse()
+            response.read()
+            return response.status
+        finally:
+            connection.close()
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=48) as pool:
+            assert list(pool.map(submit, range(48))) == [200] * 48
+        assert 1 < maximum <= 4
+        assert active == 0
+        # Every completed worker returns its permit, including after the burst.
+        for _ in range(4):
+            assert listener.capacity.acquire(timeout=1)
+        assert not listener.capacity.acquire(blocking=False)
+    finally:
+        listener.shutdown()
+        listener.server_close()
+        worker.join(timeout=3)
+
+
 @pytest.mark.parametrize('body', [b'', b'{}', b'{"action":"acquire"}'])
 def test_empty_or_partial_schedule_identity_never_enters_host_admission(server, monkeypatch, body):
     schedule = Mock(return_value={'ok': True})
