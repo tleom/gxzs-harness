@@ -1,4 +1,5 @@
 import { Service } from '@deepseek-ai/cordis'
+import { setTimeout as delay } from 'node:timers/promises'
 import z from '@deepseek-ai/schemastery'
 
 export const name = 'workbench-platform-client'
@@ -19,6 +20,13 @@ const ROUTES = new Set([
   'GET workbench/config',
   'POST scheduling',
 ])
+
+function transientConfigRead(error) {
+  return [502, 503, 504].includes(error?.upstreamStatus)
+    || ['ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'EAI_AGAIN',
+      'UND_ERR_SOCKET', 'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT']
+      .includes(error?.cause?.code ?? error?.code)
+}
 
 export class PlatformClient {
   constructor(config, { fetchImpl = globalThis.fetch } = {}) {
@@ -57,42 +65,53 @@ export class PlatformClient {
     requestSignal.throwIfAborted()
     const cacheKey = key === 'GET workbench/config' && !query ? owner.ownerId : null
     const cached = cacheKey ? this.configCache.get(cacheKey) : null
-    const response = await this.fetch(`${this.baseUrl}/${route}${query}`, {
-      method: method.toUpperCase(),
-      headers: {
-        authorization: `Bearer ${this.token}`,
-        'x-gxzs-owner': owner.ownerId,
-        'x-gxzs-host-generation': this.generation,
-        'x-gxzs-host-instance': this.instance,
-        ...(deadlineMs === undefined ? {} : { 'x-gxzs-deadline-ms': String(deadlineMs) }),
-        ...(cached ? { 'if-none-match': cached.etag } : {}),
-        ...(contentType ? { 'content-type': contentType } : {}),
-      },
-      body: body.length ? body : undefined,
-      signal: requestSignal,
-      redirect: 'error',
-    })
-    if (response.status === 304 && cached) return { status: 200, headers: cached.headers, bytes: cached.bytes.slice() }
-    const bytes = await readBoundedResponse(response, this.maxResponseBytes, requestSignal)
-    if (!response.ok) {
-      if (cacheKey) this.configCache.delete(cacheKey)
-      let message = '平台服务请求失败'
-      let code
+    for (let attempt = 0; ; attempt++) {
       try {
-        const payload = JSON.parse(Buffer.from(bytes).toString('utf8'))
-        message = payload.message || payload.msg || message
-        if (typeof payload.code === 'string' && /^[A-Za-z][A-Za-z0-9_/-]{0,99}$/.test(payload.code)) code = payload.code
-      } catch {}
-      throw Object.assign(new Error(message), { status: response.status >= 400 && response.status < 500 ? response.status : 502, ...(code ? { code } : {}) })
+        const response = await this.fetch(`${this.baseUrl}/${route}${query}`, {
+          method: method.toUpperCase(),
+          headers: {
+            authorization: `Bearer ${this.token}`,
+            'x-gxzs-owner': owner.ownerId,
+            'x-gxzs-host-generation': this.generation,
+            'x-gxzs-host-instance': this.instance,
+            ...(deadlineMs === undefined ? {} : { 'x-gxzs-deadline-ms': String(deadlineMs) }),
+            ...(cached ? { 'if-none-match': cached.etag } : {}),
+            ...(contentType ? { 'content-type': contentType } : {}),
+          },
+          body: body.length ? body : undefined,
+          signal: requestSignal,
+          redirect: 'error',
+        })
+        if (response.status === 304 && cached) return { status: 200, headers: cached.headers, bytes: cached.bytes.slice() }
+        const bytes = await readBoundedResponse(response, this.maxResponseBytes, requestSignal)
+        if (!response.ok) {
+          if (cacheKey) this.configCache.delete(cacheKey)
+          let message = '平台服务请求失败'
+          let code
+          try {
+            const payload = JSON.parse(Buffer.from(bytes).toString('utf8'))
+            message = payload.message || payload.msg || message
+            if (typeof payload.code === 'string' && /^[A-Za-z][A-Za-z0-9_/-]{0,99}$/.test(payload.code)) code = payload.code
+          } catch {}
+          throw Object.assign(new Error(message), { status: response.status >= 400 && response.status < 500 ? response.status : 502, upstreamStatus: response.status, ...(code ? { code } : {}) })
+        }
+        const etag = response.headers.get('etag')
+        if (cacheKey && etag) {
+          // Revalidate on every read: no stale-on-error fallback for credentials,
+          // model disablement or published prompt changes.
+          if (this.configCache.size >= 16 && !this.configCache.has(cacheKey)) this.configCache.delete(this.configCache.keys().next().value)
+          this.configCache.set(cacheKey, { etag, headers: response.headers, bytes: bytes.slice() })
+        } else if (cacheKey) this.configCache.delete(cacheKey)
+        return { status: response.status, headers: response.headers, bytes }
+      } catch (error) {
+        requestSignal.throwIfAborted()
+        // Re-read current policy only. Never replay tools/mutations or extend
+        // the caller's total deadline, and never substitute a stale config.
+        if (!cacheKey || attempt >= 4 || !transientConfigRead(error)) throw error
+        try { await delay(100 * 2 ** attempt, undefined, { signal: requestSignal }) }
+        catch (waitError) { requestSignal.throwIfAborted(); throw waitError }
+      }
     }
-    const etag = response.headers.get('etag')
-    if (cacheKey && etag) {
-      // Revalidate on every read: no stale-on-error fallback for credentials,
-      // model disablement or published prompt changes.
-      if (this.configCache.size >= 16 && !this.configCache.has(cacheKey)) this.configCache.delete(this.configCache.keys().next().value)
-      this.configCache.set(cacheKey, { etag, headers: response.headers, bytes: bytes.slice() })
-    } else if (cacheKey) this.configCache.delete(cacheKey)
-    return { status: response.status, headers: response.headers, bytes }
   }
 }
 
