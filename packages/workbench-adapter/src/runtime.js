@@ -156,6 +156,25 @@ export class WorkbenchRuntime extends Service {
     return resource ? { runId: run.id, ownerId: run.ownerId, resource } : undefined
   }
 
+  async authorizeMcpCall(sessionId, resourceId, version, signal = new AbortController().signal) {
+    signal.throwIfAborted()
+    const run = this.executionRun(sessionId)
+    // A native step may outlive its cached admission while streaming. Keep
+    // its frozen authority, but wait for the existing scheduler to confirm
+    // capacity before starting any external tool side effect.
+    if (!run || run.ownerId !== this.ownerId || run.stopConfirmation?.fenced
+      || !['running', 'queued'].includes(run.status)
+      || (run.status === 'queued' && !this.database.submission(this.ownerId, run.id)?.dispatched)
+      || !(run.mcpTools ?? []).some(item => item.id === resourceId && item.version === version)) return undefined
+    if (this.scheduler && !this.scheduler.hasAdmission(run.sessionId))
+      await this.scheduler.admitRun(run, signal, () => true)
+    signal.throwIfAborted()
+    const authorization = this.authorizeMcp(sessionId, resourceId, version)
+    // Cancellation or a new turn during the wait cannot lend this old call
+    // the next run's credentials or resource selection.
+    return authorization?.runId === run.id ? authorization : undefined
+  }
+
   authorizeRunMcp(ownerId, runId, resourceId, version) {
     if (ownerId !== this.ownerId) return false
     const run = this.database.getRun(ownerId, runId)

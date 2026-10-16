@@ -206,7 +206,10 @@ async function callProxy(ctx, tool, args, exec) {
   if (!ctx.workbenchRuntime.mcpCatalogState?.ready)
     throw Object.assign(new Error('MCP 工具目录暂不可用，请稍后重试'), { status: 503, code: 'MCP_CATALOG_UNAVAILABLE' })
   const sessionId = exec.agent?.session?.id ?? exec.agent?.id
-  const authorization = ctx.workbenchRuntime.authorizeMcp(sessionId, tool.id, tool.version)
+  const authorization = await ctx.workbenchRuntime.authorizeMcpCall(sessionId, tool.id, tool.version, exec.signal)
+  exec.signal?.throwIfAborted()
+  if (!ctx.workbenchRuntime.mcpCatalogState?.ready)
+    throw Object.assign(new Error('MCP 工具目录暂不可用，请稍后重试'), { status: 503, code: 'MCP_CATALOG_UNAVAILABLE' })
   if (!authorization) throw new Error('MCP tool is not authorized for the active run; select this tool before submitting a new task')
   if ((authorization.resource?.manifest_version ?? '') !== tool.manifest_version)
     throw new Error('MCP tool definition has changed; submit a new task to use the current definition')

@@ -23,10 +23,28 @@ function setup({ authorized = true } = {}) {
     on: vi.fn(), effect: vi.fn((factory) => cleanups.push(factory())), logger: { warn: vi.fn() },
   }
   ctx.reflect = { provide: (name, service) => { ctx[name] = service } }
+  ctx.workbenchRuntime.authorizeMcpCall = vi.fn(async (session, resource, version) => ctx.workbenchRuntime.authorizeMcp(session, resource, version))
   return { ctx, definitions, platform }
 }
 
 describe('platform MCP proxy tools', () => {
+  it.each(['ready', 'cancelled', 'revoked'])('waits for renewed admission before proxy I/O and rechecks %s state', async state => {
+    const { ctx, platform, definitions } = setup()
+    await apply(ctx)
+    let release
+    ctx.workbenchRuntime.authorizeMcpCall.mockImplementation(() => new Promise(resolve => { release = resolve }))
+    const controller = new AbortController()
+    const pending = definitions.get('search').execute({ query: 'q' }, { callId: 'waiting-admission', agent: { id: 's1' }, signal: controller.signal })
+    const outcome = pending.then(value => ({ value }), error => ({ error }))
+    await vi.waitFor(() => expect(release).toBeTypeOf('function'))
+    expect(platform.json.mock.calls.filter(([request]) => request.route === 'mcp/call')).toHaveLength(0)
+    if (state === 'cancelled') controller.abort()
+    if (state === 'revoked') ctx.workbenchRuntime.mcpCatalogState.ready = false
+    release({ runId: 'run-1', ownerId: 't:1', resource: catalogTool })
+    const result = await outcome
+    expect(Boolean(result.error)).toBe(state !== 'ready')
+    expect(platform.json.mock.calls.filter(([request]) => request.route === 'mcp/call')).toHaveLength(state === 'ready' ? 1 : 0)
+  })
   it('keeps recovered plugin metadata visible without expanding the current frozen run authorization', async () => {
     const { ctx, platform } = setup()
     const agent = { id: 's1', ctx: { tools: { restrict: () => () => {} } } }

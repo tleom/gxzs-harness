@@ -53,7 +53,7 @@ async function mount(root, { owner = 'owner-a', runOwner = owner, rows = catalog
   ctx.llm.registerAdapter(['mock'], model)
   const run = { id: 'run-1', ownerId: runOwner, status: 'running', mcpTools: frozen }
   ctx.provide('workbenchRuntime', { ownerId: owner, agents: ctx.agents, executionRun: () => run,
-    authorizeMcp: (_sessionId, id, version) => {
+    authorizeMcpCall: async (_sessionId, id, version) => {
       const resource = run.ownerId === owner && run.status === 'running' && run.mcpTools.find(row => row.id === id && row.version === version)
       return resource ? { ownerId: owner, runId: run.id, resource } : undefined
     },
