@@ -83,6 +83,12 @@ try {
   await plugin('search-tools', SearchTools, { sampleOverCapGlobResults: false })
   await execute('bash', { command: `mkdir -m 700 -- '${directory}'`, description: 'Create isolated tool fixture', workdir: '/tmp', timeoutMs: 10_000 })
   created = true
+  const dependencies = text(await execute('bash', {
+    command: `python3 -c "import defusedxml,reportlab,pypdf,pptx,docx,openpyxl; print('native-office-python-ok')" && node -e "require('pptxgenjs'); require('sharp'); console.log('native-office-node-ok')"`,
+    description: 'Verify bundled dependencies through the real native bash tool', workdir: directory, timeoutMs: 10_000,
+  }))
+  assert.match(dependencies, /native-office-python-ok/)
+  assert.match(dependencies, /native-office-node-ok/)
   const { default: NodeRuntime } = await native('dsh-ptc-runtime-node')
   await plugin('ptc-runtime', NodeRuntime, { launch: { kind: 'node-script', executable: '/usr/local/bin/node',
     bootstrapPath: '/opt/dsh/node_modules/@deepseek-ai/dsh-ptc-runtime-node/lib/process.js' } })

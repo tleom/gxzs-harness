@@ -30,6 +30,7 @@ AUTH_CHECK = r'''
 import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -51,6 +52,13 @@ with tempfile.TemporaryDirectory(prefix='gxzs-ssh-smoke-') as directory:
         '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=5',
         '-o', 'UserKnownHostsFile=' + str(known), 'dify@127.0.0.1', 'id -u']
     assert subprocess.check_output(command, timeout=10).strip() == b'1000', 'SSH owner identity mismatch'
+    # Test the authenticated execution path, not only docker exec's image ENV.
+    dependencies = "import sys,defusedxml,reportlab,pypdf,pptx,docx,openpyxl; assert sys.executable == '/opt/office/python/bin/python3'; print('ssh-office-python-ok')"
+    command[-1] = 'python3 -c ' + shlex.quote(dependencies)
+    assert subprocess.check_output(command, timeout=10).strip() == b'ssh-office-python-ok'
+    command[-1] = 'node -e ' + shlex.quote("require('pptxgenjs'); require('sharp'); console.log('ssh-office-node-ok')")
+    assert subprocess.check_output(command, timeout=10).strip() == b'ssh-office-node-ok'
+    command[-1] = 'id -u'
     wrong = Path(directory) / 'wrong_id'
     subprocess.run(['ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', str(wrong)], check=True)
     command[command.index(str(key))] = str(wrong)
