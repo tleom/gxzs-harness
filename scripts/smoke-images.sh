@@ -40,6 +40,7 @@ for attempt in {1..15}; do
 done
 python3 "$script_dir/smoke-sandbox-ssh.py" "$container_id" "$host_image"
 docker exec -i "$container_id" node < "$script_dir/smoke-browser-observation.cjs"
+docker exec -i "$container_id" node < "$script_dir/smoke-browser-navigation.cjs"
 docker exec -i "$container_id" node < "$script_dir/smoke-browser-display.cjs"
 docker run --rm --network none --entrypoint node "$host_image" -e \
   "process.stdout.write(require('node:fs').readFileSync('/opt/workbench/services/browser-client/dist/client.js'))" \

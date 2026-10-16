@@ -46,6 +46,136 @@ function worker(displayFactory) {
   }
   return {page,browser,runtime,frames,exit,command,input,context,launch}
 }
+
+function navigationFixture({ commit = true, readable = true, errorName = 'TimeoutError' } = {}) {
+  const value = worker(), url = 'https://example.com/loaded'
+  const frame = { url: () => url }
+  value.page.mainFrame = () => frame
+  value.page.frames = () => []
+  value.page.evaluate = vi.fn(async fn => fn.name === 'observePage'
+    ? { url, title: 'Readable page', text: 'Visible content', elements: [], viewport: {} }
+    : { url, hasBody: readable, readyState: 'loading' })
+  value.page.url = () => url
+  const navigate = vi.fn(async () => {
+    if (commit) value.page.emit('framenavigated', frame)
+    if (commit) return { url: () => url }
+    const error = new Error('load event did not arrive'); error.name = errorName; throw error
+  })
+  value.page.waitForLoadState = vi.fn(async () => {
+    const error = new Error('load event did not arrive'); error.name = errorName; throw error
+  })
+  value.page.goto = value.page.reload = value.page.goBack = value.page.goForward = navigate
+  return { ...value, navigate, frame, url }
+}
+
+it.each(['navigate', 'reload', 'back', 'forward'])('keeps the committed page observable after a %s load timeout', async action => {
+  const value = navigationFixture()
+  try {
+    await value.command(1, 'init', { width: 1000, height: 700 })
+    await value.command(2, action, { url: value.url })
+    expect(value.frames.find(frame => frame.id === 2).error).toBeUndefined()
+    await value.command(3, 'snapshot')
+    const snapshot = value.frames.find(frame => frame.id === 3).value
+    expect(snapshot).toMatchObject({ title: 'Readable page', text: 'Visible content', notice: expect.stringContaining('尚未完成加载') })
+    await value.command(4, 'key', { key: 'Tab', expected_revision: snapshot.revision })
+    expect(value.frames.find(frame => frame.id === 4).error).toBeUndefined()
+    expect(value.navigate).toHaveBeenCalledOnce()
+  } finally { await value.runtime.shutdown() }
+})
+
+it.each([
+  { commit: false }, { readable: false }, { errorName: 'Error' },
+])('preserves navigation failure when a new readable page is unproven: %j', async options => {
+  const value = navigationFixture(options)
+  try {
+    await value.command(1, 'init', { width: 1000, height: 700 })
+    await value.command(2, 'navigate', { url: value.url })
+    expect(value.frames.find(frame => frame.id === 2).error).toBe('网页加载失败，请检查地址或稍后刷新')
+    expect(value.navigate).toHaveBeenCalledOnce()
+  } finally { await value.runtime.shutdown() }
+})
+
+it('bounds the readability probe when the committed document stops responding', async () => {
+  const value = navigationFixture()
+  value.page.evaluate.mockImplementation(() => new Promise(() => {}))
+  try {
+    await value.command(1, 'init', { width: 1000, height: 700 })
+    value.input.write(JSON.stringify({ id: 2, action: 'navigate', url: value.url }) + '\n')
+    await vi.waitFor(() => expect(value.frames.find(frame => frame.id === 2)?.error)
+      .toBe('网页加载失败，请检查地址或稍后刷新'), { timeout: 2000 })
+  } finally { await value.runtime.shutdown() }
+})
+
+it('clears the incomplete-load notice when that document finishes loading', async () => {
+  const value = navigationFixture()
+  try {
+    await value.command(1, 'init', { width: 1000, height: 700 })
+    await value.command(2, 'navigate', { url: value.url })
+    value.frames.length = 0
+    value.page.emit('domcontentloaded')
+    await vi.waitFor(() => expect(value.frames.some(frame => frame.type === 'frame' && frame.notice === '')).toBe(true))
+    await value.command(3, 'snapshot')
+    expect(value.frames.find(frame => frame.id === 3).value.notice).toBeUndefined()
+  } finally { await value.runtime.shutdown() }
+})
+
+it('does not install a loading notice after DOMContentLoaded fires during the readability probe', async () => {
+  const value = navigationFixture()
+  const evaluate = value.page.evaluate.getMockImplementation()
+  value.page.evaluate.mockImplementation(async fn => {
+    if (fn.name !== 'observePage') value.page.emit('domcontentloaded')
+    return evaluate(fn)
+  })
+  try {
+    await value.command(1, 'init', { width: 1000, height: 700 })
+    await value.command(2, 'navigate', { url: value.url })
+    expect(value.frames.find(frame => frame.id === 2).error).toBeUndefined()
+    await value.command(3, 'snapshot')
+    expect(value.frames.find(frame => frame.id === 3).value.notice).toBeUndefined()
+  } finally { await value.runtime.shutdown() }
+})
+
+it('does not mistake old-page history navigation for a requested new-document commit', async () => {
+  const value = navigationFixture({ commit: false })
+  value.page.goto = async () => {
+    value.page.emit('framenavigated', value.frame)
+    const error = new Error('new document never arrived'); error.name = 'TimeoutError'; throw error
+  }
+  try {
+    await value.command(1, 'init', { width: 1000, height: 700 })
+    await value.command(2, 'navigate', { url: value.url })
+    expect(value.frames.find(frame => frame.id === 2).error).toBe('网页加载失败，请检查地址或稍后刷新')
+    expect(value.page.waitForLoadState).not.toHaveBeenCalled()
+  } finally { await value.runtime.shutdown() }
+})
+
+it('shares the existing navigation deadline between document commit and load', async () => {
+  const value = navigationFixture(), clock = vi.spyOn(Date, 'now')
+  clock.mockReturnValue(100000)
+  const navigate = value.page.goto
+  value.page.goto = async (...args) => { clock.mockReturnValue(115000); return navigate(...args) }
+  try {
+    await value.command(1, 'init', { width: 1000, height: 700 })
+    await value.command(2, 'navigate', { url: value.url })
+    expect(value.navigate).toHaveBeenCalledWith(value.url, { waitUntil: 'commit' })
+    expect(value.page.waitForLoadState).toHaveBeenCalledWith('domcontentloaded', { timeout: 5000 })
+  } finally { await value.runtime.shutdown(); clock.mockRestore() }
+})
+
+it('does not turn cancelled navigation into an observed partial success', async () => {
+  const value = navigationFixture()
+  value.page.goto = async () => {
+    value.page.emit('framenavigated', value.frame)
+    value.input.write(JSON.stringify({ id: 9, action: 'cancel', cancel_id: 2 }) + '\n')
+    const error = new Error('cancelled wait'); error.name = 'TimeoutError'; throw error
+  }
+  try {
+    await value.command(1, 'init', { width: 1000, height: 700 })
+    await value.command(2, 'navigate', { url: value.url })
+    expect(value.frames.find(frame => frame.id === 2).error).toBe('浏览器操作已取消')
+  } finally { await value.runtime.shutdown() }
+})
+
 it('uses a private visible display without starting CDP pixel encoding, and releases it with Chromium', async () => {
   const display={env:{DISPLAY:':100'},size:{width:1000,height:700},resize:vi.fn(),open:vi.fn(),write:vi.fn(),close:vi.fn(),stop:vi.fn(async()=>{})}
   const factory=vi.fn(async()=>display),value=worker(factory)
