@@ -596,9 +596,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def write_json(self, code, data, request_id=None, action='unresolved'):
         try:
+            # Each worker serves one request. Explicitly prohibit connection
+            # reuse: Java HTTP clients may otherwise pool this HTTP/1.0 socket
+            # and send the next mutation while the worker is closing it.
+            self.close_connection = True
             self.send_response(code)
             self.send_header('Content-Type', 'application/json')
             self.send_header('Content-Length', str(len(data)))
+            self.send_header('Connection', 'close')
             self.end_headers()
             self.wfile.write(data)
         except (BrokenPipeError, ConnectionResetError):

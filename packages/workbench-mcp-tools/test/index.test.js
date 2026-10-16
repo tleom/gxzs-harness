@@ -28,6 +28,24 @@ function setup({ authorized = true } = {}) {
 }
 
 describe('platform MCP proxy tools', () => {
+  it('keeps the registered definition across reordered catalog object members', async () => {
+    const { ctx, platform, definitions } = setup()
+    await apply(ctx)
+    const first = definitions.get('search')
+    const refresh = ctx.on.mock.calls.find(([event]) => event === 'workbench/resources-changed')[1]
+    platform.json.mockResolvedValue({ tools: [{ ...catalogTool, inputSchema: {
+      additionalProperties: false, required: ['query'], properties: { query: { type: 'string' } }, type: 'object',
+    } }] })
+    await refresh()
+    expect(definitions.get('search')).toBe(first)
+    expect(ctx.tools.register).toHaveBeenCalledOnce()
+    platform.json.mockResolvedValue({ tools: [{ ...catalogTool, inputSchema: {
+      type: 'object', properties: { query: { type: 'integer' } }, required: ['query'], additionalProperties: false,
+    } }] })
+    await refresh()
+    expect(definitions.get('search')).not.toBe(first)
+    expect(ctx.tools.register).toHaveBeenCalledTimes(2)
+  })
   it.each(['expired', 'waiting'])('honors an %s caller deadline before external MCP I/O', async state => {
     const { ctx, platform, definitions } = setup()
     await apply(ctx)

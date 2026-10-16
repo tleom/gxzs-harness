@@ -12,6 +12,10 @@ export const Config = z.object({ discovery: z.boolean().default(false) })
 // Java and the manager reject absolute deadlines more than 350 seconds ahead
 // of their own clocks. Reserve clock skew inside that limit, not above it.
 const MCP_CALL_TIMEOUT_MS = 350_000 - 5_000
+// Providers may serialize identical nested schema objects in a different order.
+// Keep registration identity stable without discarding any definition fields.
+const definitionStamp = value => JSON.stringify(value, (_key, item) => item && typeof item === 'object' && !Array.isArray(item)
+  ? Object.fromEntries(Object.entries(item).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)) : item)
 
 export async function apply(ctx, config = {}) {
   const registrations = new Map()
@@ -252,7 +256,7 @@ function normalizeCatalog(value) {
     const adapted = adaptInputSchema(tool.inputSchema)
     runtimeNames.add(tool.runtime_name)
     ids.add(tool.id)
-    return { ...tool, definitionStamp: JSON.stringify(tool), sourceInputSchema: tool.inputSchema, inputSchema: adapted.schema, validateArguments: adapted.validate, manifest_version: tool.manifest_version ?? '' }
+    return { ...tool, definitionStamp: definitionStamp(tool), sourceInputSchema: tool.inputSchema, inputSchema: adapted.schema, validateArguments: adapted.validate, manifest_version: tool.manifest_version ?? '' }
   })
   const names = platformToolNames(tools)
   return tools.map(tool => {

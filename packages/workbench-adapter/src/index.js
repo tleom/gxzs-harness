@@ -7,7 +7,7 @@ import { streamRunEvents } from './sse.js'
 import { streamHistoryEvents, streamNativeEvents } from './history-events.js'
 import { WorkbenchDatabase } from './persistence.js'
 import { resolveWorkspacePath } from './paths.js'
-import { claimNeedsResources, createAssistantStreamProjector, projectInboxClaim, projectSessionEvent, reconcileNativeSessions, settleNativeIdle } from './projection.js'
+import { claimNeedsResources, createAssistantStreamProjector, prepareRecoveredInboxes, projectInboxClaim, projectSessionEvent, reconcileNativeSessions, settleNativeIdle } from './projection.js'
 import { WorkbenchRuntime } from './runtime.js'
 import { WorkbenchService } from './service.js'
 import { TaskScheduler } from './scheduler.js'
@@ -133,7 +133,7 @@ export function apply(ctx, config) {
     recovering = true
     recovered = false
     recovery = (async () => {
-      await reconcileNativeSessions(database, ctx.sessionQuery, config.ownerId, () => {
+      const queued = await reconcileNativeSessions(database, ctx.sessionQuery, config.ownerId, () => {
         // Missing autonomous receipts need a fresh frozen catalog. Retry
         // recovery until its first verified sync; an unavailable read is not empty.
         if (!runtime.mcpCatalogState?.ready) throw Object.assign(
@@ -141,10 +141,13 @@ export function apply(ctx, config) {
         return { mcpTools: runtime.mcpResources?.() ?? [] }
       }, startupRunIds, () => ctx.get('workspaceRegistry')?.archivedSessionIds ?? [])
       await scheduler.flushFences()
+      const resumeInboxes = await prepareRecoveredInboxes(database, ctx.sessionController, config.ownerId, queued,
+        () => ctx.get('workspaceRegistry')?.archivedSessionIds ?? [])
       if (scheduler.closed) return
       recovered = true
       recoveryError = undefined
       scheduler.start()
+      resumeInboxes()
     })().catch(error => {
       recoveryError = error
       if (!scheduler.closed) {

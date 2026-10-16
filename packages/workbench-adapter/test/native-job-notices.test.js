@@ -111,7 +111,7 @@ it.each(['agent-message', 'subagent-settled'])('ignores unowned %s notices befor
     [{ type: 'agent/inbox/spliced', seq: 1, data: { target: 'next-turn', start: 0, removedCount: 0, inserted: [message] } }],
     [{ type: 'turn/start', seq: 2, data: { turn: 1 } }, { type: 'user/message', seq: 3, data: message }],
   ]) {
-    await expect(reconcileNativeSessions(test.database, { observeSession: async () => ({ events }) }, test.owner, unavailable)).resolves.toBeUndefined()
+    await expect(reconcileNativeSessions(test.database, { observeSession: async () => ({ events }) }, test.owner, unavailable)).resolves.toEqual([])
   }
   expect(unavailable).not.toHaveBeenCalled()
   expect(test.database.listRuns(test.owner, test.chat.id)).toEqual([])
