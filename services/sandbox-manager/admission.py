@@ -80,6 +80,17 @@ class Admission:
         with self.guard:
             return self.db.execute("SELECT COUNT(*) FROM task_admission WHERE owner=? AND state='running'", (owner,)).fetchone()[0]
 
+    def restore_pending(self, owner, generation, instance):
+        """Refresh the whole retained queue when this exact Host becomes ready.
+
+        Acquires cannot renew heartbeats while readiness is false. Refreshing
+        only the first polling ticket would let it jump earlier stale tickets.
+        Released retries retain their state until explicitly reacquired.
+        """
+        with self.guard, self.db:
+            self.db.execute("UPDATE task_admission SET heartbeat=? WHERE owner=? AND generation=? AND instance=? AND state IN ('waiting','retry')",
+                            (time.time(), owner, generation, instance))
+
     def busy(self, owner):
         """Include queued and retrying work when deciding host lifecycle."""
         with self.guard:

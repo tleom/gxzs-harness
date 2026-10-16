@@ -891,8 +891,12 @@ def test_failed_ssh_recovers_idle_pair_and_preserves_queued_tickets(tmp_path, mo
     host.failed_transport_activity.return_value = None
     host.healthy.return_value = True
     monkeypatch.setattr('hosts.pid_pressure', lambda _info: False)
+    host.admission.restore_pending.reset_mock()
     maintain(host)
+    host.admission.restore_pending.assert_called_once_with('t:1', 1, 'host-1')
     assert json.loads(record.read_text()) == item
+    maintain(host)
+    host.admission.restore_pending.assert_called_once()
 
 
 def test_failed_ssh_stop_failure_does_not_fence_or_start_replacement(tmp_path, monkeypatch):

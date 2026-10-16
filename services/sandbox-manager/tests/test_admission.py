@@ -77,6 +77,35 @@ def test_restart_cancel_and_no_expiry_overcommit(tmp_path):
     queue.close()
 
 
+def test_long_recovery_restores_waiting_fifo_before_any_dispatcher_polls(tmp_path, monkeypatch):
+    import admission
+    clock = [100]
+    monkeypatch.setattr(admission.time, 'time', lambda: clock[0])
+    path = str(tmp_path / 'queue.db')
+    queue = Admission(path)
+    for run in ('one', 'two', 'three'):
+        assert queue.request('a', 1, 'host-a', run, run, 'acquire')['state'] == 'running'
+    for run in ('first', 'second'):
+        assert queue.request('a', 1, 'host-a', run, run, 'acquire')['state'] == 'waiting'
+    queue.request('a', 1, 'host-a', 'three', 'three', 'release', retry=True)
+    clock[0] = 200
+    queue.fence('a', 'host-a', preserve_pending=True)
+    queue.close()
+    queue = Admission(path)
+    try:
+        clock[0] = 400  # Recovery and startup both exceed the 30-second window.
+        queue.restore_pending('a', 2, 'host-a')
+        queue.restore_pending('a', 1, 'other-host')
+        assert queue.db.execute("SELECT heartbeat FROM task_admission WHERE run='first'").fetchone()[0] == 100
+        queue.restore_pending('a', 1, 'host-a')
+        assert queue.request('a', 1, 'host-a', 'second', 'second', 'acquire')['state'] == 'waiting'
+        assert queue.request('a', 1, 'host-a', 'first', 'first', 'acquire')['state'] == 'running'
+        assert queue.request('a', 1, 'host-a', 'second', 'second', 'acquire')['state'] == 'running'
+        assert queue.db.execute("SELECT state FROM task_admission WHERE run='three'").fetchone()[0] == 'retry'
+    finally:
+        queue.close()
+
+
 def test_retry_requeues_released_run(tmp_path):
     queue = Admission(str(tmp_path / 'queue.db'))
     assert queue.request('a', 1, 'host', 'r', 'chat', 'acquire')['state'] == 'running'

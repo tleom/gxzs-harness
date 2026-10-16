@@ -792,6 +792,8 @@ class Hosts:
                         return
                     if item.get('state') == 'provisioning' and item.get('initial_creation') is True:
                         item['initial_creation'] = False
+                    if item.get('ready') is not True:
+                        self.admission.restore_pending(item['owner_id'], item['generation'], item['instance_id'])
                     item.update(state='ready', ready=True)
                     self._save(record, item)
                     heartbeats.append((dict(item), 'ready'))
