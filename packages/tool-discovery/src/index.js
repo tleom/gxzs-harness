@@ -1,12 +1,12 @@
 import z from '@deepseek-ai/schemastery'
 import { appendPluginRecord } from '@deepseek-ai/dsh-session'
+import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import {
-  TOOL_SEARCH_NAME, activationEntry, buildCatalog, bytes, clip, cursorSignature,
-  decodeCursor, encodeCursor, matchesEntry, renderCatalog, search,
+  MCP_NAME, TOOL_SEARCH_NAME, activationEntry, buildCatalog, hash, matchesEntry, pluginSummary, renderCatalog, search,
 } from './catalog.js'
 import { ACTIVE_EVENT, PROJECTION_KEY, discoveryProjection } from './projection.js'
 
-export { TOOL_SEARCH_NAME } from './catalog.js'
+export { MCP_NAME, TOOL_SEARCH_NAME } from './catalog.js'
 export const name = 'tool-discovery'
 export const inject = ['tools', 'systemPrompt', 'agents', 'sessionProjections', 'toolDiscoveryCatalog']
 export const Config = z.object({
@@ -14,9 +14,6 @@ export const Config = z.object({
   maxActiveTools: z.number().min(1).max(256).step(1).default(64),
   maxActiveDefinitionBytes: z.number().min(1024).step(1).default(131072),
   maxToolDefinitionBytes: z.number().min(512).step(1).default(32768),
-  maxResultBytes: z.number().min(1024).step(1).default(8192),
-  maxSummaryBytes: z.number().min(512).step(1).default(4096),
-  descriptionChars: z.number().min(16).max(1000).step(1).default(180),
   maxCatalogTools: z.number().min(1).step(1).default(10000),
   maxIndexBytes: z.number().min(1024).step(1).default(16777216),
 })
@@ -46,7 +43,7 @@ export function apply(ctx, supplied = {}) {
 
   function prepareMask(state, active) {
     const names = new Set([...active.values()].map(tool => tool.name))
-    const deny = [...new Set(bridge.managedNames())].filter(toolName => toolName !== TOOL_SEARCH_NAME && !names.has(toolName)).sort()
+    const deny = [...new Set(bridge.managedNames())].filter(toolName => ![TOOL_SEARCH_NAME, MCP_NAME].includes(toolName) && !names.has(toolName)).sort()
     const stamp = JSON.stringify(deny)
     if (stamp === state.maskStamp) return undefined
     const lift = deny.length ? state.agent.ctx.tools.restrict({ deny }) : undefined
@@ -72,12 +69,12 @@ export function apply(ctx, supplied = {}) {
     const key = JSON.stringify([snapshot.authorityKey ?? null, snapshot.revision ?? '', snapshot.ready === true])
     if (key !== state.catalogKey) {
       try { state.catalog = buildCatalog(snapshot, config); state.catalogKey = key }
-      catch {
+      catch (error) {
         // Keep native conversation usable while every MCP tool remains hidden.
         // Invalid or over-budget input is never published as a verified empty catalog.
         state.catalog = { authorityKey: typeof snapshot.authorityKey === 'string' && snapshot.authorityKey.length <= 4096 ? snapshot.authorityKey : null, revision: String(snapshot.revision ?? ''),
           ready: false, byId: new Map(), plugins: [],
-          unavailableMessage: '插件目录超出发现预算或数据无效，插件工具暂不可用；可继续处理其他任务。' }
+          unavailableMessage: `插件目录暂不可用：${error.message}。可继续处理其他任务。` }
         state.catalogKey = key; state.pending.clear()
       }
     }
@@ -128,10 +125,9 @@ export function apply(ctx, supplied = {}) {
   }
 
   function resultRow(tool, status, reason) {
-    return {
-      id: tool.id, name: tool.name, plugin_id: tool.pluginId, plugin_name: clip(tool.pluginName, 80),
-      scope: tool.pluginScope, description: clip(tool.description, config.descriptionChars), status,
+    return { name: tool.rawName, plugin: tool.pluginCallName, description: tool.description, status,
       ...(reason ? { reason } : {}),
+      ...(['prepared', 'active'].includes(status) ? { definition: tool.definition } : {}),
     }
   }
 
@@ -150,76 +146,128 @@ export function apply(ctx, supplied = {}) {
     return used + tool.definitionBytes > config.maxActiveDefinitionBytes ? 'active_definition_budget' : undefined
   }
 
-  function executeSearch(args, exec) {
+  function executionContext(exec) {
     exec.signal.throwIfAborted()
     if (!exec.agent) throw new Error('工具发现需要有效的智能体会话')
-    const state = refresh(exec.agent), catalog = state.catalog
-    const query = typeof args.query === 'string' ? args.query.trim() : ''
-    const pluginId = typeof args.plugin_id === 'string' ? args.plugin_id.trim() : ''
-    if (query.length > 512 || pluginId.length > 2048) throw new Error('查找条件过长，请缩短后重试')
-    if (!query && !pluginId) throw new Error('请提供查找关键词或插件 ID')
-    if (!catalog.ready || !catalog.authorityKey) return { status: 'unavailable', items: [], message: catalog.unavailableMessage ?? '当前插件目录暂不可用，请稍后重试。' }
+    const state = refresh(exec.agent)
     if (!state.step || state.step.signal.aborted) throw new Error('工具发现需要有效的运行步骤')
-    const matches = search(catalog, query, pluginId)
-    const signature = cursorSignature(catalog, query, pluginId)
-    const offset = decodeCursor(args.cursor, signature, matches.length)
-    if (offset === undefined) return { status: 'stale_cursor', items: [], message: '目录或查找条件已变化，请去掉 cursor 后重新查找。' }
-    if (!matches.length) return { status: 'no_match', items: [], message: '未找到匹配工具；请尝试中英文能力关键词、准确工具名，或仅提供 plugin_id 浏览目录后再搜索。' }
-    const replace = args.replace_active === true
-    if (query && state.pending.size && (replace || [...state.pending.values()].some(item => item.replace)))
-      throw new Error('replace_active 必须独占本步骤的工具发现；请在下一步单独调用。')
-    const reservations = replace ? new Map() : reserved(state), rows = [], prepared = []
-    const response = {
-      status: query ? 'matches' : 'browse', items: rows,
-      message: query ? (replace ? 'prepared 项已进入替换候选；步骤结束后按当前会话策略核验，以随后实际提供的工具为准。' : 'prepared 项已进入加载候选；步骤结束后按当前会话策略核验，以随后实际提供的工具为准。预算不足可用 replace_active:true。') : '这是插件能力目录。使用 query 指定所需能力以加载工具。',
-    }
-    let consumed = 0
-    for (const tool of matches.slice(offset, offset + config.pageSize)) {
-      const alreadyActive = !replace && state.active.has(tool.id)
-      const reason = tool.unavailableReason ?? (query && !alreadyActive ? capacity(catalog, reservations, tool) : undefined)
-      const status = reason ? 'unavailable' : alreadyActive ? 'active' : !query ? 'available' : 'prepared'
-      const row = resultRow(tool, status, reason)
-      rows.push(row)
-      const hasMore = offset + consumed + 1 < matches.length
-      const trial = { ...response, status: prepared.length || status === 'prepared' ? 'prepared' : response.status,
-        ...(hasMore ? { next_cursor: encodeCursor(signature, offset + consumed + 1) } : {}) }
-      if (bytes(trial) > config.maxResultBytes) { rows.pop(); break }
-      consumed++
-      if (status === 'prepared') {
-        const entry = activationEntry(tool); prepared.push(entry); reservations.set(entry.id, entry)
-      }
-    }
-    if (!rows.length) return { status: 'result_budget', items: [], message: '单条目录信息超过结果预算，请使用更准确的工具名或调整目录说明。' }
-    if (offset + consumed < matches.length) response.next_cursor = encodeCursor(signature, offset + consumed)
-    if (prepared.length) {
-      response.status = 'prepared'
-      state.pending.set(exec.callId, {
-        callId: exec.callId, rootCallId: exec.rootCallId ?? exec.callId,
-        authorityKey: catalog.authorityKey, turn: state.step.turn, step: state.step.step,
-        tools: prepared, replace, finalized: false, durableSeq: undefined,
-      })
-    }
-    return response
+    return state
   }
 
+  const unavailable = catalog => ({ status: 'unavailable', items: [],
+    message: catalog.unavailableMessage ?? '当前插件目录暂不可用，请稍后重试。' })
+
+  const unavailablePlugin = plugin => ({ status: 'unavailable', plugin: pluginSummary(plugin), items: [],
+    ...(plugin.unavailableReason ? { reason: plugin.unavailableReason } : {}),
+    message: plugin.unavailableReason === 'run_authorization_required'
+      ? '插件当前可用，但本任务未获这些工具的授权。请重新提交任务以核验当前权限；重复搜索不会增加权限。'
+      : '插件已安装，但工具目录暂不可用。请检查插件连接或授权状态后重试。' })
+
+  function findPlugin(catalog, name) {
+    if (typeof name !== 'string' || !name.trim()) return undefined
+    return catalog.plugins.find(plugin => plugin.name === name)
+  }
+
+  function prepareTools(state, exec, tools, replace = false) {
+    if (state.pending.size && (replace || [...state.pending.values()].some(item => item.replace)))
+      throw new Error('replace_active 必须独占本步骤的工具发现；请在下一步单独调用。')
+    const catalog = state.catalog, reservations = replace ? new Map() : reserved(state), prepared = []
+    const items = tools.map(tool => {
+      const active = !replace && state.active.has(tool.id)
+      const reason = tool.unavailableReason ?? (!active ? capacity(catalog, reservations, tool) : undefined)
+      const status = reason ? 'unavailable' : active ? 'active' : 'prepared'
+      if (status === 'prepared') {
+        const entry = activationEntry(tool)
+        prepared.push(entry); reservations.set(entry.id, entry)
+      }
+      return resultRow(tool, status, reason)
+    })
+    if (prepared.length) state.pending.set(exec.callId, {
+      callId: exec.callId, rootCallId: exec.rootCallId ?? exec.callId,
+      authorityKey: catalog.authorityKey, turn: state.step.turn, step: state.step.step,
+      tools: prepared, replace, finalized: false, durableSeq: undefined,
+    })
+    return items
+  }
+
+  function loadingResult(items) {
+    const successful = items.filter(item => ['prepared', 'active'].includes(item.status))
+    return { status: successful.length === items.length ? 'prepared' : successful.length ? 'partial' : 'unavailable', items,
+      message: 'prepared 项将在本步骤结束后按当前权限核验并加载完整定义，下一步按实际提供的名称和参数调用；逐项检查失败原因。加载不执行工具。' }
+  }
+
+  function executeMcp(args, exec) {
+    const state = executionContext(exec), catalog = state.catalog
+    if (!catalog.ready || !catalog.authorityKey) return unavailable(catalog)
+    if (args.tools !== undefined && (!Array.isArray(args.tools) || !args.tools.length
+      || args.tools.some(name => typeof name !== 'string' || !name))) throw new Error('tools 必须是非空工具名称数组')
+    if (args.name === undefined) {
+      if (args.tools !== undefined) throw new Error('加载工具时必须提供插件 name')
+      return { status: 'plugins', items: catalog.plugins.map(pluginSummary) }
+    }
+    const plugin = findPlugin(catalog, args.name)
+    if (!plugin) return { status: 'not_found', items: [], message: `插件未找到或当前不可用：${args.name}；可调用 mcp({}) 查看当前目录。` }
+    if (!plugin.available) return unavailablePlugin(plugin)
+    const tools = [...catalog.byId.values()].filter(tool => tool.pluginId === plugin.id)
+    if (args.tools === undefined) return { status: 'browse', plugin: pluginSummary(plugin),
+      items: tools.map(tool => ({ name: tool.rawName, description: tool.description })),
+      message: '这是完整工具目录。使用 mcp({name, tools:[工具名称]}) 加载一个或多个工具的完整定义。' }
+    const requested = [...new Set(args.tools)]
+    const selected = requested.map(name => tools.find(tool => tool.rawName === name) ?? tools.find(tool => tool.name === name))
+    const loaded = prepareTools(state, exec, selected.filter(Boolean), args.replace_active === true)
+    let index = 0
+    return { ...loadingResult(selected.map((tool, position) => tool ? loaded[index++]
+      : { name: requested[position], status: 'not_found', reason: 'tool_not_found' })), plugin: pluginSummary(plugin) }
+  }
+
+  function executeSearch(args, exec) {
+    const state = executionContext(exec), catalog = state.catalog
+    const query = typeof args.query === 'string' ? args.query.trim() : ''
+    if (!query || query.length > 512) throw new Error('请提供 1 至 512 字符的查找关键词')
+    if (!catalog.ready || !catalog.authorityKey) return unavailable(catalog)
+    const plugin = args.name === undefined ? undefined : findPlugin(catalog, args.name)
+    if (args.name !== undefined && !plugin) return { status: 'not_found', items: [], message: '指定插件未找到或当前不可用，可通过 mcp({}) 查看插件目录。' }
+    if (plugin && !plugin.available) return unavailablePlugin(plugin)
+    const matches = search(catalog, query, plugin?.id)
+    if (!matches.length) return { status: 'no_match', items: [], message: '未找到匹配工具。搜索未命中不代表工具不存在；可用 mcp 查看插件的完整工具目录，再按准确名称加载。' }
+    const limit = args.limit ?? config.pageSize
+    if (!Number.isInteger(limit) || limit < 1 || limit > 50) throw new Error('limit 必须是 1 至 50 的整数')
+    return { ...loadingResult(prepareTools(state, exec, matches.slice(0, limit), args.replace_active === true)), total: matches.length }
+  }
+
+  const replacementParameter = { type: 'boolean', description: '加载预算不足时设为 true，用本次成功加载的工具替换已加载集合；须在本步骤单独调用。' }
+  const output = kind => ({
+    schema: { type: 'object', additionalProperties: true },
+    render: (_args, value) => [{ type: 'text', text: JSON.stringify({ ...value,
+      items: kind === 'mcp' ? value.items : value.items.map(({ definition: _definition, ...item }) => item) }) }],
+    presentationMeta: (_args, value) => ({ tool_discovery: { kind, status: value.status, matched: value.items.length,
+      prepared: value.items.filter(item => item.status === 'prepared').length,
+      definitions: value.items.filter(item => item.definition).map(item => ({ name: item.name, plugin: item.plugin, definition: item.definition })),
+    } }),
+  })
   const searchDefinition = {
     name: TOOL_SEARCH_NAME,
-    description: '查找并按需加载当前可用插件的真实工具。按目录的中文用途、英文标识或准确工具名搜索；无匹配可改用另一种语言，或仅提供 plugin_id 分页浏览全局/个人插件能力。prepared 表示加载候选，步骤结束后仍按当前会话策略核验；下一步以实际提供的工具为准。请勿在同一批调用或同一次 run_code 中调用新发现的工具。',
+    description: '搜索并按需加载当前可用插件工具的完整定义。可用 name 限定插件。未命中时使用 mcp 查看完整目录。新工具在下一步可调用，不要在同一批调用或同一次 run_code 中调用新发现的工具。',
     parameters: { type: 'object', properties: {
       query: { type: 'string', description: '任务用途、能力关键词或准确工具名' },
-      plugin_id: { type: 'string', description: '可选：插件目录中的稳定 ID，用来限定具体插件' },
-      cursor: { type: 'string', description: '继续同一次查找时使用返回的 next_cursor，保留相同查找条件' },
-      replace_active: { type: 'boolean', description: '预算不足时设为 true，在成功步骤结束后用此次发现的工具替换已有加载集合。本步骤须单独调用一次工具发现。' },
+      name: { type: 'string', description: '可选：插件的唯一英文 name' },
+      limit: { type: 'integer', minimum: 1, maximum: 50, description: '最多加载的搜索结果数量，默认 8；需要完整目录时使用 mcp' },
+      replace_active: replacementParameter,
+    }, required: ['query'], additionalProperties: false },
+    isConcurrencySafe: () => false, output: output('search'), execute: executeSearch,
+  }
+  const mcpDefinition = {
+    name: MCP_NAME,
+    description: '查看插件。无参数返回插件目录；name 返回该插件的全部工具名称和完整描述，不分页；name 加非空 tools 数组按准确名称加载一个或多个工具的完整定义。加载后下一步可调用，不在同一批调用或同一次 run_code 中调用新工具。加载不执行业务操作。',
+    parameters: { type: 'object', properties: {
+      name: { type: 'string', description: '插件目录中的唯一英文 name' },
+      tools: { type: 'array', minItems: 1, items: { type: 'string', minLength: 1 }, description: '要加载完整定义的工具名称，一次可指定多个；省略则浏览完整目录' },
+      replace_active: replacementParameter,
     }, additionalProperties: false },
-    isConcurrencySafe: () => false,
-    output: {
-      schema: { type: 'object', additionalProperties: true },
-      render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
-      presentationMeta: (_args, value) => ({ tool_discovery: { kind: 'search', status: value.status, matched: value.items.length, prepared: value.items.filter(item => item.status === 'prepared').length } }),
-    },
-    execute: async (args, exec) => executeSearch(args, exec),
+    isConcurrencySafe: () => false, output: output('mcp'), execute: executeMcp,
   }
   ctx.tools.register(searchDefinition)
+  ctx.tools.register(mcpDefinition)
 
   ctx.on('tools/result', (exec, result) => {
     const state = states.get(exec.agent), pending = state?.pending.get(exec.callId)
@@ -268,7 +316,7 @@ export function apply(ctx, supplied = {}) {
       }
     } else if (event.type === 'tool/ptc-dispatch') {
       const pending = state.pending.get(event.data.subCallId)
-      if (pending && event.data.name === TOOL_SEARCH_NAME) {
+      if (pending && [TOOL_SEARCH_NAME, MCP_NAME].includes(event.data.name)) {
         if (event.data.isError) state.pending.delete(event.data.subCallId)
         else pending.durableSeq = event.seq
       }
@@ -279,10 +327,26 @@ export function apply(ctx, supplied = {}) {
   ctx.on('agent/created', ({ agent }) => { refresh(agent) }, { global: true })
   ctx.on('agent/inbox/claimed', ({ agent }) => { refresh(agent) }, { global: true })
   ctx.on('agent/disposed', ({ agent }) => { clearAgent(agent) }, { global: true })
-  ctx.on('agent/pre-step', (payload, next) => {
+  ctx.on('agent/pre-step', async (payload, next) => {
     const state = stateFor(payload.agent)
     state.step = { turn: payload.turn, step: payload.step, signal: payload.signal }
-    return next()
+    const decision = await next()
+    if (decision.kind === 'reject') return decision
+    payload.signal.throwIfAborted()
+    refresh(payload.agent)
+    const text = renderCatalog(state.catalog, config, {
+      searchAllowed: ctx.tools.get(TOOL_SEARCH_NAME, payload.agent) === searchDefinition,
+      browseAllowed: ctx.tools.get(MCP_NAME, payload.agent) === mcpDefinition, deniedCount: state.deniedCount,
+    })
+    const digest = hash(text), visible = new Set(payload.agent.session.surface.nodes)
+    const history = payload.agent.session.snapshotEvents().filter(event => event.type === 'user/message'
+      && event.data.source?.kind === 'mcp-catalog' && visible.has(event.seq)).at(-1)
+    const messages = decision.messages.filter(message => message.source?.kind !== 'mcp-catalog')
+    if (history?.data.source.digest === digest) return { ...decision, messages }
+    return { ...decision, messages: [...messages, createUserMessage({
+      content: [{ type: 'text', text: `<system-reminder>\n${text}\n</system-reminder>` }],
+      source: { kind: 'mcp-catalog', digest },
+    })] }
   }, { global: true })
   // DSH resolves variables synchronously before collecting native schemas and
   // rendering the PTC SDK. No interpolation is needed for this host-only guard.
@@ -305,14 +369,15 @@ export function apply(ctx, supplied = {}) {
     return next()
   }, { global: true })
   ctx.systemPrompt.section({
-    name: 'tools:discovery-catalog', order: ctx.systemPrompt.getSectionOrder('TOOLS_SDK') - 1,
-    interpolate: false, text: context => {
-      if (!context.scope) return ''
-      const state = states.get(context.scope)
-      return renderCatalog(state?.catalog, config, {
-        searchAllowed: ctx.tools.get(TOOL_SEARCH_NAME, context.scope) === searchDefinition, deniedCount: state?.deniedCount,
-      })
-    },
+    name: 'tools:discovery-rules', order: ctx.systemPrompt.getSectionOrder('TOOLS_SDK') - 1,
+    interpolate: false,
+    text: context => [
+      '插件以会话目录中的 name 定位。新加载工具仅在下一步按实际提供的名称和参数调用。用户点名插件时优先用于其对应任务。',
+      ...(ctx.tools.get(MCP_NAME, context.scope) === mcpDefinition ? ['mcp 查看插件目录或用 tools 数组批量加载完整定义。'] : []),
+      ...(ctx.tools.get(TOOL_SEARCH_NAME, context.scope) === searchDefinition ? [ctx.tools.get(MCP_NAME, context.scope) === mcpDefinition
+        ? 'tool_search 搜索并加载工具，搜索未命中时可通过 mcp 浏览完整目录。'
+        : 'tool_search 搜索并加载工具，搜索未命中不代表工具不存在。'] : []),
+    ].join('\n'),
   })
 
   const controller = { refresh, refreshAll }

@@ -1,7 +1,14 @@
 import { expect, it } from 'vitest'
 import { runFailure, presentRunEvent, goalFailureReason, resumeGoalSelection } from '../src/run-failure.js'
+import { resourceTextHash } from '../src/resource-mentions.js'
 
 const rejected = '400 data: {"error":{"code":"data_inspection_failed","message":"Input text data may contain inappropriate content."},"id":"request-1"}'
+it('drops stale goal offsets after a native objective change without stripping user text', () => {
+  const original = '用户自己写的【插件：law】文本'
+  const previous = { resource_position_hash: resourceTextHash(original), mentioned_resources: [{ kind: 'tools', id: 'law', offset: 1 }] }
+  expect(resumeGoalSelection(previous, {}, original).mentioned_resources[0].offset).toBe(1)
+  expect(resumeGoalSelection(JSON.parse(JSON.stringify(previous)), {}, '新的目标').mentioned_resources[0].offset).toBeUndefined()
+})
 it('strips historic context payloads for SSE and history without modifying the stored event or compaction facts', () => {
   const event = { event: 'workbench_context', _id: '10-0', workbench_run_id: 'run', phase: 'compacted',
     used_tokens: 1200, window_tokens: 128000, estimated: true, model: 'p/m',

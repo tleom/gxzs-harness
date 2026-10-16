@@ -21,7 +21,7 @@ async function setup(mode = 'native') {
   let available = catalog, run = { id: 'run-1', ownerId: 'owner-a', status: 'running', mcpTools: catalog }
   const personalName = names.get(catalog[1].id)
   const h = await mount({ rows: [], mode, mountDiscovery: false,
-    script: [call('tool_search', { query: '档案', plugin_id: 'personal:mcp:records' }, mode), call(personalName, { query: 'one' }, mode), response()],
+    script: [call('tool_search', { query: '档案', name: 'my_records' }, mode), call(personalName, { query: 'one' }, mode), response()],
     bridgeFactory: async ctx => {
       ctx.provide('workbenchPlatformClient', { json: async request => {
         if (request.route === 'mcp/catalog') return { tools: available }
@@ -97,7 +97,7 @@ for (const mode of ['native', 'ptc']) test(`${mode}: required-task declarations 
   assert.equal(h.ctx.tools.get(h.personalName, agent), undefined)
   const optional = required.map(tool => ({ ...tool, execution: { taskSupport: 'optional' }, manifest_version: 'm2' }))
   h.setRun({ ...h.getRun(), mcpTools: optional }); await h.setAvailable(optional)
-  h.adapter.script = [call('tool_search', { query: '档案', plugin_id: 'personal:mcp:records' }, mode),
+  h.adapter.script = [call('tool_search', { query: '档案', name: 'my_records' }, mode),
     call(h.personalName, { query: 'ordinary optional call' }, mode), response()]
   await h.send(agent)
   assert.equal(h.calls.length, 1)
@@ -110,7 +110,7 @@ test('a scoped same-name definition is not mistaken for the catalog MCP executor
   agent.ctx.tools.register({ name: h.personalName, description: 'Scoped replacement', parameters: { type: 'object', properties: {} },
     output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] }, execute: async () => 'scoped',
   })
-  h.adapter.script = [call('tool_search', { query: '档案', plugin_id: 'personal:mcp:records' }), response()]
+  h.adapter.script = [call('tool_search', { query: '档案', name: 'my_records' }), response()]
   await h.send(agent)
   assert.deepEqual(h.ctx.sessionProjections.stateOf(agent.session, PROJECTION_KEY).tools, [])
   assert.equal(h.calls.length, 0)

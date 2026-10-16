@@ -1,7 +1,7 @@
 import { test } from 'vitest'
 import assert from 'node:assert/strict'
 import { Config } from '../src/index.js'
-import { activationEntry, buildCatalog, bytes, cursorSignature, decodeCursor, encodeCursor, renderCatalog, search } from '../src/catalog.js'
+import { activationEntry, buildCatalog, renderCatalog, search } from '../src/catalog.js'
 import { ACTIVE_EVENT, activeStateSchema, discoveryProjection } from '../src/projection.js'
 import { row } from './helpers.mjs'
 
@@ -17,7 +17,7 @@ test('search handles exact names, English identifiers, Chinese descriptions, plu
     row('p:one', 'lookupContacts', 'personal', '检索客户电话', { pluginCallName: 'my_records' }),
   ]), config)
   assert.deepEqual(search(catalog, 'findCourtCases').map(t => t.id), ['g:one'])
-  assert.deepEqual(search(catalog, 'g:one').map(t => t.id), ['g:one'])
+  assert.equal(search(catalog, 'g:one').length, 0)
   assert.ok(search(catalog, 'court judgments').some(t => t.id === 'g:two'))
   assert.equal(search(catalog, '客户电话')[0].id, 'p:one')
   assert.equal(search(catalog, 'my_records')[0].id, 'p:one')
@@ -27,23 +27,18 @@ test('search handles exact names, English identifiers, Chinese descriptions, plu
   const summary = renderCatalog(catalog, config)
   assert.match(summary, /my_records/)
   assert.match(summary, /shared_records/)
-  assert.ok(summary.indexOf('personal:mcp:records') < summary.indexOf('global:mcp:records'))
+  assert.ok(summary.indexOf('my_records') < summary.indexOf('shared_records'))
+  assert.ok(!summary.includes('global:mcp:records'))
   assert.ok(!summary.includes('findCourtCases'))
 })
 
-test('summary has a UTF-8 byte bound and stable cursors invalidate on metadata, authority or query changes', () => {
-  const input = snapshot(Array.from({ length: 100 }, (_, index) => row(`t${index}`, `lookup_${index}`, 'global', '中文说明'.repeat(80), { pluginId: `global:mcp:provider${index}` })))
-  const catalog = buildCatalog(input, config)
-  const summary = renderCatalog(catalog, { ...config, maxSummaryBytes: 512 })
-  assert.ok(bytes(summary) <= 512)
-  assert.match(summary, /另有/)
-  const signature = cursorSignature(catalog, 'lookup', '')
-  const cursor = encodeCursor(signature, 8)
-  assert.equal(decodeCursor(cursor, signature, 100), 8)
-  assert.equal(decodeCursor(cursor, cursorSignature({ ...catalog, revision: 'r2' }, 'lookup', ''), 100), undefined)
-  assert.equal(decodeCursor(cursor, cursorSignature({ ...catalog, authorityKey: 'foreign' }, 'lookup', ''), 100), undefined)
-  assert.equal(decodeCursor(cursor, cursorSignature(catalog, 'different', ''), 100), undefined)
-  assert.equal(decodeCursor('not-a-cursor', signature, 100), undefined)
+test('plugin summaries remain complete and search indexes include description tails', () => {
+  const description = '插件说明'.repeat(500) + '罕见尾部能力'
+  const catalog = buildCatalog({ ready: true, tools: [row('a', 'alpha')], plugins: [
+    { id: 'global:mcp:records', name: 'records', displayName: '完整插件', description },
+  ] }, config)
+  assert.ok(renderCatalog(catalog, config).includes(description))
+  assert.deepEqual(search(catalog, '罕见尾部能力').map(tool => tool.name), ['alpha'])
 })
 
 test('catalog and projection validate identities, schema fingerprints and bounded state', () => {
@@ -57,12 +52,26 @@ test('catalog and projection validate identities, schema fingerprints and bounde
   assert.deepEqual(discoveryProjection.apply({ tools: [entry] }, { type: ACTIVE_EVENT, ignorable: true, data: { invalid: true } }).tools, [])
 })
 
-test('an oversized preferred summary row does not hide later plugins that fit', () => {
-  const longId = `global:mcp:${'long-'.repeat(150)}`
-  const catalog = buildCatalog({ ready: true, tools: [row('long', 'lookup_long', 'global', 'long', { pluginId: longId }),
-    row('short', 'lookup_short', 'personal', 'short')], plugins: [{ id: longId, preferred: true }] }, config)
-  const summary = renderCatalog(catalog, { ...config, maxSummaryBytes: 512 })
-  assert.ok(bytes(summary) <= 512)
-  assert.ok(summary.includes('personal:mcp:records'))
-  assert.ok(!summary.includes(longId))
+test('plugin names are validated and collisions across scopes are explicit', () => {
+  const tools = [row('g', 'global_lookup'), row('p', 'personal_lookup', 'personal')]
+  assert.throws(() => buildCatalog({ ready: true, tools, plugins: [
+    { id: 'global:mcp:records', name: 'same' }, { id: 'personal:mcp:records', name: 'same' },
+  ] }, config), /插件名称重复/)
+  assert.throws(() => buildCatalog({ ready: true, tools: [], plugins: [
+    { id: 'legacy', name: '中文名称' },
+  ] }, config), /插件名称无效/)
+  assert.throws(() => buildCatalog(snapshot([row('reserved', 'mcp')]), config), /保留/)
+})
+
+test('activation budgets count callable schemas while source differences remain complete and fingerprinted', () => {
+  const parameters = { type: 'object', properties: { query: { type: 'string' } } }
+  const make = inputSchema => buildCatalog(snapshot([row('a', 'lookup', 'global', 'lookup', { parameters, inputSchema })]), config).byId.get('a')
+  const base = make(undefined), identical = make({ properties: parameters.properties, type: 'object' })
+  assert.equal(identical.definitionBytes, base.definitionBytes)
+  assert.equal(identical.definition.inputSchema, undefined)
+  const original = { ...parameters, required: ['query'], additionalProperties: false }
+  const different = make(original)
+  assert.deepEqual(different.definition.inputSchema, original)
+  assert.equal(different.definitionBytes, base.definitionBytes)
+  assert.notEqual(different.fingerprint, base.fingerprint)
 })

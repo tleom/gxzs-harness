@@ -34,6 +34,27 @@ def config(**changes):
     })
 
 
+def test_full_metadata_survives_manifest_cache(ops, tmp_path):
+    saved = ops.personal_mcp({"operation": "mcp_save", "name": "my_plugin", "content": config(name="my_plugin")}, str(tmp_path))
+    tool = {"name": "lookup", "description": "", "inputSchema": {"type": "object"},
+            "annotations": {"readOnlyHint": True, "title": "完整标题"}, "execution": {"taskSupport": "required"}}
+    ops.personal_mcp({"operation": "mcp_cache", "name": "my_plugin", "version": saved["version"], "tools": [tool]}, str(tmp_path))
+    assert ops.personal_mcp({"operation": "mcp_list"}, str(tmp_path))["mcp"][0]["tools"] == [tool]
+
+
+def test_legacy_digit_name_remains_readable_and_can_be_explicitly_renamed(ops, tmp_path):
+    folder = tmp_path / "mcp" / "9old"
+    folder.mkdir(parents=True)
+    (folder / "mcp.json").write_text(config(name="9old"))
+    current = ops.personal_mcp({"operation": "mcp_read", "name": "9old"}, str(tmp_path))
+    with pytest.raises(ValueError):
+        ops.personal_mcp({"operation": "mcp_toggle", "name": "9old", "enabled": True}, str(tmp_path))
+    renamed = ops.personal_mcp({"operation": "mcp_save", "name": "9old", "new_name": "valid_name", "version": current["version"],
+                               "content": config(name="valid_name")}, str(tmp_path))
+    assert renamed["id"] == "valid_name"
+    assert not folder.exists()
+
+
 def test_server_output_schema_survives_cache_and_changes_manifest(ops, tmp_path):
     saved = ops.personal_mcp({"operation": "mcp_save", "name": "demo", "content": config()}, str(tmp_path))
     tool = {"name": "lookup", "description": "Lookup", "inputSchema": {"type": "object"},
@@ -118,7 +139,7 @@ def test_rename_keeps_assets_settings_and_cached_tools(ops, tmp_path):
     assert (tmp_path / "mcp/.cache/renamed.json").exists()
 
 
-@pytest.mark.parametrize("target", ["../escape", "/absolute", "UPPER", "a/b", ""])
+@pytest.mark.parametrize("target", ["../escape", "/absolute", "UPPER", "a/b", "", "9bad", "a" * 65])
 def test_invalid_rename_does_not_change_original(ops, tmp_path, target):
     saved = ops.personal_mcp({"operation": "mcp_save", "name": "demo", "content": config()}, str(tmp_path))
     with pytest.raises(ValueError):

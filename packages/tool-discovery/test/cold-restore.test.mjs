@@ -85,8 +85,8 @@ beforeAll(async () => {
   try {
     originalAgent = await h.ctx.agentLoop.create(sessionId, { provider: 'mock', model: 'mock' }, { cwd: originalRoot })
     await h.send(originalAgent)
-    assert.deepEqual(h.model.requests[0].tools.map(tool => tool.name), ['tool_search'])
-    assert.deepEqual(h.model.requests[1].tools.map(tool => tool.name), ['case_lookup', 'tool_search'])
+    assert.deepEqual(h.model.requests[0].tools.map(tool => tool.name), ['mcp', 'tool_search'])
+    assert.deepEqual(h.model.requests[1].tools.map(tool => tool.name), ['case_lookup', 'mcp', 'tool_search'])
     await h.ctx.sessionPersistence.flush()
     const exported = { header: originalAgent.session.header, events: originalAgent.session.snapshotEvents(),
       checkpoint: h.ctx.sessionProjections.checkpoint(originalAgent.session) }

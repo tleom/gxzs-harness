@@ -1,4 +1,5 @@
 import { presentContextEvent } from './context-usage.js'
+import { resourceTextHash } from './resource-mentions.js'
 
 /** Recognize provider facts, never infer content rejection from arbitrary prose. */
 export function runFailure(value) {
@@ -38,8 +39,13 @@ export function goalFailureReason(goal, run) {
   return null
 }
 
-export function resumeGoalSelection(previous, current) {
+export function resumeGoalSelection(previous, current, objective) {
   return { ...(previous ?? current),
+    ...(typeof objective === 'string' && previous?.resource_position_hash
+      && previous.resource_position_hash !== resourceTextHash(objective) ? {
+        resource_position_hash: undefined,
+        mentioned_resources: (previous.mentioned_resources ?? []).map(({ offset: _offset, ...resource }) => resource),
+      } : {}),
     ...(current?.model ? { model: current.model, model_parameters: current.model_parameters ?? {} } : {}),
     silent_resume: false, is_continuation: true, command: 'goal' }
 }

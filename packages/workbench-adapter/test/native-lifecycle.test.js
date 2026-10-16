@@ -1376,6 +1376,63 @@ function goalServiceFixture(test) {
     workingDirectory: test.ctx.workingDirectory, onGoalChanged: listener => test.ctx.on('goal/changed', listener, { prepend: true }),
     platformClient: { json: async () => ({ data: { tools: [] } }) }, skills: { list: async () => [] }, fileManager: { operate: async () => ({}) } })
 }
+it.each(['slash', 'button'])('keeps native Goal text clean and preserves model-visible plugin binding across %s resume', async method => {
+  const t = await fixture(['hang', 'hang', 'hang']), s = goalServiceFixture(t)
+  const tool = { id: 'personal:mcp:douyin:lookup', runtime_name: 'douyin_lookup', version: 'v1', manifest_version: 'm1',
+    scope: 'personal', server_id: 'douyin', provider_call_name: 'douyin', tool_name: 'lookup', description: '查询视频', inputSchema: { type: 'object' } }
+  s.platformClient = { json: async () => ({ tools: [tool] }) }
+  const first = await s.issueCommand(t.owner, t.chat.id, { command: '/goal 请搜索视频', request_key: 'plugin-goal',
+    resource_mentions: { plugins: ['douyin'] }, mention_positions: [{ kind: 'tools', id: 'douyin', offset: 1 }] })
+  await vi.waitFor(() => expect(t.model.requests).toHaveLength(1))
+  expect(t.ctx.goals.get(t.agent).objective).toBe('请搜索视频')
+  expect((await s.getControl(t.owner, t.chat.id)).goal.objective).toBe('请搜索视频')
+  expect(JSON.stringify(t.model.requests[0])).toContain('请【插件：douyin】搜索视频')
+  const { Session } = await native('dsh-session')
+  const restored = Session.create(t.agent.id, t.agent.session.snapshotEvents(), t.agent.session.header)
+  expect(t.ctx.sessionProjections.stateOf(restored, 'goal').current.goal.objective).toBe('请搜索视频')
+  t.ctx.goals.pause(t.agent, t.ctx.goals.get(t.agent)); await t.agent.whenIdle()
+  const resumed = method === 'slash'
+    ? await s.issueCommand(t.owner, t.chat.id, { command: '/goal resume', request_key: 'plugin-resume' })
+    : await s.mutateGoal(t.owner, t.chat.id, 'resume', { ref: t.ctx.goals.get(t.agent) })
+  expect(resumed.run.query).toBe('请搜索视频')
+  expect(resumed.run.mentioned_resources[0].offset).toBe(1)
+  await vi.waitFor(() => expect(t.model.requests).toHaveLength(2))
+  expect(JSON.stringify(t.model.requests[1])).toContain('请【插件：douyin】搜索视频')
+  t.ctx.goals.pause(t.agent, t.ctx.goals.get(t.agent)); await t.agent.whenIdle()
+  // Plain objective edits clear offsets tied to the previous text.
+  await expect(s.mutateGoal(t.owner, t.chat.id, 'edit', { ref: t.ctx.goals.get(t.agent), request: { objective: '' } })).rejects.toThrow()
+  expect(t.db.goalRun(t.agent.id).selection.mentioned_resources[0].offset).toBe(1)
+  if (method === 'slash') await s.issueCommand(t.owner, t.chat.id, { command: '/goal edit 请先整理材料', request_key: 'plugin-edit' })
+  else await s.mutateGoal(t.owner, t.chat.id, 'edit', { ref: t.ctx.goals.get(t.agent), request: { objective: '请先整理材料' } })
+  expect(t.ctx.goals.get(t.agent).objective).toBe('请先整理材料')
+  expect(t.db.goalRun(t.agent.id).selection.mentioned_resources[0].offset).toBeUndefined()
+  const last = await s.mutateGoal(t.owner, t.chat.id, 'resume', { ref: t.ctx.goals.get(t.agent) })
+  expect(last.run.query).toBe('请先整理材料')
+  await vi.waitFor(() => expect(t.model.requests).toHaveLength(3))
+  const system = t.model.requests[2].messages.filter(message => message.role === 'system')
+  expect(system.length).toBeGreaterThan(0)
+  expect(JSON.stringify(system)).not.toContain('请【插件：douyin】搜索视频')
+  expect(t.db.getRun(t.owner.ownerId, first.run.id).query).toBe('请搜索视频')
+  t.ctx.goals.pause(t.agent, t.ctx.goals.get(t.agent)); await t.agent.whenIdle()
+})
+
+it('uses newly edited Goal plugin positions only after native acceptance', async () => {
+  const t = await fixture(['hang', 'hang']), s = goalServiceFixture(t)
+  const tool = { id: 'personal:mcp:law:details', runtime_name: 'law_details', version: 'v1', scope: 'personal',
+    server_id: 'law', provider_call_name: 'law', tool_name: 'details', description: '查询', inputSchema: { type: 'object' } }
+  s.platformClient = { json: async () => ({ tools: [tool] }) }
+  await s.issueCommand(t.owner, t.chat.id, { command: '/goal 原目标', request_key: 'old' })
+  await vi.waitFor(() => expect(t.model.requests).toHaveLength(1))
+  t.ctx.goals.pause(t.agent, t.ctx.goals.get(t.agent)); await t.agent.whenIdle()
+  await s.issueCommand(t.owner, t.chat.id, { command: '/goal edit 先核验再整理', request_key: 'new',
+    resource_mentions: { plugins: ['law'] }, mention_positions: [{ kind: 'tools', id: 'law', offset: 1 }] })
+  expect(t.ctx.goals.get(t.agent).objective).toBe('先核验再整理')
+  const resumed = await s.mutateGoal(t.owner, t.chat.id, 'resume', { ref: t.ctx.goals.get(t.agent) })
+  expect(resumed.run.query).toBe('先核验再整理')
+  await vi.waitFor(() => expect(t.model.requests).toHaveLength(2))
+  expect(JSON.stringify(t.model.requests[1])).toContain('先【插件：law】核验再整理')
+  t.ctx.goals.pause(t.agent, t.ctx.goals.get(t.agent)); await t.agent.whenIdle()
+})
 it('rejected duplicate creation preserves the active goal run binding', async () => {
   const t = await fixture(['hang']); const s = goalServiceFixture(t)
   const first = await s.issueCommand(t.owner,t.chat.id,{command:'/goal first objective',request_key:'first'})

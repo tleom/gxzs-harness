@@ -47,13 +47,13 @@ class FixturePtc extends PtcRuntime {
 }
 
 export function row(id, name, pluginScope = 'global', description = '检索案件记录 case records', extra = {}) {
-  return { id, name, pluginId: `${pluginScope}:mcp:records`, pluginName: pluginScope === 'global' ? '全局案件' : '个人笔记', pluginScope,
+  return { id, name, pluginId: `${pluginScope}:mcp:records`, pluginName: pluginScope === 'global' ? '全局案件' : '个人笔记', pluginScope, pluginCallName: pluginScope === 'global' ? 'records' : 'my_records',
     description, version: 'v1', manifestVersion: 'm1', parameters: { type: 'object', properties: { query: { type: 'string' } }, additionalProperties: false }, ...extra }
 }
 
 export class Bridge {
   constructor(rows) { this.rows = rows; this.revision = 1; this.ready = true; this.owner = 'owner-a'; this.run = 'run-1'; this.listeners = new Set(); this.readyTransitions = [] }
-  snapshot(agent) { return { authorityKey: `${this.owner}\0${this.run}`, revision: String(this.revision), ready: this.ready, tools: this.visible ? this.visible(agent, this.rows) : this.rows } }
+  snapshot(agent) { return { authorityKey: `${this.owner}\0${this.run}`, revision: String(this.revision), ready: this.ready, plugins: this.plugins, tools: this.visible ? this.visible(agent, this.rows) : this.rows } }
   managedNames() { return this.rows.map(item => item.name) }
   subscribe(listener) { this.listeners.add(listener); return () => this.listeners.delete(listener) }
   setDiscoveryReady(ready) { this.readyTransitions.push(ready) }

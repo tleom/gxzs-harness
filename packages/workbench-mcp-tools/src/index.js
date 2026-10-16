@@ -15,7 +15,9 @@ const MCP_CALL_TIMEOUT_MS = 350_000 - 5_000
 
 export async function apply(ctx, config = {}) {
   const registrations = new Map()
+  let pluginMetadata = []
   ctx.workbenchRuntime.mcpResources = () => [...registrations.values()].map(({ tool }) => ({ ...tool }))
+  ctx.workbenchRuntime.mcpPlugins = () => pluginMetadata.map(plugin => ({ ...plugin }))
   const restrictions = new Map()
   let catalogLoaded = false
   let disposed = false
@@ -31,6 +33,7 @@ export async function apply(ctx, config = {}) {
     discoveryCatalog?.notify()
   }
   const clear = () => {
+    pluginMetadata = []
     for (const restriction of restrictions.values()) restriction.dispose()
     restrictions.clear()
     for (const registration of registrations.values()) registration.dispose()
@@ -93,6 +96,9 @@ export async function apply(ctx, config = {}) {
     }
     if (disposed) return
     const catalog = normalizeCatalog(payload.data?.tools ?? payload.tools ?? [])
+    const plugins = payload.data?.plugins ?? payload.plugins ?? []
+    if (!Array.isArray(plugins) || plugins.some(plugin => !plugin || typeof plugin.id !== 'string' || typeof plugin.name !== 'string'
+      || !['global', 'personal'].includes(plugin.scope))) throw new Error('invalid MCP plugin inventory')
     // A provider may not replace an existing native capability with its raw name.
     for (const tool of catalog) {
       const existing = ctx.tools.get?.(tool.public_name)
@@ -122,6 +128,7 @@ export async function apply(ctx, config = {}) {
       })
       registrations.set(tool.runtime_name, { tool, definition, dispose: ctx.tools.register(definition) })
     }
+    pluginMetadata = plugins
     catalogLoaded = true
     state(true)
     for (const agent of ctx.workbenchRuntime.agents?.list?.() ?? []) restrictAgent(agent)
@@ -239,7 +246,7 @@ function normalizeCatalog(value) {
     const adapted = adaptInputSchema(tool.inputSchema)
     runtimeNames.add(tool.runtime_name)
     ids.add(tool.id)
-    return { ...tool, definitionStamp: JSON.stringify(tool), inputSchema: adapted.schema, validateArguments: adapted.validate, manifest_version: tool.manifest_version ?? '' }
+    return { ...tool, definitionStamp: JSON.stringify(tool), sourceInputSchema: tool.inputSchema, inputSchema: adapted.schema, validateArguments: adapted.validate, manifest_version: tool.manifest_version ?? '' }
   })
   const names = platformToolNames(tools)
   return tools.map(tool => {

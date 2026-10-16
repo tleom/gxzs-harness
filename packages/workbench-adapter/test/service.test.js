@@ -153,16 +153,26 @@ it('returns state-only receipts and pages full large history without an oversize
 it('shows one badge per MCP provider while preserving its complete tool scope and distinct same-name providers', async () => {
   const { service } = setup()
   const tools = Array.from({ length: 50 }, (_, i) => ({ id: `global:mcp:redbook:tool-${i}`, provider: 'global:mcp:redbook', scope: 'global', server_id: 'redbook', provider_name: '小红书' }))
-  tools.push({ id: 'personal:mcp:redbook:tool-0', provider: 'personal:mcp:redbook', scope: 'personal', server_id: 'redbook', provider_name: '小红书' })
+  tools.push({ id: 'personal:mcp:redbook:tool-0', provider: 'personal:mcp:redbook', scope: 'personal', server_id: 'redbook', provider_call_name: 'my-redbook', provider_name: '小红书' })
   const mentions = { tools: tools.map(tool => tool.id), skills: [], knowledge: [] }
   const snapshot = await service.mentionSnapshot(mentions, tools)
-  expect(snapshot).toEqual([{ id: tools[0].id, kind: 'tools', name: '小红书' }, { id: tools[50].id, kind: 'tools', name: '小红书' }])
+  expect(snapshot).toEqual([{ id: 'redbook', kind: 'tools', name: '小红书' }, { id: 'my-redbook', kind: 'tools', name: '小红书' }])
   expect(mentions.tools).toHaveLength(51)
   const historical = tools.map(tool => ({ id: tool.id, kind: 'tools', name: '小红书' }))
   const run = { id: 'run', chatId: 'chat', query: '查热榜', createdAt: 1000, status: 'completed', seq: 1,
     selection: { resource_mentions: mentions, mentioned_resources: historical }, mcpTools: tools }
-  expect(runDto(run).mentioned_resources).toEqual(snapshot)
+  expect(runDto(run).mentioned_resources).toEqual([historical[0], historical[50]])
   expect(runDto(run).resource_mentions.tools).toHaveLength(51)
+})
+
+it('persists inline plugin positions and canonical names while keeping the displayed query unchanged', async () => {
+  const { service, owner, chat } = setup()
+  const tools = [{ id: 'global:mcp:law:lookup', provider: 'global:mcp:law', server_id: 'law', scope: 'global', provider_name: '法律检索' }]
+  service.freezeMcpTools = vi.fn(async () => tools)
+  const run = await service.submitRun(owner, chat.id, { query: '之前 后文', resource_mentions: { plugins: ['global:mcp:law'] },
+    mention_positions: [{ kind: 'tools', id: 'plugin:mcp:global:mcp:law', offset: 3 }] })
+  expect(run.query).toBe('之前 后文')
+  expect(service.getRun(owner, run.id).mentioned_resources).toEqual([{ kind: 'tools', id: 'law', name: '法律检索', offset: 3 }])
 })
 
 it('uses an observed child target while sharing native ranking and platform archive visibility', async () => {
@@ -1411,7 +1421,7 @@ describe('followup and control service', () => {
   it('admits a plan task once and persists its mode, title and resource labels', async () => {
     const { owner, chat, service, database, commands, sessionController, skills } = setup()
     skills.list.mockResolvedValue([{ name: 'evidence', displayName: '证据整理', description: '整理材料', invocation: { userInvocable: true, modelInvocable: false } }])
-    const body = { command: '/plan 调查证据', request_key: 'one-plan', resource_mentions: { skills: ['evidence'] } }
+    const body = { command: '/plan 调查证据', request_key: 'one-plan', resource_mentions: { skills: ['evidence'] }, mention_positions: [{ kind: 'skills', id: 'evidence', offset: 2 }] }
     const first = await service.issueCommand(owner, chat.id, body)
     const replay = await service.issueCommand(owner, chat.id, body)
     expect(replay.run.id).toBe(first.run.id)
@@ -1420,7 +1430,7 @@ describe('followup and control service', () => {
     expect(sessionController.prompt).not.toHaveBeenCalled()
     expect(database.listRuns(owner.ownerId, chat.id)).toHaveLength(1)
     expect(database.getChat(owner.ownerId, chat.id).title).toBe('新会话')
-    expect(first.run).toMatchObject({ command: 'plan', query: '调查证据', mentioned_resources: [{ name: '证据整理', kind: 'skills' }] })
+    expect(first.run).toMatchObject({ command: 'plan', query: '调查证据', mentioned_resources: [{ name: '证据整理', kind: 'skills', offset: 2 }] })
     skills.list.mockResolvedValue([{ name: 'evidence', displayName: '新名字' }])
     expect(service.getRun(owner, first.run.id).mentioned_resources[0].name).toBe('证据整理')
   })
@@ -1462,6 +1472,56 @@ describe('followup and control service', () => {
 
 
 describe('explicit resource mentions', () => {
+  const inlineTool = { id: 'personal:mcp:douyin:lookup', runtime_name: 'personal_douyin_lookup',
+    version: 'v1', scope: 'personal', provider: 'personal:mcp:douyin', provider_name: '抖音',
+    provider_call_name: 'douyin', server_id: 'douyin', tool_name: 'lookup',
+    description: '查询视频', inputSchema: { type: 'object', properties: {} } }
+
+  it.each(['queue', 'steer'])('preserves inline plugin binding through native %s, receipt replay and retry', async mode => {
+    const { service, owner, chat, platformClient, sessionController, database } = setup()
+    platformClient.json.mockResolvedValue({ tools: [inlineTool] })
+    sessionController.prompt.mockRejectedValueOnce(new Error('offline'))
+    const body = { query: '请搜索视频', mode, request_key: `inline-${mode}`,
+      resource_mentions: { plugins: ['douyin'] }, mention_positions: [{ kind: 'tools', id: 'douyin', offset: 1 }] }
+    const failed = await service.submitRun(owner, chat.id, body)
+    expect(failed.status).toBe('failed')
+    expect(sessionController.prompt.mock.calls[0][0].content[0].text).toBe('请【插件：douyin】搜索视频')
+    expect(database.getRun(owner.ownerId, failed.id).query).toBe(body.query)
+    await service.submitRun(owner, chat.id, body)
+    expect(sessionController.prompt).toHaveBeenCalledOnce()
+    await service.submitRun(owner, chat.id, { ...body, request_key: 'retry-inline', retry_of: failed.id })
+    expect(sessionController.prompt.mock.calls[1][0].content).toEqual(sessionController.prompt.mock.calls[0][0].content)
+  })
+
+  it.each(['plan', 'goal'])('places the plugin beside the requested action in native %s commands', async command => {
+    const { service, owner, chat, platformClient, commands, database } = setup()
+    platformClient.json.mockResolvedValue({ tools: [inlineTool] })
+    const result = await service.issueCommand(owner, chat.id, { command: `/${command} 请搜索视频`, request_key: `inline-${command}`,
+      resource_mentions: { plugins: ['douyin'] }, mention_positions: [{ kind: 'tools', id: 'douyin', offset: 1 }] })
+    expect(commands.execute.mock.calls[0][1]).toContain(command === 'goal' ? '/goal 请搜索视频' : '/plan 请【插件：douyin】搜索视频')
+    const run = database.getRun(owner.ownerId, result.run.id)
+    expect(run.query).toBe('请搜索视频')
+    expect(run.selection.resource_context).toContain('douyin')
+  })
+
+  it('updates inline queue positions only after native acceptance and removes stale offsets', async () => {
+    const { service, owner, chat, platformClient, sessionController, database } = setup()
+    platformClient.json.mockResolvedValue({ tools: [inlineTool] })
+    const run = await service.submitRun(owner, chat.id, { query: '请搜索视频',
+      resource_mentions: { plugins: ['douyin'] }, mention_positions: [{ kind: 'tools', id: 'douyin', offset: 1 }] })
+    database.adoptInboxMessage(chat.sessionId, run.id, 'native-inline')
+    const edit = { content: [{ type: 'text', text: '请先搜索视频' }], mention_positions: [{ kind: 'tools', id: 'douyin', offset: 2 }] }
+    sessionController.updateQueue.mockRejectedValueOnce(new Error('already claimed'))
+    await expect(service.editQueued(owner, run.id, edit)).rejects.toThrow('already claimed')
+    expect(service.getRun(owner, run.id).mentioned_resources[0].offset).toBe(1)
+    await service.editQueued(owner, run.id, edit)
+    expect(sessionController.updateQueue.mock.calls.at(-1)[0].action.content[0].text).toBe('请先【插件：douyin】搜索视频')
+    expect(service.getRun(owner, run.id).mentioned_resources[0].offset).toBe(2)
+    await service.editQueued(owner, run.id, { content: [{ type: 'text', text: '搜索其他视频' }] })
+    expect(sessionController.updateQueue.mock.calls.at(-1)[0].action.content[0].text).toBe('搜索其他视频')
+    expect(service.getRun(owner, run.id).mentioned_resources[0].offset).toBeUndefined()
+  })
+
   it('passes an explicitly mentioned plugin name as a preference without changing availability', async () => {
     const { service, owner, chat, platformClient, sessionController, database } = setup()
     const tool = { id: 'personal:mcp:gaode:maps_direction_bicycling', runtime_name: 'personal_gaode_maps_direction_bicycling',
