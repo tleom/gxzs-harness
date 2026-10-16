@@ -107,3 +107,42 @@ it('shares admission between concurrent native MCP calls while the original disp
   expect(platform.json).toHaveBeenCalledOnce()
   expect(sessions.prompt).not.toHaveBeenCalled()
 })
+
+it('cancels either caller promptly without cancelling a sibling sharing the acquisition', async () => {
+  const { runtime, platform, scheduler } = setup()
+  let release, sharedSignal
+  platform.json.mockImplementationOnce(request => {
+    sharedSignal = request.signal
+    return new Promise((resolve, reject) => {
+      release = resolve
+      request.signal.addEventListener('abort', () => reject(request.signal.reason), { once: true })
+    })
+  })
+  const first = new AbortController(), second = new AbortController()
+  const cancelled = runtime.authorizeMcpCall('s', 'search', 'v1', first.signal).catch(error => error)
+  const survivor = runtime.authorizeMcpCall('s', 'search', 'v1', second.signal)
+  await vi.waitFor(() => expect(release).toBeTypeOf('function'))
+  first.abort()
+  expect((await cancelled).name).toBe('AbortError')
+  expect(sharedSignal.aborted).toBe(false)
+  expect(scheduler.nativeAdmissions.size).toBe(1)
+  release({ data: { state: 'running' } })
+  expect(await survivor).toMatchObject({ ownerId: 't:1' })
+  expect(platform.json).toHaveBeenCalledOnce()
+  expect(scheduler.nativeAdmissions.size).toBe(0)
+})
+
+it('ends an expired caller wait without retrying or leaking shared I/O past scheduler shutdown', async () => {
+  const { runtime, platform, scheduler } = setup()
+  let sharedSignal
+  platform.json.mockImplementationOnce(request => new Promise((_, reject) => {
+    sharedSignal = request.signal
+    request.signal.addEventListener('abort', () => reject(request.signal.reason), { once: true })
+  }))
+  await expect(runtime.authorizeMcpCall('s', 'search', 'v1', AbortSignal.timeout(40))).rejects.toMatchObject({ name: 'TimeoutError' })
+  expect(platform.json).toHaveBeenCalledOnce()
+  expect(sharedSignal.aborted).toBe(false)
+  scheduler.close()
+  expect(sharedSignal.aborted).toBe(true)
+  await vi.waitFor(() => expect(scheduler.nativeAdmissions.size).toBe(0))
+})

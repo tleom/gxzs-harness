@@ -28,6 +28,20 @@ function setup({ authorized = true } = {}) {
 }
 
 describe('platform MCP proxy tools', () => {
+  it.each(['expired', 'waiting'])('honors an %s caller deadline before external MCP I/O', async state => {
+    const { ctx, platform, definitions } = setup()
+    await apply(ctx)
+    ctx.workbenchRuntime.authorizeMcpCall.mockImplementation((_session, _id, _version, signal) =>
+      new Promise((_, reject) => {
+        signal.addEventListener('abort', () => reject(signal.reason), { once: true })
+        if (signal.aborted) reject(signal.reason)
+      }))
+    await expect(definitions.get('search').execute({ query: 'q' }, {
+      callId: 'deadline', agent: { id: 's1' }, deadlineMs: Date.now() + (state === 'expired' ? -1 : 40),
+    })).rejects.toMatchObject({ name: 'TimeoutError' })
+    expect(ctx.workbenchRuntime.authorizeMcpCall).toHaveBeenCalledTimes(state === 'expired' ? 0 : 1)
+    expect(platform.json.mock.calls.filter(([request]) => request.route === 'mcp/call')).toHaveLength(0)
+  })
   it.each(['ready', 'cancelled', 'revoked'])('waits for renewed admission before proxy I/O and rechecks %s state', async state => {
     const { ctx, platform, definitions } = setup()
     await apply(ctx)
@@ -224,14 +238,17 @@ describe('platform MCP proxy tools', () => {
     await apply(ctx)
     const tool = definitions.get(platformToolName(catalogTool))
     expect(tool).toBeDefined()
-    const signal = new AbortController().signal
+    const controller = new AbortController()
+    const signal = controller.signal
     await expect(tool.execute({ query: 'case' }, { callId: 'call-1', agent: { id: 's1' }, signal })).resolves.toEqual({ content: [{ type: 'text', text: 'found' }] })
     expect(ctx.workbenchRuntime.authorizeMcp).toHaveBeenCalledWith('s1', catalogTool.id, 'v1')
     const call = platform.json.mock.calls.find(([request]) => request.route === 'mcp/call')[0]
     expect(tool.name).toBe('search')
     expect(JSON.parse(call.body.toString())).toMatchObject({ run_id: 'run-1', resource_id: catalogTool.id, version: 'v1',
       server_id: 'server', tool_name: 'search', arguments: { query: 'case' } })
-    expect(call.signal).toBe(signal)
+    expect(call.signal.aborted).toBe(false)
+    controller.abort()
+    expect(call.signal.aborted).toBe(true)
     expect(call.timeoutMs).toBe(345_000)
     expect(JSON.parse(call.body.toString()).deadline_ms).toBe(call.deadlineMs)
   })

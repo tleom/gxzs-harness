@@ -47,6 +47,18 @@ export function currentExecutionRun(database, agents, sessionId) {
   return ['running', 'waiting_input', 'stopping'].includes(active?.status) ? active : undefined
 }
 
+async function waitForAdmission(pending, signal) {
+  let abort
+  const cancelled = new Promise((_, reject) => {
+    abort = () => reject(signal.reason?.name === 'TimeoutError' ? signal.reason
+      : Object.assign(new Error('Admission wait cancelled', { cause: signal.reason }), { name: 'AbortError' }))
+    signal.addEventListener('abort', abort, { once: true })
+    if (signal.aborted) abort()
+  })
+  try { return await Promise.race([pending, cancelled]) }
+  finally { signal.removeEventListener('abort', abort) }
+}
+
 /** Durable admission tickets. After dispatch DSH owns the Session inbox and turns. */
 export class TaskScheduler {
   constructor({ database, sessions, platformClient, ownerId, agents, modelSettings, goals, prepareContent, generation = process.env.GXZS_HOST_GENERATION ?? 'local' }) {
@@ -263,13 +275,16 @@ export class TaskScheduler {
       const holderRun = this.database.getRun(this.ownerId, holder.runId)
       let pending = this.nativeAdmissions.get(sessionId)
       if (!pending) {
-        pending = this.request(holderRun, 'acquire', false, signal).finally(() => this.nativeAdmissions.delete(sessionId))
+        // One root/child caller cancelling must not abort the shared request.
+        // The platform client's bounded timeout and scheduler lifetime own I/O;
+        // each caller owns only its wait below.
+        pending = this.request(holderRun, 'acquire', false, this.fenceLifetime.signal).finally(() => this.nativeAdmissions.delete(sessionId))
         this.nativeAdmissions.set(sessionId, pending)
       }
       let ticket
-      try { ticket = await pending }
+      try { ticket = await waitForAdmission(pending, signal) }
       catch (error) {
-        if (!retryableAdmissionError(error)) throw error
+        if (signal.aborted || !retryableAdmissionError(error)) throw error
         // A lost response does not revoke the durable ticket. Keep native
         // execution behind the admission gate until the manager answers.
         await delay(250, undefined, { signal })
