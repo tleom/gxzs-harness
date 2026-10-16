@@ -36,7 +36,8 @@ def test_profile_upgrade_route_uses_the_registered_host_authority(server, monkey
 
 
 @pytest.mark.parametrize('state', ['draining', 'fencing'])
-def test_profile_upgrade_prevents_starting_a_stopped_or_missing_sandbox(server, monkeypatch, state):
+@pytest.mark.parametrize('allow_existing_image', [False, True])
+def test_profile_upgrade_prevents_starting_a_stopped_or_missing_sandbox(server, monkeypatch, state, allow_existing_image):
     key = str(uuid4())
     folder = server.HOSTS.root / key
     folder.mkdir()
@@ -47,7 +48,7 @@ def test_profile_upgrade_prevents_starting_a_stopped_or_missing_sandbox(server, 
     docker = Mock(return_value=SimpleNamespace(returncode=1, stdout=''))
     monkeypatch.setattr(server, 'docker', docker)
     with pytest.raises(server.SandboxUpdatePending):
-        server.ensure(key)
+        server.ensure(key, allow_existing_image=allow_existing_image)
     assert not any(call.args[0] in {'start', 'create', 'volume', 'rename'} for call in docker.call_args_list)
 
 
@@ -121,7 +122,7 @@ def test_owner_network_names_are_deterministic_and_separate(server, monkeypatch)
 @pytest.mark.parametrize('operation,maintenance,tracked', [
     ('mcp_list', True, False), ('mcp_list', False, False), ('mcp_test', True, False),
     ('mcp_test', False, True), ('mcp_read', False, True), ('mcp_call', False, True),
-    ('mcp_save', False, True), ('mcp_delete', False, True), ('mcp_toggle', False, True),
+    ('mcp_save', False, True), ('mcp_delete', False, True), ('mcp_toggle', False, True), ('mcp_pin', False, True),
 ])
 def test_mcp_maintenance_does_not_refresh_user_activity(server, monkeypatch, operation, maintenance, tracked):
     import mcp_runtime
@@ -134,8 +135,10 @@ def test_mcp_maintenance_does_not_refresh_user_activity(server, monkeypatch, ope
     monkeypatch.setattr(mcp_runtime, 'invoke', lambda *args, **kwargs: {'ok': True})
     monkeypatch.setattr(mcp_runtime, 'invalidate', Mock())
     key = str(uuid4())
-    server.operation(key, 'personal-mcp', {'operation': operation, 'maintenance': maintenance, 'name': 'example'})
-    ensured.assert_called_once_with(key, track_activity=tracked)
+    # A caller cannot opt writes or tool execution into the catalog exception.
+    server.operation(key, 'personal-mcp', {'operation': operation, 'maintenance': maintenance,
+                                         'name': 'example', 'allow_existing_image': True})
+    ensured.assert_called_once_with(key, track_activity=tracked, allow_existing_image=operation == 'mcp_list')
     assert bool(touched.call_count) is tracked
 
 
@@ -205,31 +208,103 @@ def test_sandbox_uses_one_cpu_three_gigabytes_and_owner_network(server, monkeypa
         assert any(call[0] == 'run' and 'owner-home:/srv/dsh' in call for call in calls)
 
 
-@pytest.mark.parametrize('changed', ['network', 'attachments'])
-def test_running_sandbox_on_old_network_returns_predictable_retry(server, monkeypatch, changed):
+@pytest.mark.parametrize('changed', ['network', 'attachments', 'cgroup'])
+@pytest.mark.parametrize('allow_existing_image', [False, True])
+def test_running_sandbox_on_old_network_returns_predictable_retry(server, monkeypatch, changed, allow_existing_image):
     key = str(uuid4())
     name, _ = server.identity(key)
-    existing = {'Id': 'b' * 64, 'Config': {'Image': server.IMAGE}, 'State': {'Running': True},
+    existing = {'Id': 'b' * 64, 'Config': {'Image': 'previous-image' if allow_existing_image else server.IMAGE}, 'State': {'Running': True},
                 'NetworkSettings': {'Networks': {('shared-network' if changed == 'network' else 'owner-network'): {}}}}
     if changed == 'attachments':
         folder = server.HOSTS.root / key
         folder.mkdir(parents=True)
         (folder / 'host.json').write_text(json.dumps({'workspace_id': key, 'owner_id': 't:1', 'home_volume': 'owner-home'}))
+    if changed == 'cgroup':
+        existing['HostConfig'] = {'CgroupParent': 'other-owner'}
     monkeypatch.setattr(server, 'ensure_network', lambda _: 'owner-network')
     monkeypatch.setattr(server, 'docker', lambda *args, **kwargs: SimpleNamespace(
         returncode=0, stdout=json.dumps([existing]) if args[:2] == ('inspect', name) else ''))
     with pytest.raises(server.SandboxUpdatePending):
-        server.ensure(key)
+        server.ensure(key, allow_existing_image=allow_existing_image)
+
+
+@pytest.mark.parametrize('allow_existing_image', [False, True])
+def test_running_previous_image_is_reused_only_for_catalog_reads(server, monkeypatch, allow_existing_image):
+    key = str(uuid4())
+    name, _ = server.identity(key)
+    folder = server.HOSTS.root / key
+    folder.mkdir()
+    (folder / 'host.json').write_text(json.dumps({
+        'workspace_id': key, 'owner_id': 't:1', 'home_volume': 'owner-home', 'state': 'ready',
+    }))
+    existing = {'Id': 'b' * 64, 'Config': {'Image': 'previous-image', 'Labels': {'gxzs.attachment-home': 'owner-home'}},
+                'State': {'Running': True}, 'HostConfig': {'PidsLimit': 1024},
+                'NetworkSettings': {'Networks': {'owner-network': {}}}}
+    monkeypatch.setattr(server, 'ensure_network', lambda _: 'owner-network')
+    docker = Mock(return_value=SimpleNamespace(returncode=0, stdout=json.dumps([existing])))
+    monkeypatch.setattr(server, 'docker', docker)
+    touched = Mock()
+    monkeypatch.setattr(server, 'touch', touched)
+    if allow_existing_image:
+        assert server.ensure(key, track_activity=False, allow_existing_image=True)['endpoint'].endswith(':5004')
+    else:
+        with pytest.raises(server.SandboxUpdatePending):
+            server.ensure(key, track_activity=False)
+    docker.assert_called_once_with('inspect', name, check=False)
+    touched.assert_not_called()
+
+
+def test_catalog_exception_does_not_restart_a_stopped_previous_image(server, monkeypatch):
+    key = str(uuid4())
+    name, _ = server.identity(key)
+    existing = {'Id': 'b' * 64, 'Config': {'Image': 'previous-image'}, 'State': {'Running': False},
+                'HostConfig': {'PidsLimit': 1024}, 'NetworkSettings': {'Networks': {'owner-network': {}}}}
+    monkeypatch.setattr(server, 'ensure_network', lambda _: 'owner-network')
+    class ReplacementReached(Exception):
+        pass
+    def docker(*args, **kwargs):
+        if args[0] == 'rename':
+            assert args == ('rename', name, name + '-previous-' + existing['Id'][:12])
+            raise ReplacementReached()
+        assert args == ('inspect', name)
+        return SimpleNamespace(returncode=0, stdout=json.dumps([existing]))
+    monkeypatch.setattr(server, 'docker', docker)
+    with pytest.raises(ReplacementReached):
+        server.ensure(key, track_activity=False, allow_existing_image=True)
+
+
+def test_mcp_catalog_reads_previous_image_as_the_owner_user(server, monkeypatch):
+    import mcp_runtime
+    key = str(uuid4())
+    name, _ = server.identity(key)
+    existing = {'Id': 'b' * 64, 'Config': {'Image': 'previous-image'}, 'State': {'Running': True},
+                'HostConfig': {'PidsLimit': 1024}, 'NetworkSettings': {'Networks': {'owner-network': {}}}}
+    catalog = {'mcp': [{'id': 'example', 'name': 'Example', 'tools': []}]}
+    calls = []
+    def docker(*args, **kwargs):
+        calls.append(args)
+        if args == ('inspect', name):
+            return SimpleNamespace(returncode=0, stdout=json.dumps([existing]))
+        assert args[:5] == ('exec', '--user', '1000', '-i', name)
+        assert json.loads(kwargs['stdin']) == {'operation': 'mcp_list', 'maintenance': True}
+        return SimpleNamespace(returncode=0, stdout=json.dumps(catalog))
+    monkeypatch.setattr(server, 'docker', docker)
+    monkeypatch.setattr(server, 'ensure_network', lambda _: 'owner-network')
+    monkeypatch.setattr(server, 'schedule_mcp_refresh', Mock())
+    monkeypatch.setattr(mcp_runtime, 'module_source', lambda *args: '')
+    assert server.operation(key, 'personal-mcp', {'operation': 'mcp_list', 'maintenance': True}) == catalog
+    assert len(calls) == 2
 
 
 @pytest.mark.parametrize('running,previous,desired,blocked', [
     (True, 256, 1024, False), (False, 1024, 512, False),
     (True, 1024, 512, True), (True, 0, 1024, True),
 ])
-def test_reconciles_thread_limit_without_restarting_running_tasks(server, monkeypatch, running, previous, desired, blocked):
+@pytest.mark.parametrize('allow_existing_image', [False, True])
+def test_reconciles_thread_limit_without_restarting_running_tasks(server, monkeypatch, running, previous, desired, blocked, allow_existing_image):
     key = str(uuid4())
     name, _ = server.identity(key)
-    existing = {'Id': 'b' * 64, 'Config': {'Image': server.IMAGE}, 'State': {'Running': running},
+    existing = {'Id': 'b' * 64, 'Config': {'Image': 'previous-image' if allow_existing_image and running else server.IMAGE}, 'State': {'Running': running},
                 'HostConfig': {'PidsLimit': previous}, 'NetworkSettings': {'Networks': {'owner-network': {}}}}
     calls = []
     monkeypatch.setenv('WORKBENCH_SANDBOX_PIDS_LIMIT', str(desired))
@@ -240,10 +315,10 @@ def test_reconciles_thread_limit_without_restarting_running_tasks(server, monkey
     monkeypatch.setattr(server, 'docker', docker)
     if blocked:
         with pytest.raises(server.SandboxUpdatePending):
-            server.ensure(key)
+            server.ensure(key, allow_existing_image=allow_existing_image)
         assert not any(call[0] == 'update' for call in calls)
     else:
-        server.ensure(key)
+        server.ensure(key, allow_existing_image=allow_existing_image)
         assert ('update', '--pids-limit', str(desired), name) in calls
         assert not any(call[0] in ('create', 'rename', 'stop', 'restart') for call in calls)
 
