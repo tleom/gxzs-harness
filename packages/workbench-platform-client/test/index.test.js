@@ -89,6 +89,71 @@ describe('restricted platform client', () => {
       .rejects.toMatchObject({ name: 'TimeoutError' })
   })
 
+  it('recovers transient config reads using current policy and the same request deadline', async () => {
+    const fetchImpl = vi.fn()
+      .mockResolvedValueOnce(new Response('{"message":"recovering"}', { status: 503 }))
+      .mockRejectedValueOnce(Object.assign(new TypeError('fetch failed'), { cause: { code: 'ECONNRESET' } }))
+      .mockResolvedValueOnce(new Response('{"data":{"enabled":false}}'))
+    const result = await create(fetchImpl).request({ owner: { ownerId: 't:1' }, method: 'GET', route: 'workbench/config' })
+    expect(JSON.parse(Buffer.from(result.bytes).toString())).toEqual({ data: { enabled: false } })
+    expect(fetchImpl).toHaveBeenCalledTimes(3)
+    expect(new Set(fetchImpl.mock.calls.map(([, options]) => options.signal)).size).toBe(1)
+    expect(fetchImpl.mock.calls.every(([, options]) => options.headers['x-gxzs-owner'] === 't:1')).toBe(true)
+  })
+
+  it('bounds repeated config failures and never falls back to cached policy', async () => {
+    const fetchImpl = vi.fn()
+      .mockResolvedValueOnce(new Response('{"data":{"enabled":true}}', { headers: { etag: '"old"' } }))
+      .mockImplementation(async () => new Response('{"message":"still unavailable"}', { status: 503 }))
+    const client = create(fetchImpl)
+    const request = { owner: { ownerId: 't:1' }, method: 'GET', route: 'workbench/config', timeoutMs: 5000 }
+    await client.request(request)
+    await expect(client.request(request)).rejects.toMatchObject({ status: 502, upstreamStatus: 503 })
+    expect(fetchImpl).toHaveBeenCalledTimes(6)
+    expect(client.configCache.has('t:1')).toBe(false)
+  })
+
+  it('does not restart the total timeout during config backoff', async () => {
+    const fetchImpl = vi.fn(async () => new Response(null, { status: 503 }))
+    await expect(create(fetchImpl).request({ owner: { ownerId: 't:1' }, method: 'GET', route: 'workbench/config', timeoutMs: 25 }))
+      .rejects.toMatchObject({ name: 'TimeoutError' })
+    expect(fetchImpl).toHaveBeenCalledOnce()
+  })
+
+  it('cancels config backoff without making another request', async () => {
+    const fetchImpl = vi.fn(async () => new Response(null, { status: 503 }))
+    const controller = new AbortController()
+    const result = create(fetchImpl).request({ owner: { ownerId: 't:1' }, method: 'GET', route: 'workbench/config', signal: controller.signal })
+    const rejected = expect(result).rejects.toThrow('cancel during backoff')
+    await vi.waitFor(() => expect(fetchImpl).toHaveBeenCalledOnce())
+    await new Promise(resolve => setTimeout(resolve, 10))
+    controller.abort(new Error('cancel during backoff'))
+    await rejected
+    expect(fetchImpl).toHaveBeenCalledOnce()
+  })
+
+  it.each([401, 403, 404, 500])('does not retry a nontransient config status %s', async (status) => {
+    const fetchImpl = vi.fn(async () => new Response(null, { status }))
+    await expect(create(fetchImpl).request({ owner: { ownerId: 't:1' }, method: 'GET', route: 'workbench/config' })).rejects.toThrow()
+    expect(fetchImpl).toHaveBeenCalledOnce()
+  })
+
+  it('never retries tool calls, even for a transient upstream failure', async () => {
+    const fetchImpl = vi.fn(async () => new Response(null, { status: 503 }))
+    await expect(create(fetchImpl).request({ owner: { ownerId: 't:1' }, method: 'POST', route: 'mcp/call', body: Buffer.from('{}') }))
+      .rejects.toMatchObject({ status: 502 })
+    expect(fetchImpl).toHaveBeenCalledOnce()
+  })
+
+  it('does not retry oversized configuration responses', async () => {
+    const fetchImpl = vi.fn(async () => new Response('oversized', { headers: { 'content-length': '1000' } }))
+    const client = create(fetchImpl)
+    client.maxResponseBytes = 10
+    await expect(client.request({ owner: { ownerId: 't:1' }, method: 'GET', route: 'workbench/config' }))
+      .rejects.toMatchObject({ code: 'UPSTREAM_RESPONSE_TOO_LARGE' })
+    expect(fetchImpl).toHaveBeenCalledOnce()
+  })
+
   it('keeps unconfigured platform features unavailable without blocking the core host', async () => {
     const fetchImpl = vi.fn()
     const client = new PlatformClient({ baseUrl: '', tokenEnv: 'MISSING_TOKEN', timeoutMs: 1000 }, { fetchImpl })
