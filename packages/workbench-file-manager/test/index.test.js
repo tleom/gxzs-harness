@@ -34,6 +34,33 @@ describe('restricted sandbox-manager file client', () => {
     const manager = create(async () => new Response(JSON.stringify({error:'资源繁忙',code:'MANAGER_BUSY',request_id:'request-1',retry_after:2}),{status:503}))
     await expect(manager.operate({operation:'list'})).rejects.toMatchObject({status:503,code:'MANAGER_BUSY',request_id:'request-1',retry_after:2})
   })
+  it('retries only explicit pre-dispatch capacity rejection with the same body and deadline', async () => {
+    const fetchImpl = vi.fn()
+      .mockImplementationOnce(async () => new Response(JSON.stringify({code:'MANAGER_BUSY'}),{status:503}))
+      .mockImplementationOnce(async () => new Response(JSON.stringify({ok:true})))
+    await expect(create(fetchImpl).operate({operation:'mkdir',path:'new-chat'})).resolves.toEqual({ok:true})
+    expect(fetchImpl).toHaveBeenCalledTimes(2)
+    const first = fetchImpl.mock.calls[0][1], second = fetchImpl.mock.calls[1][1]
+    expect(second.body).toBe(first.body)
+    expect(second.signal).toBe(first.signal)
+  })
+  it.each([new TypeError('connection closed'), {status:503,code:'SANDBOX_UPDATING'}, {status:500,code:'MANAGER_BUSY'}])('does not replay mutations after ambiguous failures or lifecycle errors: %s', async (failure) => {
+    const fetchImpl = vi.fn(async () => {
+      if (failure instanceof Error) throw failure
+      return new Response(JSON.stringify({code:failure.code}),{status:failure.status})
+    })
+    await expect(create(fetchImpl).operate({operation:'delete',path:'test-only'})).rejects.toThrow()
+    expect(fetchImpl).toHaveBeenCalledOnce()
+  })
+  it('stops a busy retry when the caller cancels', async () => {
+    const controller = new AbortController()
+    const fetchImpl = vi.fn(async () => {
+      controller.abort()
+      return new Response(JSON.stringify({code:'MANAGER_BUSY'}),{status:503})
+    })
+    await expect(create(fetchImpl).operate({operation:'list'},controller.signal)).rejects.toMatchObject({name:'AbortError'})
+    expect(fetchImpl).toHaveBeenCalledOnce()
+  })
   it('propagates caller cancellation to the authorized read', async () => {
     const controller = new AbortController()
     const manager = create(async (_url, options) => new Promise((_resolve, reject) => {

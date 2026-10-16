@@ -672,13 +672,19 @@ class CapacityError(RuntimeError):
 class BoundedHTTPServer(ThreadingHTTPServer):
     """Bound retained request bodies and long-running operation threads."""
     daemon_threads = True
+    # A scheduler burst can contain four requests per owner. Keep sockets in
+    # the kernel backlog while the existing bounded worker pool drains.
+    request_queue_size = 128
 
     def __init__(self, *args, **kwargs):
         self.capacity = threading.BoundedSemaphore(int(os.environ.get("WORKBENCH_MANAGER_MAX_REQUESTS", "32")))
         super().__init__(*args, **kwargs)
 
     def process_request(self, request, client_address):
-        if not self.capacity.acquire(blocking=False):
+        # Short control requests commonly free a worker within milliseconds.
+        # A bounded wait absorbs bursts without increasing threads or bodies;
+        # sustained saturation still returns the existing retryable 503.
+        if not self.capacity.acquire(timeout=0.1):
             self.reject_request(request, 'MANAGER_BUSY', '沙盒管理服务繁忙，本次操作未开始，请稍后重试')
             return
         try:

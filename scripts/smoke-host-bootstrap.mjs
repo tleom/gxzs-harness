@@ -63,6 +63,7 @@ let referenceModelCalls = 0
 let pluginCalls = 0
 let verifyAttachmentContext = false
 let attachmentPaths
+let malformedToolProbe
 const fixtureFiles = new Map()
 const remote = (command) => execFileSync('ssh', ['-T', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=5',
   process.env.GXZS_SANDBOX_SSH_HOST, command], { encoding: 'utf8', timeout: 10_000 })
@@ -200,6 +201,22 @@ const model = fixture((req, res) => {
   }
   for (const name of ['bash', 'job_output', 'job_kill', 'schedule_create', 'schedule_list', 'schedule_update', 'schedule_delete', 'working_directory']) {
     assert.ok(tools.has(name), `Native standard preset must expose ${name} to the model; received: ${JSON.stringify([...tools.keys()])}`)
+  }
+  if (malformedToolProbe) {
+    const probe = malformedToolProbe
+    probe.calls++
+    assert.ok(probe.calls <= 3, 'Malformed tool response recovery must be bounded')
+    const valid = { index: probe.calls === 1 ? 1 : 0, id: 'guard-valid-call', type: 'function',
+      function: { name: 'bash', arguments: JSON.stringify({ description: 'Count guarded execution', command: `printf 'once\\n' >> '${probe.path}'; printf GUARD_TOOL_OK` }) } }
+    const delta = probe.calls === 3 ? { role: 'assistant', content: 'GUARD_RECOVERED' }
+      : { role: 'assistant', tool_calls: probe.calls === 1
+        ? [{ index: 0, id: '', type: 'function', function: { name: '', arguments: '{}' } }, valid] : [valid] }
+    if (probe.calls === 3) assert.ok(req.fixtureBody.messages.some(message => message.role === 'tool' && JSON.stringify(message.content).includes('GUARD_TOOL_OK')))
+    res.writeHead(200, { 'content-type': 'text/event-stream' })
+    res.write(`data: ${JSON.stringify({id:'malformed-tool-probe',object:'chat.completion.chunk',created:1,model:'smoke',choices:[{index:0,delta,finish_reason:null}]})}\n\n`)
+    res.write(`data: ${JSON.stringify({id:'malformed-tool-probe',object:'chat.completion.chunk',created:1,model:'smoke',choices:[{index:0,delta:{},finish_reason:probe.calls===3?'stop':'tool_calls'}]})}\n\n`)
+    res.end('data: [DONE]\n\n')
+    return
   }
   assert.ok(tools.get('bash').parameters?.properties?.run_in_background,
     'Actual host assembly must expose native background execution')
@@ -936,6 +953,31 @@ try {
         console.log('PASS native image admission rejection: specific reason preserved in full and state-only history; no model request')
       }
     }
+  }
+  if (runningRestart && realSsh) {
+    const created = await signedRequest('POST', '/chats')
+    assert.equal(created.status, 201)
+    const target = (await created.json()).data
+    const detail = (await (await signedRequest('GET', `/chats/${target.id}`)).json()).data
+    malformedToolProbe = { calls: 0, path: `/workspace/${detail.file_directory}/guard-count.txt` }
+    assert.match(malformedToolProbe.path, /^\/workspace\/conversations\/[0-9/-]+[a-f0-9-]+\/guard-count\.txt$/)
+    const submitted = await signedRequest('POST', `/chats/${target.id}/runs`, { query: 'Exercise malformed provider recovery', request_key: 'malformed-tool-probe' })
+    assert.equal(submitted.status, 202)
+    const runId = (await submitted.json()).data.id
+    let state
+    const deadline = Date.now() + 30_000
+    while (Date.now() < deadline) {
+      if (fixtureFailure) throw fixtureFailure
+      state = (await (await signedRequest('GET', `/runs/${runId}`)).json()).data
+      assert.ok(!['failed','interrupted'].includes(state.status), JSON.stringify(state))
+      if (state.status === 'completed') break
+      await delay(100)
+    }
+    assert.equal(state.status, 'completed')
+    assert.equal(malformedToolProbe.calls, 3)
+    assert.equal(remote(`wc -l < '${malformedToolProbe.path}'`).trim(), '1', 'Valid sibling in rejected response must not execute')
+    malformedToolProbe = undefined
+    console.log('PASS malformed model tools: native bounded recovery, valid sibling executes once, readable completed history')
   }
   if (fixtureFailure) throw fixtureFailure
   passed = true
