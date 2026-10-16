@@ -5,7 +5,9 @@ export const TOOL_SEARCH_NAME = 'tool_search'
 export const MCP_NAME = 'mcp'
 export const PLUGIN_NAME = /^[a-z][a-z0-9_-]{0,63}$/
 export const bytes = value => Buffer.byteLength(typeof value === 'string' ? value : JSON.stringify(value), 'utf8')
-export const hash = value => createHash('sha256').update(typeof value === 'string' ? value : JSON.stringify(value)).digest('hex')
+export const hash = value => createHash('sha256').update(typeof value === 'string' ? value : JSON.stringify(value,
+  (_key, item) => item && typeof item === 'object' && !Array.isArray(item)
+    ? Object.fromEntries(Object.entries(item).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)) : item)).digest('hex')
 const normalized = value => String(value ?? '').normalize('NFKC').toLowerCase().trim()
 const STOP = new Set(['the', 'for', 'and', 'with', 'find', 'search', 'tool', 'tools', '查找', '搜索', '检索', '工具', '一下', '帮我', '请问', '查询'])
 
@@ -85,7 +87,7 @@ export function buildCatalog(snapshot, config) {
       definition,
       // Activation budgets measure the callable schema sent on each model step.
       // Source constraints/metadata still count toward the full catalog index.
-      definitionBytes: bytes(callable), fingerprint: hash(definitionJson),
+      definitionBytes: bytes(callable), fingerprint: hash(definition),
       unavailableReason: definition.unavailableReason,
     }
     item.nameText = normalized(item.name.replace(/([a-z\d])([A-Z])/g, '$1 $2'))

@@ -536,6 +536,40 @@ def test_http_body_framing_is_enforced_before_dispatch_on_a_real_socket(server, 
         worker.join(timeout=3)
 
 
+@pytest.mark.parametrize('failed', [False, True])
+def test_json_response_explicitly_closes_http11_keepalive_connection(server, monkeypatch, failed):
+    import http.client
+    import socket
+    import threading
+
+    operation = Mock(side_effect=RuntimeError('operation failed')) if failed else Mock(return_value={'ok': True})
+    monkeypatch.setattr(server, 'operation', operation)
+    listener = server.BoundedHTTPServer(('127.0.0.1', 0), server.Handler)
+    worker = threading.Thread(target=listener.serve_forever, daemon=True)
+    worker.start()
+    packet = (f'POST /sandboxes/{uuid4()}/schedule HTTP/1.1\r\n'
+              f'Host: localhost\r\nAuthorization: Bearer {server.TOKEN}\r\n'
+              'Content-Type: application/json\r\nConnection: keep-alive\r\n'
+              'Content-Length: 2\r\n\r\n{}').encode()
+    try:
+        with socket.create_connection(listener.server_address, timeout=3) as client:
+            client.sendall(packet)
+            response = http.client.HTTPResponse(client)
+            response.begin()
+            value = json.loads(response.read())
+            assert response.status == (503 if failed else 200)
+            assert len(value['request_id']) == 12 if failed else value['ok'] is True
+            # Java's HTTP client may pool HTTP/1.0 responses without this header.
+            # A complete response must never invite replay onto a closed socket.
+            assert response.getheader('Connection') == 'close'
+            assert client.recv(1) == b''
+        assert operation.call_count == 1
+    finally:
+        listener.shutdown()
+        listener.server_close()
+        worker.join(timeout=3)
+
+
 def test_short_control_request_burst_drains_without_exceeding_worker_limit(server, monkeypatch):
     import concurrent.futures
     import http.client

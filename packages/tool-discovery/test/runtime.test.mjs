@@ -246,6 +246,26 @@ test('pre-schema guard picks up unnotified definition changes and tolerates inve
   assert.equal(h.adapter.requests.length, 3, 'inventory-only changes do not invalidate assembled schemas')
 })
 
+for (const mode of ['native', 'ptc']) test(`${mode}: reordered nested schema keys do not revoke an active tool during request preparation`, async () => {
+  const parameters = { type: 'object', properties: { query: { type: 'string', description: 'Query' } }, required: ['query'] }
+  const h = await mount({ mode, rows: [row('g:cases', 'case_lookup', 'global', '案件', { parameters, inputSchema: parameters })],
+    script: [call('tool_search', { query: '案件' }, mode), call('case_lookup', { query: 'fixture' }, mode), response()] })
+  cleanups.push(() => h.close())
+  const agent = await h.create()
+  h.ctx.on('agent/pre-step', async ({ step }, next) => {
+    if (step === 2) {
+      const reordered = { required: ['query'], properties: { query: { description: 'Query', type: 'string' } }, type: 'object' }
+      h.bridge.rows[0] = { ...h.bridge.rows[0], parameters: reordered, inputSchema: reordered }
+      h.bridge.notify()
+    }
+    return next()
+  })
+  await h.send(agent)
+  assert.equal(h.adapter.requests.length, 3)
+  assert.deepEqual(h.executions, ['case_lookup'])
+  assert.equal(agent.session.snapshotEvents().at(-1).data.reason.kind, 'completed')
+})
+
 for (const mode of ['native', 'ptc']) for (const change of ['definition', 'authorization', 'run', 'availability'])
   test(`${mode}: request guard rejects active ${change} changes even after a preview assembly`, async () => {
     const h = await mount({ mode, script: [call('tool_search', { query: '案件' }, mode), response()] })
