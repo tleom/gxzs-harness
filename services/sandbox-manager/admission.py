@@ -68,10 +68,13 @@ class Admission:
             current = self.db.execute('SELECT state FROM task_admission WHERE owner=? AND run=?', (owner, run)).fetchone()
             return {'state': current['state'] if current else 'missing', 'limits': {'per_user': MAX_CONVERSATIONS_PER_OWNER, 'users': MAX_ACTIVE_OWNERS, 'tasks': MAX_ACTIVE_CONVERSATIONS}}
 
-    def fence(self, owner, instance):
+    def fence(self, owner, instance, *, preserve_pending=False):
         """Call only AFTER that host and its sandbox have been stopped."""
         with self.guard, self.db:
-            self.db.execute("UPDATE task_admission SET state='done' WHERE owner=? AND instance=? AND state IN ('running','waiting','retry')", (owner, instance))
+            # Same-generation recovery must retain undispatched/released tickets
+            # and their FIFO positions. Replacement/revocation still fences all.
+            states = "('running')" if preserve_pending else "('running','waiting','retry')"
+            self.db.execute("UPDATE task_admission SET state='done' WHERE owner=? AND instance=? AND state IN " + states, (owner, instance))
 
     def active(self, owner):
         with self.guard:

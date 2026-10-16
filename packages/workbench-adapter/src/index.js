@@ -654,11 +654,18 @@ export function apply(ctx, config) {
   const handler = async (req, res) => {
     try {
       if (req.method === 'GET' && req.url === config.basePath + '/health') {
-        const ready = recovered && !database.streamFlushError && runtime.mcpCatalogState?.ready === true
+        const available = recovered && !database.streamFlushError
+        const activity = available ? await nativeHostActivity(ctx, runtime.sidebarActivity, () => subagentSettings.activeWrites) : { protocol: 1, status: 'unknown' }
+        // Sample the non-reconnecting native transport after the activity await.
+        // A completed bootstrap does not make a subsequently closed SSH usable.
+        const ssh = ctx.get('ssh')
+        const transportFailed = ssh?.closed === true || Boolean(ssh?.failure) || ssh?.lifetime?.signal.aborted === true
+        const ready = available && !transportFailed && runtime.mcpCatalogState?.ready === true
         sendJson(res, ready ? 200 : 503, { live: true, ready, recovery: recovered ? 'ready' : recoveryError ? 'failed' : 'recovering',
           recovery_dependency: recoveryError?.code === 'MCP_CATALOG_UNAVAILABLE' ? 'mcp_catalog' : undefined,
           resources: runtime.mcpCatalogState?.status ?? 'initializing',
-          activity: ready ? await nativeHostActivity(ctx, runtime.sidebarActivity, () => subagentSettings.activeWrites) : { protocol: 1, status: 'unknown' } })
+          runtime_error: transportFailed ? 'SSH_UNAVAILABLE' : undefined,
+          activity })
         return
       }
       await recovery

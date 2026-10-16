@@ -34,6 +34,30 @@ def test_limits_and_fifo(tmp_path):
     queue.close()
 
 
+def test_same_generation_recovery_preserves_pending_tickets_and_fifo(tmp_path):
+    queue = Admission(str(tmp_path / 'queue.db'))
+    try:
+        for run in ('one', 'two', 'three'):
+            assert queue.request('a', 1, 'host-a', run, run, 'acquire')['state'] == 'running'
+        assert queue.request('a', 1, 'host-a', 'waiting', 'four', 'acquire')['state'] == 'waiting'
+        queue.request('a', 1, 'host-a', 'three', 'three', 'release', retry=True)
+        before = [tuple(row) for row in queue.db.execute("SELECT seq,run,state FROM task_admission WHERE state IN ('waiting','retry') ORDER BY seq")]
+        queue.fence('a', 'wrong-host', preserve_pending=True)
+        assert queue.active('a') == 2
+        queue.fence('a', 'host-a', preserve_pending=True)
+        assert queue.active('a') == 0 and queue.busy('a') == 2
+        assert [tuple(row) for row in queue.db.execute("SELECT seq,run,state FROM task_admission WHERE state IN ('waiting','retry') ORDER BY seq")] == before
+        assert queue.request('a', 1, 'host-a', 'waiting', 'four', 'acquire')['state'] == 'running'
+        assert queue.request('a', 1, 'host-a', 'three', 'three', 'acquire')['state'] == 'running'
+        assert queue.request('a', 1, 'host-a', 'one', 'one', 'acquire')['state'] == 'done'
+        # Actual replacement/revocation keeps its stricter fencing semantics.
+        queue.fence('a', 'host-a')
+        assert queue.busy('a') == 0
+        assert queue.request('a', 2, 'host-b', 'waiting', 'four', 'acquire')['state'] == 'fenced'
+    finally:
+        queue.close()
+
+
 def test_restart_cancel_and_no_expiry_overcommit(tmp_path):
     path = str(tmp_path / 'queue.db')
     queue = Admission(path)
