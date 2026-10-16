@@ -173,7 +173,7 @@ def save_operation(path, value):
     os.replace(temporary, path)
 
 
-def ensure(key, *, track_activity=True):
+def ensure(key, *, track_activity=True, allow_existing_image=False):
     pids_limit = int(os.environ.get('WORKBENCH_SANDBOX_PIDS_LIMIT', '1024'))
     if pids_limit <= 0:
         raise ValueError('WORKBENCH_SANDBOX_PIDS_LIMIT must be positive')
@@ -199,7 +199,12 @@ def ensure(key, *, track_activity=True):
             existing = json.loads(info.stdout)[0]
             attached = set((existing.get('NetworkSettings', {}).get('Networks') or {}).keys())
             mounted_home = (existing['Config'].get('Labels') or {}).get('gxzs.attachment-home')
-            if (existing["Config"]["Image"] != IMAGE or attached != {network} or mounted_home != home_volume
+            # Bootstrap catalog reads must remain available while a running owner
+            # awaits its drained image rollout. All isolation and upgrade fences
+            # still apply; stopped containers continue through normal replacement.
+            keep_running_image = allow_existing_image and existing['State']['Running']
+            if ((existing["Config"]["Image"] != IMAGE and not keep_running_image)
+                    or attached != {network} or mounted_home != home_volume
                     or (existing.get('HostConfig', {}).get('CgroupParent') or '') != owner_cgroup(key)):
                 if existing["State"]["Running"]:
                     # Do not execute privileged helpers in a previous image.
@@ -389,7 +394,7 @@ def operation(key, action, payload):
             record = HOSTS.root / key / 'host.json'
             if payload.get('maintenance') is True and record.exists() and json.loads(record.read_text(encoding='utf-8')).get('state') == 'stopped':
                 raise ResourceUnavailable('个人工作环境已休眠，维护请求稍后重试', 'HOST_IDLE', 30)
-            ensure(key, track_activity=tracked)
+            ensure(key, track_activity=tracked, allow_existing_image=payload['operation'] == 'mcp_list')
             request = payload
             if payload["operation"] in {"mcp_test", "mcp_call"}:
                 request = {"operation": "mcp_probe", "name": payload.get("name")}
