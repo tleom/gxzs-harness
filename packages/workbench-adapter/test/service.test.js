@@ -994,14 +994,16 @@ describe('followup and control service', () => {
     await expect(service.mcpCatalog({ ownerId: 'tenant:user' }, { required: true })).rejects.toMatchObject({ status: 503, code: 'MCP_CATALOG_UNAVAILABLE' })
   })
 
-  it('recovers a transient platform catalog failure without discarding the selected MCP tools', async () => {
+  it('uses the platform catalog retry deadline without replaying an exhausted read', async () => {
     const { service, platformClient, owner } = setup()
     const tool = { id: 'personal:mcp:gaode:maps_geo', runtime_name: 'maps_geo', version: 'v1',
       scope: 'personal', server_id: 'gaode', tool_name: 'maps_geo', description: 'Geocode',
       inputSchema: { type: 'object' } }
-    platformClient.json.mockRejectedValueOnce(Object.assign(new Error('temporary'), { status: 502 }))
-      .mockResolvedValueOnce({ data: { tools: [tool] } })
+    platformClient.json.mockResolvedValueOnce({ data: { tools: [tool] } })
     await expect(service.freezeMcpTools(owner, [tool.id])).resolves.toMatchObject([{ id: tool.id }])
+    expect(platformClient.json).toHaveBeenLastCalledWith(expect.objectContaining({ route: 'mcp/catalog', timeoutMs: 15_000 }))
+    platformClient.json.mockRejectedValueOnce(Object.assign(new Error('temporary'), { status: 502 }))
+    await expect(service.freezeMcpTools(owner, [tool.id])).rejects.toMatchObject({ code: 'MCP_CATALOG_UNAVAILABLE' })
     expect(platformClient.json).toHaveBeenCalledTimes(2)
   })
 

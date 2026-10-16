@@ -562,24 +562,21 @@ export class WorkbenchService {
   }
 
   async mcpCatalog(owner, { required = false, includePlugins = false } = {}) {
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        const payload = await this.platformClient.json({ owner, method: 'GET', route: 'mcp/catalog' })
-        const tools = payload.data?.tools ?? payload.tools ?? []
-        if (!Array.isArray(tools)) throw httpError(502, '平台 MCP 目录格式无效')
-        const normalized = tools.map(normalizeMcpResource)
-        const names = platformToolNames(normalized)
-        const items = normalized.map(tool => ({ ...tool, runtime_name: names.get(tool.id) }))
-        const plugins = payload.data?.plugins ?? payload.plugins ?? []
-        if (!Array.isArray(plugins)) throw httpError(502, '平台插件目录格式无效')
-        return includePlugins ? { tools: items, plugins } : items
-      } catch (error) {
-        const transient = [502, 503, 504].includes(error?.status) || ['TimeoutError', 'TypeError'].includes(error?.name)
-        if (transient && attempt === 0) continue
-        if (transient)
-          throw Object.assign(httpError(503, 'MCP 工具目录暂不可用，请稍后重试'), { code: 'MCP_CATALOG_UNAVAILABLE' })
-        throw error
-      }
+    try {
+      const payload = await this.platformClient.json({ owner, method: 'GET', route: 'mcp/catalog', timeoutMs: 15_000 })
+      const tools = payload.data?.tools ?? payload.tools ?? []
+      if (!Array.isArray(tools)) throw httpError(502, '平台 MCP 目录格式无效')
+      const normalized = tools.map(normalizeMcpResource)
+      const names = platformToolNames(normalized)
+      const items = normalized.map(tool => ({ ...tool, runtime_name: names.get(tool.id) }))
+      const plugins = payload.data?.plugins ?? payload.plugins ?? []
+      if (!Array.isArray(plugins)) throw httpError(502, '平台插件目录格式无效')
+      return includePlugins ? { tools: items, plugins } : items
+    } catch (error) {
+      const transient = [502, 503, 504].includes(error?.status) || ['TimeoutError', 'TypeError'].includes(error?.name)
+      if (transient)
+        throw Object.assign(httpError(503, 'MCP 工具目录暂不可用，请稍后重试'), { code: 'MCP_CATALOG_UNAVAILABLE' })
+      throw error
     }
   }
 
