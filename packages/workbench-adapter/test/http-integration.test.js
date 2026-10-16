@@ -345,6 +345,29 @@ describe('authenticated workbench HTTP handler', () => {
     await expect(call(handler, key, 'POST', '/migration/import', {})).resolves.toMatchObject({ status: 501 })
   })
 
+  it.each(['closed', 'failure', 'aborted'])('reports a failed SSH %s after bootstrap without disclosing its error', async (mode) => {
+    const { handler, key, context } = setup()
+    await call(handler, key, 'GET', '/health', undefined, false)
+    const runtime = context.reflect.provide.mock.calls.find(([name]) => name === 'workbenchRuntime')[1]
+    runtime.mcpCatalogState = { ready: true, status: 'ready' }
+    context.ssh = { closed: false, lifetime: new AbortController() }
+    await vi.waitFor(async () => expect((await call(handler, key, 'GET', '/health', undefined, false)).status).toBe(200))
+    context.agents.list = () => [{ status: 'idle', inbox: { nextTurn: [{}], nextStep: [] } }]
+    context.jobs = { list: () => [] }
+    context.schedule = { catalog: async () => {
+      // Failure can happen while the durable activity catalog is being read.
+      if (mode === 'aborted') context.ssh.lifetime.abort(new Error('secret transport details'))
+      else context.ssh[mode] = mode === 'closed' ? true : new Error('secret transport details')
+      return [{ status: 'active' }]
+    } }
+    const response = await call(handler, key, 'GET', '/health', undefined, false)
+    expect(response).toMatchObject({ status: 503, body: { live: true, ready: false, recovery: 'ready',
+      runtime_error: 'SSH_UNAVAILABLE', activity: { protocol: 1, status: 'ready', runningAgents: 0, pendingMessages: 1, activeSchedules: 1 } } })
+    expect(JSON.stringify(response.body)).not.toContain('secret transport details')
+    runtime.mcpCatalogState = { ready: false, status: 'unavailable' }
+    expect((await call(handler, key, 'GET', '/health', undefined, false)).body.runtime_error).toBe('SSH_UNAVAILABLE')
+  })
+
   it('returns a real assertion-derived identity without a data envelope', async () => {
     const { handler, key } = setup()
     await expect(call(handler, key, 'GET', '/identity')).resolves.toMatchObject({ status: 200, body: { user: { id: '42', name: '用户' }, workspaceId: 't' } })

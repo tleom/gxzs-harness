@@ -66,6 +66,7 @@ def setup(tmp_path, monkeypatch):
     host.healthy = Mock(return_value=True)
     host.native_activity = Mock(return_value=dict(runningAgents=0, pendingMessages=0, runningJobs=0, activeSchedules=0, activeSidebarResources=0, activeSettingsWrites=0))
     host.dependency_degraded = Mock(return_value=False)
+    host.failed_transport_activity = Mock(return_value=None)
     payload = dict(owner_id='t:1', generation=1, instance_id='host-1', platform_token='derived', assertion_key='a2V5', assertion_issuer='gxzs')
     return host, control, ensure, payload, created
 
@@ -648,7 +649,7 @@ def test_dead_host_pair_is_fenced_and_restarted_after_liveness_grace(tmp_path, m
     host._ssh.reset_mock()
     maintain(host)
     assert [call.args[-1] for call in docker.call_args_list if call.args[0] == 'stop'] == ['host-1', 'sandbox-workspace']
-    host.admission.fence.assert_called_once_with('t:1', 'host-1')
+    host.admission.fence.assert_called_once_with('t:1', 'host-1', preserve_pending=True)
     sandbox.assert_called_once_with('workspace')
     host._ssh.assert_called_once()
     assert any(call.args[:2] == ('rename', 'host-1') for call in docker.call_args_list)
@@ -841,6 +842,100 @@ def test_later_complete_activity_response_recovers_readiness_without_restart(tmp
     maintain(host)
     assert not any(call.args[0] in ('stop', 'rename', 'create') for call in docker.call_args_list)
     assert json.loads((host.root / 'workspace' / 'host.json').read_text())['ready'] is True
+
+
+def failed_ssh_setup(tmp_path, monkeypatch):
+    host, docker, sandbox, payload, created = setup(tmp_path, monkeypatch)
+    host.ensure('workspace', payload)
+    record = host.root / 'workspace' / 'host.json'
+    item = json.loads(record.read_text())
+    item.update(state='ready', ready=True)
+    host._save(record, item)
+    host.healthy.return_value = False
+    host.alive = Mock(return_value=True)
+    host.native_activity.return_value = None
+    host.failed_transport_activity.return_value = dict(runningAgents=0, pendingMessages=6,
+        runningJobs=0, activeSchedules=1, activeSidebarResources=2, activeSettingsWrites=0)
+    host.failures['host-1'] = 0
+    host.admission.busy.return_value = 2
+    docker.reset_mock()
+    return host, docker, sandbox, payload, created, record, item
+
+
+@pytest.mark.parametrize('busy', ['runningAgents', 'runningJobs', 'activeSettingsWrites', 'admission'])
+def test_failed_ssh_preserves_actual_execution(tmp_path, monkeypatch, busy):
+    host, docker, _, _, _, record, item = failed_ssh_setup(tmp_path, monkeypatch)
+    if busy == 'admission':
+        host.admission.active.return_value = 1
+    else:
+        host.failed_transport_activity.return_value[busy] = 1
+    maintain(host)
+    assert not any(call.args[0] in ('stop', 'rename', 'create') for call in docker.call_args_list)
+    host.admission.fence.assert_not_called()
+    assert json.loads(record.read_text()) == {**item, 'ready': False}
+
+
+def test_failed_ssh_recovers_idle_pair_and_preserves_queued_tickets(tmp_path, monkeypatch):
+    host, docker, sandbox, _, _, record, item = failed_ssh_setup(tmp_path, monkeypatch)
+    # An unavailable catalog or PID pressure does not heal a dead transport.
+    host.dependency_degraded.return_value = True
+    monkeypatch.setattr('hosts.pid_pressure', lambda _info: True)
+    maintain(host)
+    stops = [call for call in docker.call_args_list if call.args[0] == 'stop']
+    assert [call.args[-1] for call in stops] == ['host-1', 'sandbox-workspace']
+    assert all(call.kwargs['check'] is True for call in stops)
+    host.admission.fence.assert_called_once_with('t:1', 'host-1', preserve_pending=True)
+    assert any(call.args == ('start', 'host-1') for call in docker.call_args_list)
+    assert json.loads(record.read_text()) == {**item, 'ready': False}
+    # A new successful readiness probe is required before admitting more work.
+    host.failed_transport_activity.return_value = None
+    host.healthy.return_value = True
+    monkeypatch.setattr('hosts.pid_pressure', lambda _info: False)
+    host.admission.restore_pending.reset_mock()
+    maintain(host)
+    host.admission.restore_pending.assert_called_once_with('t:1', 1, 'host-1')
+    assert json.loads(record.read_text()) == item
+    maintain(host)
+    host.admission.restore_pending.assert_called_once()
+
+
+def test_failed_ssh_stop_failure_does_not_fence_or_start_replacement(tmp_path, monkeypatch):
+    host, docker, _, _, _, _, _ = failed_ssh_setup(tmp_path, monkeypatch)
+    original = docker.side_effect
+    def cannot_stop(*args, **kwargs):
+        if args[0] == 'stop':
+            raise OSError('Docker stop failed')
+        return original(*args, **kwargs)
+    docker.side_effect = cannot_stop
+    maintain(host)
+    host.admission.fence.assert_not_called()
+    assert not any(call.args[0] in ('rename', 'create', 'start') for call in docker.call_args_list)
+
+
+@pytest.mark.parametrize('change', [None, 'missing_code', 'wrong_code', 'ready', 'dead', 'unknown_activity', 'negative', 'boolean', 'missing_count', 'malformed', 'timeout', 'wrong_status'])
+def test_failed_transport_activity_requires_explicit_failure_and_complete_counts(tmp_path, monkeypatch, change):
+    from io import BytesIO
+    from urllib.error import HTTPError
+    host, _, _, _, _ = setup(tmp_path, monkeypatch)
+    counts = dict(runningAgents=0, pendingMessages=2, runningJobs=0, activeSchedules=1, activeSidebarResources=2, activeSettingsWrites=0)
+    payload = dict(live=True, ready=False, runtime_error='SSH_UNAVAILABLE', recovery='ready', resources='unavailable',
+                   activity=dict(protocol=1, status='ready', **counts))
+    if change == 'missing_code': payload.pop('runtime_error')
+    if change == 'wrong_code': payload['runtime_error'] = 'UPSTREAM_TIMEOUT'
+    if change == 'ready': payload['ready'] = True
+    if change == 'dead': payload['live'] = False
+    if change == 'unknown_activity': payload['activity'] = {'protocol': 1, 'status': 'unknown'}
+    if change == 'negative': payload['activity']['runningJobs'] = -1
+    if change == 'boolean': payload['activity']['runningAgents'] = False
+    if change == 'missing_count': payload['activity'].pop('activeSettingsWrites')
+    body = b'{' if change == 'malformed' else json.dumps(payload).encode()
+    def reply(*_args, **_kwargs):
+        if change == 'timeout': raise TimeoutError()
+        raise HTTPError('http://host/health', 502 if change == 'wrong_status' else 503, 'unready', {}, BytesIO(body))
+    host.opener.open = Mock(side_effect=reply)
+    assert Hosts.failed_transport_activity(host, 'http://host') == (counts if change is None else None)
+    if change is None:
+        assert Hosts.dependency_degraded(host, 'http://host') is False
 
 
 def test_unhealthy_sandbox_does_not_interrupt_admitted_work(tmp_path, monkeypatch):

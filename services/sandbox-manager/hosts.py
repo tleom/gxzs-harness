@@ -446,13 +446,16 @@ class Hosts:
             self._save(record, current)
             return self._upgrade_result(workspace, marker)
 
-    def _fence(self, workspace, owner, instance):
+    def _fence(self, workspace, owner, instance, *, preserve_pending=False):
         self.native_snapshots.pop(instance, None)
         from global_memory import fence_workspace
         fence_workspace(workspace)
         from mcp_runtime import fence_workspace as fence_mcp
         fence_mcp(workspace)
-        self.admission.fence(owner, instance)
+        if preserve_pending:
+            self.admission.fence(owner, instance, preserve_pending=True)
+        else:
+            self.admission.fence(owner, instance)
 
     def _ssh(self, folder, sandbox):
         ssh = folder / 'ssh'
@@ -522,8 +525,17 @@ class Hosts:
         catalog_blocked = (payload.get('recovery') == 'ready'
                            or (payload.get('recovery') == 'failed'
                                and payload.get('recovery_dependency') == 'mcp_catalog'))
-        return (payload.get('live') is True and catalog_blocked
+        return (payload.get('live') is True and catalog_blocked and not payload.get('runtime_error')
                 and payload.get('resources') == 'unavailable')
+
+    @staticmethod
+    def _activity_counts(payload):
+        activity = payload.get('activity') or {}
+        keys = ('runningAgents', 'pendingMessages', 'runningJobs', 'activeSchedules', 'activeSidebarResources', 'activeSettingsWrites')
+        if (activity.get('protocol') == 1 and activity.get('status') == 'ready'
+                and all(type(activity.get(key)) is int and activity[key] >= 0 for key in keys)):
+            return {key: activity[key] for key in keys}
+        return None
 
     def native_activity(self, endpoint):
         """Only a complete native activity read can authorize idle shutdown.
@@ -535,12 +547,27 @@ class Hosts:
         try:
             with self.opener.open(endpoint + '/ai/workbench/health', timeout=2) as response:
                 payload = json.loads(response.read(4096))
-                activity = payload.get('activity') or {}
-                keys = ('runningAgents', 'pendingMessages', 'runningJobs', 'activeSchedules', 'activeSidebarResources', 'activeSettingsWrites')
-                if (response.status == 200 and payload.get('ready') is True
-                        and activity.get('protocol') == 1 and activity.get('status') == 'ready'
-                        and all(type(activity.get(key)) is int and activity[key] >= 0 for key in keys)):
-                    return {key: activity[key] for key in keys}
+                if response.status == 200 and payload.get('ready') is True:
+                    return self._activity_counts(payload)
+        except Exception:
+            pass
+        return None
+
+    def failed_transport_activity(self, endpoint):
+        """A definitive, non-reconnecting SSH failure is not a probe timeout."""
+        try:
+            with self.opener.open(endpoint + '/ai/workbench/health', timeout=2):
+                return None
+        except HTTPError as error:
+            if error.code != 503:
+                return None
+            try:
+                payload = json.loads(error.read(4096))
+                if (payload.get('live') is True and payload.get('ready') is False
+                        and payload.get('runtime_error') == 'SSH_UNAVAILABLE'):
+                    return self._activity_counts(payload)
+            except (ValueError, OSError, AttributeError, TypeError):
+                pass
         except Exception:
             pass
         return None
@@ -727,6 +754,8 @@ class Hosts:
             # A later complete readiness/activity response supersedes an earlier
             # timed-out probe. Do not recover a Host that has already caught up.
             healthy = healthy or (sandbox_healthy and native_activity is not None)
+            failed_transport_activity = (self.failed_transport_activity(item['endpoint'])
+                                         if not healthy and alive else None)
             with self.lock(record.parent.name):
                 item = json.loads(record.read_text())
                 if item != observed:
@@ -763,6 +792,8 @@ class Hosts:
                         return
                     if item.get('state') == 'provisioning' and item.get('initial_creation') is True:
                         item['initial_creation'] = False
+                    if item.get('ready') is not True:
+                        self.admission.restore_pending(item['owner_id'], item['generation'], item['instance_id'])
                     item.update(state='ready', ready=True)
                     self._save(record, item)
                     heartbeats.append((dict(item), 'ready'))
@@ -774,7 +805,7 @@ class Hosts:
                 # degraded state, not evidence that either local container is
                 # damaged. Pause new admission, retain the current generation,
                 # and let the Host's catalog poller recover in place.
-                if dependency_degraded or process_pressure:
+                if (dependency_degraded or process_pressure) and failed_transport_activity is None:
                     self.failures.pop(item['instance_id'], None)
                     self.recoveries.pop(item['instance_id'], None)
                     if item.get('ready') is not False:
@@ -804,15 +835,24 @@ class Hosts:
                 # dead. Preserve admitted/native work, including when the busy
                 # event loop cannot answer the activity read. A stopped/missing
                 # container remains definitive evidence and can be recovered.
-                if host_running and sandbox_running and (self.admission.busy(item['owner_id'])
-                        or (item.get('state') != 'provisioning' and (native_activity is None
-                            or any(native_activity[key] for key in
-                                   ('runningAgents', 'pendingMessages', 'runningJobs', 'activeSettingsWrites'))))):
-                    return
+                if host_running and sandbox_running:
+                    if failed_transport_activity is not None:
+                        # Pending inbox messages/schedules are durable; an SSH
+                        # session that has failed cannot heal by waiting for them.
+                        # Preserve actual execution and settings writes until idle.
+                        if (self.admission.active(item['owner_id']) or any(failed_transport_activity[key]
+                                for key in ('runningAgents', 'runningJobs', 'activeSettingsWrites'))):
+                            return
+                    elif (self.admission.busy(item['owner_id'])
+                            or (item.get('state') != 'provisioning' and (native_activity is None
+                                or any(native_activity[key] for key in
+                                       ('runningAgents', 'pendingMessages', 'runningJobs', 'activeSettingsWrites'))))):
+                        return
                 attempts = int(recovery.get('attempts', 0)) + 1
                 reason = ('host_missing' if info is None else
                           ('sandbox_' + str(sandbox_health or ('stopped' if not sandbox_running else 'unknown'))
-                           if not sandbox_healthy else ('host_unready' if alive else 'host_unreachable')))
+                           if not sandbox_healthy else ('ssh_unavailable' if failed_transport_activity is not None
+                                                        else 'host_unready' if alive else 'host_unreachable')))
                 logging.getLogger(__name__).warning(
                     'Recovering host pair workspace=%s instance=%s attempt=%d reason=%s',
                     item['workspace_id'], item['instance_id'], attempts, reason)
@@ -823,9 +863,9 @@ class Hosts:
                 # Preserve all named volumes. Fencing invalidates in-flight
                 # tools, then the same containers restart with the same owner
                 # and generation. Readiness is published by a later probe.
-                self.docker('stop', '--time', '10', item['instance_id'], check=False)
-                self.docker('stop', '--time', '10', sandbox, check=False)
-                self._fence(item['workspace_id'], item['owner_id'], item['instance_id'])
+                self.docker('stop', '--time', '10', item['instance_id'], check=failed_transport_activity is not None)
+                self.docker('stop', '--time', '10', sandbox, check=failed_transport_activity is not None)
+                self._fence(item['workspace_id'], item['owner_id'], item['instance_id'], preserve_pending=True)
                 self.ensure_sandbox(item['workspace_id'])
                 self._ssh(record.parent, sandbox)
                 image = os.environ['GXZS_HOST_IMAGE']
