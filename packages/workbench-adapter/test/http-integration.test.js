@@ -149,6 +149,29 @@ describe('authenticated workbench HTTP handler', () => {
     expect(runtime.database.getRun('t:42', message.id).mcpTools).toEqual([{ id: 'current-tool' }])
     expect((await call(handler, key, 'GET', '/health', undefined, false)).body.recovery_dependency).toBeUndefined()
   })
+  it('resumes a cold pending inbox during startup without another user prompt', async () => {
+    const folder = mkdtempSync(join(tmpdir(), 'workbench-inbox-recovery-'))
+    const databasePath = join(folder, 'state.db')
+    const db = new WorkbenchDatabase(databasePath)
+    db.createChat({ ownerId: 't:42', sessionId: 'cold', selection: {} })
+    db.close()
+    const message = { id: 'pending-reminder', source: { kind: 'schedule' }, content: [{ type: 'text', text: 'remind' }] }
+    const events = [{ type: 'agent/inbox/spliced', seq: 1, data: { target: 'next-turn', start: 0, removedCount: 0, inserted: [message] } }]
+    const resumePending = vi.fn()
+    const resolveAgent = vi.fn(async () => ({ agent: { resumePending } }))
+    const { handler, key, context } = setup({ databasePath, configure(ctx) {
+      ctx.sessionQuery = { observeSession: async () => ({ events, [Symbol.dispose]() {} }) }
+      ctx.sessionController.resolveAgent = resolveAgent
+    } })
+    cleanups.push(() => rmSync(folder, { recursive: true, force: true }))
+    const runtime = context.reflect.provide.mock.calls.find(([name]) => name === 'workbenchRuntime')[1]
+    runtime.mcpCatalogState = { ready: true, status: 'ready' }
+    runtime.mcpResources = () => []
+    await vi.waitFor(() => expect(resumePending).toHaveBeenCalledOnce())
+    expect(resolveAgent).toHaveBeenCalledExactlyOnceWith('cold')
+    expect(runtime.database.getRun('t:42', message.id)).toMatchObject({ status: 'queued', messageId: message.id })
+    expect((await call(handler, key, 'GET', '/health', undefined, false)).body.recovery).toBe('ready')
+  })
   it('cancels the owner file read when its response connection closes', async () => {
     const { handler, key, context } = setup()
     const previous = context.workbenchFileManager.operate.getMockImplementation()

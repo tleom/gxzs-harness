@@ -1,10 +1,13 @@
-import { afterAll, beforeAll, expect, it } from 'vitest'
+import { afterAll, beforeAll, expect, it, vi } from 'vitest'
 import { createRequire } from 'node:module'
 import { readFile, writeFile, unlink } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { randomUUID } from 'node:crypto'
 import { agentLoopPath, prepareAgentInbox } from '../../../scripts/prepare-dsh-agent-inbox.mjs'
+import { WorkbenchDatabase } from '../src/persistence.js'
+import { TaskScheduler } from '../src/scheduler.js'
+import { prepareRecoveredInboxes, reconcileNativeSessions, projectInboxClaim, projectSessionEvent } from '../src/projection.js'
 
 const profile = fileURLToPath(new URL('../../../profiles/workbench/', import.meta.url))
 const require = createRequire(join(profile, 'package.json'))
@@ -19,6 +22,7 @@ let original, prepared, baselineLoop, fixedLoop
 beforeAll(async () => {
   const path = await agentLoopPath(profile)
   original = (await readFile(path, 'utf8')).replace('machine.cancel({ kind: "disposed" }, { keepInbox: true });', 'machine.cancel({ kind: "disposed" });')
+    .replace('\tresumePending() {\n\t\tif (this.phase.kind === "idle" && this.inbox.hasPending) this.wakeDriver();\n\t}\n', '')
   prepared = prepareAgentInbox(original)
   const load = async source => {
     const file = join(dirname(path), `gxzs-inbox-${randomUUID()}.js`)
@@ -82,7 +86,7 @@ it('reproduces upstream disposal losing unclaimed schedule messages', async () =
   } finally { await h.close() }
 })
 
-it('retains pending native messages across disposal and cold replay without replaying the claimed turn', async () => {
+it('automatically drains preserved messages after cold recovery and capacity admission without replaying the claimed turn', async () => {
   const h = await mount(fixedLoop, true)
   let seed, first, second, active
   try {
@@ -101,16 +105,64 @@ it('retains pending native messages across disposal and cold replay without repl
     expect(seed.filter(event => event.type === 'turn/end').at(-1).data.reason).toMatchObject({ kind: 'aborted', reason: { kind: 'disposed' } })
   } finally { await h.close() }
   const restored = await mount(fixedLoop)
+  const db = new WorkbenchDatabase(':memory:')
+  const owner = 'test:owner'
+  const chat = db.createChat({ ownerId: owner, sessionId: 'restored', selection: {} })
+  let handle, capacity = 'queued'
+  const admissions = []
+  const scheduler = new TaskScheduler({ database: db, ownerId: owner, agents: restored.ctx.agents,
+    sessions: {}, platformClient: { json: async request => {
+      admissions.push(request)
+      return { state: capacity }
+    } } })
   try {
-    const handle = await restored.ctx.agents.create({ sessionId: 'restored', seed, agentOptions: { provider: 'fixture', model: 'fixture' } })
+    const queued = await reconcileNativeSessions(db, { observeSession: async () => ({ events: seed }) }, owner, { mcpTools: [] })
+    expect(queued).toEqual([first.id, second.id])
+    const sessions = { resolveAgent: async () => {
+      handle ??= await restored.ctx.agents.create({ sessionId: chat.sessionId, seed, agentOptions: { provider: 'fixture', model: 'fixture' } })
+      return { agent: handle.agent }
+    } }
+    restored.ctx.on('agent/pre-step', async (payload, next) => {
+      for (const message of payload.messages) projectInboxClaim(db, { agent: payload.agent, message, turn: payload.turn }, owner)
+      return scheduler.admitNativeStep(payload, next)
+    }, { global: true })
+    restored.ctx.on('session/event', (session, event) => projectSessionEvent(db, session.id, event, owner), { global: true })
+    const resume = await prepareRecoveredInboxes(db, sessions, owner, queued)
     expect(restored.requests()).toBe(0)
-    handle.agent.followup(message('wake queued work'))
+    resume()
+    resume() // Recovery retry must not create a second driver or message.
+    await vi.waitFor(() => expect(admissions.length).toBeGreaterThan(0))
+    expect(restored.requests()).toBe(0)
+    capacity = 'running'
     await handle.agent.whenIdle()
-    expect(restored.requests()).toBe(3)
+    expect(restored.requests()).toBe(2)
     const ids = handle.agent.session.snapshotEvents().filter(event => event.type === 'user/message').map(event => event.data.id)
     for (const row of [active, first, second]) expect(ids.filter(id => id === row.id)).toHaveLength(1)
+    expect(db.getRun(owner, first.id).status).toBe('completed')
+    expect(db.getRun(owner, second.id).status).toBe('completed')
     expect(pending(handle.agent.session.snapshotEvents())).toEqual([])
-  } finally { await restored.close() }
+  } finally { scheduler.close(); await restored.close(); db.close() }
+})
+
+it('does not start any recovered inbox if another restore fails or a receipt is cancelled or archived', async () => {
+  const db = new WorkbenchDatabase(':memory:')
+  const owner = 'test:owner', resume = vi.fn()
+  const create = sessionId => {
+    const chat = db.createChat({ ownerId: owner, sessionId, selection: {} })
+    const { run } = db.createRun({ ownerId: owner, chatId: chat.id, sessionId, query: 'queued', selection: {} })
+    db.adoptInboxMessage(sessionId, run.id, 'message-' + sessionId)
+    return run
+  }
+  const first = create('one'), second = create('two')
+  try {
+    await expect(prepareRecoveredInboxes(db, { resolveAgent: async id => id === 'one'
+      ? { agent: { resumePending: resume } } : { error: new Error('restore failed') } }, owner, [first.id, second.id])).rejects.toThrow('restore failed')
+    expect(resume).not.toHaveBeenCalled()
+    const wake = await prepareRecoveredInboxes(db, { resolveAgent: async () => ({ agent: { resumePending: resume } }) }, owner, [first.id, second.id], () => ['two'])
+    db.transitionRun(owner, first.id, 'cancelled')
+    wake()
+    expect(resume).not.toHaveBeenCalled()
+  } finally { db.close() }
 })
 
 it('retains explicit user cancellation of pending work', async () => {

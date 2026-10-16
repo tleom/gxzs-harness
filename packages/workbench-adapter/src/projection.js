@@ -476,4 +476,26 @@ export async function reconcileNativeSessions(database, sessionQuery, ownerId, c
     } finally { observed[Symbol.dispose]?.() }
   }
   database.recoverInterrupted(Date.now(), queued, initialRunIds)
+  return queued
+}
+
+/** Resolve all preserved roots before starting any; retries must not interrupt a partially resumed batch. */
+export async function prepareRecoveredInboxes(database, sessions, ownerId, runIds, archivedSessionIds = () => []) {
+  const agents = new Map()
+  const pending = run => run?.status === 'queued' && run.messageId && !run.stopConfirmation?.fenced
+    && !archivedSessionIds().includes(run.sessionId)
+  for (const id of runIds) {
+    const run = database.getRun(ownerId, id)
+    if (!pending(run) || agents.has(run.sessionId)) continue
+    const resolved = await sessions.resolveAgent(run.sessionId)
+    if ('error' in resolved) throw resolved.error
+    if (typeof resolved.agent.resumePending !== 'function') throw new Error('DSH inbox recovery preparation is missing')
+    agents.set(run.sessionId, resolved.agent)
+  }
+  // No messages are inserted or replayed. Native claim and pre-step admission
+  // still validate the durable receipt, cancellation, resources and capacity.
+  return () => {
+    const eligible = new Set(runIds.map(id => database.getRun(ownerId, id)).filter(pending).map(run => run.sessionId))
+    for (const [sessionId, agent] of agents) if (eligible.has(sessionId)) agent.resumePending()
+  }
 }

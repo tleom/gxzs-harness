@@ -5,14 +5,19 @@ import { fileURLToPath } from 'node:url'
 
 const original = 'machine.cancel({ kind: "disposed" });'
 const prepared = 'machine.cancel({ kind: "disposed" }, { keepInbox: true });'
+const resume = '\tresumePending() {\n\t\tif (this.phase.kind === "idle" && this.inbox.hasPending) this.wakeDriver();\n\t}\n'
+const followup = '\tfollowup(input) {'
 
 /** Process teardown must not discard durable messages that have not been claimed. */
 export function prepareAgentInbox(source) {
   if (source.split(original).length + source.split(prepared).length !== 3
     || !source.includes('cancel(cause, options = {})') || !source.includes('if (!options.keepInbox) {')
-    || !source.includes('await machine.whenIdle();'))
+    || !source.includes('await machine.whenIdle();') || source.split(followup).length !== 2
+    || !source.includes('wakeDriver(wakeAfterAbort = false) {')
+    || (source.includes('resumePending(') && source.split(resume).length !== 2))
     throw new Error('DSH agent disposal contract changed; inspect upstream before upgrading')
-  return source.replace(original, prepared)
+  const result = source.replace(original, prepared)
+  return result.includes(resume) ? result : result.replace(followup, resume + followup)
 }
 
 export async function agentLoopPath(profile) {
