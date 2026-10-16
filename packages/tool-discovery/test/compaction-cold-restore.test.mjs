@@ -60,7 +60,7 @@ async function mount(root, { owner = 'owner-a', currentTool = tool, script = [ca
   await ctx.plugin(BasicCompaction, { auto: false, summarizationProvider: 'fixture', summarizationModel: 'summary', retainTokens: 0, maxTokens: 1024 })
   const run = { id: 'same-run', ownerId: owner, status: 'running', mcpTools: [currentTool] }
   ctx.provide('workbenchRuntime', { ownerId: owner, agents: ctx.agents, executionRun: () => run,
-    authorizeMcp: (_session, id, version) => id === currentTool.id && version === currentTool.version
+    authorizeMcpCall: async (_session, id, version) => id === currentTool.id && version === currentTool.version
       ? { ownerId: owner, runId: run.id, resource: currentTool } : undefined,
   })
   ctx.provide('workbenchPlatformClient', { json: async request => {

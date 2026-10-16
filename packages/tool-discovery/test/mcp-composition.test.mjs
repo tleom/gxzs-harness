@@ -30,7 +30,7 @@ async function setup(mode = 'native') {
       } })
       ctx.provide('workbenchRuntime', { ownerId: 'owner-a', agents: ctx.agents,
         executionRun: () => run,
-        authorizeMcp: (_sessionId, id, version) => {
+        authorizeMcpCall: async (_sessionId, id, version) => {
           const resource = run.ownerId === 'owner-a' && run.status === 'running' && run.mcpTools.find(item => item.id === id && item.version === version)
           return resource ? { ownerId: run.ownerId, runId: run.id, resource } : undefined
         },

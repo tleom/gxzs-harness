@@ -6,6 +6,7 @@ export async function nativeHostActivity(ctx, sidebarActivity = () => ({ browser
     // Read the durable native catalog first; sample live work after the await.
     const tasks = await schedule.catalog()
     const agents = ctx.agents.list()
+    const archived = new Set(ctx.get('workspaceRegistry')?.archivedSessionIds ?? [])
     const jobs = new Map(ctx.jobs.list().map(job => [job.id, job]))
     for (const agent of agents) {
       for (const job of ctx.jobs.list(agent.id)) jobs.set(job.id, job)
@@ -17,7 +18,11 @@ export async function nativeHostActivity(ctx, sidebarActivity = () => ({ browser
     return {
       protocol: 1, status: 'ready',
       runningAgents: agents.filter(agent => agent.status === 'running').length,
-      pendingMessages: agents.reduce((count, agent) => count + agent.inbox.nextTurn.length + agent.inbox.nextStep.length, 0),
+      // Native archival durably blocks future steps but retains queued notices.
+      // An idle archived Session is safe to preserve across a Host replacement;
+      // running Agents and all Jobs/sidebar resources remain visible below.
+      pendingMessages: agents.reduce((count, agent) => count + (agent.status !== 'running' && archived.has(agent.session?.id ?? agent.id)
+        ? 0 : agent.inbox.nextTurn.length + agent.inbox.nextStep.length), 0),
       runningJobs: [...jobs.values()].filter(job => job.status === 'running' || job.status === 'stopping').length,
       activeSchedules: tasks.filter(task => task.status === 'active').length,
       activeSidebarResources: sidebar.browser + sidebar.terminal,

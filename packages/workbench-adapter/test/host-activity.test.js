@@ -9,7 +9,8 @@ function fixture() {
   const jobs = { list: vi.fn(id => id === 'grandchild' ? [unowned, { id: 'owned', status: 'stopping' }]
     : [unowned, { id: 'finished', status: 'completed' }]), read }
   const schedule = { catalog: vi.fn(async () => [{ status: 'active', scheduledAt: '2099-01-01T00:00:00Z' }, { status: 'inactive' }]) }
-  return { agents, jobs, schedule, ctx: { get: () => schedule, agents: { list: () => agents }, jobs } }
+  const workspace = { archivedSessionIds: [] }
+  return { agents, jobs, schedule, workspace, ctx: { get: name => name === 'schedule' ? schedule : name === 'workspaceRegistry' ? workspace : undefined, agents: { list: () => agents }, jobs } }
 }
 
 it('keeps native descendant work, pending inbox, owned/unowned Jobs and future reminders visible without consuming them', async () => {
@@ -33,6 +34,25 @@ it('samples live work after a catalog await and allows a fully idle Host', async
   test.schedule.catalog.mockResolvedValue([{ status: 'inactive' }])
   expect(await nativeHostActivity(test.ctx)).toEqual({ protocol: 1, status: 'ready',
     runningAgents: 0, pendingMessages: 0, runningJobs: 0, activeSchedules: 0, activeSidebarResources: 0, activeSettingsWrites: 0 })
+})
+
+it('preserves dormant notices in archived idle sessions without blocking replacement or hiding live work', async () => {
+  const test = fixture()
+  test.agents.splice(1)
+  test.jobs.list.mockReturnValue([])
+  test.agents[0].inbox.nextTurn.push({ id: 'late-child-notice' })
+  test.schedule.catalog.mockImplementation(async () => {
+    test.workspace.archivedSessionIds = ['root']
+    return []
+  })
+  expect((await nativeHostActivity(test.ctx)).pendingMessages).toBe(0)
+  expect(test.agents[0].inbox.nextTurn).toEqual([{ id: 'late-child-notice' }])
+  test.agents[0].status = 'running'
+  expect(await nativeHostActivity(test.ctx)).toMatchObject({ runningAgents: 1, pendingMessages: 1 })
+  test.agents[0].status = 'idle'
+  test.schedule.catalog.mockResolvedValue([])
+  test.workspace.archivedSessionIds = []
+  expect((await nativeHostActivity(test.ctx)).pendingMessages).toBe(1)
 })
 
 it('does not turn missing services or failed native reads into an idle Host', async () => {

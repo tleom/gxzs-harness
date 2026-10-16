@@ -203,20 +203,26 @@ export async function apply(ctx, config = {}) {
 
 async function callProxy(ctx, tool, args, exec) {
   exec.signal?.throwIfAborted()
+  const deadlineMs = Math.min(Number.isSafeInteger(exec.deadlineMs) ? exec.deadlineMs : Infinity, Date.now() + MCP_CALL_TIMEOUT_MS)
+  if (deadlineMs <= Date.now()) throw new DOMException('MCP call deadline exceeded', 'TimeoutError')
+  const signal = AbortSignal.any([...(exec.signal ? [exec.signal] : []), AbortSignal.timeout(Math.max(0, deadlineMs - Date.now()))])
   if (!ctx.workbenchRuntime.mcpCatalogState?.ready)
     throw Object.assign(new Error('MCP 工具目录暂不可用，请稍后重试'), { status: 503, code: 'MCP_CATALOG_UNAVAILABLE' })
   const sessionId = exec.agent?.session?.id ?? exec.agent?.id
-  const authorization = ctx.workbenchRuntime.authorizeMcp(sessionId, tool.id, tool.version)
+  const authorization = await ctx.workbenchRuntime.authorizeMcpCall(sessionId, tool.id, tool.version, signal)
+  signal.throwIfAborted()
+  if (deadlineMs <= Date.now()) throw new DOMException('MCP call deadline exceeded', 'TimeoutError')
+  if (!ctx.workbenchRuntime.mcpCatalogState?.ready)
+    throw Object.assign(new Error('MCP 工具目录暂不可用，请稍后重试'), { status: 503, code: 'MCP_CATALOG_UNAVAILABLE' })
   if (!authorization) throw new Error('MCP tool is not authorized for the active run; select this tool before submitting a new task')
   if ((authorization.resource?.manifest_version ?? '') !== tool.manifest_version)
     throw new Error('MCP tool definition has changed; submit a new task to use the current definition')
   if (typeof exec.callId !== 'string' || !exec.callId.trim()) throw new Error('MCP callId is required to correlate this call')
   tool.validateArguments(args)
-  const deadlineMs = Math.min(Number.isSafeInteger(exec.deadlineMs) ? exec.deadlineMs : Infinity, Date.now() + MCP_CALL_TIMEOUT_MS)
   const payload = await ctx.workbenchPlatformClient.json({
     owner: { ownerId: authorization.ownerId }, method: 'POST', route: 'mcp/call',
     contentType: 'application/json',
-    signal: exec.signal, timeoutMs: MCP_CALL_TIMEOUT_MS, deadlineMs,
+    signal, timeoutMs: MCP_CALL_TIMEOUT_MS, deadlineMs,
     body: Buffer.from(JSON.stringify({
       run_id: authorization.runId, resource_id: tool.id, version: tool.version,
       manifest_version: tool.manifest_version, server_id: tool.server_id,
