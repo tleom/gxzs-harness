@@ -47,7 +47,32 @@ export class PlatformClient {
     this.maxResponseBytes = config.maxResponseBytes ?? 32 * 1024 * 1024
     if (!Number.isSafeInteger(this.maxResponseBytes) || this.maxResponseBytes < 1) throw new Error('maxResponseBytes must be a positive integer')
     this.configCache = new Map()
+    this.catalogReads = new Map()
     this.fetch = fetchImpl
+  }
+
+  async catalogReadSlot(ownerId, signal) {
+    const key = JSON.stringify([ownerId, this.generation, this.instance])
+    const previous = this.catalogReads.get(key) ?? Promise.resolve()
+    let release
+    const current = new Promise(resolve => { release = resolve })
+    const tail = previous.then(() => current)
+    this.catalogReads.set(key, tail)
+    void tail.then(() => { if (this.catalogReads.get(key) === tail) this.catalogReads.delete(key) })
+    let cancel
+    try {
+      // Queue before the HTTP request, rather than occupying Manager workers
+      // while waiting on the same owner's workspace lock. Every reader still
+      // fetches current policy; no fulfilled catalog or authorization is cached.
+      await Promise.race([previous, new Promise((_, reject) => {
+        cancel = () => reject(signal.reason)
+        signal.addEventListener('abort', cancel, { once: true })
+        if (signal.aborted) cancel()
+      })])
+      signal.throwIfAborted()
+      return release
+    } catch (error) { release(); throw error }
+    finally { signal.removeEventListener('abort', cancel) }
   }
 
   async request({ owner, method, route, query = '', body = Buffer.alloc(0), contentType = '', signal, timeoutMs = this.timeoutMs, deadlineMs }) {
@@ -65,53 +90,66 @@ export class PlatformClient {
     requestSignal.throwIfAborted()
     const cacheKey = key === 'GET workbench/config' && !query ? owner.ownerId : null
     const cached = cacheKey ? this.configCache.get(cacheKey) : null
-    for (let attempt = 0; ; attempt++) {
-      try {
-        const response = await this.fetch(`${this.baseUrl}/${route}${query}`, {
-          method: method.toUpperCase(),
-          headers: {
-            authorization: `Bearer ${this.token}`,
-            'x-gxzs-owner': owner.ownerId,
-            'x-gxzs-host-generation': this.generation,
-            'x-gxzs-host-instance': this.instance,
-            ...(deadlineMs === undefined ? {} : { 'x-gxzs-deadline-ms': String(deadlineMs) }),
-            ...(cached ? { 'if-none-match': cached.etag } : {}),
-            ...(contentType ? { 'content-type': contentType } : {}),
-          },
-          body: body.length ? body : undefined,
-          signal: requestSignal,
-          redirect: 'error',
-        })
-        if (response.status === 304 && cached) return { status: 200, headers: cached.headers, bytes: cached.bytes.slice() }
-        const bytes = await readBoundedResponse(response, this.maxResponseBytes, requestSignal)
-        if (!response.ok) {
-          if (cacheKey) this.configCache.delete(cacheKey)
-          let message = '平台服务请求失败'
-          let code
-          try {
-            const payload = JSON.parse(Buffer.from(bytes).toString('utf8'))
-            message = payload.message || payload.msg || message
-            if (typeof payload.code === 'string' && /^[A-Za-z][A-Za-z0-9_/-]{0,99}$/.test(payload.code)) code = payload.code
-          } catch {}
-          throw Object.assign(new Error(message), { status: response.status >= 400 && response.status < 500 ? response.status : 502, upstreamStatus: response.status, ...(code ? { code } : {}) })
+    const catalogRead = key === 'GET mcp/catalog' && !query
+    const release = catalogRead ? await this.catalogReadSlot(owner.ownerId, requestSignal) : undefined
+    try {
+      for (let attempt = 0; ; attempt++) {
+        try {
+          requestSignal.throwIfAborted()
+          const response = await this.fetch(`${this.baseUrl}/${route}${query}`, {
+            method: method.toUpperCase(),
+            headers: {
+              authorization: `Bearer ${this.token}`,
+              'x-gxzs-owner': owner.ownerId,
+              'x-gxzs-host-generation': this.generation,
+              'x-gxzs-host-instance': this.instance,
+              ...(deadlineMs === undefined ? {} : { 'x-gxzs-deadline-ms': String(deadlineMs) }),
+              ...(cached ? { 'if-none-match': cached.etag } : {}),
+              ...(contentType ? { 'content-type': contentType } : {}),
+            },
+            body: body.length ? body : undefined,
+            signal: requestSignal,
+            redirect: 'error',
+          })
+          if (response.status === 304 && cached) return { status: 200, headers: cached.headers, bytes: cached.bytes.slice() }
+          const bytes = await readBoundedResponse(response, this.maxResponseBytes, requestSignal)
+          if (!response.ok) {
+            if (cacheKey) this.configCache.delete(cacheKey)
+            let message = '平台服务请求失败'
+            let code
+            let retryAfter
+            try {
+              const payload = JSON.parse(Buffer.from(bytes).toString('utf8'))
+              message = payload.message || payload.msg || message
+              if (typeof payload.code === 'string' && /^[A-Za-z][A-Za-z0-9_/-]{0,99}$/.test(payload.code)) code = payload.code
+              if (Number.isInteger(payload.retry_after) && payload.retry_after >= 0 && payload.retry_after <= 60) retryAfter = payload.retry_after
+            } catch {}
+            const retryHeader = response.headers.get('retry-after')
+            if (retryAfter === undefined && /^\d+$/.test(retryHeader ?? '') && Number(retryHeader) <= 60) retryAfter = Number(retryHeader)
+            throw Object.assign(new Error(message), { status: response.status >= 400 && response.status < 500 ? response.status : 502, upstreamStatus: response.status,
+              ...(code ? { code } : {}), ...(retryAfter === undefined ? {} : { retry_after: retryAfter }) })
+          }
+          const etag = response.headers.get('etag')
+          if (cacheKey && etag) {
+            // Revalidate on every read: no stale-on-error fallback for credentials,
+            // model disablement or published prompt changes.
+            if (this.configCache.size >= 16 && !this.configCache.has(cacheKey)) this.configCache.delete(this.configCache.keys().next().value)
+            this.configCache.set(cacheKey, { etag, headers: response.headers, bytes: bytes.slice() })
+          } else if (cacheKey) this.configCache.delete(cacheKey)
+          return { status: response.status, headers: response.headers, bytes }
+        } catch (error) {
+          requestSignal.throwIfAborted()
+          // Re-read current policy only. Never replay tools/mutations or extend
+          // the caller's total deadline, and never substitute a stale config.
+          if ((!cacheKey && !catalogRead) || attempt >= 4 || !transientConfigRead(error)) throw error
+          const waitMs = catalogRead
+            ? Math.max(250 * 2 ** attempt, (error.retry_after ?? 0) * 1000) + Math.floor(Math.random() * 250)
+            : 100 * 2 ** attempt
+          try { await delay(waitMs, undefined, { signal: requestSignal }) }
+          catch (waitError) { requestSignal.throwIfAborted(); throw waitError }
         }
-        const etag = response.headers.get('etag')
-        if (cacheKey && etag) {
-          // Revalidate on every read: no stale-on-error fallback for credentials,
-          // model disablement or published prompt changes.
-          if (this.configCache.size >= 16 && !this.configCache.has(cacheKey)) this.configCache.delete(this.configCache.keys().next().value)
-          this.configCache.set(cacheKey, { etag, headers: response.headers, bytes: bytes.slice() })
-        } else if (cacheKey) this.configCache.delete(cacheKey)
-        return { status: response.status, headers: response.headers, bytes }
-      } catch (error) {
-        requestSignal.throwIfAborted()
-        // Re-read current policy only. Never replay tools/mutations or extend
-        // the caller's total deadline, and never substitute a stale config.
-        if (!cacheKey || attempt >= 4 || !transientConfigRead(error)) throw error
-        try { await delay(100 * 2 ** attempt, undefined, { signal: requestSignal }) }
-        catch (waitError) { requestSignal.throwIfAborted(); throw waitError }
       }
-    }
+    } finally { release?.() }
   }
 }
 
