@@ -20,6 +20,7 @@ COPY profiles/workbench ./profiles/workbench
 COPY scripts/prepare-workspace-changes.mjs /opt/workbench/scripts/prepare-workspace-changes.mjs
 COPY scripts/prepare-session-client.mjs /opt/workbench/scripts/prepare-session-client.mjs
 COPY scripts/prepare-subagent-prompt.mjs /opt/workbench/scripts/prepare-subagent-prompt.mjs
+COPY scripts/prepare-dsh-stream-arguments.mjs /opt/workbench/scripts/prepare-dsh-stream-arguments.mjs
 COPY scripts/prepare-session-references.mjs /opt/workbench/scripts/prepare-session-references.mjs
 COPY scripts/prepare-workbench-client.mjs /opt/workbench/scripts/prepare-workbench-client.mjs
 COPY scripts/native-settings-controllers.mjs /opt/workbench/scripts/native-settings-controllers.mjs

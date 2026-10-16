@@ -8,6 +8,7 @@ import { prepareSessionClient } from '../../scripts/prepare-session-client.mjs'
 import { prepareSubagentPrompt } from '../../scripts/prepare-subagent-prompt.mjs'
 import { prepareSessionReferences } from '../../scripts/prepare-session-references.mjs'
 import { prepareWorkbenchClient } from '../../scripts/prepare-workbench-client.mjs'
+import { prepareDshStreamArguments } from '../../scripts/prepare-dsh-stream-arguments.mjs'
 
 const root = dirname(fileURLToPath(import.meta.url))
 await prepareWorkspaceChanges(root)
@@ -15,6 +16,7 @@ await prepareSessionClient(root)
 await prepareSubagentPrompt(root)
 await prepareSessionReferences(root)
 await prepareWorkbenchClient(root)
+await prepareDshStreamArguments(root)
 const require = createRequire(import.meta.url)
 const shipped = join(dirname(require.resolve('@deepseek-ai/dsh-web-app/package.json')), 'presets')
 const patches = [readFileSync(join(root, 'cordis.patch.yml'), 'utf8')]
