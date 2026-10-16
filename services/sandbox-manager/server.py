@@ -94,7 +94,10 @@ def schedule_mcp_refresh(key, items):
 
 def docker(*args, stdin=None, timeout=90, check=True):
     try:
-        result = subprocess.run(["docker", *args], input=stdin, capture_output=True, text=True, timeout=timeout)
+        from docker_inspect import inspect_local
+        result = inspect_local(args, timeout) if stdin is None else None
+        if result is None:
+            result = subprocess.run(["docker", *args], input=stdin, capture_output=True, text=True, timeout=timeout)
     except OSError as error:
         if error.errno == errno.EAGAIN:
             raise ResourceUnavailable('沙盒管理服务暂时无法创建进程或线程，请稍后重试；数据已保留') from error

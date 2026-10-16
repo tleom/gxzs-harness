@@ -1,4 +1,5 @@
 import { EventEmitter } from 'node:events'
+import { createServer, get } from 'node:http'
 import { afterEach, describe, expect, it } from 'vitest'
 import { WorkbenchDatabase } from '../src/persistence.js'
 import { RunEventBus } from '../src/events.js'
@@ -34,6 +35,44 @@ function entries(res) {
 }
 
 describe('durable SSE transport', () => {
+  it('delivers headers and a comment on a real quiet connection before its heartbeat', async () => {
+    const { database, eventBus, ownerId, run } = setup()
+    const server = createServer((req, res) => {
+      const finish = streamRunEvents({ database, eventBus, ownerId, runId: run.id,
+        cursor: '0-0', req, res, heartbeatMs: 60_000 })
+      cleanups.push(finish)
+    })
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
+    try {
+      const result = await new Promise((resolve, reject) => {
+        const request = get(`http://127.0.0.1:${server.address().port}`, response => {
+          response.once('data', chunk => {
+            resolve({ status: response.statusCode, frame: chunk.toString() })
+            response.destroy()
+          })
+          response.on('error', reject)
+        })
+        request.on('error', reject)
+        request.setTimeout(2000, () => request.destroy(new Error('stream did not open before heartbeat')))
+      })
+      expect(result).toEqual({ status: 200, frame: ': connected\n\n' })
+      expect(database.eventsAfter(ownerId, run.id, 0, 10)).toEqual([])
+    } finally {
+      server.closeAllConnections()
+      await new Promise(resolve => server.close(resolve))
+    }
+  })
+
+  it('opens a caught-up queued stream immediately without creating a durable event', () => {
+    const { database, ownerId, run, res, stream } = setup()
+    stream()
+    expect(res.frames).toEqual([': connected\n\n'])
+    expect(res.ended).toBe(false)
+    expect(database.eventsAfter(ownerId, run.id, 0, 10)).toEqual([])
+    database.appendEvent(ownerId, run.id, { event: 'text', text: 'later' })
+    expect(entries(res)).toEqual([expect.objectContaining({ _id: '1-0', text: 'later' })])
+  })
+
   it('replays legacy context readings as small frames with unchanged durable cursors', async () => {
     const { database, ownerId, run, res, stream } = setup()
     database.appendEvent(ownerId, run.id, { event: 'workbench_context', phase: 'usage', used_tokens: 1200,

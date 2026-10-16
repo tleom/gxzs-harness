@@ -76,7 +76,14 @@ export function streamRunEvents({ database, eventBus, ownerId, runId, cursor, re
   res.on?.('close', finish)
   res.on?.('error', finish)
   res.on?.('drain', drain)
+  const openingSequence = sequence
   pump()
+  // A caught-up queued stream may have no events until the next heartbeat.
+  // Send an SSE comment now so proxies and clients can observe the connection.
+  if (!closed && !blocked && sequence === openingSequence) {
+    try { if (res.write(': connected\n\n') === false) pause() }
+    catch { finish() }
+  }
   if (!closed) {
     heartbeat = setInterval(() => {
       if (blocked) return
