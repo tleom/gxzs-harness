@@ -139,7 +139,7 @@ export function apply(ctx, config) {
         if (!runtime.mcpCatalogState?.ready) throw Object.assign(
           new Error('MCP catalog is not ready for native notice recovery'), { code: 'MCP_CATALOG_UNAVAILABLE' })
         return { mcpTools: runtime.mcpResources?.() ?? [] }
-      }, startupRunIds)
+      }, startupRunIds, () => ctx.get('workspaceRegistry')?.archivedSessionIds ?? [])
       await scheduler.flushFences()
       if (scheduler.closed) return
       recovered = true
