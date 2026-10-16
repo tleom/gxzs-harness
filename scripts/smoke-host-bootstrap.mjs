@@ -765,7 +765,8 @@ try {
         signedRequest('GET', `/catalog?chat_id=${cold.id}`), historySnapshot(cold.id),
       ])
       assert.equal(catalog.status, 200, 'Cold scoped catalog must share the native history resume')
-      assert.ok((await catalog.json()).data.skills.some(skill => skill.id === fixtureSkill.id))
+      assert.ok((await catalog.json()).data.skills.some(skill =>
+        skill.id === `personal:${fixtureSkill.id}` && skill.name === fixtureSkill.id && skill.scope === 'personal'))
       assert.ok(history.session_id)
     }
     assert.equal(modelCalls, callsBeforeColdReads, 'Concurrent cold reads must not submit model turns')
