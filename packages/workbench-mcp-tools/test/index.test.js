@@ -89,6 +89,10 @@ describe('platform MCP proxy tools', () => {
     platform.json.mockResolvedValueOnce({ tools: [catalogTool], plugins: [{ ...plugin, available: true }] })
     const frozen = await ctx.workbenchRuntime.refreshMcpCatalog()
     expect(frozen).toMatchObject([{ id: catalogTool.id }])
+    expect(frozen[0].inputSchema).toEqual(catalogTool.inputSchema)
+    expect(frozen[0].runtime_name).toBe('search')
+    for (const field of ['sourceInputSchema', 'definitionStamp', 'discoveryStamp', 'validateArguments'])
+      expect(frozen[0]).not.toHaveProperty(field)
     expect(ctx.toolDiscoveryCatalog.snapshot(agent)).toMatchObject({ tools: [], plugins: [
       { name: 'server', available: false, unavailableReason: 'run_authorization_required' },
     ] })

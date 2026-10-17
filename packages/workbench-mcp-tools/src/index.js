@@ -152,7 +152,10 @@ export async function apply(ctx, config = {}) {
     await synchronize()
     if (disposed || ctx.workbenchRuntime.mcpCatalogState?.status !== 'ready')
       throw Object.assign(new Error('MCP 工具目录暂不可用，请稍后重试'), { status: 503, code: 'MCP_CATALOG_UNAVAILABLE' })
-    return [...registrations.values()].map(({ tool }) => ({ ...tool }))
+    return [...registrations.values()].map(({ tool }) => {
+      const { public_name, definitionStamp, discoveryStamp, sourceInputSchema, validateArguments, ...resource } = tool
+      return { ...resource, runtime_name: public_name, inputSchema: sourceInputSchema }
+    })
   }
   // Admission freezes the same verified definitions that native discovery uses,
   // rather than a separate platform read ahead of the periodic registration sync.
