@@ -291,11 +291,14 @@ export class WorkbenchDatabase {
       const queueOrder = this.db.prepare(`SELECT COALESCE(MAX(queue_order), 0) + 1 AS value
         FROM runs WHERE chat_id = ? AND status IN ('queued', 'running', 'waiting_input', 'stopping')`)
         .get(chatId).value
+      // Only forkChat's copied historical rows carry this marker. New Goal,
+      // child and ordinary turns must expose their own native file changes.
+      const { fork_source: _forkSource, ...currentSelection } = selection
       this.db.prepare(`INSERT INTO runs
         (id, owner_id, chat_id, session_id, request_key, query, attachments_json, mcp_tools_json, status, selection_json,
          parent_run_id, queue_order, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?)`)
-        .run(id, ownerId, chatId, sessionId, requestKey ?? null, query, JSON.stringify(attachments), JSON.stringify(mcpTools), JSON.stringify(selection), parentRunId ?? null, queueOrder, now, now)
+        .run(id, ownerId, chatId, sessionId, requestKey ?? null, query, JSON.stringify(attachments), JSON.stringify(mcpTools), JSON.stringify(currentSelection), parentRunId ?? null, queueOrder, now, now)
       this.db.prepare('UPDATE chats SET updated_at = ? WHERE id = ?').run(now, chatId)
       return { run: this.getRun(ownerId, id), created: true }
     })

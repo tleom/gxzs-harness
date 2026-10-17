@@ -905,6 +905,22 @@ describe('followup and control service', () => {
     expect(service.getRun(owner, run.id).steering_messages[0].input_supplement).toEqual(expected)
   })
 
+  it('deduplicates reordered supplements both after failed dispatch and after acceptance', async () => {
+    const { database, owner, chat, service, sessionController } = setup()
+    const { run } = database.createRun({ ownerId: owner.ownerId, chatId: chat.id, sessionId: chat.sessionId, query: 'q', selection: {} })
+    const questions = [{ id: 'a', question: 'A', multiSelect: true, options: [{ label: 'one' }, { label: 'two' }] }, { id: 'b', question: 'B' }]
+    database.createPendingInput(owner.ownerId, run.id, { requestId: 'order', payload: { tool_name: 'ask_user_question', questions } })
+    database.settlePendingInput(owner.ownerId, run.id, 'order', 'skipped')
+    database.transitionRun(owner.ownerId, run.id, 'completed')
+    const answers = [{ id: 'a', selected: ['two', 'one'] }, { id: 'b', selected: [], custom: 'text' }]
+    sessionController.prompt.mockRejectedValueOnce(new Error('dispatch unavailable'))
+    await expect(service.supplement(owner, run.id, { request_id: 'order', answers })).rejects.toThrow('dispatch unavailable')
+    const reversed = [answers[1], { id: 'a', selected: ['one', 'two'] }]
+    const accepted = await service.supplement(owner, run.id, { request_id: 'order', answers: reversed })
+    expect((await service.supplement(owner, run.id, { request_id: 'order', answers })).id).toBe(accepted.id)
+    expect(sessionController.prompt).toHaveBeenCalledTimes(2)
+  })
+
   it('unblocks every pending native question before steering a historical supplement', async () => {
     const test = setup()
     const { database, owner, chat, service } = test

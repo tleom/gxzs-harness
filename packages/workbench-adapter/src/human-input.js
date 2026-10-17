@@ -31,7 +31,8 @@ export class HumanInputBridge {
     if (request.signal?.aborted) abort()
     try {
       const value = await answer
-      await this.resumeInput?.(run, request.signal ?? new AbortController().signal)
+      if (pending.resumeRun && !this.database.listPendingInputs(chat.ownerId, run.id).some(input => input.status === 'pending'))
+        await this.resumeInput?.(run, request.signal ?? new AbortController().signal)
       return value
     }
     finally { request.signal?.removeEventListener('abort', abort) }
@@ -41,7 +42,7 @@ export class HumanInputBridge {
     const resolved = this.resolve(ownerId, runId, body.request_id)
     if (resolved.stored.status === 'submitted') {
       const answer = toAnswer(resolved.stored.payload.questions ?? [], body)
-      if (!isDeepStrictEqual(resolved.stored.answer?.answers, answer.answers))
+      if (!isDeepStrictEqual(toAnswer(resolved.stored.payload.questions ?? [], resolved.stored.answer).answers, answer.answers))
         throw Object.assign(new Error('该问题已提交不同的回答，请直接发送新消息补充'), { status: 409 })
       return resolved.stored
     }
@@ -98,6 +99,7 @@ export class HumanInputBridge {
     clearTimeout(pending.timer)
     this.pendings.delete(pending.id)
     this.database.settlePendingInput(pending.ownerId, pending.runId, pending.id, outcome, answer)
+    pending.resumeRun = !this.database.listPendingInputs(pending.ownerId, pending.runId).some(input => input.status === 'pending')
     this.database.appendEvent(pending.ownerId, pending.runId, {
       event: 'workbench_status', status: this.database.getRun(pending.ownerId, pending.runId).status,
     })
@@ -139,7 +141,13 @@ export function toAnswer(questions, body) {
         (answer.custom !== undefined && typeof answer.custom !== 'string')) fail()
     if (question.intent?.kind === 'plan-review' && (answer.selected.length !== 1 || answer.custom)) fail()
   }
-  return { answers: answers.map(({ id, selected, custom }) => ({ id, selected: [...selected], ...(custom === undefined ? {} : { custom }) })) }
+  // Question IDs and selected labels are identities, not an ordering contract.
+  // Canonicalize both live answers and old receipts against the native form.
+  return { answers: questions.map(question => {
+    const { id, selected, custom } = answers.find(answer => answer.id === question.id)
+    const labels = [...new Set((question.options ?? []).map(option => option.label))]
+    return { id, selected: labels.filter(label => selected.includes(label)), ...(custom === undefined ? {} : { custom }) }
+  }) }
 }
 
 export function inputSupplement(questions, answers) {

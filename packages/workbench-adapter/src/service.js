@@ -1112,7 +1112,7 @@ export class WorkbenchService {
     if (!input) throw httpError(404, '问题不存在')
     const nativeAnswer = toAnswer(input.payload.questions ?? [], body)
     if (input.answer?.supplement_run_id) {
-      if (!isDeepStrictEqual(input.answer.answers, nativeAnswer.answers))
+      if (!isDeepStrictEqual(toAnswer(input.payload.questions ?? [], input.answer).answers, nativeAnswer.answers))
         throw httpError(409, '该补答请求已使用不同的回答')
       return this.getRun(owner, input.answer.supplement_run_id)
     }

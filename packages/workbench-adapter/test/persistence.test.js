@@ -22,6 +22,19 @@ function seed(database, ownerId = 'user-a') {
 }
 
 describe('workbench durable projection', () => {
+  it('keeps inherited-history markers on copied rows only, never on new goal or child runs', () => {
+    const database = open()
+    const { chat, ownerId } = seed(database)
+    const selection = { model: 'p/m', fork_source: { sessionId: 'original', endSeq: 9 }, command: 'goal' }
+    for (const native_child of [undefined, 'new-child']) {
+      const { run } = database.createRun({ ownerId, chatId: chat.id, sessionId: chat.sessionId,
+        query: 'new work', selection: { ...selection, native_child } })
+      expect(run.selection.fork_source).toBeUndefined()
+      expect(run.selection).toMatchObject({ model: 'p/m', command: 'goal' })
+    }
+    expect(selection.fork_source).toEqual({ sessionId: 'original', endSeq: 9 })
+  })
+
   it('returns the newest question when consecutive inputs share the same millisecond', () => {
     const database = open()
     const { chat, ownerId } = seed(database)

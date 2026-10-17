@@ -20,6 +20,38 @@ function setup(timeoutSeconds = 60) {
 }
 
 describe('durable human input bridge', () => {
+  it('treats reordered questions and multi-select labels as the same answer on retry', async () => {
+    const { database, chat, run, bridge, request } = setup()
+    request.questions.push({ id: 'format', question: '格式', multiSelect: true, options: [{ label: 'Word' }, { label: 'PDF' }] })
+    const waiting = bridge.handleRequest(request, vi.fn())
+    const request_id = database.getPendingInput(chat.ownerId, run.id).requestId
+    const answers = [{ id: 'environment', selected: ['prod'] }, { id: 'format', selected: ['Word', 'PDF'] }]
+    bridge.resume(chat.ownerId, run.id, { request_id, answers })
+    const reversed = [{ id: 'format', selected: ['PDF', 'Word'] }, answers[0]]
+    expect(bridge.resume(chat.ownerId, run.id, { request_id, answers: reversed }).answer.answers).toEqual(answers)
+    // Persisted receipts from the previous release can have arbitrary order too.
+    database.db.prepare('UPDATE pending_inputs SET answer_json=? WHERE request_id=?').run(JSON.stringify({ answers: reversed }), request_id)
+    expect(() => bridge.resume(chat.ownerId, run.id, { request_id, answers })).not.toThrow()
+    await expect(waiting).resolves.toEqual({ answers })
+  })
+
+  it.each([false, true])('reacquires admission once after all overlapping questions settle (same tick: %s)', async sameTick => {
+    const { database, chat, run, bridge, request } = setup()
+    bridge.resumeInput = vi.fn(async () => {})
+    const first = bridge.handleRequest(request, vi.fn())
+    const firstId = database.getPendingInput(chat.ownerId, run.id).requestId
+    const second = bridge.handleRequest({ ...request, questions: [{ id: 'format', question: '格式' }] }, vi.fn())
+    const secondId = database.getPendingInput(chat.ownerId, run.id).requestId
+    bridge.skip(chat.ownerId, run.id, firstId)
+    if (!sameTick) {
+      await first
+      expect(bridge.resumeInput).not.toHaveBeenCalled()
+    }
+    bridge.skip(chat.ownerId, run.id, secondId)
+    await Promise.all([first, second])
+    expect(bridge.resumeInput).toHaveBeenCalledOnce()
+  })
+
   it('deduplicates identical answers but rejects a changed answer from an older form', async () => {
     const { database, chat, run, bridge, request } = setup()
     const waiting = bridge.handleRequest(request, vi.fn())
