@@ -9,6 +9,9 @@ import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
+import { createRequire } from 'node:module'
+import { pathToFileURL } from 'node:url'
+import { createContext, runInContext } from 'node:vm'
 
 if (process.platform !== 'linux') throw new Error('Host bootstrap smoke requires the Linux host image')
 
@@ -366,10 +369,11 @@ async function nativeClientRoundtrip() {
   assert.equal(response.status, 200, `Native client graph must be installed: ${sanitize(JSON.stringify(payload))}`)
   const manifest = payload.data
   assert.equal(manifest.protocol, 1)
-  assert.equal(manifest.version, '0.2.1-alpha.2')
+  assert.equal(manifest.version, '0.2.1-alpha.5')
   assert.match(manifest.bootstrap, /__ModuleLoader__/)
   assert.match(manifest.boot.rev, /^[a-f0-9]{64}$/)
   const ids = new Set(manifest.boot.entries.map(row => row.id))
+  const sources = new Map()
   for (const id of ['@deepseek-ai/dsh-client-modules', '@deepseek-ai/dsh-api-gateway',
     '@deepseek-ai/dsh-api-job-controller', '@deepseek-ai/dsh-api-session-controller', '@gxzs/dsh-workbench-adapter'])
     assert.ok(ids.has(id), `Missing native client module ${id}`)
@@ -379,6 +383,7 @@ async function nativeClientRoundtrip() {
     const value = await resource.json()
     assert.equal(resource.status, 200, `Native client bundle ${row.id} must be present in the built image`)
     assert.equal(typeof value.data.source, 'string')
+    sources.set(row.url, value.data.source)
     assert.ok(value.data.source.includes(row.id), `Native client bundle must register ${row.id}`)
     if (row.id === '@deepseek-ai/dsh-api-session-controller') {
       assert.equal([...value.data.source.matchAll(/this\.remote\.subagents\.prompt\(\{\s+requestId: requestId \?\? randomUUID\(\),/g)].length, 1,
@@ -388,6 +393,29 @@ async function nativeClientRoundtrip() {
         sourceSha256: createHash('sha256').update(value.data.source).digest('hex'), callerRequestIdGuard: true }))
     }
     assert.ok(Buffer.byteLength(value.data.source, 'utf8') <= 8 * 1024 * 1024)
+  }
+  // Execute the image-served factories with the same static dependencies used
+  // by GXZS. Merely finding module names cannot catch a broken release graph.
+  const require = createRequire('/opt/workbench/profiles/workbench/package.json')
+  const Cordis = await import(pathToFileURL(require.resolve('@deepseek-ai/cordis')).href)
+  const Store = await import(pathToFileURL(require.resolve('@deepseek-ai/dsh-client-store')).href)
+  const Zod = await import(pathToFileURL(require.resolve('zod')).href)
+  const browser = createContext({ window: {}, console, URL, AbortController, setTimeout, clearTimeout,
+    queueMicrotask, TextEncoder, TextDecoder, crypto: globalThis.crypto })
+  runInContext(manifest.bootstrap, browser)
+  const facade = browser.window.__ModuleLoader__
+  const loadBundle = async url => {
+    assert.ok(sources.has(url), 'Only admitted native bundles may load')
+    runInContext(sources.get(url), browser)
+  }
+  await loadBundle(manifest.boot.entries.find(row => row.id === '@deepseek-ai/dsh-client-modules').url)
+  const modules = facade.create({ boot: manifest.boot, loadBundle,
+    staticModules: { '@deepseek-ai/cordis': Cordis, '@deepseek-ai/dsh-client-store': Store, zod: Zod } })
+  for (const row of manifest.boot.entries) await modules.prefetch(row.id)
+  for (const id of ['@deepseek-ai/dsh-api-gateway', '@deepseek-ai/dsh-api-job-controller',
+    '@deepseek-ai/dsh-api-session-controller', '@deepseek-ai/dsh-typert-registry',
+    '@deepseek-ai/dsh-client-connection', '@gxzs/dsh-workbench-adapter']) {
+    assert.ok(Object.keys(await modules.import(id)).length, `Native factory must resolve: ${id}`)
   }
   console.log(`PASS native client image: signed boot graph and ${ids.size} original registration bundles; generated presenter included`)
 }

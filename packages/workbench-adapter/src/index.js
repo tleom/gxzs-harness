@@ -37,7 +37,7 @@ import { WorkbenchSubagentSettings } from './settings.js'
 import { setTimeout as delay } from 'node:timers/promises'
 
 export const name = 'workbench-adapter'
-export const inject = ['webServer', 'sessionController', 'workspaceController', 'sessionReferenceResolver', 'fileReferences', 'workspaceChanges', 'workingDirectory', 'agents', 'commands', 'skills', 'systemPrompt', 'tokenMeter', 'workbenchFileManager', 'workbenchPlatformClient', 'sessionQuery', 'sessionProjections', 'agentPresets', 'agentDefaultModel', 'settings', 'attachments', 'fileUploads', 'goals', 'terminalController', 'subagents', 'subprocess', 'jobs', 'jobController', 'tools']
+export const inject = ['connection', 'typertGateway', 'webServer', 'sessionController', 'workspaceController', 'sessionReferenceResolver', 'fileReferences', 'workspaceChanges', 'workingDirectory', 'agents', 'commands', 'skills', 'systemPrompt', 'tokenMeter', 'workbenchFileManager', 'workbenchPlatformClient', 'sessionQuery', 'sessionProjections', 'agentPresets', 'agentDefaultModel', 'settings', 'attachments', 'fileUploads', 'goals', 'terminalController', 'subagents', 'subprocess', 'jobs', 'jobController', 'tools']
 
 export const Config = z.object({
   basePath: z.string().default('/ai/workbench'),
@@ -102,7 +102,8 @@ export function apply(ctx, config) {
   workspaces.schedules = schedules
   const subagents = new WorkbenchSubagents({ sessions: ctx.sessionController, service, native: ctx.subagents, attachments: ctx.attachments, runtime })
   const nativeSessions = new WorkbenchNativeSessions({ ctx, sessions: ctx.sessionController, service, subagents, database })
-  const terminals = new WorkbenchTerminals({ native: ctx.terminalController, service, sessions: ctx.sessionController })
+  const terminals = new WorkbenchTerminals({ native: ctx.terminalController, service, sessions: ctx.sessionController,
+    connection: ctx.connection, gateway: ctx.typertGateway })
   const browsers = new WorkbenchBrowsers({ subprocess: ctx.subprocess, service })
   const sidebarLeases = new SidebarLeases({ browsers, terminals, service })
   runtime.sidebarActivity = () => ({ browser: browsers.activity(), terminal: terminals.activity() })
@@ -253,7 +254,7 @@ export function apply(ctx, config) {
     })))
     return {
       resources_pending: modelsOnly,
-      dsh_version: '0.2.1-alpha.2', schedule_protocol: 1, subagent_protocol: 1, terminal_protocol: 1, browser_protocol: 1, browser_input_protocol: 2, job_protocol: 1,
+      dsh_version: '0.2.1-alpha.5', schedule_protocol: 1, subagent_protocol: 1, terminal_protocol: 1, browser_protocol: 1, browser_input_protocol: 2, job_protocol: 1,
       activity_protocol: 1, sidebar_lease_protocol: 1, human_input_protocol: 1, followup_protocol: 1, history_protocol: 1, native_history_protocol: 1,
       ...(ctx.get('clientModules') ? { native_client_protocol: 1, native_session_client_protocol: 2, native_schedule_client_protocol: 1,
         ...(ctx.sessionReferenceResolver.listSessionCandidates && ctx.get('fileReferences')?.listObserved ? { native_subagent_reference_protocol: 1 } : {}),
@@ -712,6 +713,7 @@ export function apply(ctx, config) {
       clearTimeout(recoveryTimer)
       scheduler.close()
       sidebarLeases.dispose()
+      terminals.dispose()
       browsers.dispose()
       disposeRoute?.()
       database.close()

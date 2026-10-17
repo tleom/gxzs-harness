@@ -16,15 +16,19 @@
     }
   },
   "dependencies": {
+    "immer": "10.1.1",
+    "zustand": "4.5.7",
     "esbuild": "0.28.2",
     "ajv": "8.17.1",
-    "@deepseek-ai/dsh": "0.2.1-alpha.2",
-    "@deepseek-ai/dsh-skill-filesystem": "0.2.1-alpha.2",
-    "@deepseek-ai/dsh-ssh": "0.2.1-alpha.2",
-    "@deepseek-ai/dsh-fs-ssh": "0.2.1-alpha.2",
-    "@deepseek-ai/dsh-sandbox-ssh": "0.2.1-alpha.2",
-    "@deepseek-ai/dsh-subprocess-ssh": "0.2.1-alpha.2",
-    "@deepseek-ai/dsh-mcp-client": "0.2.1-alpha.2",
+    "@deepseek-ai/dsh": "0.2.1-alpha.5",
+    "@deepseek-ai/dsh-client-ui-primitives": "0.2.1-alpha.5",
+    "@deepseek-ai/dsh-client-store": "0.2.1-alpha.5",
+    "@deepseek-ai/dsh-skill-filesystem": "0.2.1-alpha.5",
+    "@deepseek-ai/dsh-ssh": "0.2.1-alpha.5",
+    "@deepseek-ai/dsh-fs-ssh": "0.2.1-alpha.5",
+    "@deepseek-ai/dsh-sandbox-ssh": "0.2.1-alpha.5",
+    "@deepseek-ai/dsh-subprocess-ssh": "0.2.1-alpha.5",
+    "@deepseek-ai/dsh-mcp-client": "0.2.1-alpha.5",
     "@gxzs/dsh-workbench-adapter": "file:../../packages/workbench-adapter",
     "@gxzs/dsh-workbench-control-commands": "file:../../packages/workbench-control-commands",
     "@gxzs/dsh-workbench-file-manager": "file:../../packages/workbench-file-manager",
@@ -33,5 +37,8 @@
     "@gxzs/dsh-workbench-sandbox-runtime": "file:../../packages/workbench-sandbox-runtime",
     "@gxzs/dsh-workbench-mcp-tools": "file:../../packages/workbench-mcp-tools",
     "@gxzs/dsh-tool-discovery": "file:../../packages/tool-discovery"
+  },
+  "overrides": {
+    "@earendil-works/pi-ai": "1.1.0"
   }
 }

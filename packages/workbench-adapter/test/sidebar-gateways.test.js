@@ -110,21 +110,47 @@ it('waits for cancelled terminal cleanup before allocating for a reconnecting ca
 it('binds terminals to the signed Session and holds the native process until stream cancellation', async () => {
   const agent = { session: { id: chat.sessionId } }
   const released = vi.fn()
-  const native = { list: vi.fn(() => []), create: vi.fn(), close: vi.fn(), write: vi.fn(),
-    retain: vi.fn(async function* (_session, _id, signal) { try { yield { type: 'retained' }; await new Promise(resolve => signal.addEventListener('abort', resolve, { once: true })) } finally { released() } }),
-    follow: vi.fn(async function* () { yield { type: 'snapshot', screen: 'ready' } }) }
+  const native = { list: vi.fn(() => []), create: vi.fn(), close: vi.fn(),
+    environment: () => ({ maxBufferedBytes: 1024 }),
+    retain: vi.fn(async function* (_session, _id, signal) { try { yield { type: 'retained' }; await new Promise(resolve => signal.addEventListener('abort', resolve, { once: true })) } finally { released() } }) }
+  const peer = { dispose: vi.fn(async () => {}) }
+  const connection = { createPeer: vi.fn(() => peer) }
+  const remote = { stream: vi.fn(async () => (async function* () { yield { type: 'snapshot', screen: 'ready' } })()) }
   const sessions = { resolveAgent: vi.fn(async () => ({ agent })) }
-  const gateway = new WorkbenchTerminals({ native, service, sessions })
+  const gateway = new WorkbenchTerminals({ native, service, sessions, connection, gateway: remote })
   await expect(gateway.create({ ownerId: 'foreign' }, chat.id, { id: attachment }, new AbortController().signal)).rejects.toMatchObject({ status: 404 })
   expect(native.create).not.toHaveBeenCalled()
   const signal = new AbortController().signal
   const stream = gateway.follow(owner, chat.id, attachment, attachment, signal)[Symbol.asyncIterator]()
-  expect((await stream.next()).value).toEqual({ event: 'workbench_terminal', value: { type: 'snapshot', screen: 'ready' } })
+  expect((await stream.next()).value).toEqual({ event: 'workbench_terminal', value: { type: 'snapshot', screen: 'ready', environment: { maxBufferedBytes: 1024 } } })
+  expect(remote.stream).toHaveBeenCalledWith(expect.objectContaining({ peer, namespace: 'terminal', method: 'attach', args: { agentId: chat.sessionId, id: attachment } }))
   expect(native.retain).toHaveBeenCalledWith(chat.sessionId, attachment, expect.any(AbortSignal))
   await stream.return()
   expect(released).toHaveBeenCalledOnce()
+  expect(peer.dispose).toHaveBeenCalledOnce()
   await expect(gateway.control(owner, chat.id, attachment, 'write', { attachment_id: 'invalid' })).rejects.toMatchObject({ status: 400 })
-  expect(native.write).not.toHaveBeenCalled()
+  expect(gateway.attachments.size).toBe(0)
+})
+it('rejects invalid terminal inputs before the native stream and detaches on adapter unload', async () => {
+  const gateway = new WorkbenchTerminals({ native: {}, service,
+    sessions: { resolveAgent: async () => ({ agent: { session: { id: chat.sessionId } } }) } })
+  const send = vi.fn(async () => {}), abort = vi.fn()
+  gateway.attachments.set(`${owner.ownerId}/${chat.id}/${attachment}/${attachment}`, {
+    uplink: { send }, abort, environment: { maxInputBytes: 4, maxCols: 500, maxRows: 200 },
+  })
+  await expect(gateway.control(owner, chat.id, attachment, 'write', { attachment_id: attachment, data: '中文' }))
+    .rejects.toMatchObject({ status: 413 })
+  await expect(gateway.control(owner, chat.id, attachment, 'resize', { attachment_id: attachment, cols: 1, rows: 10 }))
+    .rejects.toMatchObject({ status: 400 })
+  expect(send).not.toHaveBeenCalled()
+  await gateway.control(owner, chat.id, attachment, 'resize', { attachment_id: attachment, cols: 80, rows: 24 })
+  expect(send).toHaveBeenCalledExactlyOnceWith({ type: 'resize', cols: 80, rows: 24 })
+  const pending = new AbortController()
+  gateway.creating.set('pending', { controller: pending })
+  gateway.dispose()
+  expect(abort).toHaveBeenCalledOnce()
+  expect(pending.signal.aborted).toBe(true)
+  expect(gateway.attachments.size).toBe(0)
 })
 it('authorizes native child history only through its parent catalog and rejects external local addresses', async () => {
   const sessions = { list: vi.fn(async () => ({ items: [

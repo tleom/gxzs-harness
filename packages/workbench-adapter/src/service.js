@@ -42,6 +42,7 @@ export class WorkbenchService {
     this.modelSettings = modelSettings
     this.inflightCommands = new Map()
     this.chatMutations = new Map()
+    this.sessionPreparations = new Map()
     this.scheduler = scheduler
     this.attachments = attachments
     this.goals = goals
@@ -118,6 +119,18 @@ export class WorkbenchService {
   }
 
   async ensureChatSession(owner, chat) {
+    this.requireChat(owner, chat.id)
+    let pending = this.sessionPreparations.get(chat.sessionId)
+    if (!pending) {
+      pending = this.prepareChatSession(owner, chat).finally(() => {
+        if (this.sessionPreparations.get(chat.sessionId) === pending) this.sessionPreparations.delete(chat.sessionId)
+      })
+      this.sessionPreparations.set(chat.sessionId, pending)
+    }
+    return pending
+  }
+
+  async prepareChatSession(owner, chat) {
     await this.ensureChatDirectory(owner, chat.id)
     const cwd = this.chatDirectory(chat.id, chat.directory)
     const live = this.agents.get(chat.sessionId)
@@ -140,7 +153,14 @@ export class WorkbenchService {
         if ('error' in resolved) throw resolved.error
         if (resolved.agent.session.header.cwd !== cwd)
           throw httpError(409, '会话工作目录与当前配置不一致，请新建对话')
-      } else await this.sessions.create({ sessionId: chat.sessionId, cwd })
+      } else if (!this.agents.get(chat.sessionId)) {
+        // alpha.5 may mint a different ID when the named Session has started.
+        // Shared preparation prevents concurrent reference/read and submit paths
+        // from treating create() as a second resume operation.
+        const created = await this.sessions.create({ sessionId: chat.sessionId, cwd })
+        if (created.sessionId !== chat.sessionId)
+          throw httpError(409, '会话状态已变化，请重新加载对话')
+      }
     }
     return chat
   }

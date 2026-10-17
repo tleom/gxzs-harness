@@ -26,7 +26,7 @@ export async function prepareWorkspaceChanges(profile) {
   const require=createRequire(join(profile,'package.json'))
   const manifest=require.resolve('@deepseek-ai/dsh-workspace-changes/package.json')
   const metadata=JSON.parse(await readFile(manifest,'utf8'))
-  if(metadata.version!=='0.2.1-alpha.2')throw new Error(`Unverified workspace-changes version: ${metadata.version}`)
+  if(metadata.version!=='0.2.1-alpha.5')throw new Error(`Unverified workspace-changes version: ${metadata.version}`)
   const entry=require.resolve('@deepseek-ai/dsh-workspace-changes')
   const runtimeRequire=createRequire(require.resolve('@gxzs/dsh-workbench-sandbox-runtime/changes'))
   const runtimeEntry=runtimeRequire.resolve('@deepseek-ai/dsh-workspace-changes')

@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 const require = createRequire('/opt/workbench/profiles/workbench/package.json')
 const native = name => import(pathToFileURL(require.resolve(`@deepseek-ai/${name}`)).href)
-const [{ Context }, { default: JsonlPersistence }] = await Promise.all([native('cordis'), native('dsh-session-persistence-jsonl')])
+const [{ Context }, JsonlPersistence] = await Promise.all([native('cordis'), native('dsh-session-persistence-jsonl')])
 let failures = 0
 const verifyWrite = process.argv.includes('--verify-write-copy')
 for (const root of process.argv.slice(2).filter(value => value !== '--verify-write-copy')) {

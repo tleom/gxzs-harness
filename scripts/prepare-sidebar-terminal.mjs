@@ -12,12 +12,12 @@ export function sidebarTerminalSource(source) {
     ['maxTerminals: z.number().step(1).min(1).default(8),', 'maxTerminals: z.number().step(1).min(0).default(0),'],
     ['if (new Set([\n\t\t\t\t...owner.terminals.keys(),\n\t\t\t\t...owner.pending.keys(),\n\t\t\t\t...owner.allocations.keys()\n\t\t\t]).size >= this.config.maxTerminals)',
       'if (this.config.maxTerminals > 0 && new Set([\n\t\t\t\t...owner.terminals.keys(),\n\t\t\t\t...owner.pending.keys(),\n\t\t\t\t...owner.allocations.keys()\n\t\t\t]).size >= this.config.maxTerminals)'],
-    ['\twrite(id, data) {', `\t// GXZS internal Agent input; the controller remains owned by the UI follower.
+    ['\trename(title) {', `\t// GXZS internal Agent input; the controller remains owned by the UI follower.
 \twriteFromAgent(data, signal) {
 \t\tthis.retention?.invalidate();
 \t\treturn this.enqueue(async () => {
 \t\t\tsignal.throwIfAborted();
-\t\t\tif (this.closing !== void 0 || this.info.state !== "running") throw new Error("Terminal is not running");
+\t\t\tif (this.exited || this.closing !== void 0 || this.info.state !== "running") throw new Error("Terminal is not running");
 \t\t\tawait this.handle.write(data);
 \t\t});
 \t}
@@ -32,8 +32,8 @@ export function sidebarTerminalSource(source) {
 \t\t\treturn { info: this.info, screen: text.slice(-24576), truncated: start > 0 || text.length > 24576 };
 \t\t});
 \t}
-\twrite(id, data) {`],
-    ['\t\tasync write(agent, id, attachmentId, data) {', `\t\t// Internal only: not exposed as a Typert Remote method.
+\trename(title) {`],
+    ['\t\trename(agent, id, title) {', `\t\t// Internal only: not exposed as a Typert Remote method.
 \t\tasync writeFromAgent(agent, id, data, signal) {
 \t\t\tsignal.throwIfAborted();
 \t\t\tif (Buffer.byteLength(data, "utf8") > this.config.maxInputBytes) throw new Error("Terminal input exceeds the configured limit");
@@ -43,7 +43,7 @@ export function sidebarTerminalSource(source) {
 \t\t\tsignal.throwIfAborted();
 \t\t\treturn this.terminal(agent, id).inspectForAgent(signal);
 \t\t}
-\t\tasync write(agent, id, attachmentId, data) {`],
+\t\trename(agent, id, title) {`],
   ]
   for (const [before, after] of additions) {
     if (source.includes(after)) continue
@@ -57,7 +57,7 @@ export async function prepareSidebarTerminal(profile) {
   const require = createRequire(join(profile, 'package.json'))
   const manifest = require.resolve('@deepseek-ai/dsh-api-terminal-controller/package.json')
   const metadata = JSON.parse(await readFile(manifest, 'utf8'))
-  if (metadata.version !== '0.2.1-alpha.2') throw new Error('Unverified native terminal version')
+  if (metadata.version !== '0.2.1-alpha.5') throw new Error('Unverified native terminal version')
   const entry = require.resolve('@deepseek-ai/dsh-api-terminal-controller')
   await writeFile(entry, sidebarTerminalSource(await readFile(entry, 'utf8')))
   return dirname(entry)

@@ -3,10 +3,21 @@ import { readFile, writeFile, unlink } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { createHash, randomUUID } from 'node:crypto'
-import { argumentStreamPaths, assertDshArgumentConsumer, prepareArgumentStream } from '../../../scripts/prepare-dsh-stream-arguments.mjs'
+import { argumentStreamPaths, assertDshArgumentConsumer, prepareArgumentStream, prepareUpstreamArguments, upstreamArgumentPatches } from '../../../scripts/prepare-dsh-stream-arguments.mjs'
 
 let original, prepared, consumerSource, stream, parseCount, toStreamChunks
 const temporary = []
+it.each(Object.keys(upstreamArgumentPatches))('retains the official final-argument parser and patches %s idempotently', async name => {
+  const paths = await argumentStreamPaths(fileURLToPath(new URL('../../../profiles/workbench/', import.meta.url)))
+  const source = await readFile(join(dirname(paths.provider), name), 'utf8')
+  const [before, removed, after] = upstreamArgumentPatches[name]
+  const baseline = source.includes(before + removed + after) ? source : source.replace(before + after, before + removed + after)
+  const patched = prepareUpstreamArguments(name, baseline)
+  expect(patched).toBe(baseline.replace(before + removed + after, before + after))
+  expect(prepareUpstreamArguments(name, patched)).toBe(patched)
+  expect(() => prepareUpstreamArguments(name, patched.replace(before, 'changed'))).toThrow('contract changed')
+  expect(patched.match(/parseStreamingJson\(/g)?.length ?? 0).toBe((baseline.match(/parseStreamingJson\(/g)?.length ?? 0) - 1)
+})
 beforeAll(async () => {
   const paths = await argumentStreamPaths(fileURLToPath(new URL('../../../profiles/workbench/', import.meta.url)))
   original = await readFile(paths.provider, 'utf8')

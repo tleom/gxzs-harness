@@ -31,7 +31,7 @@ export function sessionReferenceScope(source) {
 export async function prepareSessionReferences(profile) {
   const require = createRequire(join(profile, 'package.json'))
   const metadata = JSON.parse(await readFile(require.resolve('@deepseek-ai/dsh-session-reference/package.json'), 'utf8'))
-  if (metadata.version !== '0.2.1-alpha.2') throw new Error(`Unverified session reference version: ${metadata.version}`)
+  if (metadata.version !== '0.2.1-alpha.5') throw new Error(`Unverified session reference version: ${metadata.version}`)
   const entry = require.resolve('@deepseek-ai/dsh-session-reference')
   const source = await readFile(entry, 'utf8')
   const result = sessionReferenceScope(source)

@@ -26,7 +26,7 @@ function setup() {
   const sessionController = {
     updateQueue: vi.fn(async () => ({ accepted: true })), prompt: vi.fn(async () => ({ accepted: true })), cancel: vi.fn(() => ({ accepted: true })),
     rename: vi.fn(async ({ title }) => ({ title, seq: 1 })), selectModel: vi.fn(async () => ({ selected: {} })),
-    create: vi.fn(async () => ({ sessionId: 'session-new' })), fork: vi.fn(async () => ({ sessionId: 'session-fork' })),
+    create: vi.fn(async request => ({ sessionId: request.sessionId ?? 'session-new' })), fork: vi.fn(async () => ({ sessionId: 'session-fork' })),
     modelCatalog: vi.fn(async () => ({ groups: [{ id: 'p', models: [{ id: 'm', reasoning: { efforts: [{ id: 'low' }, { id: 'high' }], defaultEffort: 'low' } }] }] })),
   }
   const agent = { id: chat.sessionId, cancel: vi.fn(), whenIdle: vi.fn(async () => {}) }
@@ -81,6 +81,25 @@ it('keeps a legacy context snapshot small on follow-up polls while retaining the
   expect('mcpTools' in response.runs[0].context_usage).toBe(false)
   expect(Buffer.byteLength(JSON.stringify(response))).toBeLessThan(2048)
   expect(database.latestContextEvent(owner.ownerId, run.id).mcpTools).toHaveLength(1)
+})
+
+it('joins concurrent empty Session preparation and never silently accepts a minted identity', async () => {
+  const t = setup()
+  t.agents.get.mockReturnValue(undefined)
+  let release
+  t.sessionController.create.mockImplementationOnce(() => new Promise(resolve => { release = resolve }))
+  const first = t.service.ensureChatSession(t.owner, t.chat)
+  const second = t.service.ensureChatSession(t.owner, t.chat)
+  await vi.waitFor(() => expect(t.sessionController.create).toHaveBeenCalledOnce())
+  release({ sessionId: t.chat.sessionId })
+  expect(await first).toEqual(t.chat)
+  expect(await second).toEqual(t.chat)
+  expect(t.service.sessionPreparations.size).toBe(0)
+  t.sessionController.create.mockResolvedValueOnce({ sessionId: 'unexpected-new-session' })
+  await expect(t.service.ensureChatSession(t.owner, t.chat)).rejects.toMatchObject({ status: 409 })
+  expect(t.service.sessionPreparations.size).toBe(0)
+  expect(t.database.getChat(t.owner.ownerId, t.chat.id).sessionId).toBe(t.chat.sessionId)
+  await expect(t.service.ensureChatSession(t.owner, t.chat)).resolves.toEqual(t.chat)
 })
 
 it('joins a pending native resume when listing scoped skills for a persisted cold session', async () => {
@@ -1494,7 +1513,7 @@ describe('followup and control service', () => {
 
   it('resumes a cold DSH session before executing a control command', async () => {
     const { owner, chat, service, sessionController, agents, commands, agent } = setup()
-    agents.get.mockReturnValueOnce(undefined).mockReturnValue(agent)
+    agents.get.mockReturnValueOnce(undefined).mockReturnValueOnce(undefined).mockReturnValue(agent)
     await expect(service.issueCommand(owner, chat.id, {
       command: '/goal pause', expected_revision: 0, request_key: 'cold-goal',
     })).resolves.toMatchObject({ message: 'ok' })

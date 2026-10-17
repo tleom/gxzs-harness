@@ -1,4 +1,5 @@
 import { httpError } from './http.js'
+import { TerminalUplink } from './terminal-uplink.js'
 const uuid = /^[a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12}$/i
 async function waitFor(promise, signal) {
   let abort
@@ -12,7 +13,10 @@ async function waitFor(promise, signal) {
 }
 /** The native terminal controller owns PTYs, screens, attachments and cleanup. */
 export class WorkbenchTerminals {
-  constructor({ native, service, sessions }) { this.native = native; this.service = service; this.sessions = sessions; this.creating = new Map(); this.knownSessions = new Set() }
+  constructor({ native, service, sessions, connection, gateway }) {
+    Object.assign(this, { native, service, sessions, connection, gateway })
+    this.creating = new Map(); this.knownSessions = new Set(); this.attachments = new Map()
+  }
   activity() {
     let count = 0
     for (const sessionId of this.knownSessions) {
@@ -21,6 +25,12 @@ export class WorkbenchTerminals {
       if (!infos.length) this.knownSessions.delete(sessionId)
     }
     return count
+  }
+  dispose() {
+    for (const current of this.attachments.values()) current.abort(httpError(503, '终端连接服务已更新，请重新连接'))
+    this.attachments.clear()
+    for (const current of this.creating.values()) current.controller.abort()
+    this.knownSessions.clear()
   }
   async agent(owner, chatId) {
     const chat = this.service.requireChat(owner, chatId)
@@ -75,27 +85,57 @@ export class WorkbenchTerminals {
     const lifetime = new AbortController()
     const stop = () => lifetime.abort(signal.reason)
     signal.addEventListener('abort', stop, { once: true })
-    let held
+    const key = `${owner.ownerId}/${chatId}/${id}/${attachment}`
+    let held, peer, uplink, current
     try {
       signal.throwIfAborted()
+      const environment = this.native.environment(agent, signal)
+      peer = this.connection.createPeer({ principal: { kind: 'owner' }, interactions: 'none' })
+      uplink = new TerminalUplink({ maxBytes: environment.maxBufferedBytes,
+        signal: lifetime.signal, abort: reason => lifetime.abort(reason) })
+      current = { uplink, environment, abort: reason => lifetime.abort(reason) }
+      this.attachments.get(key)?.abort(httpError(409, '终端连接已替换'))
+      this.attachments.set(key, current)
       held = this.native.retain(agent.session.id, id, lifetime.signal)[Symbol.asyncIterator]()
       const first = await held.next()
       if (first.done || first.value.type !== 'retained') throw httpError(404, '终端已经关闭')
-      const environment = this.native.environment?.(agent, signal)
-      for await (const frame of this.native.follow(agent, id, attachment, signal))
-        yield { event: 'workbench_terminal', value: frame.type === 'snapshot' && environment ? { ...frame, environment } : frame }
+      const stream = await this.gateway.stream({ peer, namespace: 'terminal', method: 'attach',
+        args: { agentId: agent.session.id, id }, uplink, signal: lifetime.signal })
+      for await (const frame of stream) {
+        if (frame.type === 'ack') { uplink.acknowledge(frame); continue }
+        // Keep the existing signed HTTP presentation compatible with open tabs.
+        // The native per-follower writable flag remains the authority.
+        const value = frame.info ? { ...frame, info: { ...frame.info,
+          controllerId: frame.writable ? attachment : frame.info.state === 'running' ? 'other-attachment' : undefined } } : frame
+        yield { event: 'workbench_terminal', value: frame.type === 'snapshot' ? { ...value, environment } : value }
+      }
     } finally {
       signal.removeEventListener('abort', stop)
+      if (this.attachments.get(key) === current) this.attachments.delete(key)
       lifetime.abort()
-      await held?.return?.()
+      uplink?.close()
+      try { await held?.return?.() } finally { await peer?.dispose() }
     }
   }
   async control(owner, chatId, id, action, request) {
     const agent = await this.agent(owner, chatId)
     if (action === 'close') return this.native.close(agent, id)
     if (!uuid.test(request.attachment_id)) throw httpError(400, '终端连接标识无效')
-    if (action === 'write') return this.native.write(agent, id, request.attachment_id, request.data)
-    if (action === 'resize') return this.native.resize(agent, id, request.attachment_id, request.cols, request.rows)
+    const attachment = this.attachments.get(`${owner.ownerId}/${chatId}/${id}/${request.attachment_id}`)
+    if (!attachment) throw httpError(409, '终端连接已结束，请重新连接')
+    if (action === 'write') {
+      if (typeof request.data !== 'string') throw httpError(400, '终端输入无效')
+      if (Buffer.byteLength(request.data, 'utf8') > attachment.environment.maxInputBytes)
+        throw httpError(413, '终端输入超过大小限制')
+      return attachment.uplink.send({ type: 'write', data: request.data })
+    }
+    if (action === 'resize') {
+      const { maxCols, maxRows } = attachment.environment
+      if (!Number.isSafeInteger(request.cols) || request.cols < 2 || request.cols > maxCols ||
+          !Number.isSafeInteger(request.rows) || request.rows < 1 || request.rows > maxRows)
+        throw httpError(400, '终端尺寸无效')
+      return attachment.uplink.send({ type: 'resize', cols: request.cols, rows: request.rows })
+    }
     throw httpError(400, '终端操作无效')
   }
 }

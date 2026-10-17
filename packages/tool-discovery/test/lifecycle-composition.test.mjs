@@ -84,7 +84,7 @@ async function fixture(script, { delayed = false, complete = false } = {}) {
   controllerCtx.fileUploads = { retirePrompt() {}, bindPrompt: () => ({ commit() {}, [Symbol.dispose]() {} }) }
   const controller = new SessionCommandController(controllerCtx, { resolveAgent: async id => ({ agent: ctx.agents.get(id) }),
     selectionFor: () => ({ current: { provider: 'mock', model: 'mock' } }) }, process.cwd())
-  const sessions = { prompt: (request, signal) => controller.prompt(request, signal), updateQueue: request => controller.updateQueue(request),
+  const sessions = { prompt: request => controller.prompt(request, { kind: 'user', rpcId: request.requestId }), updateQueue: request => controller.updateQueue(request),
     cancel: () => agent.cancel({ kind: 'user' }, { keepInbox: true }),
     modelCatalog: async () => ({ groups: [{ id: 'mock', models: [{ id: 'mock', name: 'Fixture' }] }] }),
     selectModel: async ({ provider, model }) => {

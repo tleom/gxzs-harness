@@ -37,7 +37,8 @@ const prepared = `\tsubmitAdmitted(activation, content, options, parent) {
 const coldOriginal = [
   '\t\t\tthis.assertAdmitting(parent);',
   '\t\t\tthis.authorizeLineage(parent, childId, source.header.parentSession);',
-  '\t\t\tconst descriptor = foldSubagentDescriptor(source.events.slice(source.inheritedEventCount));',
+  '\t\t\tconst ownEvents = source.events.slice(source.inheritedEventCount);',
+  '\t\t\tconst descriptor = foldSubagentDescriptor(ownEvents);',
   '\t\t\tif (descriptor === void 0 || descriptor.mode !== "continuable") throw new SubagentError(`subagent "${childId}" has no supported continuation state and cannot be resumed; choose a different target`, "NOT_RESUMABLE");',
   '\t\t\tlet activation;',
 ].join('\n')
@@ -68,7 +69,7 @@ export function subagentPromptIdentity(source) {
 export async function prepareSubagentPrompt(profile) {
   const require = createRequire(join(profile, 'package.json'))
   const metadata = JSON.parse(await readFile(require.resolve('@deepseek-ai/dsh-subagent/package.json'), 'utf8'))
-  if (metadata.version !== '0.2.1-alpha.2') throw new Error(`Unverified subagent prompt version: ${metadata.version}`)
+  if (metadata.version !== '0.2.1-alpha.5') throw new Error(`Unverified subagent prompt version: ${metadata.version}`)
   const entry = require.resolve('@deepseek-ai/dsh-subagent')
   const source = await readFile(entry, 'utf8')
   const result = subagentPromptIdentity(source)
