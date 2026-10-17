@@ -392,6 +392,21 @@ def test_explicit_global_skill_roots_reach_native_host_config(tmp_path, monkeypa
     assert 'GXZS_GLOBAL_SKILL_DIR=/srv/dsh/published-skills\n' in (host.root / 'workspace' / 'host.env').read_text()
 
 
+def test_global_skill_mount_survives_reuse_and_requires_drained_change(tmp_path, monkeypatch):
+    host, docker, _, payload, created = setup(tmp_path, monkeypatch)
+    monkeypatch.setenv('GXZS_GLOBAL_SKILL_HOST_DIR', '/srv/global-skills')
+    host.ensure('workspace', payload)
+    create = next(call.args for call in docker.call_args_list if call.args[0] == 'create')
+    assert 'type=bind,source=/srv/global-skills,destination=/opt/workbench-global/skills,readonly' in create
+    assert 'GXZS_GLOBAL_SKILL_DIR=/opt/workbench-global/skills\n' in (host.root / 'workspace' / 'host.env').read_text()
+    created['Mounts'] = [{'Type': 'bind', 'Source': '/srv/global-skills', 'Destination': '/opt/workbench-global/skills', 'RW': False}]
+    host.ensure('workspace', payload)
+    created['Mounts'][0]['RW'] = True
+    with pytest.raises(ValueError, match='global skill mount changed'):
+        host.ensure('workspace', payload)
+    assert not any(call.args[0] in {'stop', 'rm', 'rename'} for call in docker.call_args_list)
+
+
 def test_identity_mismatch_keeps_existing_workspace(tmp_path, monkeypatch):
     host, _, _, payload, _ = setup(tmp_path, monkeypatch)
     host.ensure('workspace', payload)

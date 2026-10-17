@@ -18,6 +18,7 @@ from urllib.request import Request, build_opener, ProxyHandler
 from urllib.error import HTTPError
 from owner_auth import owner_token, assertion_key
 from runtime_names import account_names, host_name, volume_prefix
+from global_skills import mount_arguments as global_skill_mounts, matches_mount, native_root
 
 
 class Hosts:
@@ -82,6 +83,7 @@ class Hosts:
             logging.getLogger(__name__).warning('Superseded runtime cleanup deferred workspace=%s', item['workspace_id'])
 
     def ensure(self, workspace, payload):
+        global_skill_mounts()
         owner = payload['owner_id']
         instance = payload['instance_id']
         generation = int(payload['generation'])
@@ -136,6 +138,8 @@ class Hosts:
                     raise ValueError('Host image rollout requires draining before replacement')
                 if existing['Image'] != desired_digest:
                     raise ValueError('Host image digest changed; drain before replacement')
+                if not matches_mount(existing):
+                    raise ValueError('Host global skill mount changed; drain before replacement')
                 if (existing.get('HostConfig', {}).get('CgroupParent') or '') != owner_cgroup(workspace):
                     raise ValueError('Host resource rollout requires draining before replacement')
                 attached = set((existing.get('NetworkSettings', {}).get('Networks') or {}).keys())
@@ -189,8 +193,8 @@ class Hosts:
                 }
                 # Published roots are deployment-owned paths inside the Host.
                 # DSH handles discovery/watch; never infer them from a user's home.
-                if os.environ.get('GXZS_GLOBAL_SKILL_DIR'):
-                    env['GXZS_GLOBAL_SKILL_DIR'] = os.environ['GXZS_GLOBAL_SKILL_DIR']
+                if native_root():
+                    env['GXZS_GLOBAL_SKILL_DIR'] = native_root()
                 if any('\n' in str(value) or '\r' in str(value) for value in env.values()):
                     raise ValueError('Invalid runtime configuration')
                 env_file = folder / 'host.env'
@@ -253,7 +257,7 @@ class Hosts:
                     '--cpus', os.environ.get('GXZS_HOST_CPUS', '1'),
                     '--memory', memory, '--memory-swap', memory, '--pids-limit', '256', *publish,
                     '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges:true', '--env-file', str(env_file),
-                    *font_mount, '-v', item['home_volume'] + ':/srv/dsh',
+                    *font_mount, *global_skill_mounts(), '-v', item['home_volume'] + ':/srv/dsh',
                     '-v', volume_prefix(item, sandbox) + '-files:/workspace:ro',
                     '-v', str(host_state / 'hosts' / item['workspace_id']) + ':/run/gxzs:ro',
                     '-v', str(host_state / 'hosts' / item['workspace_id'] / 'ssh') + ':/home/gxzs/.ssh:ro', image)
@@ -285,6 +289,7 @@ class Hosts:
 
     def replace(self, workspace, payload):
         """Root-only, resumable drain/fence/replace; never stop an active run."""
+        global_skill_mounts()
         names = account_names(payload['owner_id'], payload.get('account_name'))
         if not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_.-]{0,100}', payload['instance_id']):
             raise ValueError('Invalid replacement identity')

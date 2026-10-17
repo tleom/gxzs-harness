@@ -18,4 +18,4 @@ docker build -f services/sandbox/fonts/Dockerfile --build-arg FONT_PACK_GENERATI
 docker build -f services/sandbox/Dockerfile --build-arg WORKBENCH_FONT_IMAGE=<immutable-private-font-image> -t <sandbox-image> .
 ```
 
-公共 CI 使用默认系统字体阶段。实际包含私有字体的沙盒镜像必须传入 `WORKBENCH_FONT_IMAGE`，并核对归档清单、`fc-list` 以及预览 PDF 的 `pdffonts` 结果。转换缓存以实际镜像 ID 区分字体和排版引擎版本。
+`WORKBENCH_FONT_IMAGE` 没有默认值，遗漏时构建失败。公共 CI 显式传入 `system-fonts`；生产必须指定已验证的私有字体镜像，并核对归档清单、`fc-list` 以及预览 PDF 的 `pdffonts` 结果。转换缓存以实际镜像 ID 区分字体和排版引擎版本。

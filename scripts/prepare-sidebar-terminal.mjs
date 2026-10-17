@@ -57,7 +57,7 @@ export async function prepareSidebarTerminal(profile) {
   const require = createRequire(join(profile, 'package.json'))
   const manifest = require.resolve('@deepseek-ai/dsh-api-terminal-controller/package.json')
   const metadata = JSON.parse(await readFile(manifest, 'utf8'))
-  if (metadata.version !== '0.2.1-alpha.5') throw new Error('Unverified native terminal version')
+  if (metadata.version !== '0.2.1-rc.2') throw new Error('Unverified native terminal version')
   const entry = require.resolve('@deepseek-ai/dsh-api-terminal-controller')
   await writeFile(entry, sidebarTerminalSource(await readFile(entry, 'utf8')))
   return dirname(entry)

@@ -31,7 +31,7 @@ async function main() {
   })
   await presentation.writeFile({ fileName: path.join(out, 'slides.pptx') })
   const browser = await chromium.launch({
-    channel: 'chrome',
+    executablePath: process.env.CHROME_BIN || '/usr/bin/chromium',
     headless: true,
     args: ['--no-sandbox', '--disable-dev-shm-usage'],
   })

@@ -24,7 +24,7 @@ export async function agentLoopPath(profile) {
   const require = createRequire(join(resolve(profile), 'package.json'))
   const path = require.resolve('@deepseek-ai/dsh-agent-loop')
   const metadata = JSON.parse(await readFile(join(dirname(path), '../package.json'), 'utf8'))
-  if (metadata.version !== '0.2.1-alpha.5') throw new Error('Unverified DSH agent loop version')
+  if (metadata.version !== '0.2.1-rc.2') throw new Error('Unverified DSH agent loop version')
   return path
 }
 

@@ -17,12 +17,12 @@
   "dsh": { "bundle": { "patch": "lib/platform.patch.yml" }, "client": { "platform": "web", "inject": [] } },
   "dependencies": {
     "@gxzs/dsh-workbench-mcp-tools": "file:../workbench-mcp-tools",
-    "@deepseek-ai/cordis": "4.0.5-alpha.2",
-    "@deepseek-ai/dsh-client-modules": "0.2.1-alpha.5",
-    "@deepseek-ai/schemastery": "3.18.5-alpha.2",
-    "@deepseek-ai/dsh-llm": "0.2.1-alpha.5",
-    "@deepseek-ai/dsh-tools": "0.2.1-alpha.5",
-    "@deepseek-ai/dsh-session-reference": "0.2.1-alpha.5",
+    "@deepseek-ai/cordis": "4.0.5",
+    "@deepseek-ai/dsh-client-modules": "0.2.1-rc.2",
+    "@deepseek-ai/schemastery": "3.18.5",
+    "@deepseek-ai/dsh-llm": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-tools": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-session-reference": "0.2.1-rc.2",
     "@gxzs/dsh-workbench-sandbox-skills": "file:../workbench-sandbox-skills"
   }
 }

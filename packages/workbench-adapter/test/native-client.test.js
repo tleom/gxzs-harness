@@ -7,7 +7,7 @@ function fixture() {
   const entries = [row('dsh-client-modules'), row('dsh-client-connection'), row('dsh-api-gateway', ['dsh-client-connection']),
     row('dsh-api-job-controller', ['dsh-api-gateway']), row('dsh-api-session-controller', [], [id('dsh-api-gateway') + '/client']),
     { id: '@gxzs/dsh-workbench-adapter', url: 'plugins/workbench-adapter.js?r=1', rev: '1', inject: [] }, row('unrelated-renderer')]
-  const registry = { graph: () => ({ release: { version: '0.2.1-alpha.5' }, entries, batches: [] }), fetchBundle: vi.fn(async () => new Response('window.__ModuleLoader__.load({})')) }
+  const registry = { graph: () => ({ release: { version: '0.2.1-rc.2' }, entries, batches: [] }), fetchBundle: vi.fn(async () => new Response('window.__ModuleLoader__.load({})')) }
   return { entries, registry, bridge: new WorkbenchNativeClient({ modules: () => registry }) }
 }
 it('keeps the original dependency graph and bootstrap while excluding unrelated client renderers', async () => {

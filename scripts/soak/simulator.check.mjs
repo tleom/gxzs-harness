@@ -47,7 +47,7 @@ function toolCall(text) {
   const result = { arguments: '' }
   for (const line of text.split('\n')) {
     if (!line.startsWith('data: {')) continue
-    const call = JSON.parse(line.slice(6)).choices[0].delta.tool_calls?.[0]
+    const call = JSON.parse(line.slice(6)).choices[0]?.delta.tool_calls?.[0]
     if (!call) continue
     result.id ??= call.id; result.name ??= call.function.name; result.arguments += call.function.arguments ?? ''
   }
@@ -90,6 +90,44 @@ test('native streaming title requests receive SSE, not a JSON body', async t => 
   const server = await fixture(t)
   const response = await server.call({ model: 'gxzs-simulator', stream: true, messages: [{ role: 'system', content: 'Create a title' }] })
   assert.equal(response.status, 200); assert.match(response.text, /chat.completion.chunk/); assert.match(response.text, /data: \[DONE\]/)
+})
+
+test('non-stream tool requests return full arguments and matching completion metadata', async t => {
+  const server = await fixture(t), body = { ...request('json'), stream: false }
+  const response = JSON.parse((await server.call(body)).text)
+  assert.equal(response.object, 'chat.completion'); assert.equal(response.model, body.model)
+  assert.ok(Math.abs(response.created - Math.floor(Date.now() / 1000)) < 10)
+  assert.equal(response.choices[0].finish_reason, 'tool_calls')
+  assert.equal(response.choices[0].message.content, null)
+  const call = response.choices[0].message.tool_calls[0]
+  assert.equal(call.id, 'sim_json_0'); assert.equal(call.type, 'function')
+  assert.match(JSON.parse(call.function.arguments).command, /GXZS_SIM_STEP json 0/)
+  assert.equal(response.usage.total_tokens, response.usage.prompt_tokens + response.usage.completion_tokens)
+})
+
+test('stream usage uses a separate empty-choices chunk only when requested', async t => {
+  const server = await fixture(t)
+  const chunks = text => text.split('\n').filter(line => line.startsWith('data: {')).map(line => JSON.parse(line.slice(6)))
+  const plain = chunks((await server.call(request('usage'))).text)
+  assert.ok(plain.every(chunk => !('usage' in chunk)))
+  const response = await server.call({ ...request('usage'), stream_options: { include_usage: true } })
+  const frames = chunks(response.text), last = frames.at(-1)
+  assert.deepEqual(last.choices, []); assert.equal(last.usage.total_tokens, 120)
+  assert.equal(frames.at(-2).choices[0].finish_reason, 'tool_calls')
+  assert.ok(frames.slice(0, -1).every(frame => frame.usage === null))
+  assert.equal(frames[0].choices[0].delta.role, 'assistant')
+  assert.equal(new Set(frames.map(frame => frame.id)).size, 1)
+  assert.equal(new Set(frames.map(frame => frame.created)).size, 1)
+  assert.notEqual(frames[0].id, plain[0].id)
+  assert.match(response.text, /data: \[DONE\]\n\n$/)
+})
+
+test('partial response disconnect is not reported as a successful completion', async t => {
+  const server = await fixture(t), body = request('disconnect')
+  body.messages[0].content = 'GXZS_SIM_CASE {"id":"disconnect","rounds":1,"stepDelayMs":0,"fault":{"mode":"disconnect","step":0,"count":1}}'
+  await assert.rejects(server.call(body))
+  assert.equal(server.stats.completed, 0)
+  assert.equal(toolCall((await server.call(body)).text).id, 'sim_disconnect_0')
 })
 test('scenario marker uses the latest child scope and rejects unsafe identifiers', () => {
   assert.equal(scenarioFrom([{ role: 'user', content: 'GXZS_SIM_CASE {"id":"parent"}\nGXZS_SIM_CASE {"id":"child"}' }]).id, 'child')

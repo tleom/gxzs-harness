@@ -74,6 +74,43 @@ export function planStep(scenario, step, state, body) {
   return planned
 }
 
+async function completion(res, body, planned, { id, created, signal, callId, chunkSize = 256 }) {
+  const identity = { id: `chatcmpl-${id}`, created, model: body.model ?? 'gxzs-simulator' }
+  const reason = planned.name ? 'tool_calls' : 'stop'
+  // Synthetic counters exercise usage handling; they are not tokenizer or billing data.
+  const usage = { prompt_tokens: 100, completion_tokens: planned.name ? 20 : 10,
+    total_tokens: planned.name ? 120 : 110 }
+  const args = planned.name ? JSON.stringify(planned.arguments) : null
+  if (body.stream !== true) {
+    const message = { role: 'assistant', content: planned.name ? null : planned.content }
+    if (planned.name) message.tool_calls = [{ id: callId, type: 'function', function: { name: planned.name, arguments: args } }]
+    res.writeHead(200, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({ ...identity, object: 'chat.completion', choices: [{ index: 0, message, finish_reason: reason }], usage }))
+    return
+  }
+  const includeUsage = body.stream_options?.include_usage === true
+  res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-store', 'x-accel-buffering': 'no' })
+  const write = async value => {
+    signal.throwIfAborted()
+    if (!res.write(value)) await once(res, 'drain', { signal })
+  }
+  const frame = (delta, finish_reason = null) => write(`data: ${JSON.stringify({ ...identity,
+    object: 'chat.completion.chunk', choices: [{ index: 0, delta, finish_reason }], ...(includeUsage ? { usage: null } : {}) })}\n\n`)
+  await frame({ role: 'assistant', content: '' })
+  if (planned.name) {
+    await frame({ tool_calls: [{ index: 0, id: callId, type: 'function', function: { name: planned.name, arguments: '' } }] })
+    for (let offset = 0; offset < args.length; offset += chunkSize) {
+      await frame({ tool_calls: [{ index: 0, function: { arguments: args.slice(offset, offset + chunkSize) } }] })
+      if (offset && offset % 65536 === 0) await delay(1, undefined, { signal })
+    }
+  } else {
+    for (let offset = 0; offset < planned.content.length; offset += chunkSize) await frame({ content: planned.content.slice(offset, offset + chunkSize) })
+  }
+  await frame({}, reason)
+  if (includeUsage) await write(`data: ${JSON.stringify({ ...identity, object: 'chat.completion.chunk', choices: [], usage })}\n\n`)
+  res.end('data: [DONE]\n\n')
+}
+
 export async function createSimulator({ token, output, host = '127.0.0.1', port = 0, publicURL, extraHandler }) {
   if (!token || token.length < 32) throw new Error('An explicit fixture token of at least 32 characters is required')
   await mkdir(output, { recursive: true })
@@ -88,7 +125,7 @@ export async function createSimulator({ token, output, host = '127.0.0.1', port 
   const record = async value => appendFile(`${output}/model-events.jsonl`, JSON.stringify({ at: new Date().toISOString(), ...value }) + '\n')
   const json = (res, status, value) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(value)) }
   const server = http.createServer(async (req, res) => {
-    const id = randomUUID(); active.add(id); stats.requests++; stats.maxInFlight = Math.max(stats.maxInFlight, active.size)
+    const id = randomUUID(), created = Math.floor(Date.now() / 1000); active.add(id); stats.requests++; stats.maxInFlight = Math.max(stats.maxInFlight, active.size)
     const abort = new AbortController(); res.once('close', () => abort.abort())
     try {
       const url = new URL(req.url, 'http://fixture')
@@ -117,12 +154,7 @@ export async function createSimulator({ token, output, host = '127.0.0.1', port 
       if (!scenario) {
         if ((body.tools ?? []).length) throw new Error('Execution request has no synthetic case marker')
         stats.titleRequests++
-        if (body.stream) {
-          res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-store' })
-          for (const [delta, reason] of [[{ role: 'assistant', content: '模拟稳定性验收' }, null], [{}, 'stop']]) res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created: 1, model: body.model, choices: [{ index: 0, delta, finish_reason: reason }] })}\n\n`)
-          res.end('data: [DONE]\n\n'); return
-        }
-        return json(res, 200, { id, object: 'chat.completion', created: 1, model: 'gxzs-simulator', choices: [{ index: 0, message: { role: 'assistant', content: '模拟稳定性验收' }, finish_reason: 'stop' }], usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 } })
+        await completion(res, body, { content: '模拟稳定性验收' }, { id, created, signal: abort.signal }); return
       }
       let state = cases.get(scenario.id)
       if (!state) { state = { startedAt: Date.now(), requests: 0, maxStep: -1, observedStep: -1, tools: [], completed: false, fixtureURL: publicURL }; cases.set(scenario.id, state) }
@@ -141,32 +173,20 @@ export async function createSimulator({ token, output, host = '127.0.0.1', port 
         state.injectedFaults = (state.injectedFaults ?? 0) + 1
         await persist(); await record({ case: scenario.id, event: 'injected_model_failure', mode: scenario.fault.mode, step })
         if (scenario.fault.mode !== 'disconnect') return json(res, scenario.fault.mode === 'http403' ? 403 : 503, { error: { message: 'Synthetic provider fault', type: 'fixture_injected' } })
-        res.writeHead(200, { 'content-type': 'text/event-stream' })
-        res.write(`data: ${JSON.stringify({ id: 'partial', object: 'chat.completion.chunk', created: 1, model: body.model, choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: `sim_${scenario.id}_${step}`, type: 'function', function: { name: 'bash', arguments: '{"command":' } }] }, finish_reason: null }] })}\n\n`)
+        res.writeHead(200, { 'content-type': body.stream === true ? 'text/event-stream' : 'application/json' })
+        if (body.stream === true) res.write(`data: ${JSON.stringify({ id: `chatcmpl-${id}`, object: 'chat.completion.chunk', created, model: body.model, choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: `sim_${scenario.id}_${step}`, type: 'function', function: { name: 'bash', arguments: '{"command":' } }] }, finish_reason: null }] })}\n\n`)
+        else res.write('{"id":')
         await delay(50); res.destroy(); return
       }
       await persist()
       await delay(Math.min(30000, Math.max(0, scenario.stepDelayMs)), undefined, { signal: abort.signal })
-      const completionId = `fixture-${scenario.id}-${step}`
-      const frame = (delta, reason = null, usage) => `data: ${JSON.stringify({ id: completionId, object: 'chat.completion.chunk', created: 1, model: body.model, choices: [{ index: 0, delta, finish_reason: reason }], ...(usage ? { usage } : {}) })}\n\n`
-      res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-store', 'x-accel-buffering': 'no' })
-      const write = async chunk => { if (!res.write(chunk)) await once(res, 'drain', { signal: abort.signal }) }
       if (planned.name) {
         stats.toolResponses++; state.tools.push(planned.name); if (state.tools.length > 50) state.tools.shift()
-        const args = JSON.stringify(planned.arguments)
-        await write(frame({ role: 'assistant', tool_calls: [{ index: 0, id: `sim_${scenario.id}_${step}`, type: 'function', function: { name: planned.name, arguments: '' } }] }))
-        const chunkSize = scenario.argumentChunkSize ?? 256
-        for (let offset = 0; offset < args.length; offset += chunkSize) {
-          if (abort.signal.aborted) return
-          await write(frame({ tool_calls: [{ index: 0, function: { arguments: args.slice(offset, offset + chunkSize) } }] }))
-          if (offset && offset % 65536 === 0) await delay(1, undefined, { signal: abort.signal })
-        }
-        await write(frame({}, 'tool_calls', { prompt_tokens: 100, completion_tokens: 20, total_tokens: 120 }))
       } else {
         if (!planned.intermediate) { state.completed = true; stats.completed++ }
-        await write(frame({ role: 'assistant', content: planned.content })); await write(frame({}, 'stop', { prompt_tokens: 100, completion_tokens: 10, total_tokens: 110 }))
       }
-      res.end('data: [DONE]\n\n')
+      await completion(res, body, planned, { id, created, signal: abort.signal,
+        callId: `sim_${scenario.id}_${step}`, chunkSize: scenario.argumentChunkSize ?? 256 })
       await persist()
       await record({ case: scenario.id, step, tool: planned.name ?? null, inputBytes: size, complete: !planned.name && !planned.intermediate })
     } catch (error) {

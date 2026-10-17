@@ -48,7 +48,7 @@ export async function argumentStreamPaths(profile) {
   const require = createRequire(join(resolve(profile), 'package.json'))
   const consumer = require.resolve('@deepseek-ai/dsh-llm-pi-ai')
   const consumerMetadata = JSON.parse(await readFile(join(dirname(consumer), '../package.json'), 'utf8'))
-  if (consumerMetadata.version !== '0.2.1-alpha.5') throw new Error('Unverified DSH argument consumer version')
+  if (consumerMetadata.version !== '0.2.1-rc.2') throw new Error('Unverified DSH argument consumer version')
   const dependencyRequire = createRequire(consumer)
   const folder = dependencyRequire.resolve.paths('@earendil-works/pi-ai')
     .map(path => join(path, '@earendil-works/pi-ai')).find(path => existsSync(join(path, 'package.json')))

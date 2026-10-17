@@ -23,6 +23,7 @@ from owner_networks import OwnerNetworks
 from owner_auth import authorize as authorize_request
 from office_conversions import OfficeConversions
 from runtime_names import volume_prefix
+from global_skills import mount_arguments as global_skill_mounts, matches_mount
 
 
 LOGGER = logging.getLogger(__name__)
@@ -190,6 +191,7 @@ def save_operation(path, value):
 
 
 def ensure(key, *, track_activity=True, allow_existing_image=False):
+    skills_mount = global_skill_mounts()
     pids_limit = int(os.environ.get('WORKBENCH_SANDBOX_PIDS_LIMIT', '1024'))
     if pids_limit <= 0:
         raise ValueError('WORKBENCH_SANDBOX_PIDS_LIMIT must be positive')
@@ -225,6 +227,7 @@ def ensure(key, *, track_activity=True, allow_existing_image=False):
             # still apply; stopped containers continue through normal replacement.
             keep_running_image = allow_existing_image and existing['State']['Running']
             if ((existing["Config"]["Image"] != IMAGE and not keep_running_image)
+                    or not matches_mount(existing)
                     or attached != {network} or mounted_home != home_volume
                     or (existing.get('HostConfig', {}).get('CgroupParent') or '') != owner_cgroup(key)):
                 if existing["State"]["Running"]:
@@ -274,7 +277,7 @@ def ensure(key, *, track_activity=True, allow_existing_image=False):
                    "--memory-swap", os.environ.get("WORKBENCH_SANDBOX_MEMORY", "3g"), "--pids-limit", str(pids_limit),
                    "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true",
                    "-v", volumes + "-home:/home/gxzs", "-v", volumes + "-files:/workspace",
-                   "-v", volumes + "-env:/opt/user-env:ro",
+                   "-v", volumes + "-env:/opt/user-env:ro", *skills_mount,
                    "-e", "SHELLCTL_AUTH_TOKEN=" + token,
                    "-e", "PATH=/opt/user-env/current/python/bin:/opt/office/python/bin:/opt/user-env/current/node/node_modules/.bin:/opt/office/node/node_modules/.bin:/usr/local/bin:/usr/bin:/bin",
                    "-e", "NODE_PATH=/opt/user-env/current/node/node_modules:/opt/office/node/node_modules", IMAGE)

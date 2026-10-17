@@ -56,6 +56,9 @@ WORKBENCH_SANDBOX_ADDRESS_POOL=10.249.0.0/16
 WORKBENCH_SANDBOX_SUBNET_PREFIX=27
 WORKBENCH_SANDBOX_PREFIX=gxzs-wb
 WORKBENCH_MANAGER_STATE=/state
+# Docker 宿主机上持久保存的已发布技能；Host 与 Sandbox 同路径只读挂载。
+# 目录必须预先存在，发布前核对完整 SKILL.md、脚本、引用资源和 SHA-256 清单。
+GXZS_GLOBAL_SKILL_HOST_DIR=/srv/gxzs/global-resources/skills
 # Java根地址；manager会调用 /internal/ai/mcp/authorize。
 WORKBENCH_MCP_API_URL=http://gxzs-backend:8080
 ```
@@ -67,6 +70,18 @@ manager需要：
 - 仅内网暴露5010；
 - Java和manager之间共享`GXZS_SANDBOX_MANAGER_TOKEN`；
 - 与用户sandbox处于可管理的Docker网络，但不要公开5010。
+
+设置 `GXZS_GLOBAL_SKILL_HOST_DIR` 后，原生技能根固定为 `/opt/workbench-global/skills`。
+更换挂载目录须先 drain/fence，再创建新容器；禁止将技能仅复制到临时容器层。
+同一路径的根目录也不能通过删除或整体重命名替换：现有 bind mount 会继续引用旧目录。
+日常更新保留根目录 inode，按文件原子更新；确需整体换根时，按换代流程重新创建容器。
+使用 `--mount` 校验源目录存在，避免 Docker 自动创建空目录造成静默丢失。
+验收必须比较原发布清单的名称、展示名、内容摘要和全部配套文件，并检查新建、重建的
+Host/Sandbox 目录与计划调查容器读取一致。个人技能仍保存在各自 workspace 卷。
+
+生产沙盒构建须传入已核对的 `WORKBENCH_FONT_IMAGE` 私有字体资产镜像，不能使用公共 CI
+的默认系统字体阶段替代。发布前后比较字体 manifest 的 generation、文件数与 SHA-256，
+验证字体匹配和中文文档转换；同时验证 Git、Python/Node、Office、OCR、浏览器及个人环境卷。
 
 ## 3. 每个owner一个DSH host
 

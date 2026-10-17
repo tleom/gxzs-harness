@@ -37,7 +37,7 @@ ${original.split('\n').map(line => '\t' + line).join('\n')}
 export async function prepareTerminalCleanup(profile) {
   const require = createRequire(join(profile, 'package.json'))
   const metadata = JSON.parse(await readFile(require.resolve('@deepseek-ai/dsh-subprocess-local/package.json'), 'utf8'))
-  if (metadata.version !== '0.2.1-alpha.5') throw new Error('Unverified native terminal cleanup version')
+  if (metadata.version !== '0.2.1-rc.2') throw new Error('Unverified native terminal cleanup version')
   const entry = require.resolve('@deepseek-ai/dsh-subprocess-local')
   await writeFile(entry, terminalCleanupSource(await readFile(entry, 'utf8')))
 }

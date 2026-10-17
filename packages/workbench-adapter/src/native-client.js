@@ -31,7 +31,7 @@ export class WorkbenchNativeClient {
     // without serving unrelated renderers from the Host's application combo.
     const rows = graph.entries.filter(row => selected.has(row.id))
     const release = graph.release
-    if (release?.version !== '0.2.1-alpha.5') throw httpError(503, '原生客户端版本尚未就绪')
+    if (release?.version !== '0.2.1-rc.2') throw httpError(503, '原生客户端版本尚未就绪')
     const rev = createHash('sha256').update(JSON.stringify({ release, rows })).digest('hex')
     return { registry, boot: { rev, release, entries: rows, batches: rows.map(row => ({
       phase: row.id === MODULES ? 'bootstrap' : 'application', url: row.url, rev: row.rev, entries: [row.id],
@@ -42,7 +42,7 @@ export class WorkbenchNativeClient {
     const { boot } = this.graph()
     const bootstrap = bootInjections(boot).find(row => row.kind === 'script' && typeof row.text === 'string')?.text
     if (!bootstrap) throw httpError(503, '原生客户端启动入口不可用')
-    return { protocol: 1, version: '0.2.1-alpha.5', boot, bootstrap }
+    return { protocol: 1, version: '0.2.1-rc.2', boot, bootstrap }
   }
 
   async bundle(url, rev) {

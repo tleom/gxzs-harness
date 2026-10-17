@@ -168,7 +168,10 @@ def test_background_mcp_refresh_is_marked_as_maintenance(server, monkeypatch):
 
 
 @pytest.mark.parametrize('native_attachments', [False, True])
-def test_sandbox_uses_one_cpu_three_gigabytes_and_owner_network(server, monkeypatch, native_attachments):
+@pytest.mark.parametrize('global_skills', [False, True])
+def test_sandbox_uses_one_cpu_three_gigabytes_and_owner_network(server, monkeypatch, native_attachments, global_skills):
+    if global_skills:
+        monkeypatch.setenv('GXZS_GLOBAL_SKILL_HOST_DIR', '/srv/global-skills')
     containers, calls = {}, []
     monkeypatch.setattr(server, 'ensure_network', lambda key: 'owner-network-' + key[:8])
 
@@ -201,6 +204,7 @@ def test_sandbox_uses_one_cpu_three_gigabytes_and_owner_network(server, monkeypa
     assert create[create.index('--memory-swap') + 1] == '3g'
     assert create[create.index('--pids-limit') + 1] == '1024'
     assert create[create.index('--network') + 1] == 'owner-network-' + key[:8]
+    assert ('type=bind,source=/srv/global-skills,destination=/opt/workbench-global/skills,readonly' in create) == global_skills
     if native_attachments:
         assert create[create.index('--mount') + 1] == 'type=volume,source=owner-home,destination=/srv/dsh/attachments,volume-subpath=attachments,readonly'
         assert 'gxzs.attachment-home=owner-home' in create
@@ -208,7 +212,7 @@ def test_sandbox_uses_one_cpu_three_gigabytes_and_owner_network(server, monkeypa
         assert any(call[0] == 'run' and 'owner-home:/srv/dsh' in call for call in calls)
 
 
-@pytest.mark.parametrize('changed', ['network', 'attachments', 'cgroup'])
+@pytest.mark.parametrize('changed', ['network', 'attachments', 'cgroup', 'global_skills'])
 @pytest.mark.parametrize('allow_existing_image', [False, True])
 def test_running_sandbox_on_old_network_returns_predictable_retry(server, monkeypatch, changed, allow_existing_image):
     key = str(uuid4())
@@ -221,6 +225,8 @@ def test_running_sandbox_on_old_network_returns_predictable_retry(server, monkey
         (folder / 'host.json').write_text(json.dumps({'workspace_id': key, 'owner_id': 't:1', 'home_volume': 'owner-home'}))
     if changed == 'cgroup':
         existing['HostConfig'] = {'CgroupParent': 'other-owner'}
+    if changed == 'global_skills':
+        monkeypatch.setenv('GXZS_GLOBAL_SKILL_HOST_DIR', '/srv/global-skills')
     monkeypatch.setattr(server, 'ensure_network', lambda _: 'owner-network')
     monkeypatch.setattr(server, 'docker', lambda *args, **kwargs: SimpleNamespace(
         returncode=0, stdout=json.dumps([existing]) if args[:2] == ('inspect', name) else ''))
