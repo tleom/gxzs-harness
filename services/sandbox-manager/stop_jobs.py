@@ -9,9 +9,9 @@ from urllib.request import Request, urlopen
 from uuid import UUID
 
 binding = str(UUID(json.load(sys.stdin)["binding_id"]))
-home = "/home/dify/" + binding
+home = "/home/gxzs/" + binding
 stopped = 0
-for entry in Path("/home/dify/.local/share/shellctl/jobs").glob("*"):
+for entry in Path("/home/gxzs/.local/share/shellctl/jobs").glob("*"):
     environment = entry / ".job-env.json"
     if entry.is_symlink() or environment.is_symlink() or not environment.is_file():
         continue

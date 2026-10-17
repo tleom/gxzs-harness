@@ -17,6 +17,7 @@ import time
 from urllib.request import Request, build_opener, ProxyHandler
 from urllib.error import HTTPError
 from owner_auth import owner_token, assertion_key
+from runtime_names import account_names, host_name, volume_prefix
 
 
 class Hosts:
@@ -43,7 +44,7 @@ class Hosts:
                              '--format', '{{.Names}}', timeout=5, check=False)
         if listed.returncode:
             raise RuntimeError('Unable to list superseded hosts')
-        prefix = item['instance_id'] + '-previous-'
+        prefix = host_name(item) + '-previous-'
         for name in listed.stdout.splitlines()[:8]:
             if not re.fullmatch(re.escape(prefix) + r'[0-9a-f]{12}', name):
                 continue
@@ -52,12 +53,14 @@ class Hosts:
                 continue
             previous = json.loads(observed.stdout)[0]
             labels = previous.get('Config', {}).get('Labels') or {}
+            previous_generation = labels.get('gxzs.generation', '')
             if (previous.get('Id', '')[:12] != name[len(prefix):]
                     or previous.get('State', {}).get('Running') is not False
+                    or not previous_generation.isdecimal()
+                    or not 1 <= int(previous_generation) <= item['generation']
                     or any(labels.get(label) != expected for label, expected in {
                         'gxzs.owner': item['owner_id'],
                         'gxzs.workspace': item['workspace_id'],
-                        'gxzs.generation': str(item['generation']),
                     }.items())):
                 continue
             removed = self.docker('rm', name, timeout=5, check=False)
@@ -68,6 +71,7 @@ class Hosts:
         owner = payload['owner_id']
         instance = payload['instance_id']
         generation = int(payload['generation'])
+        names = account_names(owner, payload.get('account_name'))
         if not re.fullmatch(r'[^:\s/]+:\d+', owner) or not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_.-]{0,100}', instance) or generation < 1:
             raise ValueError('Invalid host identity')
         with self.lock(workspace):
@@ -75,10 +79,13 @@ class Hosts:
             folder.mkdir(mode=0o750, exist_ok=True)
             record = folder / 'host.json'
             current = {}
-            if record.exists():
+            registered = record.exists()
+            if registered:
                 current = json.loads(record.read_text())
                 if (current['owner_id'], current['generation'], current['instance_id']) != (owner, generation, instance):
                     raise ValueError('Host identity changed; fence the previous generation before replacement')
+                if current.get('account_name') and names and current['account_name'] != names['account_name']:
+                    raise ValueError('Runtime account binding cannot change')
                 if 'profile_upgrade' in current or current.get('state') in {'draining', 'fencing'}:
                     return {**current, 'ready': False}
                 # A ready generation can temporarily be unavailable while the
@@ -86,19 +93,26 @@ class Hosts:
                 # platform's monotonic ready state back to provisioning.
                 if current.get('state') == 'ready' and current.get('ready') is False:
                     return current
+            else:
+                current.update(names)
+                if names:
+                    current['sandbox_volume_prefix'] = names['sandbox_name']
+            container = host_name(dict(current, instance_id=instance))
             image = os.environ['GXZS_HOST_IMAGE']
             image_info = json.loads(self.docker('image', 'inspect', image).stdout)[0]
             desired_digest = image_info['Id']
             if payload.get('image_digest') and payload['image_digest'] != desired_digest:
                 raise ValueError('Desired host image does not match the installed digest')
             network, advertise, publish, host_state = self._runtime_config(workspace)
-            sandbox, _ = self.identity(workspace)
-            info = self.docker('inspect', instance, check=False)
+            sandbox = current.get('sandbox_name') or self.identity(workspace)[0]
+            info = self.docker('inspect', container, check=False)
             if not info.returncode:
                 existing = json.loads(info.stdout)[0]
                 labels = existing['Config'].get('Labels') or {}
                 if labels.get('gxzs.owner') != owner or labels.get('gxzs.workspace') != workspace or labels.get('gxzs.generation') != str(generation):
                     raise ValueError('Existing host is not managed for this owner; explicit adoption is required')
+                if labels.get('gxzs.instance') is not None and labels['gxzs.instance'] != instance:
+                    raise ValueError('Existing named Host instance identity changed')
                 if labels.get('gxzs.credentials') != 'owner-v1':
                     raise ValueError('Host credential rollout requires draining before replacement')
                 if existing['Config']['Image'] != image:
@@ -118,14 +132,14 @@ class Hosts:
             # Retain that fact across bootstrap retries; recovery of an existing
             # pair (including stopped or migrated containers) is ordinary loading.
             initial_creation = generation == 1 and current.get('initial_creation') is True and current.get('state') == 'provisioning'
-            if not current and generation == 1 and info.returncode:
+            if not registered and generation == 1 and info.returncode:
                 existing_sandbox = self.docker('ps', '-a', '--filter', 'name=^/' + sandbox + '$',
                                                '--format', '{{.Names}}', check=False)
                 initial_creation = existing_sandbox.returncode == 0 and not existing_sandbox.stdout.strip()
             # Persist ownership before provisioning, including failed starts.
             # A replacement inherits the original volume, including adopted
             # instance-home names. Fresh hosts use a stable workspace volume.
-            home_volume = current.get('home_volume') or (instance + '-home' if not info.returncode else 'gxzs-dsh-' + workspace + '-home')
+            home_volume = current.get('home_volume') or (container + '-home' if names or not info.returncode else 'gxzs-dsh-' + workspace + '-home')
             current.update(owner_id=owner, workspace_id=workspace, generation=generation,
                            instance_id=instance, ready=False, state='provisioning', home_volume=home_volume,
                            desired_image_digest=desired_digest, initial_creation=initial_creation)
@@ -167,7 +181,7 @@ class Hosts:
                 os.chmod(env_file, 0o600)
                 self.docker('volume', 'create', '--label', 'gxzs.owner=' + owner, home_volume)
                 self._create_container(current, folder, image, network, publish, host_state)
-            self.docker('start', instance)
+            self.docker('start', container)
             current.update(**self._container_identity(current, advertise))
             temporary.write_text(json.dumps(current))
             temporary.replace(record)
@@ -212,8 +226,10 @@ class Hosts:
                 raise ValueError('Host font directory must be an absolute Docker-host path')
             font_mount = ['-v', font_root + ':/usr/local/share/fonts/workbench:ro']
         sandbox, _ = self.identity(item['workspace_id'])
-        self.docker('create', '--name', item['instance_id'], '--label', 'gxzs.owner=' + item['owner_id'],
+        self.docker('create', '--name', host_name(item), '--label', 'gxzs.owner=' + item['owner_id'],
                     '--label', 'gxzs.workspace=' + item['workspace_id'],
+                    '--label', 'gxzs.instance=' + item['instance_id'],
+                    *(['--label', 'gxzs.account=' + item['account_name']] if item.get('account_name') else []),
                     '--label', 'gxzs.generation=' + str(item['generation']), '--label', 'gxzs.credentials=owner-v1',
                     '--log-driver', 'json-file', '--log-opt', 'max-size=10m', '--log-opt', 'max-file=3',
                     '--network', network, '--restart', 'no', *cgroup_args(item['workspace_id']),
@@ -221,12 +237,13 @@ class Hosts:
                     '--memory', memory, '--memory-swap', memory, '--pids-limit', '256', *publish,
                     '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges:true', '--env-file', str(env_file),
                     *font_mount, '-v', item['home_volume'] + ':/srv/dsh',
-                    '-v', sandbox + '-files:/workspace:ro',
+                    '-v', volume_prefix(item, sandbox) + '-files:/workspace:ro',
                     '-v', str(host_state / 'hosts' / item['workspace_id']) + ':/run/gxzs:ro',
-                    '-v', str(host_state / 'hosts' / item['workspace_id'] / 'ssh') + ':/home/node/.ssh:ro', image)
+                    '-v', str(host_state / 'hosts' / item['workspace_id'] / 'ssh') + ':/home/gxzs/.ssh:ro', image)
 
     def _container_identity(self, item, advertise):
-        info = json.loads(self.docker('inspect', item['instance_id']).stdout)[0]
+        info = json.loads(self.docker('inspect', host_name(item)).stdout)[0]
+        self._verify_named_container(item, info)
         ports = (info.get('NetworkSettings', {}).get('Ports') or {}).get('3081/tcp')
         if not ports or not isinstance(ports[0], dict) or not str(ports[0].get('HostPort', '')).isdecimal():
             state = info.get('State', {})
@@ -236,8 +253,22 @@ class Hosts:
         endpoint = 'http://' + advertise + ':' + str(ports[0]['HostPort'])
         return {'endpoint': endpoint, 'image_digest': info['Image']}
 
+    @staticmethod
+    def _verify_named_container(item, info, *, sandbox=False):
+        if not item.get('container_name') or info is None:
+            return
+        labels = info.get('Config', {}).get('Labels') or {}
+        expected = {'gxzs.workspace': item['workspace_id']}
+        if not sandbox:
+            expected.update({'gxzs.owner': item['owner_id'], 'gxzs.generation': str(item['generation'])})
+            if labels.get('gxzs.instance') is not None:
+                expected['gxzs.instance'] = item['instance_id']
+        if any(labels.get(key) != value for key, value in expected.items()):
+            raise ValueError('Named runtime container ownership changed')
+
     def replace(self, workspace, payload):
         """Root-only, resumable drain/fence/replace; never stop an active run."""
+        names = account_names(payload['owner_id'], payload.get('account_name'))
         if not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_.-]{0,100}', payload['instance_id']):
             raise ValueError('Invalid replacement identity')
         # Fail before draining for an unavailable image or unusable credentials.
@@ -255,6 +286,12 @@ class Hosts:
                         'error': 'Profile upgrade preparation must complete before replacement'}
             expected = (int(payload['expected_generation']), payload['expected_instance_id'])
             desired = (int(payload['generation']), payload['instance_id'])
+            if current.get('account_name') and names and current['account_name'] != names['account_name']:
+                raise ValueError('Runtime account binding cannot change')
+            if current.get('account_name'):
+                # Older callers may omit account_name; a registered physical
+                # identity also survives later deployment-prefix changes.
+                names = {key: current[key] for key in ('account_name', 'container_name', 'sandbox_name')}
             if payload['owner_id'] != current['owner_id'] or desired[0] != expected[0] + 1 or desired[1] == expected[1]:
                 raise ValueError('Invalid replacement identity')
             transition = current.get('replacement') or {}
@@ -267,6 +304,10 @@ class Hosts:
             if ((transition.get('previous_generation'), transition.get('previous_instance_id')) == expected
                     and (transition.get('generation'), transition.get('instance_id')) != desired):
                 raise ValueError('Another replacement transition is already in progress')
+            for target, previous in ((names.get('container_name'), host_name(current)),
+                                     (names.get('sandbox_name'), self.identity(workspace)[0])):
+                if target and target != previous and self._upgrade_inspect(target) is not None:
+                    raise ValueError('Runtime account container name is already allocated')
             transition = dict(previous_generation=expected[0], previous_instance_id=expected[1],
                               generation=desired[0], instance_id=desired[1])
             current.update(state='draining', ready=False, replacement=transition)
@@ -278,7 +319,7 @@ class Hosts:
         # Probe outside the workspace lock because Host plugins can call back
         # into this manager. Future schedules and UI leases survive replacement
         # through native recovery; they are not in-flight task admission.
-        inspected = self.docker('inspect', expected[1], timeout=5, check=False)
+        inspected = self.docker('inspect', host_name(observed), timeout=5, check=False)
         info = json.loads(inspected.stdout)[0] if not inspected.returncode else None
         if info and info['State']['Running']:
             activity = self.native_activity(observed.get('endpoint')) if observed.get('endpoint') else None
@@ -295,12 +336,33 @@ class Hosts:
             from global_memory import invalidate as cancel_memory
             cancel_memory(workspace)
             sandbox, _ = self.identity(workspace)
-            for container in (expected[1], sandbox):
+            inspected_containers = []
+            for container in (host_name(current), sandbox):
                 inspect = self.docker('inspect', container, check=False)
                 if not inspect.returncode:
-                    self.docker('stop', '--time', '10', container)
+                    previous = json.loads(inspect.stdout)[0]
+                    self._verify_named_container(current, previous, sandbox=container == sandbox)
+                    inspected_containers.append(container)
+            for container in inspected_containers:
+                self.docker('stop', '--time', '10', container)
             # Capacity is freed only after both stop operations succeeded.
             self._fence(workspace, current['owner_id'], expected[1])
+            # Logical instances remain unique across generations. The readable
+            # Docker name is reusable only after the old generation is stopped.
+            previous_name = host_name(current)
+            if names and previous_name == names['container_name']:
+                previous = self._upgrade_inspect(previous_name)
+                if previous is not None:
+                    labels = previous.get('Config', {}).get('Labels') or {}
+                    if previous['State']['Running'] or any(labels.get(key) != value for key, value in {
+                        'gxzs.owner': current['owner_id'], 'gxzs.workspace': workspace,
+                        'gxzs.generation': str(current['generation']),
+                    }.items()):
+                        raise ValueError('Previous runtime container identity changed')
+                    self.docker('rename', previous_name, previous_name + '-previous-' + previous['Id'][:12])
+            if names:
+                current['sandbox_volume_prefix'] = volume_prefix(current, sandbox)
+                current.update(names)
             current.update(generation=desired[0], instance_id=desired[1], state='provisioning', ready=False,
                            home_volume=current.get('home_volume') or expected[1] + '-home')
             current.pop('profile_upgrade', None)
@@ -311,6 +373,8 @@ class Hosts:
     def _upgrade_result(self, workspace, marker):
         identity = {key: marker[key] for key in
                     ('owner_id', 'generation', 'instance_id', 'home_volume', 'image_digest')}
+        if marker.get('container_name'):
+            identity['container_name'] = marker['container_name']
         message = json.dumps([workspace, marker['nonce'], identity], sort_keys=True, separators=(',', ':'))
         token = hmac.new(os.environ['WORKBENCH_SANDBOX_MANAGER_TOKEN'].encode(),
                          ('profile-upgrade\n' + message).encode(), hashlib.sha256).hexdigest()
@@ -318,15 +382,15 @@ class Hosts:
 
     def _upgrade_stopped(self, workspace, marker):
         sandbox, _ = self.identity(workspace)
-        for container in (marker['instance_id'], sandbox):
+        for container in (host_name(marker), sandbox):
             info = self._upgrade_inspect(container)
             if info is None:
                 continue
             if info['State']['Running']:
                 raise ValueError('Profile upgrade requires both original containers to remain stopped')
-            if container == marker['instance_id'] and info['Image'] != marker['image_digest']:
+            if container == host_name(marker) and info['Image'] != marker['image_digest']:
                 raise ValueError('Profile upgrade image identity changed')
-            if container == marker['instance_id']:
+            if container == host_name(marker):
                 labels = info.get('Config', {}).get('Labels') or {}
                 if any(labels.get(key) != value for key, value in {
                     'gxzs.owner': marker['owner_id'], 'gxzs.workspace': workspace,
@@ -368,7 +432,7 @@ class Hosts:
                     if (current.get('state') == 'fencing' or
                             transition.get('generation', current['generation']) > current['generation']):
                         raise ValueError('Another host maintenance transition is in progress')
-                    info = self._upgrade_inspect(current['instance_id'])
+                    info = self._upgrade_inspect(host_name(current))
                     if info:
                         labels = info.get('Config', {}).get('Labels') or {}
                         if any(labels.get(key) != value for key, value in {
@@ -390,12 +454,16 @@ class Hosts:
                     marker = dict(owner_id=current['owner_id'], generation=current['generation'],
                                   instance_id=current['instance_id'], image_digest=image, home_volume=home,
                                   nonce=secrets.token_hex(32), phase='draining')
+                    if current.get('container_name'):
+                        marker['container_name'] = current['container_name']
                     current.update(home_volume=home, profile_upgrade=marker, state='draining', ready=False)
                     self._save(record, current)
             if not isinstance(marker, dict) or marker.get('phase') not in {'draining', 'fencing', 'preparing', 'prepared'}:
                 raise ValueError('Profile upgrade has not begun')
             if any(current.get(key) != marker[key] for key in ('owner_id', 'generation', 'instance_id', 'home_volume')):
                 raise ValueError('Profile upgrade original binding changed')
+            if host_name(current) != host_name(marker):
+                raise ValueError('Profile upgrade container binding changed')
             result = self._upgrade_result(workspace, marker)
             if operation != 'begin':
                 supplied = payload.get('token')
@@ -418,7 +486,7 @@ class Hosts:
             observed = json.loads(json.dumps(current))
         # Native activity may call back into the manager; never hold its workspace lock here.
         if marker['phase'] == 'draining':
-            info = self._upgrade_inspect(marker['instance_id'])
+            info = self._upgrade_inspect(host_name(marker))
             if info and info['State']['Running']:
                 activity = self.native_activity(observed.get('endpoint')) if observed.get('endpoint') else None
                 if activity is None or any(activity[key] for key in
@@ -437,7 +505,9 @@ class Hosts:
             invalidate(workspace)
             cancel_memory(workspace)
             sandbox, _ = self.identity(workspace)
-            for container in (marker['instance_id'], sandbox):
+            for container in (host_name(marker), sandbox):
+                self._verify_named_container(current, self._upgrade_inspect(container), sandbox=container == sandbox)
+            for container in (host_name(marker), sandbox):
                 if self._upgrade_inspect(container) is not None:
                     self.docker('stop', '--time', '10', container)
             self._upgrade_stopped(workspace, marker)
@@ -466,16 +536,16 @@ class Hosts:
         public = key.with_suffix('.pub').read_text().strip()
         # The sandbox drops all capabilities. UID 0 cannot bypass the owner's
         # 0700 SSH directory or chown files; install keys as the actual owner.
-        script = "from pathlib import Path; import os,sys; p=Path('/home/dify/.ssh'); p.mkdir(mode=0o700,exist_ok=True); f=p/'authorized_keys'; key=sys.stdin.read().strip(); old=f.read_text() if f.exists() else ''; f.write_text(old if key in old.splitlines() else old.rstrip()+'\\n'+key+'\\n'); os.chmod(f,0o600)"
+        script = "from pathlib import Path; import os,sys; p=Path('/home/gxzs/.ssh'); p.mkdir(mode=0o700,exist_ok=True); f=p/'authorized_keys'; key=sys.stdin.read().strip(); old=f.read_text() if f.exists() else ''; f.write_text(old if key in old.splitlines() else old.rstrip()+'\\n'+key+'\\n'); os.chmod(f,0o600)"
         self.docker('exec', '--user', '1000', '-i', sandbox, '/usr/local/bin/python', '-I', '-S', '-c', script, stdin=public)
-        host_key = self.docker('exec', '--user', '1000', sandbox, 'cat', '/home/dify/.ssh/ssh_host_ed25519_key.pub').stdout.split()
+        host_key = self.docker('exec', '--user', '1000', sandbox, 'cat', '/home/gxzs/.ssh/ssh_host_ed25519_key.pub').stdout.split()
         if len(host_key) < 2 or host_key[0] != 'ssh-ed25519':
             raise ValueError('Sandbox SSH host key is missing or invalid')
         port = int(os.environ.get('GXZS_SANDBOX_SSH_PORT', '2222'))
         if not 1 <= port <= 65535:
             raise ValueError('Invalid sandbox SSH port')
         (ssh / 'known_hosts').write_text(f'[{sandbox}]:{port} ' + ' '.join(host_key[:2]) + '\n')
-        (ssh / 'config').write_text(f'Host {sandbox}\n  HostName {sandbox}\n  Port {port}\n  User dify\n  IdentityFile /home/node/.ssh/id_ed25519\n  UserKnownHostsFile /home/node/.ssh/known_hosts\n  StrictHostKeyChecking yes\n  BatchMode yes\n')
+        (ssh / 'config').write_text(f'Host {sandbox}\n  HostName {sandbox}\n  Port {port}\n  User gxzs\n  IdentityFile /home/gxzs/.ssh/id_ed25519\n  UserKnownHostsFile /home/gxzs/.ssh/known_hosts\n  StrictHostKeyChecking yes\n  BatchMode yes\n')
         os.chown(folder, 1000, 1000)
         os.chown(ssh, 1000, 1000)
         for item in ssh.iterdir():
@@ -694,7 +764,8 @@ class Hosts:
                 raise ValueError('Host is draining; new task admission is paused')
             if payload['action'] != 'release':
                 if info is None:
-                    info = json.loads(self.docker('inspect', item['instance_id']).stdout)[0]
+                    info = json.loads(self.docker('inspect', host_name(item)).stdout)[0]
+                self._verify_named_container(item, info)
                 if not info['State']['Running']:
                     raise ValueError('Scheduling host is stopped')
             if managed and payload['action'] == 'acquire' and item.get('ready') is not True and not draining_ticket:
@@ -717,11 +788,13 @@ class Hosts:
                 observed = dict(item)
             # Both Docker inspection and health checks can be slow. In
             # particular, plugin readiness may call back into this workspace.
-            host_result = self.docker('inspect', item['instance_id'], check=False)
+            host_result = self.docker('inspect', host_name(item), check=False)
             info = json.loads(host_result.stdout)[0] if not host_result.returncode else None
             sandbox, _ = self.identity(item['workspace_id'])
             sandbox_result = self.docker('inspect', sandbox, check=False)
             sandbox_info = json.loads(sandbox_result.stdout)[0] if not sandbox_result.returncode else None
+            self._verify_named_container(item, info)
+            self._verify_named_container(item, sandbox_info, sandbox=True)
             sandbox_running = bool(sandbox_info and sandbox_info['State']['Running'])
             sandbox_health = ((sandbox_info or {}).get('State', {}).get('Health') or {}).get('Status')
             sandbox_healthy = sandbox_running and sandbox_health in (None, 'healthy')
@@ -735,7 +808,7 @@ class Hosts:
                     if current != observed or self.admission.busy(current['owner_id']):
                         return
                     if host_running:
-                        self.docker('stop', '--time', '10', current['instance_id'])
+                        self.docker('stop', '--time', '10', host_name(current))
                     if sandbox_running:
                         self.docker('stop', '--time', '10', sandbox)
                     if host_running or sandbox_running:
@@ -775,7 +848,7 @@ class Hosts:
                         and time.time() - activity.stat().st_mtime > 1800
                         and not self.admission.busy(item['owner_id']) and native_idle)
                 if host_running and idle:
-                    self.docker('stop', '--time', '10', item['instance_id'])
+                    self.docker('stop', '--time', '10', host_name(item))
                     self.docker('stop', '--time', '10', sandbox, check=False)
                     self._fence(item['workspace_id'], item['owner_id'], item['instance_id'])
                     item.update(state='stopped', ready=False)
@@ -863,7 +936,7 @@ class Hosts:
                 # Preserve all named volumes. Fencing invalidates in-flight
                 # tools, then the same containers restart with the same owner
                 # and generation. Readiness is published by a later probe.
-                self.docker('stop', '--time', '10', item['instance_id'], check=failed_transport_activity is not None)
+                self.docker('stop', '--time', '10', host_name(item), check=failed_transport_activity is not None)
                 self.docker('stop', '--time', '10', sandbox, check=failed_transport_activity is not None)
                 self._fence(item['workspace_id'], item['owner_id'], item['instance_id'], preserve_pending=True)
                 self.ensure_sandbox(item['workspace_id'])
@@ -876,11 +949,11 @@ class Hosts:
                 # stale shared network or obsolete cgroup limit cannot survive
                 # recovery. Durable owner state remains in the named volume.
                 if info is not None:
-                    self.docker('rename', item['instance_id'],
-                                item['instance_id'] + '-previous-' + info['Id'][:12])
+                    self.docker('rename', host_name(item),
+                                host_name(item) + '-previous-' + info['Id'][:12])
                 network, advertise, publish, host_state = self._runtime_config(item['workspace_id'])
                 self._create_container(item, record.parent, image, network, publish, host_state)
-                self.docker('start', item['instance_id'])
+                self.docker('start', host_name(item))
                 item.update(**self._container_identity(item, advertise))
                 self._save(record, item)
                 self.failures[item['instance_id']] = time.time()

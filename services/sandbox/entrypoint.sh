@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 umask 077
-ssh_dir="${HOME:-/home/dify}/.ssh"
+ssh_dir="${HOME:-/home/gxzs}/.ssh"
 mkdir -p "$ssh_dir"
 chmod 700 "$ssh_dir"
 host_key="$ssh_dir/ssh_host_ed25519_key"

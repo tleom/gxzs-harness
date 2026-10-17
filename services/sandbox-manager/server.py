@@ -22,6 +22,7 @@ from resource_limits import cgroup_args, owner_cgroup, ResourceUnavailable
 from owner_networks import OwnerNetworks
 from owner_auth import authorize as authorize_request
 from office_conversions import OfficeConversions
+from runtime_names import volume_prefix
 
 
 LOGGER = logging.getLogger(__name__)
@@ -159,6 +160,9 @@ def lock(key):
 def identity(key):
     key = str(uuid.UUID(key))
     name = PREFIX + "-" + key
+    record = STATE / 'hosts' / key / 'host.json'
+    if record.exists():
+        name = json.loads(record.read_text()).get('sandbox_name') or name
     token = hmac.new(TOKEN.encode(), key.encode(), hashlib.sha256).hexdigest()
     return name, token
 
@@ -184,9 +188,11 @@ def ensure(key, *, track_activity=True, allow_existing_image=False):
         raise ValueError('WORKBENCH_SANDBOX_PIDS_LIMIT must be positive')
     name, token = identity(key)
     with lock(key):
+        name, token = identity(key)
         network = ensure_network(key)
         record = HOSTS.root / key / 'host.json'
         home_volume = None
+        host = {}
         if record.exists():
             host = json.loads(record.read_text(encoding='utf-8'))
             if ('profile_upgrade' in host and (host.get('state') == 'fencing'
@@ -195,6 +201,7 @@ def ensure(key, *, track_activity=True, allow_existing_image=False):
             home_volume = host.get('home_volume')
             if host.get('workspace_id') != key or not isinstance(home_volume, str) or not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_.-]+', home_volume):
                 raise ValueError('Invalid owner attachment volume')
+        volumes = volume_prefix(host, name)
         attachment_mount = (['--mount', 'type=volume,source=' + home_volume
                              + ',destination=/srv/dsh/attachments,volume-subpath=attachments,readonly'] if home_volume else [])
         info = docker("inspect", name, check=False)
@@ -202,6 +209,8 @@ def ensure(key, *, track_activity=True, allow_existing_image=False):
             raise SandboxUpdatePending('个人工作台正在准备配置升级；不能重启原环境')
         if not info.returncode:
             existing = json.loads(info.stdout)[0]
+            if host.get('sandbox_name') and (existing.get('Config', {}).get('Labels') or {}).get('gxzs.workspace') != key:
+                raise ValueError('Sandbox container name belongs to another workspace')
             attached = set((existing.get('NetworkSettings', {}).get('Networks') or {}).keys())
             mounted_home = (existing['Config'].get('Labels') or {}).get('gxzs.attachment-home')
             # Bootstrap catalog reads must remain available while a running owner
@@ -235,29 +244,30 @@ def ensure(key, *, track_activity=True, allow_existing_image=False):
                        "os.chown('/srv/dsh',1000,1000); "
                        "os.makedirs(p,exist_ok=True); os.chown(p,1000,1000); os.chmod(p,0o700)")
             for suffix in ("home", "files", "env"):
-                docker("volume", "create", "--label", "workbench=" + PREFIX, name + "-" + suffix)
+                docker("volume", "create", "--label", "workbench=" + PREFIX, volumes + "-" + suffix)
             docker("run", "--rm", *cgroup_args(key), '--memory', '256m', '--cpus', '1', '--pids-limit', '128',
                    "--user", "0", "--network", "none", "--entrypoint", MANAGER_PYTHON[0],
-                   "-v", name + "-home:/home/dify", "-v", name + "-files:/workspace", "-v", name + "-env:/opt/user-env",
-                   IMAGE, *MANAGER_PYTHON[1:], "-c", "import os; paths=['/home/dify','/workspace','/workspace/conversations','/opt/user-env']; "
+                   "-v", volumes + "-home:/home/gxzs", "-v", volumes + "-files:/workspace", "-v", volumes + "-env:/opt/user-env",
+                   IMAGE, *MANAGER_PYTHON[1:], "-c", "import os; paths=['/home/gxzs','/workspace','/workspace/conversations','/opt/user-env']; "
                    "[(os.makedirs(p,exist_ok=True),os.chown(p,1000,1000)) for p in paths]")
             # Existing personal venvs gain the immutable office fallback without replacing their packages.
             docker("run", "--rm", *cgroup_args(key), '--memory', '256m', '--cpus', '1', '--pids-limit', '128',
                    "--user", "1000", "--network", "none", "--entrypoint", MANAGER_PYTHON[0],
-                   "-v", name + "-env:/opt/user-env", IMAGE, *MANAGER_PYTHON[1:], "-c",
+                   "-v", volumes + "-env:/opt/user-env", IMAGE, *MANAGER_PYTHON[1:], "-c",
                    "from pathlib import Path; site=Path('/opt/user-env/current/python/lib/python3.12/site-packages'); "
                    "base=Path('/opt/office/python/lib/python3.12/site-packages'); "
                    "(site/'workbench_office.pth').write_text(str(base)+'\\n') if site.exists() and base.exists() else None")
             docker("create", "--name", name, "--label", "workbench=" + PREFIX,
                    '--label', 'gxzs.workspace=' + key, "--network", network, *cgroup_args(key),
+                   *(['--label', 'gxzs.account=' + host['account_name']] if host.get('account_name') else []),
                    *(['--label', 'gxzs.attachment-home=' + home_volume] if home_volume else []), *attachment_mount,
                    '--log-driver', 'json-file', '--log-opt', 'max-size=10m', '--log-opt', 'max-file=3',
                    "--cpus", os.environ.get("WORKBENCH_SANDBOX_CPUS", "1"),
                    "--memory", os.environ.get("WORKBENCH_SANDBOX_MEMORY", "3g"),
                    "--memory-swap", os.environ.get("WORKBENCH_SANDBOX_MEMORY", "3g"), "--pids-limit", str(pids_limit),
                    "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true",
-                   "-v", name + "-home:/home/dify", "-v", name + "-files:/workspace",
-                   "-v", name + "-env:/opt/user-env:ro",
+                   "-v", volumes + "-home:/home/gxzs", "-v", volumes + "-files:/workspace",
+                   "-v", volumes + "-env:/opt/user-env:ro",
                    "-e", "SHELLCTL_AUTH_TOKEN=" + token,
                    "-e", "PATH=/opt/user-env/current/python/bin:/opt/office/python/bin:/opt/user-env/current/node/node_modules/.bin:/opt/office/node/node_modules/.bin:/usr/local/bin:/usr/bin:/bin",
                    "-e", "NODE_PATH=/opt/user-env/current/node/node_modules:/opt/office/node/node_modules", IMAGE)
@@ -400,6 +410,7 @@ def operation(key, action, payload):
             if payload.get('maintenance') is True and record.exists() and json.loads(record.read_text(encoding='utf-8')).get('state') == 'stopped':
                 raise ResourceUnavailable('个人工作环境已休眠，维护请求稍后重试', 'HOST_IDLE', 30)
             ensure(key, track_activity=tracked, allow_existing_image=payload['operation'] == 'mcp_list')
+            name, _ = identity(key)
             request = payload
             if payload["operation"] in {"mcp_test", "mcp_call"}:
                 request = {"operation": "mcp_probe", "name": payload.get("name")}
@@ -487,6 +498,7 @@ def operation(key, action, payload):
     if action == "files":
         with lock(key):
             ensure(key)
+            name, _ = identity(key)
             script = Path(__file__).with_name("file_ops.py").read_text()
             result = docker("exec", "--user", "1000", "-i", name, *MANAGER_PYTHON, "-c", script,
                             stdin=json.dumps(payload), check=False)
@@ -497,6 +509,7 @@ def operation(key, action, payload):
     if action in ("personal-resources", "global-resources"):
         with lock(key):
             ensure(key)
+            name, _ = identity(key)
             if action == "personal-resources" and payload.get("operation") == "global_install":
                 raise ValueError("Global resources are read-only")
             if action == "global-resources" and payload.get("operation") != "global_install":
@@ -516,6 +529,9 @@ def operation(key, action, payload):
     if action == "environment":
         with lock(key):
             ensure(key)
+            name, _ = identity(key)
+            host_record = HOSTS.root / key / 'host.json'
+            volumes = volume_prefix(json.loads(host_record.read_text()) if host_record.exists() else {}, name)
             request_id = payload.get("request_id", "")
             if not request_id or len(request_id) > 128:
                 raise ValueError("Environment update requires a stable request ID")
@@ -529,7 +545,7 @@ def operation(key, action, payload):
             try:
                 result = docker("run", "--rm", "--name", installer, *cgroup_args(key), "--user", "1000", "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true",
                     "--memory", "1g", "--cpus", "1", "--pids-limit", "256", "--entrypoint", MANAGER_PYTHON[0],
-                    "-v", name + "-env:/opt/user-env", "-i", IMAGE, *MANAGER_PYTHON[1:], "-c", script,
+                    "-v", volumes + "-env:/opt/user-env", "-i", IMAGE, *MANAGER_PYTHON[1:], "-c", script,
                     stdin=json.dumps(payload), timeout=INSTALL_TIMEOUT)
                 output = json.loads(result.stdout)
             except subprocess.TimeoutExpired:
@@ -572,8 +588,9 @@ def operation(key, action, payload):
         with lock(key):
             stop_binding(key, binding)
             ensure(key)
+            name, _ = identity(key)
             docker("exec", "--user", "1000", name, *MANAGER_PYTHON, "-c",
-                   "import shutil; shutil.rmtree('/home/dify/" + binding + "',ignore_errors=True); "
+                   "import shutil; shutil.rmtree('/home/gxzs/" + binding + "',ignore_errors=True); "
                    "shutil.rmtree('/workspace/conversations/" + binding + "',ignore_errors=True)")
             docker("volume", "rm", scratch_name(name, binding), check=False)
             return {"ok": True}

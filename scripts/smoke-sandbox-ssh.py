@@ -50,7 +50,7 @@ with tempfile.TemporaryDirectory(prefix='gxzs-ssh-smoke-') as directory:
     command = ['ssh', '-p', '2222', '-i', str(key),
         '-o', 'IdentitiesOnly=yes', '-o', 'StrictHostKeyChecking=yes',
         '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=5',
-        '-o', 'UserKnownHostsFile=' + str(known), 'dify@127.0.0.1', 'id -u']
+        '-o', 'UserKnownHostsFile=' + str(known), 'gxzs@127.0.0.1', 'id -u']
     assert subprocess.check_output(command, timeout=10).strip() == b'1000', 'SSH owner identity mismatch'
     # Test the authenticated execution path, not only docker exec's image ENV.
     dependencies = "import sys,defusedxml,reportlab,pypdf,pptx,docx,openpyxl; assert sys.executable == '/opt/office/python/bin/python3'; print('ssh-office-python-ok')"
@@ -117,9 +117,9 @@ def verify(container, host_image=None):
             ssh_folder = folder / 'ssh'
             (ssh_folder / 'known_hosts').write_text(known)
             (ssh_folder / 'config').write_text('Host fixture-sandbox\n  HostName 127.0.0.1\n'
-                '  User dify\n  Port 2222\n  IdentityFile /home/node/.ssh/id_ed25519\n'
+                '  User gxzs\n  Port 2222\n  IdentityFile /home/gxzs/.ssh/id_ed25519\n'
                 '  IdentitiesOnly yes\n  StrictHostKeyChecking yes\n'
-                '  UserKnownHostsFile /home/node/.ssh/known_hosts\n')
+                '  UserKnownHostsFile /home/gxzs/.ssh/known_hosts\n')
             helper_hash = docker('exec', container, 'sha256sum',
                 '/opt/dsh/node_modules/@deepseek-ai/dsh-ssh/lib/helper.js').stdout.split()[0]
             scripts = Path(__file__).resolve().parent
@@ -163,7 +163,7 @@ def verify(container, host_image=None):
                         entry = tarfile.TarInfo('.ssh/' + name)
                         entry.size, entry.mode, entry.uid, entry.gid = len(data), 0o600, 1000, 1000
                         tar.addfile(entry, io.BytesIO(data))
-                subprocess.run(['docker', 'cp', '-a', '-', host + ':/home/node'],
+                subprocess.run(['docker', 'cp', '-a', '-', host + ':/home/gxzs'],
                                input=archive.getvalue(), capture_output=True, check=True, timeout=20)
                 docker('start', host)
                 selected_scripts = ('smoke-host-bootstrap.mjs',) if os.environ.get('GXZS_SMOKE_BOOTSTRAP') == '1' else ('smoke-native-ssh.mjs', 'smoke-native-sandbox-tools.mjs')

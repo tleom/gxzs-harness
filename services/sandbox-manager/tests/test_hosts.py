@@ -91,6 +91,32 @@ def test_first_use_creates_once_and_reuses_workspace(tmp_path, monkeypatch):
     assert not any(value.endswith(':/workspace') for value in create)
 
 
+def test_account_named_host_keeps_the_logical_instance_and_owner_volumes(tmp_path, monkeypatch):
+    host, docker, _, payload, _ = setup(tmp_path, monkeypatch)
+    first = host.ensure('workspace', dict(payload, account_name='00066943'))
+    assert first['container_name'] == 'gxzs-host-t.00066943'
+    assert first['instance_id'] == 'host-1'
+    assert first['initial_creation'] is True
+    create = next(call.args for call in docker.call_args_list if call.args[0] == 'create')
+    assert create[create.index('--name') + 1] == first['container_name']
+    assert 'GXZS_HOST_INSTANCE_ID=host-1' in (host.root / 'workspace' / 'host.env').read_text()
+    assert 'gxzs-sandbox-t.00066943-files:/workspace:ro' in create
+    assert 'gxzs.instance=host-1' in create
+    assert '/srv/manager/hosts/workspace/ssh:/home/gxzs/.ssh:ro' in create
+    host._ssh.assert_called_once_with(host.root / 'workspace', 'gxzs-sandbox-t.00066943')
+    with pytest.raises(ValueError, match='account binding'):
+        host.ensure('workspace', dict(payload, account_name='other'))
+
+
+def test_legacy_generation_is_not_renamed_by_an_ordinary_ensure(tmp_path, monkeypatch):
+    host, docker, _, payload, _ = setup(tmp_path, monkeypatch)
+    host.ensure('workspace', payload)
+    docker.reset_mock()
+    result = host.ensure('workspace', dict(payload, account_name='admin'))
+    assert 'container_name' not in result
+    assert not any(call.args[0] in {'rename', 'create', 'stop'} for call in docker.call_args_list)
+
+
 def test_existing_sandbox_without_host_is_not_first_creation(tmp_path, monkeypatch):
     host, docker, _, payload, _ = setup(tmp_path, monkeypatch)
     original = docker.side_effect
@@ -1254,9 +1280,9 @@ def test_ssh_installs_keys_as_sandbox_owner_without_chown(tmp_path, monkeypatch)
             script = args[args.index('-c') + 1]
             assert 'chown' not in script
             monkeypatch.setattr(sys, 'stdin', io.StringIO(stdin))
-            exec(script.replace("'/home/dify/.ssh'", repr(str(owner_ssh))))
+            exec(script.replace("'/home/gxzs/.ssh'", repr(str(owner_ssh))))
             return SimpleNamespace(returncode=0, stdout='')
-        assert args[-2:] == ('cat', '/home/dify/.ssh/ssh_host_ed25519_key.pub')
+        assert args[-2:] == ('cat', '/home/gxzs/.ssh/ssh_host_ed25519_key.pub')
         return SimpleNamespace(returncode=0, stdout='ssh-ed25519 AAAAhost\n')
     host.docker = Mock(side_effect=docker)
     Hosts._ssh(host, folder, 'sandbox-workspace')
@@ -1266,3 +1292,90 @@ def test_ssh_installs_keys_as_sandbox_owner_without_chown(tmp_path, monkeypatch)
     assert 'Port 2222' in (ssh / 'config').read_text()
     assert host_chown.call_count > 0
     assert all(str(call.args[0]).startswith(str(folder)) for call in host_chown.call_args_list)
+
+
+@pytest.mark.parametrize('send_account', [True, False])
+def test_readable_name_is_reused_only_after_old_generation_is_fenced(tmp_path, monkeypatch, send_account):
+    host, docker, payload, containers, record, _ = upgrade_setup(tmp_path, monkeypatch)
+    name = 'gxzs-host-t.admin'
+    containers[name] = containers.pop('host-1')
+    containers['sandbox-workspace']['Config'] = {'Labels': {'gxzs.workspace': 'workspace'}}
+    data = json.loads(record.read_text())
+    data.update(container_name=name, sandbox_name='sandbox-workspace', account_name='admin')
+    host._save(record, data)
+    previous_volume = data['home_volume']
+    original = docker.side_effect
+    def operate(*args, **kwargs):
+        if args[0] == 'rename':
+            containers[args[2]] = containers.pop(args[1])
+            assert not containers[args[2]]['State']['Running']
+            return SimpleNamespace(returncode=0, stdout='')
+        return original(*args, **kwargs)
+    docker.side_effect = operate
+    replacement = dict(payload, expected_generation=1, expected_instance_id='host-1', generation=2, instance_id='host-2')
+    if send_account:
+        replacement['account_name'] = 'admin'
+    host.ensure = Mock(return_value={'new_generation': True})
+    host.admission.busy.return_value = 1
+    assert host.replace('workspace', replacement)['state'] == 'draining'
+    assert containers[name]['State']['Running']
+    host.admission.busy.return_value = 0
+    assert host.replace('workspace', replacement) == {'new_generation': True}
+    after = json.loads(record.read_text())
+    assert after['container_name'] == name and after['instance_id'] == 'host-2'
+    assert after['generation'] == 2 and after['home_volume'] == previous_volume
+    assert after['sandbox_volume_prefix'] == 'sandbox-workspace'
+    assert name not in containers
+    assert name + '-previous-' + 'c' * 12 in containers
+    assert host.replace('workspace', replacement) == {'new_generation': True}
+    assert sum(call.args[0] == 'rename' for call in docker.call_args_list) == 1
+    host.admission.fence.assert_called_once_with('t:1', 'host-1')
+
+
+def test_name_collision_does_not_stop_or_adopt_another_container(tmp_path, monkeypatch):
+    host, docker, payload, containers, record, _ = upgrade_setup(tmp_path, monkeypatch)
+    containers['gxzs-host-t.admin'] = {'Id': 'foreign', 'State': {'Running': True}}
+    before = record.read_text()
+    with pytest.raises(ValueError, match='already allocated'):
+        host.replace('workspace', dict(payload, account_name='admin', expected_generation=1, expected_instance_id='host-1', generation=2, instance_id='host-2'))
+    assert record.read_text() == before
+    assert not any(call.args[0] in {'stop', 'rename', 'create'} for call in docker.call_args_list)
+
+
+@pytest.mark.parametrize('foreign', ['host', 'sandbox'])
+def test_named_replacement_never_stops_a_container_claimed_by_another_workspace(tmp_path, monkeypatch, foreign):
+    host, docker, payload, containers, record, _ = upgrade_setup(tmp_path, monkeypatch)
+    name = 'gxzs-host-t.admin'
+    containers[name] = containers.pop('host-1')
+    containers['sandbox-workspace']['Config'] = {'Labels': {'gxzs.workspace': 'workspace'}}
+    data = json.loads(record.read_text())
+    data.update(container_name=name, sandbox_name='sandbox-workspace', account_name='admin')
+    host._save(record, data)
+    containers[name if foreign == 'host' else 'sandbox-workspace']['Config']['Labels']['gxzs.workspace'] = 'foreign'
+    with pytest.raises(ValueError, match='ownership changed'):
+        host.replace('workspace', dict(payload, expected_generation=1, expected_instance_id='host-1', generation=2, instance_id='host-2'))
+    assert not any(call.args[0] in {'stop', 'rename', 'create'} for call in docker.call_args_list)
+    host.admission.fence.assert_not_called()
+
+
+@pytest.mark.parametrize('generation,owner,running,removed', [
+    ('1', 't:1', False, True), ('2', 't:1', False, True),
+    ('3', 't:1', False, False), ('1', 't:2', False, False),
+    ('1', 't:1', True, False), ('invalid', 't:1', False, False),
+])
+def test_named_generation_cleanup_preserves_foreign_or_live_containers(tmp_path, monkeypatch, generation, owner, running, removed):
+    host, docker, _, _, _ = setup(tmp_path, monkeypatch)
+    name = 'gxzs-host-admin-previous-' + 'c' * 12
+    item = dict(container_name='gxzs-host-admin', instance_id='logical-g2', generation=2, owner_id='t:1', workspace_id='workspace')
+    def operate(*args, **kwargs):
+        if args[0] == 'ps':
+            return SimpleNamespace(returncode=0, stdout=name + '\n')
+        if args[0] == 'inspect':
+            return SimpleNamespace(returncode=0, stdout=json.dumps([{
+                'Id': 'c' * 64, 'State': {'Running': running},
+                'Config': {'Labels': {'gxzs.owner': owner, 'gxzs.workspace': 'workspace', 'gxzs.generation': generation}},
+            }]))
+        return SimpleNamespace(returncode=0, stdout='')
+    docker.side_effect = operate
+    host._cleanup_superseded(item)
+    assert any(call.args == ('rm', name) for call in docker.call_args_list) is removed

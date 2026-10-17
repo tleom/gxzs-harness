@@ -11,7 +11,7 @@ COPY mcp_outcomes.py global_memory.py ./
 RUN python global_memory.py --install
 COPY server.py file_ops.py resource_ops.py environment.py stop_jobs.py office_preview.py office_conversions.py planning.py planning_exec.py ./
 COPY mcp_ops.py mcp_worker.py mcp_runtime.py mcp_exec.py ./
-COPY hosts.py admission.py owner_auth.py mcp_authorization.py resource_limits.py ./
+COPY hosts.py admission.py owner_auth.py mcp_authorization.py resource_limits.py runtime_names.py ./
 COPY owner_networks.py docker_inspect.py ./
 COPY memory_exec.py ./
 ARG VCS_REF=unknown

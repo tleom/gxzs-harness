@@ -8,7 +8,8 @@
     "node": "^22.19.0 || >=24.0.0"
   },
   "scripts": {
-    "check": "pnpm check:syntax && pnpm test && pnpm check:plugin",
+    "check": "pnpm check:syntax && pnpm test && pnpm test:simulator && pnpm check:plugin",
+    "test:simulator": "node --test scripts/soak/simulator.check.mjs",
     "check:syntax": "node scripts/check-syntax.mjs",
     "check:plugin": "node scripts/check-plugin.mjs",
     "check:config": "node scripts/check-config.mjs",

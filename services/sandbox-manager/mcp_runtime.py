@@ -106,7 +106,7 @@ class Worker:
                 container,
                 "/usr/bin/env",
                 "-i",
-                "HOME=/home/dify",
+                "HOME=/home/gxzs",
                 "LANG=C.UTF-8",
                 "PATH=" + PATH,
                 "NODE_PATH=/opt/user-env/current/node/node_modules:/opt/office/node/node_modules",
