@@ -6,6 +6,9 @@ COPY services/browser-client/build.mjs ./
 RUN node build.mjs /dist
 
 FROM node:24.20.0-bookworm-slim@sha256:ba849c60be29959425b8734d57b8b4b7d56f98edd9504c9af091d5281095a71e
+RUN /usr/sbin/groupmod --new-name gxzs node \
+    && /usr/sbin/usermod --login gxzs --home /home/gxzs --move-home node \
+    && ln -s /home/gxzs /home/node
 RUN node -e "require('fs').mkdirSync('/etc/ssl/certs',{recursive:true});require('fs').writeFileSync('/etc/ssl/certs/ca-certificates.crt',require('tls').rootCertificates.join('\n'))" \
     && sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources \
     && apt-get -o Acquire::Retries=3 -o Acquire::https::Timeout=30 update \
@@ -22,6 +25,7 @@ COPY scripts/prepare-session-client.mjs /opt/workbench/scripts/prepare-session-c
 COPY scripts/prepare-subagent-prompt.mjs /opt/workbench/scripts/prepare-subagent-prompt.mjs
 COPY scripts/prepare-dsh-stream-arguments.mjs /opt/workbench/scripts/prepare-dsh-stream-arguments.mjs
 COPY scripts/prepare-dsh-agent-inbox.mjs /opt/workbench/scripts/prepare-dsh-agent-inbox.mjs
+COPY scripts/prepare-terminal-cleanup.mjs /opt/workbench/scripts/prepare-terminal-cleanup.mjs
 COPY scripts/prepare-session-references.mjs /opt/workbench/scripts/prepare-session-references.mjs
 COPY scripts/prepare-workbench-client.mjs /opt/workbench/scripts/prepare-workbench-client.mjs
 COPY scripts/native-settings-controllers.mjs /opt/workbench/scripts/native-settings-controllers.mjs
@@ -40,12 +44,12 @@ COPY services/dsh-host/start.sh /usr/local/bin/start-workbench
 COPY services/dsh-host/relay.mjs /opt/workbench/relay.mjs
 # Native session creation ensures its cwd locally before mounting SSH tools.
 # This empty directory holds only cwd placeholders; user files stay in the sandbox.
-RUN chmod 755 /usr/local/bin/start-workbench && mkdir -p /srv/dsh /workspace && chown node:node /srv/dsh /workspace
+RUN chmod 755 /usr/local/bin/start-workbench && mkdir -p /srv/dsh /workspace && chown gxzs:gxzs /srv/dsh /workspace
 ARG VCS_REF=unknown
 LABEL org.opencontainers.image.source="https://github.com/tleom/gxzs-harness" \
       org.opencontainers.image.revision=$VCS_REF
-USER node
-ENV DSH_HOME=/srv/dsh
+USER gxzs
+ENV DSH_HOME=/srv/dsh HOME=/home/gxzs USER=gxzs LOGNAME=gxzs
 EXPOSE 3081
 HEALTHCHECK --interval=15s --timeout=5s --start-period=60s --retries=3 \
   CMD node -e "fetch('http://127.0.0.1:3081/ai/workbench/health').then(async r=>{if(!(await r.json()).live)process.exit(1)}).catch(()=>process.exit(1))"

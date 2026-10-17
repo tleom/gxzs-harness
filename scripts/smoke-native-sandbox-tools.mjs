@@ -103,7 +103,7 @@ try {
       const {createChangesIo}=await import(pathToFileURL(process.env.GXZS_PROBE_CHANGES_IO).href)
       const factorySource=fs.readFileSync(process.env.GXZS_PROBE_CHANGES_FACTORY,'utf8').replace(/from "([^"]+)"/g,(match,specifier)=>specifier.startsWith('node:')?match:`from ${JSON.stringify(pathToFileURL(require.resolve(specifier)).href)}`)
       const {createWorkspaceChanges}=await import(`data:text/javascript;base64,${Buffer.from(factorySource).toString('base64')}`)
-      const io=createChangesIo(ctx.subprocess,{node:process.env.GXZS_SANDBOX_NODE || '/usr/local/bin/node',cwd:directory,home:'/home/dify',tempRoot:'/tmp'})
+      const io=createChangesIo(ctx.subprocess,{node:process.env.GXZS_SANDBOX_NODE || '/usr/local/bin/node',cwd:directory,home:'/home/gxzs',tempRoot:'/tmp'})
       recorder=createWorkspaceChanges(io)
     }else{
       // Exercise the installed wrapper and its generated native factory in the built image.

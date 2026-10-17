@@ -14,6 +14,7 @@ COPY scripts/prepare-session-client.mjs /opt/workbench/scripts/prepare-session-c
 COPY scripts/prepare-subagent-prompt.mjs /opt/workbench/scripts/prepare-subagent-prompt.mjs
 COPY scripts/prepare-dsh-stream-arguments.mjs /opt/workbench/scripts/prepare-dsh-stream-arguments.mjs
 COPY scripts/prepare-dsh-agent-inbox.mjs /opt/workbench/scripts/prepare-dsh-agent-inbox.mjs
+COPY scripts/prepare-terminal-cleanup.mjs /opt/workbench/scripts/prepare-terminal-cleanup.mjs
 COPY scripts/prepare-session-references.mjs /opt/workbench/scripts/prepare-session-references.mjs
 COPY scripts/prepare-workbench-client.mjs /opt/workbench/scripts/prepare-workbench-client.mjs
 COPY scripts/native-settings-controllers.mjs /opt/workbench/scripts/native-settings-controllers.mjs
@@ -25,6 +26,9 @@ RUN ln -s profiles/workbench/node_modules /opt/workbench/node_modules \
 FROM langgenius/dify-agent-local-sandbox@sha256:f4d404c9dcdf80bd72f65e84c3f2bbd1f3404fd4b363db837176da8aaf771b1d
 ARG PIP_INDEX_URL=https://pypi.org/simple
 USER root
+RUN /usr/sbin/groupmod --new-name gxzs dify \
+    && /usr/sbin/usermod --login gxzs --home /home/gxzs --move-home dify \
+    && ln -s /home/gxzs /home/dify
 ARG KASMVNC_VERSION=1.5.0
 ARG KASMVNC_SHA256=770fd3df51510beecc89666879d82faf411276e68c6e11df612f736b891b5f71
 ENV DEBIAN_FRONTEND=noninteractive PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 \
@@ -86,7 +90,8 @@ LABEL org.opencontainers.image.source="https://github.com/tleom/gxzs-harness" \
       org.opencontainers.image.revision=$VCS_REF
 ENV PATH=/opt/user-env/current/python/bin:/opt/office/python/bin:/opt/user-env/current/node/node_modules/.bin:/opt/office/node/node_modules/.bin:/usr/local/bin:/usr/bin:/bin \
     NODE_PATH=/opt/user-env/current/node/node_modules:/opt/office/node/node_modules
-USER dify
+ENV HOME=/home/gxzs USER=gxzs LOGNAME=gxzs
+USER gxzs
 EXPOSE 2222 5004
 HEALTHCHECK --interval=15s --timeout=5s --start-period=15s --retries=3 \
   CMD /usr/local/bin/python -I -S -c "import socket; socket.create_connection(('127.0.0.1',2222),2).close()"

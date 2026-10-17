@@ -450,6 +450,12 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
         if (display) {
           await display.resize(value.width, value.height)
           await fitDisplayWindow(session)
+          // XRandR and CDP acknowledge before Chromium applies the resize.
+          // Observe the renderer before accepting another input or snapshot.
+          const resized = await page.waitForFunction(({ width, height }) =>
+            innerWidth === width && innerHeight === height,
+          { width: value.width, height: value.height }, { timeout: 5000, polling: 50 })
+          await resized.dispose()
         } else await page.setViewportSize({ width: value.width, height: value.height })
         navigation++
         if (capturing) await captureFinished

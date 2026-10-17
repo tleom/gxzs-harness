@@ -61,7 +61,7 @@ def remove_container(name, *, docker):
         raise RuntimeError("无法确认调查容器已停止")
 
 
-def copy_global_resources(source, destination):
+def copy_global_resources(source, destination, manager_python):
     """Stream the trusted global tree; never buffer a resource archive in RAM."""
     with tempfile.TemporaryFile() as errors:
         export = subprocess.Popen(
@@ -78,12 +78,15 @@ def copy_global_resources(source, destination):
                     "0",
                     "-i",
                     destination,
-                    "/bin/tar",
-                    "--no-same-owner",
-                    "-xf",
-                    "-",
-                    "-C",
-                    "/opt/workbench-global",
+                    *manager_python,
+                    "-c",
+                    # GNU tar assumes UID 0 can write through restored 0555
+                    # directories. This container deliberately drops that
+                    # capability. Python defers directory attributes and the
+                    # data filter also rejects escaping archive members.
+                    "import sys,tarfile; "
+                    "archive=tarfile.open(fileobj=sys.stdin.buffer,mode='r|'); "
+                    "archive.extractall('/opt/workbench-global',filter='data')",
                 ],
                 stdin=export.stdout,
                 capture_output=True,
@@ -103,7 +106,7 @@ def scratch_name(owner, binding):
 
 
 def inspect_plan(
-    key, payload, *, docker, ensure, identity, image, prefix, manager_python, admission
+    key, payload, *, docker, ensure, identity, storage_identity, image, prefix, manager_python, admission
 ):
     binding = str(uuid.UUID(payload["binding_id"]))
     execution = str(uuid.UUID(payload["execution_id"]))
@@ -124,7 +127,7 @@ def inspect_plan(
     if not isinstance(request_key, str) or not request_key or len(request_key) > 128:
         raise ValueError("调查命令缺少有效请求标识")
     owner, _ = identity(key)
-    scratch = scratch_name(owner, binding)
+    scratch = scratch_name(storage_identity(key), binding)
     digest = hashlib.sha256(
         (key + ":" + execution + ":" + request_key).encode()
     ).hexdigest()
@@ -250,7 +253,7 @@ def inspect_plan(
             )
             created = True
             docker("start", name)
-        copy_global_resources(owner, name)
+        copy_global_resources(owner, name, manager_python)
         helper = (
             Path(__file__).with_name("planning_exec.py").read_text(encoding="utf-8")
         )
