@@ -53,7 +53,7 @@ export function mixedStep(scenario, step, state) {
 }
 
 export function specialStep(scenario, step, state, body) {
-  if (scenario.kind === 'scheduled-delivery') return step === 0
+  if (scenario.kind === 'schedule-delivery') return step === 0
     ? call('schedule_create', { title: '合成到期提醒', after_seconds: 10,
       prompt: `GXZS_SIM_CASE ${JSON.stringify({ id: scenario.id + '_delivery', rounds: 3, stepDelayMs: 100 })}` })
     : ledger(scenario, step)

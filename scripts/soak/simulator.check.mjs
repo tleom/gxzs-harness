@@ -3,7 +3,7 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
-import { createSimulator, scenarioFrom } from './simulator.mjs'
+import { createSimulator, planStep, scenarioFrom } from './simulator.mjs'
 
 const token = 'synthetic-test-token-with-no-upstream-credentials'
 const tools = [{ type: 'function', function: { name: 'bash', parameters: { type: 'object' } } }]
@@ -73,6 +73,15 @@ test('scenario marker uses the latest child scope and rejects unsafe identifiers
 test('accepts native schedule and goal prompts inside a quoted JSON envelope', () => {
   const content = JSON.stringify({ prompt: 'GXZS_SIM_CASE {"id":"scheduled","rounds":3}' })
   assert.equal(scenarioFrom([{ role: 'user', content }]).id, 'scheduled')
+})
+
+test('documented schedule delivery creates a real schedule and unknown kinds fail closed', () => {
+  for (const kind of ['schedule-delivery', 'scheduled-delivery']) {
+    const scenario = scenarioFrom([{ role: 'user', content: `GXZS_SIM_CASE ${JSON.stringify({id:'schedule',kind})}` }])
+    const planned = planStep(scenario, 0, { startedAt: Date.now() }, { tools: [{ function: { name: 'schedule_create' } }] })
+    assert.equal(planned.name, 'schedule_create'); assert.match(planned.arguments.prompt, /schedule_delivery/)
+  }
+  assert.throws(() => scenarioFrom([{ role: 'user', content: 'GXZS_SIM_CASE {"id":"typo","kind":"scheduel"}' }]), /Invalid scenario kind/)
 })
 test('browser recovery validates its waiting tool without requiring a ledger marker', async t => {
   const server = await fixture(t)

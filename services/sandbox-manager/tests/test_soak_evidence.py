@@ -11,6 +11,29 @@ spec.loader.exec_module(module)
 EventJournal = module.EventJournal
 
 
+def test_requested_owner_count_cannot_silently_shrink():
+    with pytest.raises(AssertionError, match='requested load'):
+        module.select_owners({'one': {'owner':'one'}}, 30)
+    assert len(module.select_owners({str(i): {} for i in range(30)}, 30)) == 30
+
+
+def test_schedule_parent_is_not_proof_of_delivered_child_completion():
+    tasks = [{'case':{'id':'schedule','kind':'schedule-delivery'}}]
+    snapshot = {'cases':[{'id':'schedule','completed':True}]}
+    assert module.missing_cases(tasks,snapshot) == ['schedule_delivery']
+    snapshot['cases'].append({'id':'schedule_delivery','completed':False})
+    assert module.missing_cases(tasks,snapshot) == ['schedule_delivery']
+    snapshot['cases'][-1]['completed'] = True
+    assert module.missing_cases(tasks,snapshot) == []
+
+
+def test_each_mixed_parent_requires_every_observed_child_cycle():
+    tasks = [{'case':{'id':'a','kind':'mixed'}},{'case':{'id':'b','kind':'mixed'}}]
+    snapshot = {'cases':[{'id':'a','maxStep':80,'completed':True},{'id':'b','maxStep':40,'completed':True},
+                         {'id':'a_child0','completed':True},{'id':'a_child1','completed':True}]}
+    assert module.missing_cases(tasks,snapshot) == ['b_child0']
+
+
 def test_resume_deduplicates_events_appended_before_cursor_checkpoint(tmp_path):
     path = tmp_path / 'events.jsonl'
     batch = [{'_id': '1-0', 'text': '中文😀'}, {'_id': '2-0'}]

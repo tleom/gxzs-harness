@@ -3,6 +3,25 @@ import json
 import os
 
 
+def select_owners(bindings, count):
+    rows = list(bindings.values())[:count]
+    assert 1 <= count <= 30 and len(rows) == count, 'Fixture owner count differs from the requested load'
+    return rows
+
+
+def missing_cases(tasks, snapshot):
+    cases = {case['id']: case for case in snapshot['cases']}
+    required = {task['case']['id'] for task in tasks}
+    for task in tasks:
+        case = task['case']
+        if case.get('kind') in ('schedule-delivery', 'scheduled-delivery'):
+            required.add(case['id'] + '_delivery')
+        if case.get('kind') == 'mixed':
+            rounds = max(1, cases.get(case['id'], {}).get('maxStep', 0) // 40)
+            required.update(case['id'] + '_child' + str(cycle) for cycle in range(rounds))
+    return sorted(case for case in required if not cases.get(case, {}).get('completed'))
+
+
 class EventJournal:
     def __init__(self, path):
         self.path = path

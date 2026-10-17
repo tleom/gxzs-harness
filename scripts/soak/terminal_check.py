@@ -68,8 +68,10 @@ try:
     target = '/workspace/' + chat['file_directory'] + '/terminal-proof.jsonl'
     deadline = time.monotonic() + 30
     while True:
-        result = subprocess.run(['docker', 'exec', '--user', '1000', sandbox, 'cat', target], capture_output=True, text=True, check=True, timeout=10)
-        numbers = [int(line) for line in result.stdout.splitlines()]
+        result = subprocess.run(['docker', 'exec', '--user', '1000', sandbox, 'cat', target], capture_output=True, text=True, timeout=10)
+        if result.returncode and 'no such file or directory' not in result.stderr.lower():
+            raise RuntimeError('Cannot read terminal ledger: ' + result.stderr[-500:])
+        numbers = [int(line) for line in result.stdout.splitlines()] if result.returncode == 0 else []
         if len(numbers) >= 100 or time.monotonic() >= deadline: break
         time.sleep(0.25)
     assert numbers == list(range(100)), 'Terminal ledger differs: ' + json.dumps(numbers)

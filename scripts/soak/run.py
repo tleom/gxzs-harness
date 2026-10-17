@@ -9,7 +9,7 @@ import subprocess
 import time
 import uuid
 from client import FixtureClient
-from evidence import EventJournal
+from evidence import EventJournal, missing_cases, select_owners
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('action', choices=['fixtures', 'pilot', 'soak', 'resume'])
@@ -23,8 +23,7 @@ assert re.fullmatch(r'[A-Za-z0-9_-]{1,64}', args.case), 'Invalid case identifier
 assert 1 <= args.minutes <= 1440
 client = FixtureClient(args.root)
 root = client.root
-rows = list(client.bindings().values())[:args.owners]
-assert rows and 1 <= args.owners <= 30
+rows = select_owners(client.bindings(), args.owners)
 journals = {}
 
 
@@ -127,7 +126,11 @@ else:
         while time.monotonic() < deadline:
             bindings = client.bindings()
             pending = [task for task in tasks if not task.get('complete')]
-            if not pending: break
+            if not pending:
+                if all(task['status'] == 'completed' for task in tasks) and missing_cases(tasks, client.platform('/__test/status')):
+                    time.sleep(1)
+                    continue
+                break
             futures = {pool.submit(poll, task, bindings): task for task in pending}
             for future, task in futures.items():
                 try: future.result()
@@ -145,6 +148,5 @@ else:
     save('proof-' + args.case + '.json', proof)
     print(json.dumps({key: value for key, value in proof.items() if key != 'simulator'}), flush=True)
     assert proof['completed'] == len(tasks), 'Some native synthetic tasks failed; inspect recorded events'
-    child_cases = [case for case in proof['simulator']['cases'] if case['id'].startswith(args.case + '_') and '_child' in case['id']]
-    mixed_tasks = [task for task in tasks if task['case'].get('kind') == 'mixed']
-    assert len(child_cases) >= len(mixed_tasks) and all(case['completed'] for case in child_cases), 'Some synthetic child tasks did not complete'
+    missing = missing_cases(tasks, proof['simulator'])
+    assert not missing, 'Some required synthetic cases did not complete: ' + ', '.join(missing)

@@ -36,6 +36,8 @@ export function scenarioFrom(messages) {
   }
   if (end < 0) throw new Error('Incomplete synthetic scenario')
   const value = JSON.parse(source.slice(0, end))
+  if (value.kind === 'scheduled-delivery') value.kind = 'schedule-delivery'
+  if (!['chain', 'mixed', 'schedule-delivery', 'goal', 'browser-recovery'].includes(value.kind ?? 'chain')) throw new Error('Invalid scenario kind')
   if (!/^[a-zA-Z0-9_-]{1,64}$/.test(value.id)) throw new Error('Invalid fixture case id')
   if (!Number.isInteger(value.rounds ?? 10) || (value.rounds ?? 10) < 1 || (value.rounds ?? 10) > 10000) throw new Error('Invalid rounds')
   if (!Number.isFinite(value.durationMs ?? 0) || (value.durationMs ?? 0) < 0 || (value.durationMs ?? 0) > 86400000) throw new Error('Invalid duration')
