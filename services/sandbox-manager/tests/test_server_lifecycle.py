@@ -654,3 +654,31 @@ def test_complete_schedule_identity_reaches_the_existing_host_validator(server, 
     handler.do_POST()
     schedule.assert_called_once_with(handler.path.split('/')[2], payload)
     assert handler.send_response.call_args.args[0] == 200
+
+
+def test_migrated_plan_uses_and_cleans_the_original_scratch_volume(server, monkeypatch):
+    from contextlib import nullcontext
+    import planning
+    key, binding, execution = (str(uuid4()) for _ in range(3))
+    folder = server.HOSTS.root / key
+    folder.mkdir()
+    stable = server.PREFIX + '-' + key
+    (folder / 'host.json').write_text(json.dumps({'sandbox_name':'gxzs-sandbox-admin', 'sandbox_volume_prefix':stable}))
+    ensure = Mock()
+    monkeypatch.setattr(server, 'ensure', ensure)
+    monkeypatch.setattr(server, 'stop_binding', Mock())
+    docker = Mock(return_value=SimpleNamespace(returncode=0, stdout='{}'))
+    monkeypatch.setattr(server, 'docker', docker)
+    monkeypatch.setattr(planning, 'copy_global_resources', Mock())
+    admission = SimpleNamespace(guard=lambda *_:nullcontext(), lock=lambda *_:nullcontext())
+    def operate(*args, **kwargs):
+        return SimpleNamespace(returncode=0, stdout='0' if args[0]=='wait' else '{}')
+    docker.side_effect = operate
+    planning.inspect_plan(key, {'binding_id':binding,'execution_id':execution,'script':'true','request_key':'test'},
+        docker=docker,ensure=ensure,identity=server.identity,storage_identity=server.storage_identity,
+        image='test',prefix=server.PREFIX,manager_python=['python'],admission=admission)
+    scratch=stable+'-plan-'+binding
+    assert any(call.args[:2]==('volume','create') and call.args[-1]==scratch for call in docker.call_args_list)
+    assert any('--volumes-from' in call.args and 'gxzs-sandbox-admin:ro' in call.args for call in docker.call_args_list)
+    server.operation(key,'clean-binding',{'binding_id':binding})
+    assert any(call.args==('volume','rm',scratch) for call in docker.call_args_list)

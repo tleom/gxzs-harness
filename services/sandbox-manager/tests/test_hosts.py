@@ -1303,6 +1303,7 @@ def test_readable_name_is_reused_only_after_old_generation_is_fenced(tmp_path, m
     name = 'gxzs-host-t.admin'
     containers[name] = containers.pop('host-1')
     containers['sandbox-workspace']['Config'] = {'Labels': {'gxzs.workspace': 'workspace'}}
+    containers['sandbox-workspace']['Id'] = 'd' * 64
     data = json.loads(record.read_text())
     data.update(container_name=name, sandbox_name='sandbox-workspace', account_name='admin')
     if legacy:
@@ -1335,7 +1336,9 @@ def test_readable_name_is_reused_only_after_old_generation_is_fenced(tmp_path, m
     assert name not in containers
     assert name + '-previous-' + 'c' * 12 in containers
     assert host.replace('workspace', replacement) == {'new_generation': True}
-    assert sum(call.args[0] == 'rename' for call in docker.call_args_list) == 1
+    assert sum(call.args[0] == 'rename' for call in docker.call_args_list) == (2 if legacy else 1)
+    if legacy:
+        assert 'gxzs-sandbox-t.admin-previous-' + 'd' * 12 in containers
     host.admission.fence.assert_called_once_with('t:1', 'host-1')
 
 
@@ -1381,6 +1384,29 @@ def test_named_generation_cleanup_preserves_foreign_or_live_containers(tmp_path,
             return SimpleNamespace(returncode=0, stdout=json.dumps([{
                 'Id': 'c' * 64, 'State': {'Running': running},
                 'Config': {'Labels': {'gxzs.owner': owner, 'gxzs.workspace': 'workspace', 'gxzs.generation': generation}},
+            }]))
+        return SimpleNamespace(returncode=0, stdout='')
+    docker.side_effect = operate
+    host._cleanup_superseded(item)
+    assert any(call.args == ('rm', name) for call in docker.call_args_list) is removed
+
+
+@pytest.mark.parametrize('workspace,running,identity,removed', [
+    ('workspace', False, 'd', True), ('foreign', False, 'd', False),
+    ('workspace', True, 'd', False), ('workspace', False, 'e', False),
+])
+def test_named_sandbox_cleanup_checks_workspace_and_container_identity(tmp_path, monkeypatch, workspace, running, identity, removed):
+    host, docker, _, _, _ = setup(tmp_path, monkeypatch)
+    name = 'gxzs-sandbox-admin-previous-' + 'd' * 12
+    item = dict(container_name='gxzs-host-admin', sandbox_name='gxzs-sandbox-admin', instance_id='logical-g2',
+                generation=2, owner_id='t:1', workspace_id='workspace')
+    def operate(*args, **kwargs):
+        if args[0] == 'ps':
+            return SimpleNamespace(returncode=0, stdout=name + '\n')
+        if args[0] == 'inspect':
+            return SimpleNamespace(returncode=0, stdout=json.dumps([{
+                'Id': identity * 64, 'State': {'Running': running},
+                'Config': {'Labels': {'gxzs.workspace': workspace}},
             }]))
         return SimpleNamespace(returncode=0, stdout='')
     docker.side_effect = operate

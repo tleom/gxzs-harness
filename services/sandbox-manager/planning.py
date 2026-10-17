@@ -103,7 +103,7 @@ def scratch_name(owner, binding):
 
 
 def inspect_plan(
-    key, payload, *, docker, ensure, identity, image, prefix, manager_python, admission
+    key, payload, *, docker, ensure, identity, storage_identity, image, prefix, manager_python, admission
 ):
     binding = str(uuid.UUID(payload["binding_id"]))
     execution = str(uuid.UUID(payload["execution_id"]))
@@ -124,7 +124,7 @@ def inspect_plan(
     if not isinstance(request_key, str) or not request_key or len(request_key) > 128:
         raise ValueError("调查命令缺少有效请求标识")
     owner, _ = identity(key)
-    scratch = scratch_name(owner, binding)
+    scratch = scratch_name(storage_identity(key), binding)
     digest = hashlib.sha256(
         (key + ":" + execution + ":" + request_key).encode()
     ).hexdigest()

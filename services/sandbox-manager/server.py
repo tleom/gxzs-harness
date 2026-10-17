@@ -167,6 +167,13 @@ def identity(key):
     return name, token
 
 
+def storage_identity(key):
+    key = str(uuid.UUID(key))
+    record = STATE / 'hosts' / key / 'host.json'
+    host = json.loads(record.read_text()) if record.exists() else {}
+    return volume_prefix(host, PREFIX + '-' + key)
+
+
 def touch(key):
     (STATE / key).touch()
 
@@ -395,7 +402,7 @@ def operation(key, action, payload):
         if action == "plan-admission":
             return {"ticket": admission.ticket(key, payload["binding_id"])}
         return inspect_plan(
-            key, payload, docker=docker, ensure=ensure, identity=identity,
+            key, payload, docker=docker, ensure=ensure, identity=identity, storage_identity=storage_identity,
             image=IMAGE, prefix=PREFIX, manager_python=MANAGER_PYTHON, admission=admission,
         )
     if action == "personal-mcp":
@@ -592,7 +599,7 @@ def operation(key, action, payload):
             docker("exec", "--user", "1000", name, *MANAGER_PYTHON, "-c",
                    "import shutil; shutil.rmtree('/home/gxzs/" + binding + "',ignore_errors=True); "
                    "shutil.rmtree('/workspace/conversations/" + binding + "',ignore_errors=True)")
-            docker("volume", "rm", scratch_name(name, binding), check=False)
+            docker("volume", "rm", scratch_name(storage_identity(key), binding), check=False)
             return {"ok": True}
     raise ValueError("Unsupported operation")
 

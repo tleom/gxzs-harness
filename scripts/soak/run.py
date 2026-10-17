@@ -9,6 +9,7 @@ import subprocess
 import time
 import uuid
 from client import FixtureClient
+from evidence import EventJournal
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('action', choices=['fixtures', 'pilot', 'soak', 'resume'])
@@ -24,6 +25,7 @@ client = FixtureClient(args.root)
 root = client.root
 rows = list(client.bindings().values())[:args.owners]
 assert rows and 1 <= args.owners <= 30
+journals = {}
 
 
 def save(name, value):
@@ -69,9 +71,10 @@ def submit(row, case, chat):
 
 def poll(task, bindings):
     value = client.host(bindings[task['owner']], 'GET', '/runs/' + task['run'] + '?after=' + task['cursor'])
-    with (root / ('events-' + task['case']['id'] + '.jsonl')).open('a') as output:
-        for event in value['events']: output.write(json.dumps(event, ensure_ascii=False) + '\n')
-    task['events'] += len(value['events'])
+    case = task['case']['id']
+    if case not in journals:
+        journals[case] = EventJournal(root / ('events-' + case + '.jsonl'))
+    task['events'] = journals[case].append(value['events'])
     task['cursor'] = value['events_cursor']
     task['status'] = value['status']
     task['complete'] = value['history_complete'] and value['status'] not in ['running', 'queued', 'stopping']

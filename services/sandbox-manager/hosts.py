@@ -38,14 +38,16 @@ class Hosts:
         self._maintenance_closed = False
 
     def _cleanup_superseded(self, item):
-        """Remove only stopped, identity-verified predecessors after the new Host is healthy."""
-        listed = self.docker('ps', '-a', '--filter', 'label=gxzs.owner=' + item['owner_id'],
-                             '--filter', 'label=gxzs.workspace=' + item['workspace_id'],
+        """Remove only stopped, identity-verified predecessors after the new pair is healthy."""
+        listed = self.docker('ps', '-a', '--filter', 'label=gxzs.workspace=' + item['workspace_id'],
                              '--format', '{{.Names}}', timeout=5, check=False)
         if listed.returncode:
             raise RuntimeError('Unable to list superseded hosts')
-        prefix = host_name(item) + '-previous-'
+        host_prefix = host_name(item) + '-previous-'
+        sandbox_prefix = item.get('sandbox_name', '') + '-previous-'
         for name in listed.stdout.splitlines()[:8]:
+            sandbox = bool(item.get('sandbox_name')) and name.startswith(sandbox_prefix)
+            prefix = sandbox_prefix if sandbox else host_prefix
             if not re.fullmatch(re.escape(prefix) + r'[0-9a-f]{12}', name):
                 continue
             observed = self.docker('inspect', name, timeout=5, check=False)
@@ -56,16 +58,14 @@ class Hosts:
             previous_generation = labels.get('gxzs.generation', '')
             if (previous.get('Id', '')[:12] != name[len(prefix):]
                     or previous.get('State', {}).get('Running') is not False
-                    or not previous_generation.isdecimal()
-                    or not 1 <= int(previous_generation) <= item['generation']
-                    or any(labels.get(label) != expected for label, expected in {
-                        'gxzs.owner': item['owner_id'],
-                        'gxzs.workspace': item['workspace_id'],
-                    }.items())):
+                    or labels.get('gxzs.workspace') != item['workspace_id']
+                    or (not sandbox and (labels.get('gxzs.owner') != item['owner_id']
+                        or not previous_generation.isdecimal()
+                        or not 1 <= int(previous_generation) <= item['generation']))):
                 continue
             removed = self.docker('rm', name, timeout=5, check=False)
             if removed.returncode:
-                logging.getLogger(__name__).warning('Superseded Host cleanup deferred workspace=%s', item['workspace_id'])
+                logging.getLogger(__name__).warning('Superseded runtime cleanup deferred workspace=%s', item['workspace_id'])
 
     def ensure(self, workspace, payload):
         owner = payload['owner_id']
@@ -363,6 +363,13 @@ class Hosts:
                     }.items()):
                         raise ValueError('Previous runtime container identity changed')
                     self.docker('rename', previous_name, names['container_name'] + '-previous-' + previous['Id'][:12])
+                if sandbox != names['sandbox_name']:
+                    previous = self._upgrade_inspect(sandbox)
+                    if previous is not None:
+                        if (previous['State']['Running'] or
+                                (previous.get('Config', {}).get('Labels') or {}).get('gxzs.workspace') != workspace):
+                            raise ValueError('Previous sandbox identity changed')
+                        self.docker('rename', sandbox, names['sandbox_name'] + '-previous-' + previous['Id'][:12])
             if names:
                 current['sandbox_volume_prefix'] = volume_prefix(current, sandbox)
                 current.update(names)
