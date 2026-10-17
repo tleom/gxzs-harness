@@ -137,6 +137,17 @@ try {
   const p=await runtime.spawnTerminal({argv:['/bin/bash','--noprofile','--norc'],cwd:'/workspace',rows:24,cols:80,terminalType:'xterm',graceMs:200})
   let out='';p.output.on('data',b=>out+=b);await p.write('printf "pty-bridge-ok\\n"; exit\n');assert.equal((await p.done).exitCode,0);await p.terminate();assert.match(out,/pty-bridge-ok/);await drained()
  })
+ await check('closing_busy_pty_stops_queued_commands_without_orphans',async()=>{
+  for(let cycle=0;cycle<4;cycle++){
+   const p=await runtime.spawnTerminal({argv:['/bin/sh'],cwd:'/workspace',rows:40,cols:120,terminalType:'xterm',graceMs:200})
+   p.output.on('error',()=>{});p.output.resume()
+   // A live shell must not launch replacement children while cleanup drains them.
+   for(let index=0;index<100;index++) await p.write(`node -e 'console.log("busy-${cycle}-${index}")'\r`)
+   await p.terminate()
+   await Promise.race([p.done,new Promise((_,reject)=>{const timer=setTimeout(()=>reject(new Error('Busy PTY survived close')),3000);timer.unref()})])
+   await drained()
+  }
+ })
  await check('dispose_stops_active_streams',async()=>{
   const p=runtime.spawn({argv:['/bin/sh','-c','printf running; sleep 30'],cwd:'/workspace',stdio:{stdin:'ignore',stdout:'pipe',stderr:'pipe'},graceMs:200})
   p.stdout.on('error',()=>{});p.stderr.on('error',()=>{});p.stderr.resume();await new Promise(r=>p.stdout.once('data',r));const d=Date.now();await Promise.race([ssh.dispose(),new Promise((_,reject)=>{const t=setTimeout(()=>reject(new Error('dispose_exceeded_5s')),5000);t.unref()})]);console.log(JSON.stringify({stage:'dispose_returned',elapsed_ms:Date.now()-d}));await p.done.catch(()=>{});console.log(JSON.stringify({stage:'done_returned',elapsed_ms:Date.now()-d}));assert.equal(ssh.bridges.size,0)
