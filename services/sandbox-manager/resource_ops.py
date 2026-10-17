@@ -359,17 +359,20 @@ def personal(payload, root="/workspace"):
                                 saved_order, _ = read_order(skillsfd)
                             except (ValueError, OSError):
                                 saved_order = {}
+                            previous_order = read_file(skillsfd, ORDER) if name in saved_order else None
                             # Keep the complete package recoverable outside the active catalog.
                             os.rename(name, backup_name, src_dir_fd=skillsfd, dst_dir_fd=backups)
                             try:
                                 if name in saved_order:
                                     saved_order.pop(name)
                                     atomic_write(skillsfd, ORDER, json.dumps(saved_order).encode())
+                                os.fsync(skillsfd)
+                                os.fsync(backups)
                             except BaseException:
                                 os.rename(backup_name, name, src_dir_fd=backups, dst_dir_fd=skillsfd)
+                                if previous_order is not None and read_file(skillsfd, ORDER) != previous_order:
+                                    atomic_write(skillsfd, ORDER, previous_order)
                                 raise
-                            os.fsync(skillsfd)
-                            os.fsync(backups)
                             return {"id": name, "uninstalled": True}
                         backup = directory(backups, backup_name)
                         try:

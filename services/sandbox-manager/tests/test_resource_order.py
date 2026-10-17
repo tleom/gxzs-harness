@@ -100,7 +100,8 @@ def test_delete_removes_order_and_reinstall_appends(catalog, layout_modules, tmp
     assert [item['id'] for item in listing()[kind]] == ['b', 'a', 'c']
 
 
-def test_failed_delete_keeps_resource_and_preferences(catalog, layout_modules, tmp_path, monkeypatch):
+@pytest.mark.parametrize('committed', [False, True])
+def test_failed_delete_keeps_resource_and_preferences(catalog, layout_modules, tmp_path, monkeypatch, committed):
     kind, root, listing, reorder = catalog
     resources, mcp = layout_modules
     module = resources if kind == 'skills' else mcp
@@ -110,8 +111,13 @@ def test_failed_delete_keeps_resource_and_preferences(catalog, layout_modules, t
     before = listing()
     item = before[kind][0]
     original = module.atomic_write
+    failed = False
     def fail_order(fd, name, data):
-        if name == '.order.json':
+        nonlocal failed
+        if name == '.order.json' and not failed:
+            failed = True
+            if committed:
+                original(fd, name, data)
             raise OSError('simulated order write failure')
         return original(fd, name, data)
     monkeypatch.setattr(module, 'atomic_write', fail_order)
