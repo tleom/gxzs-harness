@@ -165,5 +165,5 @@ it('uses the exact generated native form/controllers over real Host schema, stag
   await vi.waitFor(()=>expect(face.hooks.subagentModelSelectionCard.getSnapshot()).toMatchObject({saving:false,dirty:false,enabled:true}))
   expect(host.ctx.subagentModelSelection.current().allowedModels).toEqual([{provider:'p',model:'current'}])
   limits.dispose();models.dispose();policy.dispose()
-  expect(core.nativeSettingsProvenance.version).toBe('0.2.1-alpha.2')
+  expect(core.nativeSettingsProvenance.version).toBe('0.2.1-alpha.5')
 })

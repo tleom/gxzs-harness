@@ -17,7 +17,7 @@ export async function nativeSettingsControllers(profile) {
   const require = createRequire(join(resolve(profile), 'package.json'))
   const read = async (name, entry) => {
     const manifest = JSON.parse(await readFile(require.resolve(name + '/package.json'), 'utf8'))
-    if (manifest.version !== '0.2.1-alpha.2') throw new Error('Unverified native settings version: ' + manifest.version)
+    if (manifest.version !== '0.2.1-alpha.5') throw new Error('Unverified native settings version: ' + manifest.version)
     return readFile(require.resolve(entry ?? name + '/client'), 'utf8')
   }
   const [forms, primitives, card, conversation, schedule] = await Promise.all([
@@ -71,7 +71,7 @@ ${region(schedule, 'lib/types/client/catalog-source.js')}
 export { ConfigForms, SettingsSchemaService, SettingsDescribeMirror, SubagentLimitsCardController,
   SubagentModelSelectionCardController, subagentCardFace, subagentCardShell, ComposerSubmissionPolicy, resolveSubmitMode, deriveAncestry, createCatalogSource };
 export const nativeSettingsProvenance = ${JSON.stringify({
-  version: '0.2.1-alpha.2',
+  version: '0.2.1-alpha.5',
     sources: Object.fromEntries([['dsh-client-ui-settings/client', forms], ['dsh-client-ui-primitives', primitives],
       ['dsh-client-ui-settings-subagent/client', card], ['dsh-client-ui-conversation/client', conversation], ['dsh-client-ui-schedule/client', schedule]].map(([name, source]) => [name, createHash('sha256').update(source).digest('hex')])),
     regions: ['settings-form/form-model', 'subagent-limits-card-controller', 'subagent-model-selection-card-controller', 'subagent-card-controller', 'submission-policy', 'ConversationSession.deriveAncestry', 'schedule/catalog-source'],

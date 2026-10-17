@@ -295,7 +295,7 @@ async function fixture(script, { scheduledClaims = false } = {}) {
   const controller = new SessionCommandController(controllerCtx, {
     resolveAgent: async () => ({ agent }), selectionFor: () => ({ current: { provider: 'mock', model: 'mock' } }),
   }, '/workspace')
-  const sessions = { updateQueue: request => controller.updateQueue(request), prompt: (request, signal) => controller.prompt(request, signal), cancel: () => agent.cancel({ kind: 'user' }, { keepInbox: true }) }
+  const sessions = { updateQueue: request => controller.updateQueue(request), prompt: request => controller.prompt(request, { kind: 'user', rpcId: request.requestId }), cancel: () => agent.cancel({ kind: 'user' }, { keepInbox: true }) }
   let permitted = true
   const requests = []
   const platform = { json: async request => {
@@ -1507,6 +1507,28 @@ it('rejected replacement leaves original goal continuation intact', async () => 
   t.ctx.goals.pause(t.agent,t.ctx.goals.get(t.agent));await t.agent.whenIdle()
 })
 
+it.each([true, false])('waits for native descendants before a goal round, preserving pause=%s', async pause => {
+  const t = await fixture(['first round', 'hang'])
+  const s = goalServiceFixture(t)
+  let finishChildren
+  const children = new Promise(resolve => { finishChildren = resolve })
+  const waitForChildren = vi.fn(() => t.model.requests.length ? children : Promise.resolve())
+  t.ctx.provide('subagents', { waitForChildren })
+  await s.issueCommand(t.owner, t.chat.id, { command: '/goal Verify records', request_key: 'descendants' })
+  await vi.waitFor(() => expect(waitForChildren.mock.calls.length).toBeGreaterThanOrEqual(2))
+  expect(t.model.requests).toHaveLength(1)
+  expect(t.ctx.goals.get(t.agent).roundsStarted).toBe(1)
+  if (pause) t.ctx.goals.pause(t.agent, t.ctx.goals.get(t.agent))
+  finishChildren()
+  if (!pause) {
+    await vi.waitFor(() => expect(t.model.requests).toHaveLength(2))
+    t.ctx.goals.pause(t.agent, t.ctx.goals.get(t.agent))
+  }
+  await t.agent.whenIdle()
+  expect(t.model.requests).toHaveLength(pause ? 1 : 2)
+  expect(t.ctx.goals.get(t.agent).phase).toBe('paused')
+})
+
 it('cold control uses native projection round counter', async () => {
   const t=await fixture(['hang']);const s=goalServiceFixture(t)
   await s.issueCommand(t.owner,t.chat.id,{command:'/goal count rounds',request_key:'rounds'})
@@ -1540,13 +1562,43 @@ it.each(['approve', 'discuss'])('settles native plan review through the Workbenc
   else bridge.resume(t.owner.ownerId,response.run.id,{ request_id: saved.requestId, answers: [{id:saved.payload.questions[0].id,selected:[saved.payload.questions[0].intent.approve]}] })
   const result=await pending
   if (action === 'discuss') {
-    expect(result.isError).toBe(true)
-    expect(JSON.stringify(result.content)).toContain('stay in plan mode, stop here, and wait for their message')
+    // alpha.5 concludes this turn natively when review is dismissed.
+    expect(result.isError).toBe(false)
+    expect(result.concludesTurn).toBe(true)
+    expect(JSON.stringify(result.content)).toContain('plan mode remains active')
     expect(t.ctx.sessionProjections.snapshot(t.agent.session,['plan']).values.plan.active).toBe(true)
   } else {
     expect(result.isError).not.toBe(true)
     expect(t.ctx.planMode.get(t.agent)).toMatchObject({active:true,pending:false})
   }
+})
+
+it('dismisses plan review without another model request and settles the Workbench receipt', async () => {
+  const t = await fixture([])
+  const [{ default: Questions }, { default: Plan }] = await Promise.all([native('dsh-user-questions'), native('dsh-plan-mode')])
+  await t.ctx.plugin(Questions)
+  await t.ctx.plugin(Plan, { section: 'Prepare a plan for review.' })
+  t.ctx.planMode.set(t.agent, true)
+  t.model.stream = async function* (options) {
+    this.requests.push(options)
+    if (this.requests.length > 1) throw new Error('Dismissal must not call the model again')
+    yield { type: 'tool-call-delta', index: 0, id: 'review-plan', name: 'exit_plan_mode', argumentsDelta: JSON.stringify({ plan: '# Review\nCheck evidence' }) }
+    yield { type: 'finish', reason: { kind: 'tool-calls' } }
+  }
+  const run = t.create('Prepare the plan')
+  const bridge = new HumanInputBridge({ database: t.db, executionRun: id => t.runtime.executionRun(id),
+    resumeInput: (current, signal) => t.scheduler.resumeInput(current, signal) })
+  t.ctx.on('user-questions/request', bridge.handleRequest, { global: true, prepend: true })
+  await t.scheduler.enqueue(run, [{ type: 'text', text: run.query }])
+  await t.scheduler.tick()
+  await vi.waitFor(() => expect(bridge.pendings.size).toBe(1))
+  const pending = t.db.getPendingInput(t.owner.ownerId, run.id)
+  bridge.skip(t.owner.ownerId, run.id, pending.requestId)
+  await t.agent.whenIdle()
+  expect(t.model.requests).toHaveLength(1)
+  expect(t.ctx.planMode.get(t.agent)).toMatchObject({ active: true })
+  expect(t.db.getRun(t.owner.ownerId, run.id)).toMatchObject({ status: 'completed' })
+  expect(t.agent.session.snapshotEvents().filter(event => event.type === 'turn/end').at(-1).data.reason).toEqual({ kind: 'completed' })
 })
 
 it('accepts an old answer while a newer native question has released admission, skipping only the newer question', async () => {

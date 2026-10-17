@@ -26,11 +26,29 @@ export function prepareArgumentStream(source) {
   return oldCount ? source.replace(original, prepared) : source
 }
 
+// Match the remaining providers in upstream alpha.5's pi-ai@1.1.0 patch.
+// npm does not apply the upstream repository's pnpm patchedDependencies.
+export const upstreamArgumentPatches = {
+  'anthropic-messages.js': ['                            block.partialJson += event.delta.partial_json;\n', '                            block.arguments = parseStreamingJson(block.partialJson);\n', '                            stream.push({'],
+  'bedrock-converse-stream.js': ['        block.partialJson = (block.partialJson || "") + (delta.toolUse.input || "");\n', '        block.arguments = parseStreamingJson(block.partialJson);\n', '        stream.push({ type: "toolcall_delta",'],
+  'mistral-conversations.js': ['            block.partialArgs = (block.partialArgs || "") + argsDelta;\n', '            block.arguments = parseStreamingJson(block.partialArgs);\n', '            stream.push({'],
+  'openai-responses-shared.js': ['            slot.block.partialJson += event.delta;\n', '            slot.block.arguments = parseStreamingJson(slot.block.partialJson);\n', '            pushToolCallDelta(slot, event.delta);'],
+  'pi-messages.js': ['                toolJson.set(event.contentIndex, json);\n', '                partial.content[event.contentIndex].arguments =\n                    parseStreamingJson(json);\n', '                break;'],
+}
+
+export function prepareUpstreamArguments(name, source) {
+  const [before, removed, after] = upstreamArgumentPatches[name]
+  const old = before + removed + after, prepared = before + after
+  if (source.split(old).length + source.split(prepared).length !== 3)
+    throw new Error(`pi-ai ${name} argument stream contract changed; inspect upstream before upgrading`)
+  return source.replace(old, prepared)
+}
+
 export async function argumentStreamPaths(profile) {
   const require = createRequire(join(resolve(profile), 'package.json'))
   const consumer = require.resolve('@deepseek-ai/dsh-llm-pi-ai')
   const consumerMetadata = JSON.parse(await readFile(join(dirname(consumer), '../package.json'), 'utf8'))
-  if (consumerMetadata.version !== '0.2.1-alpha.2') throw new Error('Unverified DSH argument consumer version')
+  if (consumerMetadata.version !== '0.2.1-alpha.5') throw new Error('Unverified DSH argument consumer version')
   const dependencyRequire = createRequire(consumer)
   const folder = dependencyRequire.resolve.paths('@earendil-works/pi-ai')
     .map(path => join(path, '@earendil-works/pi-ai')).find(path => existsSync(join(path, 'package.json')))
@@ -46,6 +64,12 @@ export async function prepareDshStreamArguments(profile) {
   const source = await readFile(provider, 'utf8')
   const result = prepareArgumentStream(source)
   if (result !== source) await writeFile(provider, result)
+  for (const name of Object.keys(upstreamArgumentPatches)) {
+    const path = join(dirname(provider), name)
+    const source = await readFile(path, 'utf8')
+    const result = prepareUpstreamArguments(name, source)
+    if (result !== source) await writeFile(path, result)
+  }
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url))

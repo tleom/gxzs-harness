@@ -5,6 +5,9 @@ import { pathToFileURL } from 'node:url'
 import path from 'node:path'
 
 const root = process.argv[2] ?? '/opt/workbench/packages'
+// Published client-store imports these packages without declaring them.
+// Verify the profile's explicit dependencies, independently of the dev root.
+await import('@deepseek-ai/dsh-client-store')
 for (const packageName of await readdir(root)) {
   const folder = path.join(root, packageName, 'src')
   for (const file of await readdir(folder)) {

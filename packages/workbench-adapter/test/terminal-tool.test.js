@@ -4,6 +4,7 @@ import { readFile } from 'node:fs/promises'
 import { pathToFileURL } from 'node:url'
 import { sidebarTerminalSource } from '../../../scripts/prepare-sidebar-terminal.mjs'
 import { registerTerminalTool } from '../src/terminal-tool.js'
+import { TerminalUplink } from '../src/terminal-uplink.js'
 
 const id = '12345678-1234-1234-1234-123456789abc'
 function fixture() {
@@ -92,15 +93,20 @@ it('keeps the native UI attachment writable while the Agent observes and writes 
   const handle={write:vi.fn(async()=>{}),output:{async *[Symbol.asyncIterator](){yield await new Promise(resolve=>{output=resolve})}},done:new Promise(resolve=>{finish=resolve}),terminate:async()=>{finish({exitCode:0})}}
   const terminal=new BrowserTerminal(handle,{id,title:'bash',cols:80,rows:24,state:'running'},100,1024*1024)
   const abort=new AbortController()
-  const ui=terminal.follow('ui',abort.signal)[Symbol.asyncIterator]()
-  await ui.next()
+  const uplink=new TerminalUplink({maxBytes:65536,signal:abort.signal,abort:reason=>abort.abort(reason)})
+  const ui=terminal.attach(uplink,{maxInputBytes:32768,maxCols:500,maxRows:200},abort.signal)[Symbol.asyncIterator]()
+  expect((await ui.next()).value.writable).toBe(true)
   output(Buffer.from('ready\r\n$ '))
   expect((await ui.next()).value.type).toBe('output')
   const before=await terminal.inspectForAgent(abort.signal)
-  expect(before.info.controllerId).toBe('ui')
+  expect(before.info.state).toBe('running')
   expect(before.screen).toContain('ready')
   await terminal.writeFromAgent('echo ai\r',abort.signal)
-  await terminal.write('ui','echo user\r')
+  const writing=uplink.send({type:'write',data:'echo user\r'})
+  const ack=(await ui.next()).value
+  expect(ack).toEqual({type:'ack',sequence:1})
+  uplink.acknowledge(ack)
+  await writing
   expect(handle.write.mock.calls.map(([data])=>data)).toEqual(['echo ai\r','echo user\r'])
   const cancelled=new AbortController();cancelled.abort()
   await expect(terminal.writeFromAgent('echo stopped\r',cancelled.signal)).rejects.toBeTruthy()

@@ -70,7 +70,7 @@ async function fixture(script = []) {
   controllerCtx.fileUploads = { retirePrompt() {}, bindPrompt: () => ({ commit() {}, [Symbol.dispose]() {} }) }
   const controller = new SessionCommandController(controllerCtx, { resolveAgent: async () => ({ agent }),
     selectionFor: () => ({ current: { provider: 'mock', model: 'mock' } }) }, '/workspace')
-  const sessions = { prompt: (request, signal) => controller.prompt(request, signal), updateQueue: request => controller.updateQueue(request),
+  const sessions = { prompt: request => controller.prompt(request, { kind: 'user', rpcId: request.requestId }), updateQueue: request => controller.updateQueue(request),
     modelCatalog: async () => ({ groups: [{ id: 'mock', models: [{ id: 'mock' }] }] }),
     selectModel: async () => ({}), cancel: () => agent.cancel({ kind: 'user' }, { keepInbox: true }) }
   let permitted = true
