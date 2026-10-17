@@ -9,7 +9,7 @@ import subprocess
 import time
 import uuid
 from client import FixtureClient
-from evidence import EventJournal, missing_cases, select_owners, validate_resume
+from evidence import EventJournal, missing_cases, require_complete, select_owners, validate_case_ids, validate_resume
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('action', choices=['fixtures', 'pilot', 'soak', 'resume'])
@@ -107,8 +107,9 @@ else:
         validate_resume(tasks, json.loads((root / ('prepared-' + args.case + '.json')).read_text()))
         bindings = client.bindings()
         assert tasks and all(task['owner'] in bindings for task in tasks)
-        assert all(task['case']['id'].startswith(args.case + '_') for task in tasks)
+        assert all(task['case']['id'] == args.case or task['case']['id'].startswith(args.case + '_') for task in tasks)
     else:
+        validate_case_ids([case for _, case in cases])
         assert not manifest.exists(), 'Existing run: use resume after stopping its previous observer'
         tasks = []
         # Opening the page/chat is preparation; the measured burst is submission of runs.
@@ -148,6 +149,4 @@ else:
         'simulator': client.platform('/__test/status'), 'paidModelCalls': 0}
     save('proof-' + args.case + '.json', proof)
     print(json.dumps({key: value for key, value in proof.items() if key != 'simulator'}), flush=True)
-    assert proof['completed'] == len(tasks), 'Some native synthetic tasks failed; inspect recorded events'
-    missing = missing_cases(tasks, proof['simulator'])
-    assert not missing, 'Some required synthetic cases did not complete: ' + ', '.join(missing)
+    require_complete(tasks, proof['simulator'])

@@ -1,12 +1,21 @@
 """Append native events once even if an observer restarts before saving its cursor."""
 import json
 import os
+import re
 
 
 def select_owners(bindings, count):
     rows = list(bindings.values())[:count]
     assert 1 <= count <= 30 and len(rows) == count, 'Fixture owner count differs from the requested load'
     return rows
+
+
+def validate_case_ids(cases):
+    for case in cases:
+        # Reserve room for generated child or schedule-delivery identifiers.
+        maximum = {'mixed':48, 'schedule-delivery':55, 'scheduled-delivery':55}.get(case.get('kind'),64)
+        if not re.fullmatch(r'[A-Za-z0-9_-]{1,' + str(maximum) + r'}', case.get('id','')):
+            raise ValueError('Case ID exceeds its scenario family limit')
 
 
 def validate_resume(tasks, prepared):
@@ -27,6 +36,14 @@ def missing_cases(tasks, snapshot):
             rounds = max(1, cases.get(case['id'], {}).get('maxStep', 0) // 40)
             required.update(case['id'] + '_child' + str(cycle) for cycle in range(rounds))
     return sorted(case for case in required if not cases.get(case, {}).get('completed'))
+
+
+def require_complete(tasks, snapshot):
+    if not tasks or any(task.get('status') != 'completed' or task.get('complete') is not True for task in tasks):
+        raise ValueError('Native tasks or their event histories are incomplete')
+    missing = missing_cases(tasks, snapshot)
+    if missing:
+        raise ValueError('Some required synthetic cases did not complete: ' + ', '.join(missing))
 
 
 class EventJournal:

@@ -5,6 +5,22 @@ import path from 'node:path'
 import test from 'node:test'
 import { createSimulator, planStep, scenarioFrom } from './simulator.mjs'
 
+test('scenario defaults are normalized and identifiers and delays are typed', () => {
+  const parse = value => scenarioFrom([{role:'user',content:`GXZS_SIM_CASE ${JSON.stringify(value)}`}])
+  assert.equal(parse({id:'nullable',rounds:null,kind:null}).rounds, 10)
+  assert.equal(parse({id:'nullable',rounds:null,kind:null}).kind, 'chain')
+  assert.throws(() => parse({id:123}), /case id/)
+  for (const stepDelayMs of [-1, '100', 30001]) assert.throws(() => parse({id:'bad',stepDelayMs}), /step delay/)
+})
+
+test('scenario IDs reserve room for generated child and delivery names', () => {
+  for (const [kind, maximum] of [['chain',64], ['mixed',48], ['schedule-delivery',55]]) {
+    const parse = length => scenarioFrom([{role:'user',content:`GXZS_SIM_CASE ${JSON.stringify({id:'a'.repeat(length),kind})}`}])
+    assert.equal(parse(maximum).id.length, maximum)
+    assert.throws(() => parse(maximum+1), /case id|family limit/)
+  }
+})
+
 test('special scenarios cannot finish before their defining verification step', () => {
   for (const [kind, minimum] of [['goal', 6], ['browser-recovery', 3]]) {
     for (let rounds = 1; rounds < minimum; rounds++) {

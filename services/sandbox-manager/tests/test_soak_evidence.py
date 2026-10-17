@@ -11,6 +11,22 @@ spec.loader.exec_module(module)
 EventJournal = module.EventJournal
 
 
+@pytest.mark.parametrize('kind,maximum', [('chain',64),('mixed',48),('schedule-delivery',55)])
+def test_generated_case_ids_reserve_room_for_children(kind, maximum):
+    module.validate_case_ids([{'id':'a' * maximum,'kind':kind}])
+    with pytest.raises(ValueError, match='family limit'):
+        module.validate_case_ids([{'id':'a' * (maximum+1),'kind':kind}])
+
+
+def test_completed_status_without_complete_event_history_is_not_success():
+    tasks = [{'case':{'id':'pilot'},'status':'completed','complete':False}]
+    snapshot = {'cases':[{'id':'pilot','completed':True}]}
+    with pytest.raises(ValueError, match='event histories are incomplete'):
+        module.require_complete(tasks,snapshot)
+    tasks[0]['complete'] = True
+    module.require_complete(tasks,snapshot)
+
+
 @pytest.mark.parametrize('change', ['missing', 'duplicate', 'different_owner', 'different_scenario'])
 def test_resume_rejects_partial_or_changed_submission_manifests(change):
     prepared = [{'owner':'owner', 'chat':{'id':str(i)}, 'case':{'id':str(i),'rounds':40}} for i in range(3)]

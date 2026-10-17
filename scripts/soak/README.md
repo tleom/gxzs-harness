@@ -34,6 +34,10 @@ python3 terminal_check.py --root /home/jrgx/gxzs-simulated-soak-example
 
 `resume` 只轮询已有任务，不创建聊天、不重复提交。不要与原观察进程同时运行。
 事件文件采用追加写入；恢复读取时以事件 ID 去重。
+提交清单必须与完整准备清单一致；提交途中退出时，先调查已被接收的任务，不能把残缺清单当作完整压测。
+验收同时要求原生任务结束、所有事件页读取完成及派生任务完成。
+`mixed` 场景 ID 最长 48 字符，定时投递场景最长 55 字符，为派生任务预留后缀；其他场景最长 64 字符。
+`soak` 会给基名附加用户和通道编号，因此基名最多 41 字符。所有生成名称在创建聊天前校验。
 
 候选验证支持 `--host-image`、`--sandbox-image`、`--manager-image`、`--account-names`。
 多个测试栈必须指定不重叠的 `--pool` 和不同的 `--model-port`、`--manager-port`。

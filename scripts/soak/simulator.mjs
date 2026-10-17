@@ -38,16 +38,20 @@ export function scenarioFrom(messages) {
   const value = JSON.parse(source.slice(0, end))
   if (value.kind === 'scheduled-delivery') value.kind = 'schedule-delivery'
   if (!['chain', 'mixed', 'schedule-delivery', 'goal', 'browser-recovery'].includes(value.kind ?? 'chain')) throw new Error('Invalid scenario kind')
-  if (!/^[a-zA-Z0-9_-]{1,64}$/.test(value.id)) throw new Error('Invalid fixture case id')
+  if (typeof value.id !== 'string' || !/^[a-zA-Z0-9_-]{1,64}$/.test(value.id)) throw new Error('Invalid fixture case id')
+  const maximumId = { mixed: 48, 'schedule-delivery': 55 }[value.kind] ?? 64
+  if (value.id.length > maximumId) throw new Error('Case ID exceeds its scenario family limit')
   if (!Number.isInteger(value.rounds ?? 10) || (value.rounds ?? 10) < 1 || (value.rounds ?? 10) > 10000) throw new Error('Invalid rounds')
   const minimumRounds = { goal: 6, 'browser-recovery': 3 }[value.kind] ?? 1
   if ((value.rounds ?? 10) < minimumRounds) throw new Error(`Scenario ${value.kind} requires at least ${minimumRounds} rounds`)
   if (!Number.isFinite(value.durationMs ?? 0) || (value.durationMs ?? 0) < 0 || (value.durationMs ?? 0) > 86400000) throw new Error('Invalid duration')
+  if (!Number.isInteger(value.stepDelayMs ?? 100) || (value.stepDelayMs ?? 100) < 0 || (value.stepDelayMs ?? 100) > 30000) throw new Error('Invalid step delay')
   if (!Number.isInteger(value.argumentChunkSize ?? 256) || (value.argumentChunkSize ?? 256) < 64 || (value.argumentChunkSize ?? 256) > 65536) throw new Error('Invalid chunk size')
   if (value.fault && (!['http503', 'http403', 'disconnect'].includes(value.fault.mode)
       || !Number.isInteger(value.fault.step) || value.fault.step < 0
       || !Number.isInteger(value.fault.count) || value.fault.count < 1 || value.fault.count > 3)) throw new Error('Invalid synthetic model fault')
-  return { kind: 'chain', rounds: 10, durationMs: 0, stepDelayMs: 100, ...value }
+  return { ...value, kind: value.kind ?? 'chain', rounds: value.rounds ?? 10,
+    durationMs: value.durationMs ?? 0, stepDelayMs: value.stepDelayMs ?? 100 }
 }
 
 export function completedSteps(messages, id) {
