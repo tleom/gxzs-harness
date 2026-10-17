@@ -1,9 +1,11 @@
+import io
 import json
 import os
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import tarfile
 import threading
 import unittest
 from unittest.mock import Mock, patch
@@ -11,6 +13,23 @@ from unittest.mock import Mock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import global_memory as memory
 from global_memory import operate
+
+
+class InstallTests(unittest.TestCase):
+    def test_installs_runtime_entry_dependencies_without_unrelated_repository_files(self):
+        archive = io.BytesIO()
+        with tarfile.open(fileobj=archive, mode='w:gz') as tar:
+            for name in ('md_cg/mdcos.py', 'utf8_boot.py', 'package.json', 'LICENSE', 'data/private.json', '../outside'):
+                content = b'fixture'
+                item = tarfile.TarInfo('dsh-memory-' + memory.REVISION + '/' + name)
+                item.size = len(content)
+                tar.addfile(item, io.BytesIO(content))
+        archive.seek(0)
+        with tempfile.TemporaryDirectory() as folder, patch.object(memory, 'SOURCE', folder), \
+                patch('urllib.request.urlopen', return_value=archive):
+            memory.install()
+            installed = {p.relative_to(folder).as_posix() for p in Path(folder).rglob('*') if p.is_file()}
+            self.assertEqual(installed, {'md_cg/mdcos.py', 'utf8_boot.py', 'package.json', 'LICENSE'})
 
 
 class RoutingTests(unittest.TestCase):

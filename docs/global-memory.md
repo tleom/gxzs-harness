@@ -2,9 +2,11 @@
 
 “全局记忆”（英文名 `global memory`，内部标识 `global-memory`）注册在现有 `gxzs_ai_mcp_global`，与联网搜索、法律检索使用相同的发布、启停、工具选择和任务授权链路。前端不增加独立入口。全局是能力的提供范围；每个用户的数据仍在自己的沙盒中。
 
-唯一专用运行文件是 `services/sandbox-manager/global_memory.py`。它将已授权的调用送往平台为当前用户确定的沙盒，并复用 dsh-memory 原生 MCP 的 `cg`、`stg` 工具定义和执行入口，不复制其记忆算法。工具参数不能设置用户身份或记忆根目录。上游版本固定为 `bf846ebffca0d33c6d3b1468e12e16c7358fd715`，安装时保留 MIT LICENSE。
+唯一专用运行文件是 `services/sandbox-manager/global_memory.py`。它将已授权的调用送往平台为当前用户确定的沙盒，并复用 dsh-memory 原生 MCP 的 `cg`、`stg` 工具定义和执行入口，不复制其记忆算法。工具参数不能设置用户身份或记忆根目录。上游固定为 v0.8.1（`32ac237fb56afa43f73d668f1dfe9b306d71b025`），安装时包含 `md_cg`、启动依赖 `utf8_boot.py`、版本元数据 `package.json` 和 MIT LICENSE。
 
-数据和用户独立令牌保存在沙盒 `/home/dify/.gxzs-global-memory`，使用已有的用户 home 持久卷，更新程序不删除数据。程序放在 root 管理的 `/opt/gxzs-global-memory/<revision>`。临时进程重建会读取同一份记忆。
+数据和用户独立令牌保存在沙盒 `/home/gxzs/.gxzs-global-memory`，使用已有的用户 home 持久卷，更新程序不删除数据。程序放在 root 管理的 `/opt/gxzs-global-memory/<revision>`。临时进程重建会读取同一份记忆。
+
+v0.8.1 默认把改写、遗忘送入独立审核队列。平台使用上游 `MDCG_AUTONOMY=full` 配置保留用户已授权操作的即时执行语义；原有用户令牌、允许操作/记忆层、内容规则及原生写入验证仍然生效。此接入仅提供 MCP 工具，没有启用上游 DSH 插件的自动记录或上下文注入。
 
 `cg(op=write)` 使用上游原生写入审核流程；`ok=true` 不一定代表记忆已落盘，必须检查 `committed=true`。待审核内容不能报告为“已经记住”。普通文本使用基本凭据排除规则，不把该规则当作法律合规审查。任务提示要求只保存明确的长期偏好或已核实的可复用事实，不保存密码或完整聊天。
 

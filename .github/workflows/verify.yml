@@ -55,7 +55,7 @@ jobs:
           python services/sandbox-manager/global_memory.py --install
       - name: Manager and real Linux MCP transports
         env:
-          GLOBAL_MEMORY_TEST_SOURCE: /opt/gxzs-global-memory/bf846ebffca0d33c6d3b1468e12e16c7358fd715
+          GLOBAL_MEMORY_TEST_SOURCE: /opt/gxzs-global-memory/32ac237fb56afa43f73d668f1dfe9b306d71b025
         run: python -m pytest services/sandbox-manager/tests -q -rs
 
   images:
