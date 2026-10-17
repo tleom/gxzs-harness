@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Disposable multi-owner stack using exactly the installed production image IDs.
+"""Disposable multi-owner stack using pinned production or candidate image IDs.
 
 Only names, paths and identities in this invocation's manifest may be mutated.
 No production environment file, model credential or database is copied.
@@ -17,7 +17,11 @@ parser.add_argument('--sandbox-image',help='Explicit candidate sandbox image; de
 parser.add_argument('--host-image',help='Explicit candidate Host image')
 parser.add_argument('--manager-image',help='Explicit candidate Manager image')
 parser.add_argument('--account-names',action='store_true',help='Exercise readable names in an isolated runtime namespace')
+parser.add_argument('--global-skills-dir',help='Verified Docker-host skill directory to mount read-only in fixture runtimes')
 args=parser.parse_args()
+if args.global_skills_dir:
+ skill_root=pathlib.Path(args.global_skills_dir)
+ assert skill_root.is_absolute() and skill_root.is_dir() and list(skill_root.glob('*/SKILL.md')),'Expected a populated absolute global skill directory'
 root=pathlib.Path(args.root).resolve()
 assert root.name.startswith('gxzs-simulated-soak-') and root.parent==pathlib.Path('/home/jrgx')
 root.mkdir(exist_ok=True,mode=0o700);os.umask(0o077)
@@ -74,16 +78,20 @@ if args.action=='up':
  if args.sandbox_image:images['sandbox']=json.loads(docker('image','inspect',args.sandbox_image).stdout)[0]['Id']
  if args.host_image:images['host']=json.loads(docker('image','inspect',args.host_image).stdout)[0]['Id']
  if args.manager_image:images['manager']=json.loads(docker('image','inspect',args.manager_image).stdout)[0]['Id']
+ helper_path='/opt/workbench/profiles/workbench/node_modules/@deepseek-ai/dsh-ssh/lib/helper.js'
+ helper=docker('run','--rm','--network','none','--entrypoint','sha256sum',images['host'],helper_path).stdout.split()[0]
+ assert helper==docker('run','--rm','--network','none','--entrypoint','sha256sum',images['sandbox'],helper_path).stdout.split()[0],'Candidate Host/Sandbox helper mismatch'
  assert all(not pool.overlaps(ipaddress.ip_network(item['Subnet'])) for network in networks for item in (network.get('IPAM',{}).get('Config') or []) if item.get('Subnet') and ':' not in item['Subnet'])
  (root/'output').mkdir(exist_ok=True);(root/'state').mkdir(exist_ok=True)
  config={'prefix':prefix,'token':secrets.token_hex(32),'assertionKey':base64.b64encode(secrets.token_bytes(32)).decode(),'publicURL':f'http://10.16.9.237:{args.model_port}','managerURL':f'http://10.16.9.237:{args.manager_port}','images':images,'pool':str(pool),'owners':[],'accountNames':args.account_names}
  save(manifest,config)
  credentials=root/'fixture-credentials.yaml';credentials.write_text('version: 1\nrefs:\n  GXZS_SIM_MODEL_KEY: '+config['token']+'\nrecords: {}\n')
  container_config={**config,'host':'0.0.0.0','port':args.model_port,'output':'/output'};save(root/'simulator-private.json',container_config)
- manager_env={'WORKBENCH_SANDBOX_MANAGER_TOKEN':config['token'],'WORKBENCH_SANDBOX_IMAGE':images['sandbox'],'WORKBENCH_SANDBOX_PREFIX':prefix+'-sbx','WORKBENCH_SANDBOX_NETWORK':prefix+'-net','WORKBENCH_SANDBOX_ADDRESS_POOL':config['pool'],'WORKBENCH_SANDBOX_SUBNET_PREFIX':'27','WORKBENCH_MANAGER_HOST_STATE':str(root/'state'),'GXZS_HOST_IMAGE':images['host'],'GXZS_HOST_PLATFORM_URL':config['publicURL']+'/internal/workbench','GXZS_HOST_MANAGER_URL':config['managerURL'],'GXZS_HOST_ADVERTISE_IP':'10.16.9.237','GXZS_HOST_BIND_IP':'10.16.9.237','GXZS_ORCHESTRATOR_TOKEN':config['token'],'GXZS_SANDBOX_HELPER_HASH':env['GXZS_SANDBOX_HELPER_HASH'],'GXZS_HOST_CREDENTIALS_FILE':'/fixture-credentials.yaml','WORKBENCH_RUNTIME_CONTAINER':prefix+'-simulator','WORKBENCH_MCP_API_URL':config['publicURL']}
+ manager_env={'WORKBENCH_SANDBOX_MANAGER_TOKEN':config['token'],'WORKBENCH_SANDBOX_IMAGE':images['sandbox'],'WORKBENCH_SANDBOX_PREFIX':prefix+'-sbx','WORKBENCH_SANDBOX_NETWORK':prefix+'-net','WORKBENCH_SANDBOX_ADDRESS_POOL':config['pool'],'WORKBENCH_SANDBOX_SUBNET_PREFIX':'27','WORKBENCH_MANAGER_HOST_STATE':str(root/'state'),'GXZS_HOST_IMAGE':images['host'],'GXZS_HOST_PLATFORM_URL':config['publicURL']+'/internal/workbench','GXZS_HOST_MANAGER_URL':config['managerURL'],'GXZS_HOST_ADVERTISE_IP':'10.16.9.237','GXZS_HOST_BIND_IP':'10.16.9.237','GXZS_ORCHESTRATOR_TOKEN':config['token'],'GXZS_SANDBOX_HELPER_HASH':helper,'GXZS_HOST_CREDENTIALS_FILE':'/fixture-credentials.yaml','WORKBENCH_RUNTIME_CONTAINER':prefix+'-simulator','WORKBENCH_MCP_API_URL':config['publicURL']}
  for key in ['GXZS_HOST_CPUS','GXZS_HOST_MEMORY','WORKBENCH_SANDBOX_CPUS','WORKBENCH_SANDBOX_MEMORY','WORKBENCH_SANDBOX_PIDS_LIMIT','WORKBENCH_MANAGER_MAX_OPERATIONS']:
   if key in env:manager_env[key]=env[key]
  if args.account_names:manager_env['GXZS_RUNTIME_PREFIX']=prefix
+ if args.global_skills_dir:manager_env['GXZS_GLOBAL_SKILL_HOST_DIR']=str(skill_root)
  (root/'manager-private.env').write_text(''.join(key+'='+value+'\n' for key,value in manager_env.items()))
  docker('run','-d','--name',prefix+'-simulator','--label','gxzs.simulator='+prefix,'--memory','1g','--cpus','2','--pids-limit','128','--cap-drop','ALL','--security-opt','no-new-privileges:true','--no-healthcheck','-p',f'10.16.9.237:{args.model_port}:{args.model_port}','-v',str(source)+':/fixture:ro','-v',str(root/'output')+':/output','-v',str(root/'simulator-private.json')+':/fixture-config.json:ro','--entrypoint','node',images['host'],'/fixture/platform.mjs','/fixture-config.json')
  manager_limits=production['HostConfig']

@@ -24,6 +24,7 @@ import altair as alt
 import cairosvg
 import cn2an
 import graphviz
+import kaleido
 import networkx as nx
 import numpy_financial as npf
 import pandas as pd
@@ -81,7 +82,9 @@ result['spreadsheet_chart_recalc_financial'] = 'passed'
 figure = go.Figure(go.Bar(x=['一月', '二月', '三月'], y=[12, 18, 25]))
 figure.update_layout(title='款项统计', font_family='Noto Sans CJK SC', width=700, height=420)
 for suffix in ('png', 'svg', 'pdf'):
-    figure.write_image(out / ('plotly.' + suffix))
+    # This offline probe has no mathematical labels; do not depend on MathJax CDN.
+    kaleido.write_fig_sync(figure, path=out / ('plotly.' + suffix), opts={'format': suffix},
+                          kopts={'page_generator': kaleido.PageGenerator(mathjax=False)})
 figure.write_html(out / 'plotly.html', include_plotlyjs=True)
 chart = alt.Chart(pd.DataFrame({'月份': ['一月', '二月'], '金额': [1200, 3400]})).mark_bar().encode(x='月份:N', y='金额:Q')
 chart.save(out / 'altair.svg')
@@ -122,7 +125,7 @@ subprocess.run(['sqlite3', str(out / 'table.sqlite'), 'CREATE TABLE amounts (amo
 assert subprocess.check_output(['sqlite3', str(out / 'table.sqlite'), 'SELECT SUM(amount) FROM amounts;'], text=True).strip() == '4600'
 result['sqlite_table'] = 'passed'
 
-subprocess.run(['node', '/opt/office/capabilities-smoke.cjs', str(out)], check=True, timeout=180)
+subprocess.run(['node', str(Path(__file__).with_name('capabilities-smoke.cjs')), str(out)], check=True, timeout=180)
 result['node'] = json.loads((out / 'node-capabilities.json').read_text())
 for path in out.glob('*.png'):
     with Image.open(path) as image:

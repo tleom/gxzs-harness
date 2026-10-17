@@ -67,6 +67,6 @@ jobs:
         run: |
           docker build --build-arg VCS_REF="$GITHUB_SHA" -t gxzs/verify-host -f services/dsh-host/Dockerfile .
           docker build --build-arg VCS_REF="$GITHUB_SHA" -t gxzs/verify-manager services/sandbox-manager
-          docker build --build-arg VCS_REF="$GITHUB_SHA" -t gxzs/verify-sandbox -f services/sandbox/Dockerfile .
+          docker build --build-arg VCS_REF="$GITHUB_SHA" --build-arg WORKBENCH_FONT_IMAGE=system-fonts -t gxzs/verify-sandbox -f services/sandbox/Dockerfile .
       - name: Runtime, Office and container isolation smoke
         run: bash scripts/smoke-images.sh gxzs/verify-host gxzs/verify-manager gxzs/verify-sandbox

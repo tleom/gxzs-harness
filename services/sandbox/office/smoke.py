@@ -1,6 +1,7 @@
 """Exercise document generation, Office preview, Chinese text and both browser APIs."""
 import importlib
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -35,7 +36,7 @@ sheet.append(['乙', 20])
 sheet.append(['合计', '=SUM(B2:B3)'])
 sheet.column_dimensions['A'].width = 28
 book.save(out / 'sheet.xlsx')
-subprocess.run(['node', '/opt/office/smoke.cjs', str(out)], check=True, timeout=90)
+subprocess.run(['node', str(Path(__file__).with_name('smoke.cjs')), str(out)], check=True, timeout=90)
 
 result = {'ok': True, 'previews': {}, 'python_browser': False}
 pdfs = out / 'preview'
@@ -56,7 +57,7 @@ for name in ('document.docx', 'sheet.xlsx', 'slides.pptx'):
 subprocess.run(['pdftoppm', '-f', '1', '-singlefile', '-png', '-r', '72', str(pdfs / 'document.pdf'), str(out / 'poppler-preview')], check=True, timeout=30, capture_output=True)
 assert (out / 'poppler-preview.png').stat().st_size > 1000
 with sync_playwright() as p:
-    browser = p.chromium.launch(channel='chrome', headless=True, args=['--no-sandbox', '--disable-dev-shm-usage'])
+    browser = p.chromium.launch(executable_path=os.environ.get('CHROME_BIN', '/usr/bin/chromium'), headless=True, args=['--no-sandbox', '--disable-dev-shm-usage'])
     try:
         page = browser.new_page()
         page.set_content(f'<title>{text}</title><h1>{text}</h1>')

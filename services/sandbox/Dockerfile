@@ -1,4 +1,5 @@
-ARG WORKBENCH_FONT_IMAGE=system-fonts
+# Explicit for every build: a private asset image in production, system-fonts in CI.
+ARG WORKBENCH_FONT_IMAGE
 FROM scratch AS system-fonts
 COPY services/sandbox/fonts/system-manifest.json /fonts/manifest.json
 FROM ${WORKBENCH_FONT_IMAGE} AS workbench-fonts

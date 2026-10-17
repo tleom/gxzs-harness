@@ -15,6 +15,9 @@
 - id: web-search-deepseek
   disabled: true
 
+- id: web-deepseek-api
+  disabled: true
+
 - id: web-fetch-http
   disabled: true
 

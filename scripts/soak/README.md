@@ -40,6 +40,8 @@ python3 terminal_check.py --root /home/jrgx/gxzs-simulated-soak-example
 `soak` 会给基名附加用户和通道编号，因此基名最多 41 字符。所有生成名称在创建聊天前校验。
 
 候选验证支持 `--host-image`、`--sandbox-image`、`--manager-image`、`--account-names`。
+`--global-skills-dir` 可指定已核验的宿主机技能目录，让测试 Host 和 Sandbox 只读挂载同一资源；
+候选 SSH helper 的哈希从指定镜像读取，Host 与 Sandbox 必须一致。
 多个测试栈必须指定不重叠的 `--pool` 和不同的 `--model-port`、`--manager-port`。
 名字验证使用独立 `GXZS_RUNTIME_PREFIX`，不会占用生产的 `gxzs-host-admin` 等名称。
 

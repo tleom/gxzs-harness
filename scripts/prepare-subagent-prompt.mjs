@@ -69,7 +69,7 @@ export function subagentPromptIdentity(source) {
 export async function prepareSubagentPrompt(profile) {
   const require = createRequire(join(profile, 'package.json'))
   const metadata = JSON.parse(await readFile(require.resolve('@deepseek-ai/dsh-subagent/package.json'), 'utf8'))
-  if (metadata.version !== '0.2.1-alpha.5') throw new Error(`Unverified subagent prompt version: ${metadata.version}`)
+  if (metadata.version !== '0.2.1-rc.2') throw new Error(`Unverified subagent prompt version: ${metadata.version}`)
   const entry = require.resolve('@deepseek-ai/dsh-subagent')
   const source = await readFile(entry, 'utf8')
   const result = subagentPromptIdentity(source)

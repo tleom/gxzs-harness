@@ -254,7 +254,7 @@ export function apply(ctx, config) {
     })))
     return {
       resources_pending: modelsOnly,
-      dsh_version: '0.2.1-alpha.5', schedule_protocol: 1, subagent_protocol: 1, terminal_protocol: 1, browser_protocol: 1, browser_input_protocol: 2, job_protocol: 1,
+      dsh_version: '0.2.1-rc.2', schedule_protocol: 1, subagent_protocol: 1, terminal_protocol: 1, browser_protocol: 1, browser_input_protocol: 2, job_protocol: 1,
       activity_protocol: 1, sidebar_lease_protocol: 1, human_input_protocol: 1, followup_protocol: 1, history_protocol: 1, native_history_protocol: 1,
       ...(ctx.get('clientModules') ? { native_client_protocol: 1, native_session_client_protocol: 2, native_schedule_client_protocol: 1,
         ...(ctx.sessionReferenceResolver.listSessionCandidates && ctx.get('fileReferences')?.listObserved ? { native_subagent_reference_protocol: 1 } : {}),

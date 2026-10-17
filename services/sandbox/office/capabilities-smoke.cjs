@@ -87,7 +87,7 @@ async function main() {
     `<!doctype html><meta charset="utf-8"><link rel="stylesheet" href="katex.min.css"><style>body{font-family:"Noto Sans CJK SC";padding:24px}${style}</style>${content}${math}<div id="app"></div><script src="bundle.js"></script>`,
   )
   const browser = await chromium.launch({
-    channel: 'chrome',
+    executablePath: process.env.CHROME_BIN || '/usr/bin/chromium',
     headless: true,
     args: ['--no-sandbox', '--disable-dev-shm-usage'],
   })

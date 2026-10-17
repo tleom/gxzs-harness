@@ -369,7 +369,7 @@ async function nativeClientRoundtrip() {
   assert.equal(response.status, 200, `Native client graph must be installed: ${sanitize(JSON.stringify(payload))}`)
   const manifest = payload.data
   assert.equal(manifest.protocol, 1)
-  assert.equal(manifest.version, '0.2.1-alpha.5')
+  assert.equal(manifest.version, '0.2.1-rc.2')
   assert.match(manifest.bootstrap, /__ModuleLoader__/)
   assert.match(manifest.boot.rev, /^[a-f0-9]{64}$/)
   const ids = new Set(manifest.boot.entries.map(row => row.id))

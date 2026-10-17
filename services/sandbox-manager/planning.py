@@ -84,9 +84,13 @@ def copy_global_resources(source, destination, manager_python):
                     # directories. This container deliberately drops that
                     # capability. Python defers directory attributes and the
                     # data filter also rejects escaping archive members.
-                    "import sys,tarfile; "
+                    "import os,sys,tarfile,pathlib; "
+                    "skills='/opt/workbench-global/skills'; "
+                    "mounted=os.path.ismount(skills) and bool(os.statvfs(skills).f_flag & os.ST_RDONLY); "
                     "archive=tarfile.open(fileobj=sys.stdin.buffer,mode='r|'); "
-                    "archive.extractall('/opt/workbench-global',filter='data')",
+                    "archive.extractall('/opt/workbench-global',filter=lambda member,path: "
+                    "None if mounted and pathlib.PurePosixPath(member.name).parts[:1]==('skills',) "
+                    "else tarfile.data_filter(member,path))",
                 ],
                 stdin=export.stdout,
                 capture_output=True,
