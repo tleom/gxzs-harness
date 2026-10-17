@@ -96,7 +96,10 @@ class Hosts:
             else:
                 current.update(names)
                 if names:
-                    current['sandbox_volume_prefix'] = names['sandbox_name']
+                    # Human-readable container names must never become the
+                    # storage identity: orphaned account-named volumes may
+                    # belong to a different workspace after account deletion.
+                    current['sandbox_volume_prefix'] = self.identity(workspace)[0]
             container = host_name(dict(current, instance_id=instance))
             image = os.environ['GXZS_HOST_IMAGE']
             image_info = json.loads(self.docker('image', 'inspect', image).stdout)[0]
@@ -139,7 +142,7 @@ class Hosts:
             # Persist ownership before provisioning, including failed starts.
             # A replacement inherits the original volume, including adopted
             # instance-home names. Fresh hosts use a stable workspace volume.
-            home_volume = current.get('home_volume') or (container + '-home' if names or not info.returncode else 'gxzs-dsh-' + workspace + '-home')
+            home_volume = current.get('home_volume') or (container + '-home' if not names and not info.returncode else 'gxzs-dsh-' + workspace + '-home')
             current.update(owner_id=owner, workspace_id=workspace, generation=generation,
                            instance_id=instance, ready=False, state='provisioning', home_volume=home_volume,
                            desired_image_digest=desired_digest, initial_creation=initial_creation)
@@ -350,7 +353,7 @@ class Hosts:
             # Logical instances remain unique across generations. The readable
             # Docker name is reusable only after the old generation is stopped.
             previous_name = host_name(current)
-            if names and previous_name == names['container_name']:
+            if names:
                 previous = self._upgrade_inspect(previous_name)
                 if previous is not None:
                     labels = previous.get('Config', {}).get('Labels') or {}
@@ -359,7 +362,7 @@ class Hosts:
                         'gxzs.generation': str(current['generation']),
                     }.items()):
                         raise ValueError('Previous runtime container identity changed')
-                    self.docker('rename', previous_name, previous_name + '-previous-' + previous['Id'][:12])
+                    self.docker('rename', previous_name, names['container_name'] + '-previous-' + previous['Id'][:12])
             if names:
                 current['sandbox_volume_prefix'] = volume_prefix(current, sandbox)
                 current.update(names)

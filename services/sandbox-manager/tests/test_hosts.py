@@ -100,7 +100,10 @@ def test_account_named_host_keeps_the_logical_instance_and_owner_volumes(tmp_pat
     create = next(call.args for call in docker.call_args_list if call.args[0] == 'create')
     assert create[create.index('--name') + 1] == first['container_name']
     assert 'GXZS_HOST_INSTANCE_ID=host-1' in (host.root / 'workspace' / 'host.env').read_text()
-    assert 'gxzs-sandbox-t.00066943-files:/workspace:ro' in create
+    assert 'sandbox-workspace-files:/workspace:ro' in create
+    assert first['sandbox_volume_prefix'] == 'sandbox-workspace'
+    assert first['home_volume'] == 'gxzs-dsh-workspace-home'
+    assert not any(value.startswith('gxzs-host-t.00066943-home:') or value.startswith('gxzs-sandbox-t.00066943-') for value in create)
     assert 'gxzs.instance=host-1' in create
     assert '/srv/manager/hosts/workspace/ssh:/home/gxzs/.ssh:ro' in create
     host._ssh.assert_called_once_with(host.root / 'workspace', 'gxzs-sandbox-t.00066943')
@@ -1294,14 +1297,18 @@ def test_ssh_installs_keys_as_sandbox_owner_without_chown(tmp_path, monkeypatch)
     assert all(str(call.args[0]).startswith(str(folder)) for call in host_chown.call_args_list)
 
 
-@pytest.mark.parametrize('send_account', [True, False])
-def test_readable_name_is_reused_only_after_old_generation_is_fenced(tmp_path, monkeypatch, send_account):
+@pytest.mark.parametrize('legacy,send_account', [(False, True), (False, False), (True, True)])
+def test_readable_name_is_reused_only_after_old_generation_is_fenced(tmp_path, monkeypatch, send_account, legacy):
     host, docker, payload, containers, record, _ = upgrade_setup(tmp_path, monkeypatch)
     name = 'gxzs-host-t.admin'
     containers[name] = containers.pop('host-1')
     containers['sandbox-workspace']['Config'] = {'Labels': {'gxzs.workspace': 'workspace'}}
     data = json.loads(record.read_text())
     data.update(container_name=name, sandbox_name='sandbox-workspace', account_name='admin')
+    if legacy:
+        containers['host-1'] = containers.pop(name)
+        for key in ('container_name', 'sandbox_name', 'account_name'):
+            data.pop(key)
     host._save(record, data)
     previous_volume = data['home_volume']
     original = docker.side_effect
@@ -1318,7 +1325,7 @@ def test_readable_name_is_reused_only_after_old_generation_is_fenced(tmp_path, m
     host.ensure = Mock(return_value={'new_generation': True})
     host.admission.busy.return_value = 1
     assert host.replace('workspace', replacement)['state'] == 'draining'
-    assert containers[name]['State']['Running']
+    assert containers['host-1' if legacy else name]['State']['Running']
     host.admission.busy.return_value = 0
     assert host.replace('workspace', replacement) == {'new_generation': True}
     after = json.loads(record.read_text())
