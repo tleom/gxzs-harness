@@ -198,6 +198,40 @@ it('uses a private visible display without starting CDP pixel encoding, and rele
   expect(value.browser.close).toHaveBeenCalledOnce()
 })
 
+it.each([false, true])('waits for visible renderer resize before acknowledgement; timeout=%s', async timeout => {
+  const display={env:{DISPLAY:':100'},size:{width:1000,height:700},resize:vi.fn(),stop:vi.fn(async()=>{})}
+  const value=worker(async()=>display)
+  value.context.exposeBinding=vi.fn(async()=>{})
+  value.context.addInitScript=vi.fn(async()=>{})
+  value.page.bringToFront=vi.fn(async()=>{})
+  let size={width:1000,height:700},settle
+  const handle={dispose:vi.fn(async()=>{})}
+  value.page.evaluate=vi.fn(async()=>size)
+  value.page.waitForFunction=vi.fn(()=>new Promise((resolve,reject)=>{
+    settle=()=>{if(timeout) reject(new Error('resize_timeout'));else {size={width:823,height:617};resolve(handle)}}
+  }))
+  try {
+    await value.command(1,'init',{width:1000,height:700})
+    value.frames.length=0
+    value.input.write(JSON.stringify({id:2,action:'resize',width:823,height:617})+'\n')
+    await vi.waitFor(()=>expect(settle).toBeTypeOf('function'))
+    expect(value.frames.some(frame=>frame.type==='result'&&frame.id===2)).toBe(false)
+    expect(value.page.waitForFunction).toHaveBeenCalledWith(expect.any(Function),
+      {width:823,height:617},{timeout:5000,polling:50})
+    settle()
+    await vi.waitFor(()=>expect(value.frames.some(frame=>frame.type==='result'&&frame.id===2)).toBe(true))
+    const result=value.frames.find(frame=>frame.type==='result'&&frame.id===2)
+    if(timeout) {
+      expect(result.error).toBe('浏览器操作失败')
+      expect(handle.dispose).not.toHaveBeenCalled()
+    } else {
+      expect(result.error).toBeUndefined()
+      expect(value.frames.filter(frame=>frame.type==='frame').at(-1)).toMatchObject({width:823,height:617})
+      expect(handle.dispose).toHaveBeenCalledOnce()
+    }
+  } finally {await value.runtime.shutdown()}
+})
+
 it('replaces the displayed page with a native popup, preserving the browser identity', async () => {
   const value=worker()
   value.page.close=vi.fn(async()=>value.page.emit('close'))
