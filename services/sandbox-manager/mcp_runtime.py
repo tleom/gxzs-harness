@@ -345,8 +345,6 @@ def invoke(key, container, payload, state, *, authorize=None):
         return {"conflict": True}
     if payload["operation"] == "mcp_call" and not state["enabled"]:
         return {"error": "个人 MCP 已停用"}
-    if payload["operation"] == "mcp_test":
-        invalidate(key, name)
     call = Invocation(key, payload)
     identity = key, name
     with GUARD:
@@ -366,7 +364,7 @@ def invoke(key, container, payload, state, *, authorize=None):
         if call.cancelled.is_set():
             return {"error": "MCP 执行已失效，本次操作未执行"}
         if not acquired:
-            return {"error": "此 MCP 正忙，本次操作未执行，请稍后再试"}
+            return {"error": "此 MCP 正忙，本次操作未执行，请稍后再试", "code": "MCP_BUSY"}
         if payload["operation"] == "mcp_call" and (
             authorize is None or not authorize({"authorization": payload["authorization"], "action": "validate"})
         ):
@@ -375,7 +373,10 @@ def invoke(key, container, payload, state, *, authorize=None):
             worker = WORKERS.get(identity)
         if worker and (
             worker.version != state["version"] or worker.process.poll() is not None
+            or payload["operation"] == "mcp_test"
         ):
+            # Discovery now owns this plugin's call lock. Reconnect only after
+            # the preceding call has settled; never cancel it to refresh metadata.
             with GUARD:
                 WORKERS.pop(identity, None)
             retire(worker, key, name, call.binding)

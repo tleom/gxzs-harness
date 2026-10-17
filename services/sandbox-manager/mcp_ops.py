@@ -5,6 +5,7 @@ source of truth; cached tool declarations are valid only for their config hash.
 All file traversal follows the same no-symlink contract as personal skills.
 """
 
+import fcntl
 import json
 import os
 import re
@@ -281,12 +282,16 @@ def snapshot(rootfd, selected=None):
                             and cached.get("connection_fingerprint") == connection_fingerprint(config)
                             and cached.get("authentication_version") == authentication_version(config)
                             and isinstance(cached.get("discovered_at"), (int, float))
-                            and 0 <= time.time() - cached["discovered_at"] < DISCOVERY_TTL):
+                            and 0 <= time.time() - cached["discovered_at"]):
                         tools = tool_manifest(cached.get("tools", []))
                         fingerprint = manifest_version(tools)
                         if fingerprint == cached.get("manifest_version"):
-                            item.update(tools=tools, manifest_version=fingerprint, status="ready",
-                                        discovered_at=cached["discovered_at"])
+                            item["discovered_at"] = cached["discovered_at"]
+                            # Age requests revalidation; it is not evidence that a
+                            # previously verified, unchanged plugin is unavailable.
+                            if not cached.get("refresh_failed"):
+                                item.update(tools=tools, manifest_version=fingerprint, status="ready",
+                                            refresh_due=time.time() - cached["discovered_at"] >= DISCOVERY_TTL)
                 except (ValueError, OSError, RecursionError):
                     warnings.append(f"个人 MCP {name} 的目录缓存无效，正在重新发现")
                 items.append(item)
@@ -315,12 +320,15 @@ def personal_mcp(payload, root="/workspace"):
             configuration(content.encode("utf-8"))
         if operation == "mcp_probe":
             config, revision = load(rootfd, name)
-            return {
+            result = {
                 "id": name,
                 "version": revision,
                 "timeout": config["timeout"],
                 "enabled": mapping(statefd, SETTINGS).get(name, True),
             }
+            if payload.get("include_discovery_state"):
+                result["discovered_at"] = snapshot(rootfd, name)["mcp"][0].get("discovered_at")
+            return result
         if operation in {"mcp_toggle", "mcp_pin"}:
             if operation == "mcp_toggle" and payload.get("enabled") is True:
                 plugin_name(name)
@@ -480,11 +488,25 @@ def personal_mcp(payload, root="/workspace"):
                         values.pop(name, None)
                         atomic_write(statefd, setting, json.dumps(values).encode())
                     return {"id": name, "removed": True}
+                if operation == "mcp_cache_failure":
+                    cachefd = directory(statefd, ".cache")
+                    try:
+                        fcntl.flock(cachefd, fcntl.LOCK_EX)
+                        cached = json.loads(read_file(cachefd, name + ".json") or b"{}")
+                        # A late failure must not invalidate a newer discovery.
+                        if (cached.get("version") != revision or payload.get("discovered_at") is None
+                                or cached.get("discovered_at") != payload["discovered_at"]):
+                            return {"conflict": True}
+                        atomic_write(cachefd, name + ".json", json.dumps({**cached, "refresh_failed": True}).encode())
+                    finally:
+                        os.close(cachefd)
+                    return {"id": name, "version": revision}
                 if operation == "mcp_cache":
                     tools = tool_manifest(payload.get("tools"))
                     config = configuration(raw)
                     cachefd = directory(statefd, ".cache")
                     try:
+                        fcntl.flock(cachefd, fcntl.LOCK_EX)
                         atomic_write(
                             cachefd, name + ".json", json.dumps({
                                 "version": revision, "connection_fingerprint": connection_fingerprint(config),

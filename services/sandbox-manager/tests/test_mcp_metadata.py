@@ -93,21 +93,40 @@ def test_new_config_rejects_name_different_from_call_name(ops, tmp_path):
                           "content": config(name="different")}, str(tmp_path))
 
 
-def test_discovery_expires_and_authentication_edit_invalidates(ops, tmp_path, monkeypatch):
+def test_discovery_age_requests_refresh_and_authentication_edit_invalidates(ops, tmp_path, monkeypatch):
     now = 1_000_000
     monkeypatch.setattr(ops.time, "time", lambda: now)
     save = ops.personal_mcp({"operation": "mcp_save", "name": "demo",
                              "content": config(headers={"Authorization": "Bearer old"})}, str(tmp_path))
-    tools = [{"name": "lookup", "inputSchema": {"type": "object", "required": ["q"]}}]
+    tools = [{"name": "lookup", "description": "", "inputSchema": {"type": "object", "required": ["q"]}}]
     ops.personal_mcp({"operation": "mcp_cache", "name": "demo", "version": save["version"],
                       "tools": tools}, str(tmp_path))
     assert ops.personal_mcp({"operation": "mcp_list"}, str(tmp_path))["mcp"][0]["status"] == "ready"
     monkeypatch.setattr(ops.time, "time", lambda: now + ops.DISCOVERY_TTL)
-    assert ops.personal_mcp({"operation": "mcp_list"}, str(tmp_path))["mcp"][0]["status"] == "unverified"
+    item = ops.personal_mcp({"operation": "mcp_list"}, str(tmp_path))["mcp"][0]
+    assert item["status"] == "ready" and item["refresh_due"] and item["tools"] == tools
     monkeypatch.setattr(ops.time, "time", lambda: now)
     ops.personal_mcp({"operation": "mcp_save", "name": "demo", "version": save["version"],
                       "content": config(headers={"Authorization": "Bearer new"})}, str(tmp_path))
     assert ops.personal_mcp({"operation": "mcp_list"}, str(tmp_path))["mcp"][0]["status"] == "unverified"
+
+
+def test_failed_refresh_hides_tools_but_late_failure_cannot_replace_new_discovery(ops, tmp_path, monkeypatch):
+    now = [1_000_000]
+    monkeypatch.setattr(ops.time, "time", lambda: now[0])
+    saved = ops.personal_mcp({"operation": "mcp_save", "name": "demo", "content": config()}, str(tmp_path))
+    cache = {"operation": "mcp_cache", "name": "demo", "version": saved["version"],
+             "tools": [{"name": "lookup", "description": "", "inputSchema": {"type": "object"}}]}
+    ops.personal_mcp(cache, str(tmp_path))
+    failure = {"operation": "mcp_cache_failure", "name": "demo", "version": saved["version"], "discovered_at": now[0]}
+    ops.personal_mcp(failure, str(tmp_path))
+    item = ops.personal_mcp({"operation": "mcp_list"}, str(tmp_path))["mcp"][0]
+    assert item["status"] == "unverified" and item["tools"] == [] and item["enabled"]
+    now[0] += 1
+    ops.personal_mcp(cache, str(tmp_path))
+    assert ops.personal_mcp(failure, str(tmp_path)) == {"conflict": True}
+    item = ops.personal_mcp({"operation": "mcp_list"}, str(tmp_path))["mcp"][0]
+    assert item["status"] == "ready" and item["tools"] == cache["tools"]
 
 
 def test_corrupt_cache_does_not_disable_valid_plugin(ops, tmp_path):

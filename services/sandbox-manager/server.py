@@ -57,7 +57,8 @@ MANAGER_PYTHON = ("/usr/local/bin/python", "-I", "-S")
 def schedule_mcp_refresh(key, items):
     """Refresh expired personal catalogs without making list reads wait for a provider."""
     for item in items:
-        if not isinstance(item, dict) or not item.get("enabled") or item.get("status") != "unverified" or not item.get("version"):
+        if (not isinstance(item, dict) or not item.get("enabled") or not item.get("version")
+                or not (item.get("status") == "unverified" or item.get("refresh_due") is True)):
             continue
         identity = key, item["id"]
         with MCP_REFRESH_GUARD:
@@ -72,11 +73,12 @@ def schedule_mcp_refresh(key, items):
             MCP_REFRESH_ATTEMPTS[identity] = time.monotonic()
             MCP_REFRESHING.add(identity)
 
-        def refresh(target=identity, version=item["version"]):
+        def refresh(target=identity, version=item["version"], discovered_at=item.get("discovered_at")):
             try:
                 operation(target[0], "personal-mcp", {"operation": "mcp_test", "name": target[1],
                                                       "version": version,
                                                       "maintenance": True,
+                                                      "catalog_discovered_at": discovered_at,
                                                       "deadline_ms": int(time.time() * 1000) + 30_000})
             except Exception:
                 LOGGER.warning("Personal MCP catalog refresh failed for %s", target[1])
@@ -401,6 +403,8 @@ def operation(key, action, payload):
             request = payload
             if payload["operation"] in {"mcp_test", "mcp_call"}:
                 request = {"operation": "mcp_probe", "name": payload.get("name")}
+                if payload["operation"] == "mcp_test":
+                    request["include_discovery_state"] = True
             source = module_source("file_ops", "resource_ops", "mcp_ops")
             source += "import json; print(json.dumps(sys.modules['mcp_ops'].personal_mcp(json.load(sys.stdin))))"
             result = docker("exec", "--user", "1000", "-i", name, *MANAGER_PYTHON, "-c", source,
@@ -414,7 +418,20 @@ def operation(key, action, payload):
         if payload["operation"] in {"mcp_save", "mcp_delete", "mcp_toggle"} and not output.get("conflict"):
             invalidate(key, payload["name"])
         if payload["operation"] in {"mcp_test", "mcp_call"}:
+            discovered_at = payload.get("catalog_discovered_at", output.get("discovered_at"))
             output = invoke(key, name, payload, output, authorize=authorize_mcp)
+            if (payload["operation"] == "mcp_test"
+                    and output.get("error") and output.get("code") != "MCP_BUSY"
+                    and discovered_at is not None):
+                failure = {"operation": "mcp_cache_failure", "name": payload["name"],
+                           "version": payload["version"], "discovered_at": discovered_at}
+                # Only the owning sandbox can invalidate its unchanged cache.
+                # The expected timestamp protects a concurrently completed refresh.
+                with lock(key):
+                    result = docker("exec", "--user", "1000", "-i", name, *MANAGER_PYTHON, "-c", source,
+                                    stdin=json.dumps(failure), check=False)
+                    if result.returncode:
+                        LOGGER.warning("Unable to record personal MCP discovery failure")
         elif payload["operation"] == "mcp_list":
             schedule_mcp_refresh(key, output.get("mcp", []))
         if tracked:

@@ -92,6 +92,11 @@ export function apply(ctx, config) {
   service.cancelOwned = (sessionId, runId) => runtime.cancelOwned(sessionId, runId)
   service.hasOwnedWork = (sessionId, runId) => runtime.hasOwnedWork(sessionId, runId)
   service.executionRun = sessionId => runtime.executionRun(sessionId)
+  service.refreshMcpCatalog = owner => {
+    if (owner.ownerId !== config.ownerId || !runtime.refreshMcpCatalog)
+      throw Object.assign(new Error('MCP 工具目录暂不可用，请稍后重试'), { status: 503, code: 'MCP_CATALOG_UNAVAILABLE' })
+    return runtime.refreshMcpCatalog()
+  }
   service.waitSessionActivity = sessionId => waitSessionActivity(ctx, sessionId)
   const schedules = new WorkbenchSchedules({ native: () => ctx.get('schedule'), database, service })
   workspaces.schedules = schedules

@@ -87,7 +87,8 @@ describe('platform MCP proxy tools', () => {
     platform.json.mockResolvedValueOnce({ tools: [], plugins: [plugin] })
     await apply(ctx, { discovery: true })
     platform.json.mockResolvedValueOnce({ tools: [catalogTool], plugins: [{ ...plugin, available: true }] })
-    await ctx.on.mock.calls.find(([event]) => event === 'workbench/resources-changed')[1]()
+    const frozen = await ctx.workbenchRuntime.refreshMcpCatalog()
+    expect(frozen).toMatchObject([{ id: catalogTool.id }])
     expect(ctx.toolDiscoveryCatalog.snapshot(agent)).toMatchObject({ tools: [], plugins: [
       { name: 'server', available: false, unavailableReason: 'run_authorization_required' },
     ] })
@@ -96,6 +97,15 @@ describe('platform MCP proxy tools', () => {
     expect(ctx.toolDiscoveryCatalog.snapshot(agent).plugins[0].unavailableReason).toBeUndefined()
     run = { ...run, ownerId: 'other-owner' }
     expect(ctx.toolDiscoveryCatalog.snapshot(agent).plugins).toEqual([])
+  })
+  it('does not freeze stale retained definitions after a failed admission refresh', async () => {
+    const { ctx, platform, definitions } = setup()
+    await apply(ctx)
+    expect(definitions.size).toBe(1)
+    platform.json.mockRejectedValueOnce(Object.assign(new Error('upstream details'), { status: 503 }))
+    await expect(ctx.workbenchRuntime.refreshMcpCatalog()).rejects.toMatchObject({ status: 503, code: 'MCP_CATALOG_UNAVAILABLE' })
+    expect(definitions.size).toBe(1)
+    expect(ctx.workbenchRuntime.mcpCatalogState.status).toBe('degraded')
   })
   it('keeps empty and unavailable plugin metadata owner-scoped and refreshes its revision', async () => {
     const { ctx, platform } = setup()

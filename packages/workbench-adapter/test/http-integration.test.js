@@ -65,9 +65,20 @@ function setup({ databasePath = ':memory:', configure = () => {} } = {}) {
     assertionIssuer: 'gxzs', assertionAudiencePath: '/console/api/workbench', assertionKeyEnv: 'TEST_ASSERTION_KEY',
     ownerId: 't:42', humanInputTimeoutSeconds: 60,
   })
+  const runtime = context.reflect.provide.mock.calls.find(([name]) => name === 'workbenchRuntime')[1]
+  runtime.refreshMcpCatalog = vi.fn(async () => [])
   cleanups.push(() => vi.unstubAllEnvs())
   return { handler, key, context }
 }
+
+it('refuses new admission while native MCP registration is unavailable', async () => {
+  const { handler, key, context } = setup()
+  const chat = (await call(handler, key, 'POST', '/chats', {})).body.data
+  const runtime = context.reflect.provide.mock.calls.find(([name]) => name === 'workbenchRuntime')[1]
+  delete runtime.refreshMcpCatalog
+  expect(await call(handler, key, 'POST', `/chats/${chat.id}/runs`, { query: 'read tools' })).toMatchObject({ status: 503 })
+  expect(runtime.database.listRuns('t:42', chat.id)).toEqual([])
+})
 
 async function call(handler, key, method, route, value, authenticated = true, userId = '42', extraHeaders = {}, onResponse) {
   const body = value === undefined ? Buffer.alloc(0) : Buffer.from(JSON.stringify(value))

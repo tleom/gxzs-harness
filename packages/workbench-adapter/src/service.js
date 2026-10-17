@@ -581,7 +581,7 @@ export class WorkbenchService {
   }
 
   async freezeMcpTools(owner, selectedIds, selectedPlugins = []) {
-    const catalog = await this.mcpCatalog(owner, { required: true })
+    const catalog = this.refreshMcpCatalog ? await this.refreshMcpCatalog(owner) : await this.mcpCatalog(owner, { required: true })
     const byId = new Map(catalog.map((tool) => [tool.id, tool]))
     for (const id of selectedIds ?? [])
       if (!byId.has(id)) throw httpError(409, `MCP 工具已不可用：${id}`)

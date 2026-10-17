@@ -1007,6 +1007,21 @@ describe('followup and control service', () => {
     expect(platformClient.json).toHaveBeenCalledTimes(2)
   })
 
+  it('freezes definitions after native registration refresh without a second divergent catalog read', async () => {
+    const { service, platformClient, owner } = setup()
+    const tool = { id: 'personal:mcp:demo:lookup', version: 'v1', scope: 'personal', server_id: 'demo', tool_name: 'lookup' }
+    let ready
+    service.refreshMcpCatalog = vi.fn(() => new Promise(resolve => { ready = resolve }))
+    const frozen = service.freezeMcpTools(owner, [tool.id])
+    expect(service.refreshMcpCatalog).toHaveBeenCalledWith(owner)
+    expect(platformClient.json).not.toHaveBeenCalled()
+    ready([tool])
+    await expect(frozen).resolves.toEqual([tool])
+    service.refreshMcpCatalog.mockRejectedValueOnce(Object.assign(new Error('not ready'), { code: 'MCP_CATALOG_UNAVAILABLE' }))
+    await expect(service.freezeMcpTools(owner, [tool.id])).rejects.toMatchObject({ code: 'MCP_CATALOG_UNAVAILABLE' })
+    expect(platformClient.json).not.toHaveBeenCalled()
+  })
+
   it.each(['TimeoutError', 'TypeError'])('makes catalog %s explicit without leaking upstream error details', async (name) => {
     const { service, platformClient } = setup()
     platformClient.json.mockRejectedValue(Object.assign(new Error('secret upstream address'), { name }))
