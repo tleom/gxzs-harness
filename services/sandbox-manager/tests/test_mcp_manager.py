@@ -109,12 +109,13 @@ def test_background_catalog_refresh_keeps_each_observed_version(manager, monkeyp
     key = str(uuid4())
     module.schedule_mcp_refresh(key, [
         {"id": "first", "enabled": True, "status": "unverified", "version": "v1"},
-        {"id": "second", "enabled": True, "status": "unverified", "version": "v2"},
+        {"id": "second", "enabled": True, "status": "ready", "refresh_due": True, "version": "v2", "discovered_at": 123},
     ])
     for target in pending:
         target()
     assert [(body["name"], body["version"]) for _, _, body in observed] == [("first", "v1"), ("second", "v2")]
     assert all(owner == key and resource == "personal-mcp" and body["operation"] == "mcp_test" for owner, resource, body in observed)
+    assert observed[1][2]["catalog_discovered_at"] == 123
     assert not module.MCP_REFRESHING
 
 
@@ -150,6 +151,79 @@ def test_stop_and_catalog_do_not_wait_for_business_call_and_queued_calls_reautho
         assert active.result()["uncertain"]
         assert "失效" in queued.result()["error"]
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize('maintenance', [True, False])
+def test_refresh_defers_or_waits_without_cancelling_inflight_call(manager, monkeypatch, maintenance):
+    module, runtime, calls, entered = manager
+    key, binding = str(uuid4()), str(uuid4())
+    release = threading.Event()
+    original = runtime.Worker.response
+
+    def response(worker, cancelled=None, timeout=None):
+        if worker.ready is not None and worker.pending.get("tool") == "slow":
+            assert release.wait(4)
+            assert not worker.closed.is_set() and not cancelled.is_set()
+            return {"result": {"value": "finished"}}
+        return original(worker, cancelled, timeout)
+
+    monkeypatch.setattr(runtime.Worker, "response", response)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        active = pool.submit(module.operation, key, "personal-mcp", payload(key, binding))
+        assert entered.wait(2)
+        worker = runtime.WORKERS[(key, "demo")]
+        request = {"operation": "mcp_test", "name": "demo", "version": "v1", "maintenance": maintenance}
+        refresh = pool.submit(module.operation, key, "personal-mcp", request)
+        try:
+            if maintenance:
+                assert refresh.result(timeout=1)["code"] == "MCP_BUSY"
+            else:
+                deadline = time.monotonic() + 2
+                while len([call for call in runtime.ACTIVE if call.key == key]) < 2 and not refresh.done() and time.monotonic() < deadline:
+                    time.sleep(.01)
+                assert not refresh.done()
+            assert not worker.closed.is_set()
+        finally:
+            release.set()
+        assert active.result()["result"]["value"] == "finished"
+        refresh.result()
+        if maintenance:
+            assert module.operation(key, "personal-mcp", request)["result"]["value"] == "ok"
+    assert worker.closed.is_set() and runtime.WORKERS[(key, "demo")] is not worker
+    assert [call["operation"] for call in calls] == ["mcp_call", "mcp_test"]
+
+
+def test_background_refresh_defers_when_preflight_used_connection_budget(manager):
+    module, runtime, calls, _ = manager
+    key, binding = str(uuid4()), str(uuid4())
+    module.operation(key, "personal-mcp", payload(key, binding, tool="fast"))
+    worker = runtime.WORKERS[(key, "demo")]
+    result = module.operation(key, "personal-mcp", {
+        "operation": "mcp_test", "name": "demo", "version": "v1", "maintenance": True,
+        "deadline_ms": int(time.time() * 1000) + 1000,
+    })
+    assert result["code"] == "MCP_BUSY"
+    assert not worker.closed.is_set()
+    assert len(calls) == 1
+
+
+def test_refresh_failure_records_cache_failure_but_capacity_wait_does_not(manager, monkeypatch):
+    module, runtime, _, _ = manager
+    writes = []
+    original = module.docker
+    def docker(*args, stdin=None, **kwargs):
+        if stdin is not None and json.loads(stdin).get("operation") == "mcp_cache_failure":
+            writes.append(json.loads(stdin))
+            return SimpleNamespace(returncode=0, stdout='{}')
+        return original(*args, stdin=stdin, **kwargs)
+    monkeypatch.setattr(module, "docker", docker)
+    request = {"operation": "mcp_test", "name": "demo", "version": "v1", "maintenance": True, "catalog_discovered_at": 123}
+    monkeypatch.setattr(runtime, "invoke", lambda *a, **k: {"error": "busy", "code": "MCP_BUSY"})
+    module.operation(str(uuid4()), "personal-mcp", request)
+    assert not writes
+    monkeypatch.setattr(runtime, "invoke", lambda *a, **k: {"error": "discovery failed"})
+    module.operation(str(uuid4()), "personal-mcp", request)
+    assert writes == [{"operation": "mcp_cache_failure", "name": "demo", "version": "v1", "discovered_at": 123}]
 
 
 def test_stop_cancels_only_its_binding_and_other_server_can_complete(manager):

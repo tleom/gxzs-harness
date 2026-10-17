@@ -345,8 +345,6 @@ def invoke(key, container, payload, state, *, authorize=None):
         return {"conflict": True}
     if payload["operation"] == "mcp_call" and not state["enabled"]:
         return {"error": "个人 MCP 已停用"}
-    if payload["operation"] == "mcp_test":
-        invalidate(key, name)
     call = Invocation(key, payload)
     identity = key, name
     with GUARD:
@@ -358,15 +356,23 @@ def invoke(key, container, payload, state, *, authorize=None):
     acquired, worker = False, None
     tracked, outcome_uncertain = False, True
     try:
-        deadline = min(time.monotonic() + 20, call.deadline)
-        while not call.cancelled.is_set() and time.monotonic() < deadline:
-            if mutex.acquire(timeout=0.1):
-                acquired = True
-                break
+        maintenance = payload["operation"] == "mcp_test" and payload.get("maintenance") is True
+        if maintenance:
+            # Background discovery can retry later; waiting behind a business
+            # call would consume its connection budget and fake a plugin outage.
+            acquired = mutex.acquire(blocking=False)
+        else:
+            deadline = min(time.monotonic() + 20, call.deadline)
+            while not call.cancelled.is_set() and time.monotonic() < deadline:
+                if mutex.acquire(timeout=0.1):
+                    acquired = True
+                    break
         if call.cancelled.is_set():
             return {"error": "MCP 执行已失效，本次操作未执行"}
         if not acquired:
-            return {"error": "此 MCP 正忙，本次操作未执行，请稍后再试"}
+            return {"error": "此 MCP 正忙，本次操作未执行，请稍后再试", "code": "MCP_BUSY"}
+        if maintenance and call.deadline - time.monotonic() < 25:
+            return {"error": "MCP 刷新准备耗时过长，稍后重试", "code": "MCP_BUSY"}
         if payload["operation"] == "mcp_call" and (
             authorize is None or not authorize({"authorization": payload["authorization"], "action": "validate"})
         ):
@@ -375,12 +381,19 @@ def invoke(key, container, payload, state, *, authorize=None):
             worker = WORKERS.get(identity)
         if worker and (
             worker.version != state["version"] or worker.process.poll() is not None
+            or payload["operation"] == "mcp_test"
         ):
+            # Discovery now owns this plugin's call lock. Reconnect only after
+            # the preceding call has settled; never cancel it to refresh metadata.
             with GUARD:
                 WORKERS.pop(identity, None)
             retire(worker, key, name, call.binding)
             worker = None
         if worker is None:
+            # Closing a previous worker may also consume the remaining budget.
+            # Do not start a shortened discovery and invalidate a healthy cache.
+            if maintenance and call.deadline - time.monotonic() < 25:
+                return {"error": "MCP 刷新准备耗时过长，稍后重试", "code": "MCP_BUSY"}
             with GUARD:
                 if len(WORKERS) + len(STARTING) + len(CLOSING) >= 64:
                     return {"error": "MCP 连接容量暂满，本次操作未执行", "code": "MCP_BUSY"}
