@@ -8,6 +8,7 @@ import { Context } from '@deepseek-ai/cordis'
 import SessionReferences from '@deepseek-ai/dsh-session-reference'
 import { goalFailureReason } from '../src/run-failure.js'
 import { resourceTextHash } from '../src/resource-mentions.js'
+import { HumanInputBridge } from '../src/human-input.js'
 
 function referenceResolver(test, candidates) {
   test.service.sessionQuery = { listSessions: vi.fn(async () => candidates),
@@ -869,6 +870,10 @@ describe('followup and control service', () => {
     const accepted = await service.supplement(owner, run.id, body)
     const repeated = await service.supplement(owner, run.id, body)
     expect(repeated.id).toBe(accepted.id)
+    await expect(service.supplement(owner, run.id, { ...body,
+      answers: [{ id: 'q', selected: [], custom: 'different answer' }],
+    })).rejects.toMatchObject({ status: 409 })
+    expect(accepted.input_supplement).toEqual([{ question: 'Question', answer: 'answer' }])
     expect(sessionController.prompt).toHaveBeenCalledTimes(2)
     expect(sessionController.prompt.mock.calls[0][0].requestId).toBe(sessionController.prompt.mock.calls[1][0].requestId)
     expect(service.getRun(owner, run.id).human_input_history).toMatchObject([
@@ -878,6 +883,69 @@ describe('followup and control service', () => {
     await expect(service.supplement(owner, run.id, { ...body, request_id: undefined })).rejects.toMatchObject({ status: 404 })
     await expect(service.supplement(owner, run.id, { ...body, request_id: null })).rejects.toMatchObject({ status: 404 })
   })
+  it('preserves all answered question labels in live, reloaded and legacy supplement history', async () => {
+    const { database, owner, chat, service } = setup()
+    const { run } = database.createRun({ ownerId: owner.ownerId, chatId: chat.id, sessionId: chat.sessionId, query: '任务', selection: {} })
+    const questions = [{ id: 'format', question: '文件格式', options: [{ label: 'Word' }] },
+      { id: 'focus', question: '报告重点', multiSelect: true, options: [{ label: '证据' }, { label: '时间线' }] },
+      { id: 'empty', question: '未补答' }]
+    database.createPendingInput(owner.ownerId, run.id, { requestId: 'late', payload: { tool_name: 'ask_user_question', questions }, deadlineAt: null })
+    database.settlePendingInput(owner.ownerId, run.id, 'late', 'timeout')
+    const accepted = await service.supplement(owner, run.id, { request_id: 'late', answers: [
+      { id: 'format', selected: ['Word'] }, { id: 'focus', selected: ['证据', '时间线'], custom: '简洁' }, { id: 'empty', selected: [] },
+    ] })
+    const expected = [{ question: '文件格式', answer: 'Word' }, { question: '报告重点', answer: '证据；时间线；简洁' }]
+    expect(accepted.input_supplement).toEqual(expected)
+    database.appendEvent(owner.ownerId, run.id, { event: 'workbench_steering', steering_id: accepted.id, query: accepted.query })
+    expect(service.getRun(owner, run.id).steering_messages[0].input_supplement).toEqual(expected)
+    const saved = database.getRun(owner.ownerId, accepted.id)
+    const { input_supplement, ...selection } = saved.selection
+    database.updateRunResources(saved, selection, [])
+    expect(service.getRun(owner, accepted.id).input_supplement).toEqual(expected)
+    expect(service.getRun(owner, run.id).steering_messages[0].input_supplement).toEqual(expected)
+  })
+
+  it('deduplicates reordered supplements both after failed dispatch and after acceptance', async () => {
+    const { database, owner, chat, service, sessionController } = setup()
+    const { run } = database.createRun({ ownerId: owner.ownerId, chatId: chat.id, sessionId: chat.sessionId, query: 'q', selection: {} })
+    const questions = [{ id: 'a', question: 'A', multiSelect: true, options: [{ label: 'one' }, { label: 'two' }] }, { id: 'b', question: 'B' }]
+    database.createPendingInput(owner.ownerId, run.id, { requestId: 'order', payload: { tool_name: 'ask_user_question', questions } })
+    database.settlePendingInput(owner.ownerId, run.id, 'order', 'skipped')
+    database.transitionRun(owner.ownerId, run.id, 'completed')
+    const answers = [{ id: 'a', selected: ['two', 'one'] }, { id: 'b', selected: [], custom: 'text' }]
+    sessionController.prompt.mockRejectedValueOnce(new Error('dispatch unavailable'))
+    await expect(service.supplement(owner, run.id, { request_id: 'order', answers })).rejects.toThrow('dispatch unavailable')
+    const reversed = [answers[1], { id: 'a', selected: ['one', 'two'] }]
+    const accepted = await service.supplement(owner, run.id, { request_id: 'order', answers: reversed })
+    expect((await service.supplement(owner, run.id, { request_id: 'order', answers })).id).toBe(accepted.id)
+    expect(sessionController.prompt).toHaveBeenCalledTimes(2)
+  })
+
+  it('unblocks every pending native question before steering a historical supplement', async () => {
+    const test = setup()
+    const { database, owner, chat, service } = test
+    const { run: source } = database.createRun({ ownerId: owner.ownerId, chatId: chat.id, sessionId: chat.sessionId, query: '原任务', selection: {} })
+    database.createPendingInput(owner.ownerId, source.id, { requestId: 'old', payload: { tool_name: 'ask_user_question', questions: [{ id: 'old', question: '旧问题' }] } })
+    database.settlePendingInput(owner.ownerId, source.id, 'old', 'timeout')
+    database.transitionRun(owner.ownerId, source.id, 'completed')
+    const { run } = database.createRun({ ownerId: owner.ownerId, chatId: chat.id, sessionId: chat.sessionId, query: '后续任务', selection: {} })
+    activateNative(test, run.id)
+    const bridge = new HumanInputBridge({ database })
+    service.humanInput = bridge
+    service.scheduler = { enqueue: vi.fn(async () => {}) }
+    const pending = ['a', 'b'].map(id => bridge.handleRequest({ agent: { session: { id: chat.sessionId } }, questions: [{ id, question: id }] }, vi.fn()))
+    try {
+      await service.supplement(owner, source.id, { request_id: 'old', answers: [{ id: 'old', selected: [], custom: '补答' }] })
+      expect(database.listPendingInputs(owner.ownerId, run.id).map(input => input.status)).toEqual(['skipped', 'skipped'])
+      expect(await Promise.all(pending)).toEqual(['a', 'b'].map(id => ({ answers: [{ id, selected: [] }] })))
+      expect(service.scheduler.enqueue).toHaveBeenCalledOnce()
+    } finally {
+      for (const input of database.listPendingInputs(owner.ownerId, run.id))
+        if (input.status === 'pending') bridge.skip(owner.ownerId, run.id, input.requestId)
+      await Promise.all(pending)
+    }
+  })
+
   it.each(['running', 'completed'])('admits a historical answer through native prompt when the task is %s', async (status) => {
     const test = setup()
     const { database, owner, chat, service, sessionController, agent } = test
@@ -895,6 +963,7 @@ describe('followup and control service', () => {
     expect(content[0].text).toContain('Word')
     expect(accepted.selection.prompt_mode).toBe('steer')
     expect(result.status).toBe('queued')
+    expect(result.input_supplement).toEqual([{ question: '交付格式？', answer: 'Word' }])
     await service.supplement(owner, run.id, body)
     expect(enqueue).toHaveBeenCalledTimes(1)
     if (status === 'running') expect(agent.steer).not.toHaveBeenCalled()
@@ -937,14 +1006,15 @@ describe('followup and control service', () => {
   it('aggregates personal skills and MCP while keeping global skills readonly', async () => {
     const { service, fileManager, skills } = setup()
     fileManager.personalResources.mockResolvedValueOnce({
-      memory: { content: 'm', version: 'v' }, warnings: [],
-      skills: [{ id: 'demo', content: '---\nname: demo\ndescription: Demo skill\n---\nBody', enabled: true, pinned: false, path: '/workspace/skills/demo', version: 's1' }],
+      memory: { content: 'm', version: 'v' }, warnings: [], order_version: 'skill-order',
+      skills: [{ id: 'demo', content: '---\nname: demo\ndescription: Demo skill\n---\nBody', enabled: true, path: '/workspace/skills/demo', version: 's1' }],
     })
-    fileManager.personalMcp.mockResolvedValueOnce({ mcp: [{ id: 'server', status: 'ready' }], warnings: [] })
+    fileManager.personalMcp.mockResolvedValueOnce({ mcp: [{ id: 'server', status: 'ready' }], warnings: [], order_version: 'mcp-order' })
     skills.list.mockResolvedValueOnce([{ name: 'global', description: 'Global', path: '/global/SKILL.md', source: 'custom', provider: 'gxzs' }])
     await expect(service.resources()).resolves.toMatchObject({
       skills: [{ id: 'demo', name: 'demo', description: 'Demo skill', scope: 'personal', readonly: false }],
       mcp: [{ id: 'server', status: 'ready' }],
+      skill_order_version: 'skill-order', mcp_order_version: 'mcp-order',
       global: { skills: [{ id: 'global', scope: 'global', readonly: true }] },
     })
   })
@@ -967,9 +1037,9 @@ describe('followup and control service', () => {
   it('forwards validated resource mutations to fixed manager actions', async () => {
     const { service, fileManager } = setup()
     await service.mutateResource({ operation: 'skill_toggle', name: 'demo', enabled: false })
-    await service.mutateResource({ operation: 'mcp_pin', name: 'server', pinned: true })
+    await service.mutateResource({ operation: 'mcp_reorder', order: ['server'], order_version: null })
     expect(fileManager.personalResources).toHaveBeenCalledWith({ operation: 'skill_toggle', name: 'demo', enabled: false })
-    expect(fileManager.personalMcp).toHaveBeenCalledWith({ operation: 'mcp_pin', name: 'server', pinned: true })
+    expect(fileManager.personalMcp).toHaveBeenCalledWith({ operation: 'mcp_reorder', order: ['server'], order_version: null })
     fileManager.personalResources
       .mockResolvedValueOnce({ content: '---\nname: demo\ndescription: Demo\n---\nBody' })
       .mockResolvedValueOnce({ skills: [{ id: 'demo', version: 'v1' }] })
@@ -1860,6 +1930,22 @@ describe('submission cancellation', () => {
 
 
 describe('forked conversations', () => {
+  it('keeps historical tool names across paged forks without inheriting pending execution', async () => {
+    const { service, owner, database, second, sessionController } = history()
+    database.startToolCall(owner.ownerId, second.id, 'split-call', 'ask_user_question')
+    const child = await service.fork(owner, second.id, { request_key: 'tool-page' })
+    const childSession = database.getChat(owner.ownerId, child.id).sessionId
+    const records = [{ type: 'event', event: { seq: 18, type: 'tool/result', data: { turn: 2,
+      message: { source: { callId: 'split-call' }, content: [{ type: 'tool-result', content: [{ type: 'text', text: '{"answers":[]}' }] }] },
+    } } }]
+    sessionController.page = vi.fn(async () => ({ records, hasMore: false }))
+    const page = await service.historyPage(owner, child.id, { sessionId: childSession, throughSeq: 19, beforeSeq: 19 }, new AbortController().signal)
+    expect(page.runs[0].events[0].data.tool_name).toBe('ask_user_question')
+    expect(database.db.prepare('SELECT status FROM tool_calls WHERE run_id=? AND call_id=?')
+      .get(child.runs[1].id, 'split-call').status).toBe('finished')
+    expect(database.db.prepare('SELECT status FROM tool_calls WHERE run_id=? AND call_id=?')
+      .get(second.id, 'split-call').status).toBe('started')
+  })
   function history() {
     const context = setup()
     const { database, owner, chat } = context
@@ -1953,13 +2039,223 @@ describe('forked conversations', () => {
     expect(service.getChat(owner, child.id).file_directory).toBe(`conversations/${chat.id}`)
   })
 
+  it.each(['conversations/2026-10-18/original', 'conversations/案件材料'])('keeps %s for every fork and its following prompt', async directory => {
+    const { service, owner, chat, database, agents, second, sessionController } = history()
+    database.updateChat(owner.ownerId, chat.id, { directory })
+    const cwd = `/workspace/${directory}`
+    service.sessionQuery = { observeSession: vi.fn(async () => ({ header: { cwd }, [Symbol.dispose]() {} })) }
+    sessionController.fork.mockResolvedValueOnce({ sessionId: 'fork-a' }).mockResolvedValueOnce({ sessionId: 'fork-b' })
+    const first = await service.fork(owner, second.id, { request_key: 'first' })
+    const next = await service.fork(owner, first.runs[1].id, { request_key: 'next' })
+    expect(first.file_directory).toBe(directory)
+    expect(next.file_directory).toBe(directory)
+    agents.get.mockReturnValue({ session: { header: { cwd } } })
+    await service.submitRun(owner, next.id, { query: '继续处理同一目录' })
+    expect(sessionController.prompt).toHaveBeenLastCalledWith(expect.objectContaining({ sessionId: 'fork-b' }), expect.any(AbortSignal))
+    expect(service.fileManager.operate).toHaveBeenCalledWith({ operation: 'list', path: directory })
+    expect(service.requireChat(owner, next.id).directory).toBe(directory)
+  })
+
+  it('hides cached change announcements in existing fork history without losing files or new comparisons', async () => {
+    const { service, owner, database, second, sessionController } = history()
+    database.appendEvent(owner.ownerId, second.id, { event: 'workbench_changes', turn: 2, source_seq: 18 })
+    database.appendEvent(owner.ownerId, second.id, { event: 'workbench_presented', files: [{ path: 'report.md' }] })
+    sessionController.fork.mockResolvedValueOnce({ sessionId: 'fork-a' }).mockResolvedValueOnce({ sessionId: 'fork-b' })
+    const first = await service.fork(owner, second.id, { request_key: 'first' })
+    const next = await service.fork(owner, first.runs[1].id, { request_key: 'next' })
+    for (const inherited of [first.runs[1], next.runs[1]]) {
+      // Exercise old durable rows as well as newly forked conversations.
+      expect(database.allEvents(owner.ownerId, inherited.id).some(event => event.event === 'workbench_changes')).toBe(true)
+      const events = service.getRun(owner, inherited.id, true).events
+      expect(events.some(event => event.event === 'workbench_changes')).toBe(false)
+      expect(events.some(event => event.event === 'workbench_presented')).toBe(true)
+    }
+    expect(service.getRun(owner, second.id, true).events.some(event => event.event === 'workbench_changes')).toBe(true)
+    const own = await service.submitRun(owner, next.id, { query: '新的修改' })
+    database.appendEvent(owner.ownerId, own.id, { event: 'workbench_changes', turn: 3, source_seq: 30 })
+    expect(service.getRun(owner, own.id, true).events.some(event => event.event === 'workbench_changes')).toBe(true)
+  })
+
   it('can fork inherited answers again and keeps original event boundaries', async () => {
     const { service, owner, second, sessionController } = history()
     sessionController.fork.mockResolvedValueOnce({ sessionId: 'child-1' }).mockResolvedValueOnce({ sessionId: 'child-2' })
     const child = await service.fork(owner, second.id, { request_key: 'a' })
     const grandchild = await service.fork(owner, child.runs[0].id, { request_key: 'b' })
     expect(grandchild.runs.map(run => run.query)).toEqual(['first'])
-    expect(sessionController.fork).toHaveBeenLastCalledWith({ sessionId: 'session-1', atSeq: 9 })
+    expect(sessionController.fork).toHaveBeenLastCalledWith({ sessionId: 'child-1', atSeq: 9 })
+  })
+
+  it('reforks the current session after the original was deleted and the fork moved workspace', async () => {
+    const { service, owner, chat, database, second, sessionController } = history()
+    sessionController.fork.mockResolvedValueOnce({ sessionId: 'child-1' }).mockResolvedValueOnce({ sessionId: 'child-2' })
+    const first = await service.fork(owner, second.id, { request_key: 'a' })
+    database.deleteChat(owner.ownerId, chat.id)
+    database.updateChat(owner.ownerId, first.id, { directory: 'cases/moved' })
+    service.sessionQuery = { observeSession: vi.fn(async id => {
+      if (id !== 'child-1') throw new Error('original session unavailable')
+      return { header: { cwd: '/workspace/cases/moved' }, [Symbol.dispose]() {} }
+    }) }
+    const next = await service.fork(owner, first.runs[0].id, { request_key: 'b' })
+    expect(next.file_directory).toBe('cases/moved')
+    expect(next.runs.map(run => run.query)).toEqual(['first'])
+    expect(sessionController.fork).toHaveBeenLastCalledWith({ sessionId: 'child-1', atSeq: 9 })
+  })
+
+  it('remaps platform identities without rewriting literal message text or question answers', async () => {
+    const { service, owner, database, first, second } = history()
+    database.appendEvent(owner.ownerId, second.id, { event: 'message', answer: first.id })
+    database.appendEvent(owner.ownerId, second.id, { event: 'workbench_activity', data: {
+      workbench_run_id: second.id, kind: 'tool', input: { request_id: first.id }, output: first.id,
+    } })
+    database.createPendingInput(owner.ownerId, second.id, { requestId: 'literal-answer', payload: { tool_name: 'ask_user_question', questions: [{ id: 'q', question: first.id }] } })
+    database.settlePendingInput(owner.ownerId, second.id, 'literal-answer', 'submitted', { answers: [{ id: 'q', selected: [], custom: first.id }] })
+    database.transitionRun(owner.ownerId, second.id, 'completed')
+    const child = await service.fork(owner, second.id, { request_key: 'literal-ids' })
+    const copy = service.getRun(owner, child.runs[1].id, true)
+    expect(copy.events).toContainEqual(expect.objectContaining({ event: 'message', answer: first.id }))
+    expect(copy.events).toContainEqual(expect.objectContaining({ data: {
+      workbench_run_id: copy.id, kind: 'tool', input: { request_id: first.id }, output: first.id,
+    } }))
+    const [input] = database.listPendingInputs(owner.ownerId, copy.id)
+    expect(input.payload.questions[0].question).toBe(first.id)
+    expect(input.answer.answers[0].custom).toBe(first.id)
+  })
+
+  it('revalidates a source that resumed while waiting for the conversation lock', async () => {
+    const { service, owner, database, chat, second, sessionController } = history()
+    let release
+    const held = service.withChatMutation(chat.id, () => new Promise(resolve => { release = resolve }))
+    await vi.waitFor(() => expect(release).toBeTypeOf('function'))
+    const pending = service.fork(owner, second.id, { request_key: 'changed-source' })
+    database.transitionRun(owner.ownerId, second.id, 'running')
+    release()
+    await held
+    await expect(pending).rejects.toMatchObject({ status: 409 })
+    expect(sessionController.fork).not.toHaveBeenCalled()
+  })
+
+  it.each(['submitted', 'skipped', 'timeout', 'aborted'])('preserves settled %s question history when forking', async status => {
+    const { service, owner, database, second } = history()
+    const answer = status === 'submitted' ? { answers: [{ id: 'question', selected: ['yes'], custom: '保留这份答复' }] } : null
+    database.createPendingInput(owner.ownerId, second.id, { requestId: 'question-request', payload: { tool_name: 'ask_user_question', questions: [{ id: 'question', question: '继续吗' }] } })
+    database.settlePendingInput(owner.ownerId, second.id, 'question-request', status, answer)
+    database.transitionRun(owner.ownerId, second.id, 'completed')
+    const child = await service.fork(owner, second.id, { request_key: 'question' })
+    const copied = database.listPendingInputs(owner.ownerId, child.runs[1].id)
+    expect(copied).toHaveLength(1)
+    expect(copied[0]).toMatchObject({ status, answer })
+    expect(copied[0].requestId).not.toBe('question-request')
+  })
+
+  it('does not carry source turn execution flags into the fork conversation or its next prompt', async () => {
+    const { service, owner, database, second } = history()
+    const selected = { model: 'p/m', tools: [], skills: [], knowledge: [], model_parameters: {}, tool_parameters: {} }
+    database.updateRunResources(second, { ...selected, command: 'goal', is_continuation: true, native_notice: true,
+      native_source: 'schedule', schedule_titles: ['原定时任务'], prompt_mode: 'steer', silent_resume: true }, [])
+    const child = await service.fork(owner, second.id, { request_key: 'fresh-flags' })
+    expect(child.selection).toEqual(selected)
+    const own = await service.submitRun(owner, child.id, { query: '新的普通消息' })
+    expect(own.command).toBeUndefined()
+    expect(own.is_continuation).toBeUndefined()
+    expect(own.source).toBeUndefined()
+    expect(child.runs[1]).toMatchObject({ command: 'goal', is_continuation: true, source: { kind: 'schedule' } })
+  })
+
+  it.each([false, true])('retains a late question supplement only when its turn is inside the fork (included=%s)', async included => {
+    const { service, owner, database, first, second } = history()
+    database.createPendingInput(owner.ownerId, first.id, { requestId: 'question', payload: { tool_name: 'ask_user_question' } })
+    database.settlePendingInput(owner.ownerId, first.id, 'question', 'skipped', null)
+    database.transitionRun(owner.ownerId, first.id, 'completed')
+    database.recordInputSupplement(owner.ownerId, first.id, 'question', { supplement_run_id: second.id, answers: ['保留的补答'] })
+    const child = await service.fork(owner, included ? second.id : first.id, { request_key: 'supplement-cut' })
+    const [question] = database.listPendingInputs(owner.ownerId, child.runs[0].id)
+    expect(question.status).toBe(included ? 'submitted' : 'skipped')
+    expect(question.answer).toEqual(included ? { supplement_run_id: child.runs[1].id, answers: ['保留的补答'] } : null)
+    expect(database.getPendingInput(owner.ownerId, first.id).answer.supplement_run_id).toBe(second.id)
+  })
+
+  it('closes inherited unresolved question controls without changing the source', async () => {
+    const { service, owner, database, second } = history()
+    database.createPendingInput(owner.ownerId, second.id, { requestId: 'pending-question', payload: { tool_name: 'ask_user_question' } })
+    database.transitionRun(owner.ownerId, second.id, 'interrupted')
+    const child = await service.fork(owner, second.id, { request_key: 'pending-cut' })
+    expect(database.getPendingInput(owner.ownerId, child.runs[1].id)).toMatchObject({ status: 'skipped', answer: null })
+    expect(database.getPendingInput(owner.ownerId, second.id).status).toBe('pending')
+  })
+
+  it('keeps intervening turns when a child reply points back to an earlier spawning run', async () => {
+    const { service, owner, database, chat, first } = history()
+    const { run: notice } = database.createRun({ ownerId: owner.ownerId, chatId: chat.id, sessionId: chat.sessionId,
+      query: '子智能体回复', selection: { model: 'p/m', native_notice: true, is_continuation: true }, parentRunId: first.id, now: 40000 })
+    database.bindRunMessage(chat.sessionId, notice.id, 4, 'notice-message')
+    database.setRunSourceSeq(owner.ownerId, notice.id, 'source_end_seq', 39)
+    database.transitionRun(owner.ownerId, notice.id, 'completed')
+    const child = await service.fork(owner, notice.id, { request_key: 'notice-prefix' })
+    expect(child.runs.map(run => run.query)).toEqual(['first', 'second', 'third', '子智能体回复'])
+    expect(child.runs[3].parent_run_id).toBe(child.runs[0].id)
+  })
+
+  it('preserves reply text and attachment paths without adopting the original child as a new task', async () => {
+    const { service, owner, database, chat, second } = history()
+    database.updateRunResources(second, { ...second.selection, subagent_ids: ['child-session'] }, [])
+    database.appendEvent(owner.ownerId, second.id, { event: 'workbench_agent_message', sender_session_id: 'child-session', sender_type: 'child', query: '原子智能体回复' })
+    const files = [{ name: '材料.pdf', path: `conversations/${chat.id}/材料.pdf` }]
+    database.db.prepare('UPDATE runs SET attachments_json=? WHERE id=?').run(JSON.stringify(files), second.id)
+    const child = await service.fork(owner, second.id, { request_key: 'child-reply' })
+    const inherited = service.getRun(owner, child.runs[1].id, true)
+    expect(inherited.attachments).toEqual(files)
+    expect(inherited.events).toContainEqual(expect.objectContaining({ event: 'workbench_agent_message', sender_session_id: 'child-session', query: '原子智能体回复' }))
+    expect(child.selection.subagent_ids).toBeUndefined()
+    const own = await service.submitRun(owner, child.id, { query: '新的工作' })
+    expect(database.getRun(owner.ownerId, own.id).selection.subagent_ids).toBeUndefined()
+  })
+
+  it('serializes duplicate fork requests into one native session', async () => {
+    const { service, owner, second, sessionController } = history()
+    const [first, retry] = await Promise.all([
+      service.fork(owner, second.id, { request_key: 'concurrent' }),
+      service.fork(owner, second.id, { request_key: 'concurrent' }),
+    ])
+    expect(first.id).toBe(retry.id)
+    expect(sessionController.fork).toHaveBeenCalledOnce()
+  })
+
+  it('leaves the source and database intact when native fork rejects the selected cut', async () => {
+    const { service, owner, database, chat, second, sessionController } = history()
+    const original = service.getChat(owner, chat.id)
+    sessionController.fork.mockRejectedValueOnce(new Error('source unavailable'))
+    await expect(service.fork(owner, second.id, { request_key: 'failed' })).rejects.toThrow('source unavailable')
+    expect(database.listChats(owner.ownerId)).toHaveLength(1)
+    expect(service.getChat(owner, chat.id)).toEqual(original)
+    expect(sessionController.rename).not.toHaveBeenCalled()
+    expect((await service.fork(owner, second.id, { request_key: 'failed' })).runs).toHaveLength(2)
+  })
+
+  it.each(['rename', 'database'])('reuses the native child when %s fails after creation', async stage => {
+    const { service, owner, database, second, sessionController } = history()
+    if (stage === 'rename') sessionController.rename.mockRejectedValueOnce(new Error('temporary failure'))
+    else vi.spyOn(database, 'importChat').mockImplementationOnce(() => { throw new Error('temporary failure') })
+    await expect(service.fork(owner, second.id, { request_key: 'recover' })).rejects.toThrow('temporary failure')
+    const child = await service.fork(owner, second.id, { request_key: 'recover' })
+    expect(child.runs).toHaveLength(2)
+    expect(database.listChats(owner.ownerId)).toHaveLength(2)
+    expect(sessionController.fork).toHaveBeenCalledOnce()
+  })
+
+  it('does not combine a prepared native cut with a later version of the source answer', async () => {
+    const { service, owner, database, second, sessionController } = history()
+    sessionController.rename.mockRejectedValueOnce(new Error('rename failed'))
+    await expect(service.fork(owner, second.id, { request_key: 'old-cut' })).rejects.toThrow('rename failed')
+    database.setRunSourceSeq(owner.ownerId, second.id, 'source_end_seq', 29)
+    await expect(service.fork(owner, second.id, { request_key: 'old-cut' })).rejects.toMatchObject({ status: 409 })
+    expect(sessionController.fork).toHaveBeenCalledOnce()
+  })
+
+  it('rejects a source directory outside the owner workspace before native creation', async () => {
+    const { service, owner, second, sessionController } = history()
+    service.sessionQuery = { observeSession: vi.fn(async () => ({ header: { cwd: '/another-owner' }, [Symbol.dispose]() {} })) }
+    await expect(service.fork(owner, second.id, { request_key: 'outside' })).rejects.toMatchObject({ status: 403 })
+    expect(sessionController.fork).not.toHaveBeenCalled()
   })
 
   it('rejects other owners, unfinished answers and deleted chats', async () => {

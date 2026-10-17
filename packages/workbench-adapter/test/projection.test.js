@@ -23,6 +23,16 @@ function bind(database, chat, run, turn = 1) {
 }
 
 describe('DSH session event projection', () => {
+  it.each([false, true])('replays file announcements without advertising unavailable fork comparisons (inherited=%s)', inherited => {
+    const { database, chat, run } = setup()
+    if (inherited) database.updateRunResources(run, { fork_source: { sessionId: 'original', endSeq: 19 } }, [])
+    bind(database, chat, run)
+    const change = { type: 'workspace/changes', seq: 15, data: { turn: 1 } }
+    expect(() => projectSessionEvent(database, chat.sessionId, change)).not.toThrow()
+    expect(database.allEvents(chat.ownerId, run.id).filter(event => event.event === 'workbench_changes')).toHaveLength(inherited ? 0 : 1)
+    projectSessionEvent(database, chat.sessionId, { type: 'deliverables/presented', seq: 16, data: { turn: 1, files: [{ path: 'report.md' }] } })
+    expect(database.allEvents(chat.ownerId, run.id)).toContainEqual(expect.objectContaining({ event: 'workbench_presented' }))
+  })
   it('carries goal tag positions through native control events and drops stale positions after an objective edit', () => {
     const { database, chat, run } = setup()
     const mentions = [{ kind: 'skills', id: 'official-docx', name: '公文排版', offset: 2 }]

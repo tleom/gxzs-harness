@@ -122,7 +122,7 @@ def test_owner_network_names_are_deterministic_and_separate(server, monkeypatch)
 @pytest.mark.parametrize('operation,maintenance,tracked', [
     ('mcp_list', True, False), ('mcp_list', False, False), ('mcp_test', True, False),
     ('mcp_test', False, True), ('mcp_read', False, True), ('mcp_call', False, True),
-    ('mcp_save', False, True), ('mcp_delete', False, True), ('mcp_toggle', False, True), ('mcp_pin', False, True),
+    ('mcp_save', False, True), ('mcp_delete', False, True), ('mcp_toggle', False, True), ('mcp_reorder', False, True),
 ])
 def test_mcp_maintenance_does_not_refresh_user_activity(server, monkeypatch, operation, maintenance, tracked):
     import mcp_runtime

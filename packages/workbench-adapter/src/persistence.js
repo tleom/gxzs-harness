@@ -291,11 +291,14 @@ export class WorkbenchDatabase {
       const queueOrder = this.db.prepare(`SELECT COALESCE(MAX(queue_order), 0) + 1 AS value
         FROM runs WHERE chat_id = ? AND status IN ('queued', 'running', 'waiting_input', 'stopping')`)
         .get(chatId).value
+      // Only forkChat's copied historical rows carry this marker. New Goal,
+      // child and ordinary turns must expose their own native file changes.
+      const { fork_source: _forkSource, ...currentSelection } = selection
       this.db.prepare(`INSERT INTO runs
         (id, owner_id, chat_id, session_id, request_key, query, attachments_json, mcp_tools_json, status, selection_json,
          parent_run_id, queue_order, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?)`)
-        .run(id, ownerId, chatId, sessionId, requestKey ?? null, query, JSON.stringify(attachments), JSON.stringify(mcpTools), JSON.stringify(selection), parentRunId ?? null, queueOrder, now, now)
+        .run(id, ownerId, chatId, sessionId, requestKey ?? null, query, JSON.stringify(attachments), JSON.stringify(mcpTools), JSON.stringify(currentSelection), parentRunId ?? null, queueOrder, now, now)
       this.db.prepare('UPDATE chats SET updated_at = ? WHERE id = ?').run(now, chatId)
       return { run: this.getRun(ownerId, id), created: true }
     })
@@ -526,7 +529,7 @@ export class WorkbenchDatabase {
     const row = this.db.prepare(`SELECT p.* FROM pending_inputs p
       JOIN runs r ON r.id = p.run_id WHERE p.run_id = ? AND r.owner_id = ?
         AND (? IS NULL OR p.request_id = ?)
-      ORDER BY p.created_at DESC, p.rowid DESC LIMIT 1`).get(runId, ownerId, requestId, requestId)
+      ORDER BY (p.status = 'pending') DESC, p.created_at DESC, p.rowid DESC LIMIT 1`).get(runId, ownerId, requestId, requestId)
     return row ? decodePending(row) : null
   }
 
@@ -568,7 +571,8 @@ export class WorkbenchDatabase {
       this.db.prepare(`UPDATE pending_inputs SET status = ?, answer_json = ?, settled_at = ? WHERE request_id = ?`)
         .run(outcome, answer == null ? null : JSON.stringify(answer), now, requestId)
       if (resumeRun)
-        this.db.prepare(`UPDATE runs SET status = 'running', updated_at = ? WHERE id = ? AND status = 'waiting_input'`).run(now, runId)
+        this.db.prepare(`UPDATE runs SET status = 'running', updated_at = ? WHERE id = ? AND status = 'waiting_input'
+          AND NOT EXISTS (SELECT 1 FROM pending_inputs WHERE run_id = ? AND status = 'pending')`).run(now, runId, runId)
       return { pending: this.getPendingInput(ownerId, runId), changed: true }
     })()
   }

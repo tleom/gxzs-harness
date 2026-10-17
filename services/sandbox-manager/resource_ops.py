@@ -23,12 +23,13 @@ MAX_PACKAGE = 20 * 1024 * 1024
 MAX_SKILL_TEXT = 64 * 1024
 MAX_FILES = 200
 SETTINGS = ".settings.json"
-PINS = ".pins.json"
+ORDER = ".order.json"
+LEGACY_PINS = ".pins.json"
 
 RESOURCE_LAYOUT = {
-    "skills": ((".skills-settings.json", SETTINGS), (".skills-pins.json", PINS),
+    "skills": ((".skills-settings.json", SETTINGS), (".skills-pins.json", LEGACY_PINS),
                (".skill-backups", ".backups")),
-    "mcp": ((".mcp-settings.json", SETTINGS), (".mcp-pins.json", PINS),
+    "mcp": ((".mcp-settings.json", SETTINGS), (".mcp-pins.json", LEGACY_PINS),
             (".mcp-backups", ".backups"), (".mcp-cache", ".cache")),
 }
 
@@ -175,11 +176,73 @@ def resource_directory(rootfd, kind):
                     os.close(backups)
             os.fsync(fd)
             os.fsync(rootfd)
+        try:
+            migrate_order(fd)
+        except (ValueError, OSError):
+            # A broken presentation preference must not hide installed resources.
+            # Preserve the bytes; read_order reports the problem and rejects writes.
+            pass
         fcntl.flock(fd, fcntl.LOCK_UN)
         return fd
     except BaseException:
         os.close(fd)
         raise
+
+
+def resource_names(fd):
+    return sorted(name for name in os.listdir(fd) if not name.startswith(".")
+                  and stat.S_ISDIR(os.stat(name, dir_fd=fd, follow_symlinks=False).st_mode))
+
+
+def migrate_order(fd):
+    raw = read_file(fd, LEGACY_PINS)
+    if raw is None:
+        return
+    if read_file(fd, ORDER) is None:
+        pins = json.loads(raw)
+        if not isinstance(pins, dict) or any(not isinstance(value, bool) for value in pins.values()):
+            raise ValueError("旧资源置顶文件无效，请修复后重试")
+        names = sorted(resource_names(fd), key=lambda name: not pins.get(name, False))
+        atomic_write(fd, ORDER, json.dumps(dict(zip(names, range(len(names))))).encode())
+    # The new order is authoritative if migration was interrupted after writing it.
+    read_order(fd)
+    os.unlink(LEGACY_PINS, dir_fd=fd)
+    os.fsync(fd)
+
+
+def read_order(fd):
+    raw = read_file(fd, ORDER)
+    if raw is None and read_file(fd, LEGACY_PINS) is not None:
+        raise ValueError("旧资源排序尚未迁移，请检查 .pins.json")
+    values = json.loads(raw) if raw is not None else {}
+    if (not isinstance(values, dict) or any(type(value) is not int or value < 0 for value in values.values())
+            or len(set(values.values())) != len(values)):
+        raise ValueError("资源排序文件格式无效")
+    return values, version(raw) if raw is not None else None
+
+
+def order_items(items, order):
+    return sorted(items, key=lambda item: (order.get(item["id"], float("inf")), item["id"]))
+
+
+def reorder_resources(fd, payload):
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        order, revision = read_order(fd)
+        if "order_version" not in payload or payload["order_version"] != revision:
+            return {"conflict": True}
+        names = payload.get("order")
+        available = resource_names(fd)
+        if (not isinstance(names, list) or any(not isinstance(name, str) for name in names)
+                or len(set(names)) != len(names) or any(name not in available for name in names)):
+            raise ValueError("资源排序列表无效")
+        remaining = [item["id"] for item in order_items([{"id": name} for name in available], order) if item["id"] not in names]
+        names = names + remaining
+        raw = json.dumps(dict(zip(names, range(len(names))))).encode()
+        atomic_write(fd, ORDER, raw)
+        return {"order": names, "order_version": version(raw)}
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
 
 
 def write_package(fd, files, *, readonly=False):
@@ -211,7 +274,7 @@ def write_package(fd, files, *, readonly=False):
 
 def personal(payload, root="/workspace"):
     operation = payload["operation"]
-    if operation not in {"list", "skill_inspect", "skill_import", "skill_update", "skill_uninstall", "skill_toggle", "skill_pin"}:
+    if operation not in {"list", "skill_inspect", "skill_import", "skill_update", "skill_uninstall", "skill_toggle", "skill_reorder"}:
         raise ValueError("未知个人资源操作")
     rootfd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     skillsfd = None
@@ -226,6 +289,8 @@ def personal(payload, root="/workspace"):
             if operation != "list":
                 raise
             return {"skills": [], "warnings": ["skills 目录无法读取：" + str(error)]}
+        if operation == "skill_reorder":
+            return reorder_resources(skillsfd, payload)
         if operation in {"list", "skill_toggle"}:
             try:
                 raw_settings = read_file(skillsfd, SETTINGS)
@@ -244,14 +309,10 @@ def personal(payload, root="/workspace"):
                 settings = {}
                 warnings.append("技能开关文件无效，个人技能暂时停用")
         try:
-            pins = json.loads(read_file(skillsfd, PINS) or b"{}")
-            if not isinstance(pins, dict):
-                raise ValueError("置顶设置格式无效")
+            order, order_version = read_order(skillsfd)
         except (ValueError, OSError) as error:
-            if operation == "skill_pin":
-                raise
-            pins = {}
-            warnings.append("技能置顶设置无法读取：" + str(error))
+            order, order_version = {}, None
+            warnings.append("技能排序设置无法读取：" + str(error))
         try:
             if operation == "list":
                 skills = []
@@ -269,23 +330,14 @@ def personal(payload, root="/workspace"):
                         skills.append({
                             "id": name, "content": source.decode("utf-8-sig"),
                             "enabled": not invalid_settings and settings.get(name, True) is not False,
-                            "pinned": pins.get(name) is True,
                             "path": "/workspace/skills/" + name, "version": tree_version(fd),
                         })
                     except (ValueError, OSError) as error:
                         warnings.append("技能 " + name + " 未载入：" + str(error))
                     finally:
                         os.close(fd)
-                return {"skills": skills, "warnings": warnings}
+                return {"skills": order_items(skills, order), "order_version": order_version, "warnings": warnings}
             name = safe_name(payload["name"])
-            if operation == "skill_pin":
-                fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=skillsfd)
-                os.close(fd)
-                if not isinstance(payload.get("pinned"), bool):
-                    raise ValueError("技能置顶值无效")
-                pins[name] = payload["pinned"]
-                atomic_write(skillsfd, PINS, json.dumps(pins).encode())
-                return {"id": name, "pinned": pins[name]}
             if operation in {"skill_update", "skill_uninstall"}:
                 fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=skillsfd)
                 try:
@@ -303,10 +355,24 @@ def personal(payload, root="/workspace"):
                     backup_name = name + "-" + uuid.uuid4().hex
                     try:
                         if operation == "skill_uninstall":
+                            try:
+                                saved_order, _ = read_order(skillsfd)
+                            except (ValueError, OSError):
+                                saved_order = {}
+                            previous_order = read_file(skillsfd, ORDER) if name in saved_order else None
                             # Keep the complete package recoverable outside the active catalog.
                             os.rename(name, backup_name, src_dir_fd=skillsfd, dst_dir_fd=backups)
-                            os.fsync(skillsfd)
-                            os.fsync(backups)
+                            try:
+                                if name in saved_order:
+                                    saved_order.pop(name)
+                                    atomic_write(skillsfd, ORDER, json.dumps(saved_order).encode())
+                                os.fsync(skillsfd)
+                                os.fsync(backups)
+                            except BaseException:
+                                os.rename(backup_name, name, src_dir_fd=backups, dst_dir_fd=skillsfd)
+                                if previous_order is not None and read_file(skillsfd, ORDER) != previous_order:
+                                    atomic_write(skillsfd, ORDER, previous_order)
+                                raise
                             return {"id": name, "uninstalled": True}
                         backup = directory(backups, backup_name)
                         try:
@@ -330,7 +396,7 @@ def personal(payload, root="/workspace"):
                         try:
                             atomic_write(fd, "SKILL.md", text)
                             if renamed:
-                                for filename in (SETTINGS, PINS):
+                                for filename in (SETTINGS, ORDER):
                                     raw = read_file(skillsfd, filename)
                                     if raw is None:
                                         continue

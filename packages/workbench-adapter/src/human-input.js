@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto'
+import { isDeepStrictEqual } from 'node:util'
 
 export class HumanInputBridge {
   constructor({ database, timeoutSeconds = 60, executionRun, resumeInput }) {
@@ -30,7 +31,8 @@ export class HumanInputBridge {
     if (request.signal?.aborted) abort()
     try {
       const value = await answer
-      await this.resumeInput?.(run, request.signal ?? new AbortController().signal)
+      if (pending.resumeRun && !this.database.listPendingInputs(chat.ownerId, run.id).some(input => input.status === 'pending'))
+        await this.resumeInput?.(run, request.signal ?? new AbortController().signal)
       return value
     }
     finally { request.signal?.removeEventListener('abort', abort) }
@@ -38,13 +40,18 @@ export class HumanInputBridge {
 
   resume(ownerId, runId, body) {
     const resolved = this.resolve(ownerId, runId, body.request_id)
-    if (resolved.stored.status === 'submitted') return resolved.stored
+    if (resolved.stored.status === 'submitted') {
+      const answer = toAnswer(resolved.stored.payload.questions ?? [], body)
+      if (!isDeepStrictEqual(toAnswer(resolved.stored.payload.questions ?? [], resolved.stored.answer).answers, answer.answers))
+        throw Object.assign(new Error('该问题已提交不同的回答，请直接发送新消息补充'), { status: 409 })
+      return resolved.stored
+    }
     if (resolved.stored.status !== 'pending') throw Object.assign(new Error('该问题已关闭，请直接发送新消息'), { status: 409 })
     const pending = resolved.pending
     const answer = toAnswer(pending.questions, body)
     this.settle(pending, 'submitted', answer)
     pending.resolve(answer)
-    return this.database.getPendingInput(ownerId, runId)
+    return this.database.getPendingInput(ownerId, runId, body.request_id)
   }
 
   skip(ownerId, runId, requestId, reason = 'skipped') {
@@ -59,7 +66,7 @@ export class HumanInputBridge {
       // Do not disguise a system hint as the user's custom answer.
       pending.resolve({ answers: pending.questions.map((question) => ({ id: question.id, selected: [] })) })
     }
-    return this.database.getPendingInput(ownerId, runId)
+    return this.database.getPendingInput(ownerId, runId, requestId)
   }
 
   touch(ownerId, runId, requestId) {
@@ -67,7 +74,7 @@ export class HumanInputBridge {
     const pending = resolved.pending
     if (pending?.timer) { clearTimeout(pending.timer); pending.timer = undefined }
     this.database.touchPendingInput(ownerId, runId, requestId)
-    return this.database.getPendingInput(ownerId, runId)
+    return this.database.getPendingInput(ownerId, runId, requestId)
   }
 
   timeout(ownerId, runId, requestId) {
@@ -77,7 +84,7 @@ export class HumanInputBridge {
   }
 
   resolve(ownerId, runId, requestId) {
-    const stored = this.database.getPendingInput(ownerId, runId)
+    const stored = this.database.getPendingInput(ownerId, runId, requestId)
     if (!stored || stored.requestId !== requestId) throw Object.assign(new Error('问题不存在或已关闭'), { status: 404 })
     if (stored.status !== 'pending') return { stored, pending: undefined }
     const pending = this.pendings.get(requestId)
@@ -92,7 +99,10 @@ export class HumanInputBridge {
     clearTimeout(pending.timer)
     this.pendings.delete(pending.id)
     this.database.settlePendingInput(pending.ownerId, pending.runId, pending.id, outcome, answer)
-    this.database.appendEvent(pending.ownerId, pending.runId, { event: 'workbench_status', status: 'running' })
+    pending.resumeRun = !this.database.listPendingInputs(pending.ownerId, pending.runId).some(input => input.status === 'pending')
+    this.database.appendEvent(pending.ownerId, pending.runId, {
+      event: 'workbench_status', status: this.database.getRun(pending.ownerId, pending.runId).status,
+    })
     return true
   }
 
@@ -131,7 +141,21 @@ export function toAnswer(questions, body) {
         (answer.custom !== undefined && typeof answer.custom !== 'string')) fail()
     if (question.intent?.kind === 'plan-review' && (answer.selected.length !== 1 || answer.custom)) fail()
   }
-  return { answers: answers.map(({ id, selected, custom }) => ({ id, selected: [...selected], ...(custom === undefined ? {} : { custom }) })) }
+  // Question IDs and selected labels are identities, not an ordering contract.
+  // Canonicalize both live answers and old receipts against the native form.
+  return { answers: questions.map(question => {
+    const { id, selected, custom } = answers.find(answer => answer.id === question.id)
+    const labels = [...new Set((question.options ?? []).map(option => option.label))]
+    return { id, selected: labels.filter(label => selected.includes(label)), ...(custom === undefined ? {} : { custom }) }
+  }) }
+}
+
+export function inputSupplement(questions, answers) {
+  return questions.flatMap(question => {
+    const value = answers.find(answer => answer.id === question.id)
+    const answer = [...(value?.selected ?? []), value?.custom].filter(Boolean).join('；').trim()
+    return answer ? [{ question: question.question, answer }] : []
+  })
 }
 
 function cancelledError(reason = 'skipped') {

@@ -143,7 +143,7 @@ def test_rename_keeps_assets_settings_and_cached_tools(ops, tmp_path):
     tools = [{"name": "lookup", "description": "lookup", "inputSchema": {"type": "object"}, "outputSchema": {"type": "object"}}]
     ops.personal_mcp({"operation": "mcp_cache", "name": "demo", "version": saved["version"], "tools": tools}, str(tmp_path))
     ops.personal_mcp({"operation": "mcp_toggle", "name": "demo", "enabled": False}, str(tmp_path))
-    ops.personal_mcp({"operation": "mcp_pin", "name": "demo", "pinned": True}, str(tmp_path))
+    ops.personal_mcp({"operation": "mcp_reorder", "order": ["demo"], "order_version": None}, str(tmp_path))
     (tmp_path / "mcp/demo/server.py").write_text("# local tool", encoding="utf-8")
     result = ops.personal_mcp({"operation": "mcp_save", "name": "demo", "new_name": "renamed",
                                "version": saved["version"], "content": config(name="renamed")}, str(tmp_path))
@@ -152,7 +152,7 @@ def test_rename_keeps_assets_settings_and_cached_tools(ops, tmp_path):
     assert (tmp_path / "mcp/renamed/server.py").read_text() == "# local tool"
     item = ops.personal_mcp({"operation": "mcp_list"}, str(tmp_path))["mcp"][0]
     assert item["id"] == item["call_name"] == "renamed"
-    assert item["enabled"] is False and item["pinned"] is True
+    assert item["enabled"] is False
     assert item["tools"] == tools and item["status"] == "ready"
     assert not (tmp_path / "mcp/.cache/demo.json").exists()
     assert (tmp_path / "mcp/.cache/renamed.json").exists()
@@ -188,7 +188,7 @@ def test_rename_conflict_and_missing_source_do_not_replace_anything(ops, tmp_pat
     assert (tmp_path / "mcp/demo/mcp.json").read_text() == config()
 
 
-@pytest.mark.parametrize("failure", ["mcp.json", ".pins.json", "renamed.json"])
+@pytest.mark.parametrize("failure", ["mcp.json", ".order.json", "renamed.json"])
 @pytest.mark.parametrize("transport", ["streamable-http", "stdio"])
 def test_rename_rolls_back_config_settings_and_cache_on_save_failure(ops, tmp_path, monkeypatch, failure, transport):
     content = config() if transport == "streamable-http" else json.dumps({
@@ -198,8 +198,8 @@ def test_rename_rolls_back_config_settings_and_cache_on_save_failure(ops, tmp_pa
     ops.personal_mcp({"operation": "mcp_cache", "name": "demo", "version": saved["version"],
                       "tools": [{"name": "lookup", "inputSchema": {"type": "object"}}]}, str(tmp_path))
     ops.personal_mcp({"operation": "mcp_toggle", "name": "demo", "enabled": False}, str(tmp_path))
-    ops.personal_mcp({"operation": "mcp_pin", "name": "demo", "pinned": True}, str(tmp_path))
-    paths = ["demo/mcp.json", ".settings.json", ".pins.json", ".cache/demo.json"]
+    ops.personal_mcp({"operation": "mcp_reorder", "order": ["demo"], "order_version": None}, str(tmp_path))
+    paths = ["demo/mcp.json", ".settings.json", ".order.json", ".cache/demo.json"]
     previous = {path: (tmp_path / "mcp" / path).read_bytes() for path in paths}
     original_write = ops.atomic_write
     injected = False

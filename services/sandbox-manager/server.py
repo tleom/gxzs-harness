@@ -411,7 +411,7 @@ def operation(key, action, payload):
     if action == "personal-mcp":
         from mcp_runtime import invalidate, invoke, module_source
 
-        allowed = {"mcp_list", "mcp_read", "mcp_save", "mcp_delete", "mcp_toggle", "mcp_pin", "mcp_test", "mcp_call"}
+        allowed = {"mcp_list", "mcp_read", "mcp_save", "mcp_delete", "mcp_toggle", "mcp_reorder", "mcp_test", "mcp_call"}
         if payload.get("operation") not in allowed:
             raise ValueError("Unsupported MCP operation")
         tracked = payload['operation'] != 'mcp_list' and payload.get('maintenance') is not True

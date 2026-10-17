@@ -165,8 +165,10 @@ function projectEvent(database, sessionId, event, expectedOwnerId, context) {
         ...(event.data?.reason?.error?.code ? { error_code: event.data.reason.error.code } : {}) }))
     }
     case 'deliverables/presented':
-    case 'workspace/changes':
-      return append(nativePresentation(run, event)[0])
+    case 'workspace/changes': {
+      const payload = nativePresentation(run, event)[0]
+      return payload && append(payload)
+    }
     case 'tool/call':
       database.startToolCall(chat.ownerId, run.id, String(event.data?.callId ?? ''), String(event.data?.name ?? ''))
       return append(nativePresentation(run, event)[0])

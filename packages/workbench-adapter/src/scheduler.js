@@ -246,7 +246,11 @@ export class TaskScheduler {
 
   async resumeInput(run, signal) {
     // Serialize against a waiting-input release already in flight.
-    const admitted = await this.withSubmissionMutation(`input:${run.sessionId}`, () => this.admitRun(run, signal, () => true))
+    const admitted = await this.withSubmissionMutation(`input:${run.sessionId}`, () => {
+      // Another native question may arrive while this answer waits for the lock.
+      if (this.database.listPendingInputs(this.ownerId, run.id).some(input => input.status === 'pending')) return true
+      return this.admitRun(run, signal, () => true)
+    })
     if (admitted !== true) throw Object.assign(new Error('Question continuation cancelled'), { name: 'AbortError' })
   }
 

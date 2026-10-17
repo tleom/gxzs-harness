@@ -56,10 +56,10 @@ def test_skill_catalog_preserves_legacy_flags_versions_and_backups(layout_module
     assert len(listed["skills"]) == 1
     assert listed["skills"][0]["id"] == "report"
     assert listed["skills"][0]["enabled"] is False
-    assert listed["skills"][0]["pinned"] is True
     assert listed["skills"][0]["version"] == original["version"]
     assert (tmp_path / "skills/.settings.json").read_bytes() == b'{"report":false}'
-    assert (tmp_path / "skills/.pins.json").read_bytes() == b'{"report":true}'
+    assert json.loads((tmp_path / "skills/.order.json").read_bytes()) == {"report": 0}
+    assert not (tmp_path / "skills/.pins.json").exists()
     assert (tmp_path / "skills/.backups/old-package/SKILL.md").read_bytes() == b"# Recoverable"
     assert not any((tmp_path / old).exists() for old in
                    (".skills-settings.json", ".skills-pins.json", ".skill-backups"))
@@ -83,7 +83,7 @@ def test_mcp_catalog_preserves_legacy_cache_and_config_revision(layout_modules, 
     assert listed["warnings"] == []
     assert len(listed["mcp"]) == 1
     item = listed["mcp"][0]
-    assert item["id"] == "demo" and item["enabled"] is False and item["pinned"] is True
+    assert item["id"] == "demo" and item["enabled"] is False
     assert item["version"] == original["version"]
     assert item["status"] == "ready" and item["tools"] == tools
     assert (tmp_path / "mcp/demo/mcp.json").read_bytes() == content.encode()
@@ -94,9 +94,7 @@ def test_mcp_catalog_preserves_legacy_cache_and_config_revision(layout_modules, 
 
 @pytest.mark.parametrize("kind,old,current", [
     ("mcp", ".mcp-settings.json", ".settings.json"),
-    ("mcp", ".mcp-pins.json", ".pins.json"),
     ("skills", ".skills-settings.json", ".settings.json"),
-    ("skills", ".skills-pins.json", ".pins.json"),
 ])
 def test_both_locations_preserve_keys_active_values_and_original_bytes(layout_modules, tmp_path, kind, old, current):
     resources, _ = layout_modules
@@ -223,7 +221,7 @@ def test_live_mcp_connection_uses_relocated_state_and_keeps_working_directory(co
     (root / ".mcp-settings.json").write_bytes(b'{"demo":true}')
     (root / ".mcp-pins.json").write_bytes(b'{"demo":true}')
     item = ops.personal_mcp({"operation": "mcp_list"}, str(root))["mcp"][0]
-    assert item["status"] == "ready" and item["pinned"] is True
+    assert item["status"] == "ready"
     after = connection.call("add", {"value": 4})["result"]["structuredContent"]
     assert after["pid"] == before["pid"]
     assert after["value"] == 5 and after["calls"] == before["calls"] + 1

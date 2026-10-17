@@ -439,6 +439,21 @@ it('releases waiting-input capacity and reacquires before continuing without ano
   expect(sessions.prompt).toHaveBeenCalledTimes(1)
 })
 
+it('does not reacquire if another question arrived while the input admission lock was held', async () => {
+  const { db, scheduler, create, permit, platform } = setup()
+  const run = create('overlapping questions')
+  permit()
+  let unlock
+  const release = scheduler.withSubmissionMutation('input:s', () => new Promise(resolve => { unlock = resolve }))
+  await vi.waitFor(() => expect(unlock).toBeTypeOf('function'))
+  const resume = scheduler.resumeInput(run, new AbortController().signal)
+  db.createPendingInput('t:1', run.id, { requestId: 'later', payload: { tool_name: 'ask_user_question', questions: [] } })
+  unlock()
+  await Promise.all([release, resume])
+  expect(platform.json).not.toHaveBeenCalled()
+  expect(scheduler.hasAdmission('s')).toBe(false)
+})
+
 it('renews the root ticket while an owned child runs during a parent question, then releases it when the child ends', async () => {
   const { db, scheduler, create, permit, platform } = setup()
   const run = create('parent question with an active child')
