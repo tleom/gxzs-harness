@@ -154,7 +154,7 @@ def test_stop_and_catalog_do_not_wait_for_business_call_and_queued_calls_reautho
 
 
 @pytest.mark.parametrize('maintenance', [True, False])
-def test_refresh_waits_for_inflight_call_without_cancelling_it(manager, monkeypatch, maintenance):
+def test_refresh_defers_or_waits_without_cancelling_inflight_call(manager, monkeypatch, maintenance):
     module, runtime, calls, entered = manager
     key, binding = str(uuid4()), str(uuid4())
     release = threading.Event()
@@ -172,19 +172,39 @@ def test_refresh_waits_for_inflight_call_without_cancelling_it(manager, monkeypa
         active = pool.submit(module.operation, key, "personal-mcp", payload(key, binding))
         assert entered.wait(2)
         worker = runtime.WORKERS[(key, "demo")]
-        refresh = pool.submit(module.operation, key, "personal-mcp", {
-            "operation": "mcp_test", "name": "demo", "version": "v1", "maintenance": maintenance})
+        request = {"operation": "mcp_test", "name": "demo", "version": "v1", "maintenance": maintenance}
+        refresh = pool.submit(module.operation, key, "personal-mcp", request)
         try:
-            deadline = time.monotonic() + 2
-            while len([call for call in runtime.ACTIVE if call.key == key]) < 2 and not refresh.done() and time.monotonic() < deadline:
-                time.sleep(.01)
-            assert not refresh.done() and not worker.closed.is_set()
+            if maintenance:
+                assert refresh.result(timeout=1)["code"] == "MCP_BUSY"
+            else:
+                deadline = time.monotonic() + 2
+                while len([call for call in runtime.ACTIVE if call.key == key]) < 2 and not refresh.done() and time.monotonic() < deadline:
+                    time.sleep(.01)
+                assert not refresh.done()
+            assert not worker.closed.is_set()
         finally:
             release.set()
         assert active.result()["result"]["value"] == "finished"
         refresh.result()
+        if maintenance:
+            assert module.operation(key, "personal-mcp", request)["result"]["value"] == "ok"
     assert worker.closed.is_set() and runtime.WORKERS[(key, "demo")] is not worker
     assert [call["operation"] for call in calls] == ["mcp_call", "mcp_test"]
+
+
+def test_background_refresh_defers_when_preflight_used_connection_budget(manager):
+    module, runtime, calls, _ = manager
+    key, binding = str(uuid4()), str(uuid4())
+    module.operation(key, "personal-mcp", payload(key, binding, tool="fast"))
+    worker = runtime.WORKERS[(key, "demo")]
+    result = module.operation(key, "personal-mcp", {
+        "operation": "mcp_test", "name": "demo", "version": "v1", "maintenance": True,
+        "deadline_ms": int(time.time() * 1000) + 1000,
+    })
+    assert result["code"] == "MCP_BUSY"
+    assert not worker.closed.is_set()
+    assert len(calls) == 1
 
 
 def test_refresh_failure_records_cache_failure_but_capacity_wait_does_not(manager, monkeypatch):

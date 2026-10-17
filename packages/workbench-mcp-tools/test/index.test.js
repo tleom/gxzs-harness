@@ -111,6 +111,26 @@ describe('platform MCP proxy tools', () => {
     expect(definitions.size).toBe(1)
     expect(ctx.workbenchRuntime.mcpCatalogState.status).toBe('degraded')
   })
+  it.each([false, true])('coalesces concurrent admissions while preserving resource-change refreshes (%s)', async changed => {
+    const { ctx, platform } = setup()
+    await apply(ctx)
+    const releases = []
+    platform.json.mockClear().mockImplementation(() => new Promise(resolve => releases.push(resolve)))
+    const admissions = Array.from({ length: 20 }, () => ctx.workbenchRuntime.refreshMcpCatalog())
+    expect(platform.json).toHaveBeenCalledOnce()
+    const refresh = ctx.on.mock.calls.find(([event]) => event === 'workbench/resources-changed')[1]
+    const update = changed ? refresh() : undefined
+    releases[0]({ tools: [catalogTool] })
+    if (changed) {
+      await vi.waitFor(() => expect(releases).toHaveLength(2))
+      admissions.push(...Array.from({ length: 20 }, () => ctx.workbenchRuntime.refreshMcpCatalog()))
+      releases[1]({ tools: [] })
+    }
+    const frozen = await Promise.all(admissions)
+    await update
+    expect(platform.json).toHaveBeenCalledTimes(changed ? 2 : 1)
+    expect(frozen.every(tools => tools.length === (changed ? 0 : 1))).toBe(true)
+  })
   it('keeps empty and unavailable plugin metadata owner-scoped and refreshes its revision', async () => {
     const { ctx, platform } = setup()
     const agent = { id: 's1', ctx: { tools: { restrict: () => () => {} } } }

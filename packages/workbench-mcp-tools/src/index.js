@@ -149,7 +149,9 @@ export async function apply(ctx, config = {}) {
   }
   const refresh = () => synchronize().catch((error) => ctx.logger.warn(`MCP catalog refresh failed (${error.code ?? error.status ?? 'invalid-catalog'})`))
   const refreshForAdmission = async () => {
-    await synchronize()
+    // Concurrent admissions share the current refresh. Only a resource-change
+    // event needs to request another pass while that refresh is in flight.
+    await (inFlight ?? synchronize())
     if (disposed || ctx.workbenchRuntime.mcpCatalogState?.status !== 'ready')
       throw Object.assign(new Error('MCP 工具目录暂不可用，请稍后重试'), { status: 503, code: 'MCP_CATALOG_UNAVAILABLE' })
     return [...registrations.values()].map(({ tool }) => {
