@@ -11,6 +11,19 @@ spec.loader.exec_module(module)
 EventJournal = module.EventJournal
 
 
+@pytest.mark.parametrize('change', ['missing', 'duplicate', 'different_owner', 'different_scenario'])
+def test_resume_rejects_partial_or_changed_submission_manifests(change):
+    prepared = [{'owner':'owner', 'chat':{'id':str(i)}, 'case':{'id':str(i),'rounds':40}} for i in range(3)]
+    tasks = [{'owner':r['owner'], 'chat':r['chat']['id'], 'case':dict(r['case'])} for r in prepared]
+    module.validate_resume(tasks, prepared)
+    if change == 'missing': tasks.pop()
+    elif change == 'duplicate': tasks[-1] = tasks[0]
+    elif change == 'different_owner': tasks[-1]['owner'] = 'another'
+    else: tasks[-1]['case']['rounds'] = 1
+    with pytest.raises(ValueError, match='Incomplete submission checkpoint'):
+        module.validate_resume(tasks, prepared)
+
+
 def test_requested_owner_count_cannot_silently_shrink():
     with pytest.raises(AssertionError, match='requested load'):
         module.select_owners({'one': {'owner':'one'}}, 30)

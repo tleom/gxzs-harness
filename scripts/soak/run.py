@@ -9,7 +9,7 @@ import subprocess
 import time
 import uuid
 from client import FixtureClient
-from evidence import EventJournal, missing_cases, select_owners
+from evidence import EventJournal, missing_cases, select_owners, validate_resume
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('action', choices=['fixtures', 'pilot', 'soak', 'resume'])
@@ -104,6 +104,7 @@ else:
     if args.action == 'resume':
         # Resume observation only: never create chats or resubmit a measured run.
         tasks = json.loads(manifest.read_text())
+        validate_resume(tasks, json.loads((root / ('prepared-' + args.case + '.json')).read_text()))
         bindings = client.bindings()
         assert tasks and all(task['owner'] in bindings for task in tasks)
         assert all(task['case']['id'].startswith(args.case + '_') for task in tasks)

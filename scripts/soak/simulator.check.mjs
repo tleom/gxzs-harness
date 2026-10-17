@@ -5,6 +5,16 @@ import path from 'node:path'
 import test from 'node:test'
 import { createSimulator, planStep, scenarioFrom } from './simulator.mjs'
 
+test('special scenarios cannot finish before their defining verification step', () => {
+  for (const [kind, minimum] of [['goal', 6], ['browser-recovery', 3]]) {
+    for (let rounds = 1; rounds < minimum; rounds++) {
+      assert.throws(() => scenarioFrom([{ role: 'user', content: `GXZS_SIM_CASE ${JSON.stringify({ id: 'short', kind, rounds })}` }]), /requires at least/)
+    }
+    const scenario = scenarioFrom([{ role: 'user', content: `GXZS_SIM_CASE ${JSON.stringify({ id: 'complete', kind, rounds: minimum })}` }])
+    assert.equal(scenario.rounds, minimum)
+  }
+})
+
 const token = 'synthetic-test-token-with-no-upstream-credentials'
 const tools = [{ type: 'function', function: { name: 'bash', parameters: { type: 'object' } } }]
 async function fixture(t) {

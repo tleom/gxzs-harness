@@ -713,7 +713,7 @@ def test_healthy_recovery_removes_only_verified_stopped_predecessor(tmp_path, mo
     docker.side_effect = with_predecessors
     host.healthy.return_value = True
     maintain(host)
-    assert [call.args for call in docker.call_args_list if call.args[0] == 'rm'] == [('rm', old_name)]
+    assert [call.args for call in docker.call_args_list if call.args[0] == 'rm'] == [('rm', 'c' * 64)]
 
 
 def test_slow_predecessor_cleanup_does_not_hold_admission_lock(tmp_path, monkeypatch):
@@ -1377,6 +1377,9 @@ def test_named_generation_cleanup_preserves_foreign_or_live_containers(tmp_path,
     host, docker, _, _, _ = setup(tmp_path, monkeypatch)
     name = 'gxzs-host-admin-previous-' + 'c' * 12
     item = dict(container_name='gxzs-host-admin', instance_id='logical-g2', generation=2, owner_id='t:1', workspace_id='workspace')
+    record = host.root / 'workspace' / 'host.json'
+    record.parent.mkdir()
+    record.write_text(json.dumps(dict(item, state='ready', ready=True)))
     def operate(*args, **kwargs):
         if args[0] == 'ps':
             return SimpleNamespace(returncode=0, stdout=name + '\n')
@@ -1388,7 +1391,7 @@ def test_named_generation_cleanup_preserves_foreign_or_live_containers(tmp_path,
         return SimpleNamespace(returncode=0, stdout='')
     docker.side_effect = operate
     host._cleanup_superseded(item)
-    assert any(call.args == ('rm', name) for call in docker.call_args_list) is removed
+    assert any(call.args == ('rm', 'c' * 64) for call in docker.call_args_list) is removed
 
 
 @pytest.mark.parametrize('workspace,running,identity,removed', [
@@ -1400,6 +1403,9 @@ def test_named_sandbox_cleanup_checks_workspace_and_container_identity(tmp_path,
     name = 'gxzs-sandbox-admin-previous-' + 'd' * 12
     item = dict(container_name='gxzs-host-admin', sandbox_name='gxzs-sandbox-admin', instance_id='logical-g2',
                 generation=2, owner_id='t:1', workspace_id='workspace')
+    record = host.root / 'workspace' / 'host.json'
+    record.parent.mkdir()
+    record.write_text(json.dumps(dict(item, state='ready', ready=True)))
     def operate(*args, **kwargs):
         if args[0] == 'ps':
             return SimpleNamespace(returncode=0, stdout=name + '\n')
@@ -1411,4 +1417,32 @@ def test_named_sandbox_cleanup_checks_workspace_and_container_identity(tmp_path,
         return SimpleNamespace(returncode=0, stdout='')
     docker.side_effect = operate
     host._cleanup_superseded(item)
-    assert any(call.args == ('rm', name) for call in docker.call_args_list) is removed
+    assert any(call.args == ('rm', 'd' * 64) for call in docker.call_args_list) is removed
+
+
+@pytest.mark.parametrize('transition', ['fencing', 'next_generation', 'profile_upgrade'])
+def test_predecessor_cleanup_revalidates_after_docker_inspection(tmp_path, monkeypatch, transition):
+    host, docker, _, _, _ = setup(tmp_path, monkeypatch)
+    item = dict(container_name='gxzs-host-admin', instance_id='logical-g2', generation=2,
+                owner_id='t:1', workspace_id='workspace', state='ready', ready=True)
+    record = host.root / 'workspace' / 'host.json'
+    record.parent.mkdir()
+    record.write_text(json.dumps(item))
+    name = 'gxzs-host-admin-previous-' + 'c' * 12
+    def operate(*args, **kwargs):
+        if args[0] == 'ps':
+            return SimpleNamespace(returncode=0, stdout=name + '\n')
+        if args[0] == 'inspect':
+            current = dict(item)
+            if transition == 'fencing': current.update(state='fencing', ready=False)
+            elif transition == 'next_generation': current.update(generation=3, instance_id='logical-g3')
+            else: current['profile_upgrade'] = {'phase':'draining'}
+            record.write_text(json.dumps(current))
+            return SimpleNamespace(returncode=0, stdout=json.dumps([{
+                'Id':'c' * 64, 'State':{'Running':False},
+                'Config':{'Labels':{'gxzs.owner':'t:1','gxzs.workspace':'workspace','gxzs.generation':'2'}},
+            }]))
+        raise AssertionError('Stale cleanup must not remove a rollback container')
+    docker.side_effect = operate
+    host._cleanup_superseded(item)
+    assert not any(call.args[0] == 'rm' for call in docker.call_args_list)

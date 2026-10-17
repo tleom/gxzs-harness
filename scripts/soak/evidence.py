@@ -9,6 +9,13 @@ def select_owners(bindings, count):
     return rows
 
 
+def validate_resume(tasks, prepared):
+    expected = {(row['owner'], row['chat']['id'], row['case']['id']): row['case'] for row in prepared}
+    actual = {(row['owner'], row['chat'], row['case']['id']): row['case'] for row in tasks}
+    if not tasks or len(expected) != len(prepared) or len(actual) != len(tasks) or actual != expected:
+        raise ValueError('Incomplete submission checkpoint; inspect accepted runs before recovery')
+
+
 def missing_cases(tasks, snapshot):
     cases = {case['id']: case for case in snapshot['cases']}
     required = {task['case']['id'] for task in tasks}

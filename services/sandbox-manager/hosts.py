@@ -45,6 +45,7 @@ class Hosts:
             raise RuntimeError('Unable to list superseded hosts')
         host_prefix = host_name(item) + '-previous-'
         sandbox_prefix = item.get('sandbox_name', '') + '-previous-'
+        predecessors = []
         for name in listed.stdout.splitlines()[:8]:
             sandbox = bool(item.get('sandbox_name')) and name.startswith(sandbox_prefix)
             prefix = sandbox_prefix if sandbox else host_prefix
@@ -63,9 +64,22 @@ class Hosts:
                         or not previous_generation.isdecimal()
                         or not 1 <= int(previous_generation) <= item['generation']))):
                 continue
-            removed = self.docker('rm', name, timeout=5, check=False)
-            if removed.returncode:
-                logging.getLogger(__name__).warning('Superseded runtime cleanup deferred workspace=%s', item['workspace_id'])
+            predecessors.append(previous['Id'])
+        if not predecessors:
+            return
+        # Listing and inspecting stay outside the admission lock. Recheck the
+        # ready generation immediately before one bounded removal operation;
+        # replacement cannot rename its rollback pair during this step. The
+        # inspected IDs cannot be reused by a concurrent Docker name change.
+        with self.lock(item['workspace_id']):
+            current = json.loads((self.root / item['workspace_id'] / 'host.json').read_text())
+            if (current.get('ready') is not True or current.get('state') != 'ready'
+                    or 'profile_upgrade' in current or any(current.get(field) != item.get(field) for field in
+                        ('owner_id', 'workspace_id', 'generation', 'instance_id', 'container_name', 'sandbox_name'))):
+                return
+            removed = self.docker('rm', *predecessors, timeout=5, check=False)
+        if removed.returncode:
+            logging.getLogger(__name__).warning('Superseded runtime cleanup deferred workspace=%s', item['workspace_id'])
 
     def ensure(self, workspace, payload):
         owner = payload['owner_id']

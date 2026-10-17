@@ -40,6 +40,8 @@ export function scenarioFrom(messages) {
   if (!['chain', 'mixed', 'schedule-delivery', 'goal', 'browser-recovery'].includes(value.kind ?? 'chain')) throw new Error('Invalid scenario kind')
   if (!/^[a-zA-Z0-9_-]{1,64}$/.test(value.id)) throw new Error('Invalid fixture case id')
   if (!Number.isInteger(value.rounds ?? 10) || (value.rounds ?? 10) < 1 || (value.rounds ?? 10) > 10000) throw new Error('Invalid rounds')
+  const minimumRounds = { goal: 6, 'browser-recovery': 3 }[value.kind] ?? 1
+  if ((value.rounds ?? 10) < minimumRounds) throw new Error(`Scenario ${value.kind} requires at least ${minimumRounds} rounds`)
   if (!Number.isFinite(value.durationMs ?? 0) || (value.durationMs ?? 0) < 0 || (value.durationMs ?? 0) > 86400000) throw new Error('Invalid duration')
   if (!Number.isInteger(value.argumentChunkSize ?? 256) || (value.argumentChunkSize ?? 256) < 64 || (value.argumentChunkSize ?? 256) > 65536) throw new Error('Invalid chunk size')
   if (value.fault && (!['http503', 'http403', 'disconnect'].includes(value.fault.mode)
