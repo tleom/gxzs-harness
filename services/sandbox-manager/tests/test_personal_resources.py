@@ -133,17 +133,19 @@ def test_global_package_is_read_only_for_the_sandbox_user(resources, tmp_path):
     assert skill.read_text().startswith("---")
 
 
-def test_pin_is_persistent_and_isolated_without_changing_enable_state(resources, tmp_path):
+def test_order_is_persistent_and_isolated_without_changing_enable_state(resources, tmp_path):
     a, b = tmp_path / "a", tmp_path / "b"
     a.mkdir(); b.mkdir()
     for root in (a, b):
         resources.personal({"operation": "skill_import", "name": "report", **package()}, str(root))
     resources.personal({"operation": "skill_toggle", "name": "report", "enabled": False}, str(a))
-    resources.personal({"operation": "skill_pin", "name": "report", "pinned": True}, str(a))
+    resources.personal({"operation": "skill_reorder", "order": ["report"], "order_version": None}, str(a))
     first = resources.personal({"operation": "list"}, str(a))["skills"][0]
     other = resources.personal({"operation": "list"}, str(b))["skills"][0]
-    assert first["pinned"] is True and first["enabled"] is False
-    assert other["pinned"] is False and other["enabled"] is True
+    assert first["enabled"] is False
+    assert other["enabled"] is True
+    assert resources.personal({"operation": "list"}, str(a))["order_version"]
+    assert resources.personal({"operation": "list"}, str(b))["order_version"] is None
 
 
 def test_edit_preserves_assets_and_keeps_source_backup_with_version_checks(resources, tmp_path):
@@ -159,12 +161,12 @@ def test_edit_preserves_assets_and_keeps_source_backup_with_version_checks(resou
     assert (tmp_path / "skills/report/SKILL.md").read_text() == "updated"
 
 
-def test_skill_rename_preserves_assets_toggle_pin_and_rejects_existing_target(resources, tmp_path):
+def test_skill_rename_preserves_assets_toggle_order_and_rejects_existing_target(resources, tmp_path):
     payload = package()
     payload["files"].append({"path": "scripts/helper.py", "data": base64.b64encode(b"asset").decode()})
     first = resources.personal({"operation": "skill_import", "name": "report", **payload}, str(tmp_path))
     resources.personal({"operation": "skill_toggle", "name": "report", "enabled": False}, str(tmp_path))
-    resources.personal({"operation": "skill_pin", "name": "report", "pinned": True}, str(tmp_path))
+    resources.personal({"operation": "skill_reorder", "order": ["report"], "order_version": None}, str(tmp_path))
     updated = "---\nname: evidence-review\ndescription: Review evidence\n---\n# Evidence"
     renamed = resources.personal({"operation": "skill_update", "name": "report", "new_name": "evidence-review",
                                   "version": first["version"], "content": updated}, str(tmp_path))
@@ -174,7 +176,7 @@ def test_skill_rename_preserves_assets_toggle_pin_and_rejects_existing_target(re
     assert (tmp_path / "skills/evidence-review/scripts/helper.py").read_text() == "asset"
     listed = resources.personal({"operation": "list"}, str(tmp_path))["skills"]
     assert listed[0]["id"] == "evidence-review"
-    assert listed[0]["enabled"] is False and listed[0]["pinned"] is True
+    assert listed[0]["enabled"] is False
     resources.personal({"operation": "skill_import", "name": "report", **package()}, str(tmp_path))
     assert resources.personal({"operation": "skill_update", "name": "evidence-review", "new_name": "report",
                                "version": renamed["version"], "content": updated}, str(tmp_path)) == {"conflict": True}
@@ -190,7 +192,7 @@ def test_uninstall_requires_version_and_moves_the_whole_package_to_backup(resour
     assert next((tmp_path / "skills/.backups").iterdir()).joinpath("SKILL.md").read_text().startswith("---")
 
 
-@pytest.mark.parametrize("operation", ["skill_pin", "skill_update", "skill_uninstall"])
+@pytest.mark.parametrize("operation", ["skill_reorder", "skill_update", "skill_uninstall"])
 @pytest.mark.parametrize("settings_state", ["malformed", "wrong_type", "symlink"])
 def test_skill_mutations_do_not_depend_on_toggle_settings(resources, tmp_path, operation, settings_state):
     first = resources.personal({"operation": "skill_import", "name": "report", **package()}, str(tmp_path))
@@ -208,11 +210,11 @@ def test_skill_mutations_do_not_depend_on_toggle_settings(resources, tmp_path, o
     with pytest.raises((ValueError, OSError)):
         resources.personal({"operation": "skill_toggle", "name": "report", "enabled": True}, str(tmp_path))
 
-    result = resources.personal({"operation": operation, "name": "report", "pinned": True,
+    result = resources.personal({"operation": operation, "name": "report", "order": ["report"], "order_version": None,
                                  "version": first["version"], "content": "updated"}, str(tmp_path))
-    if operation == "skill_pin":
-        assert result == {"id": "report", "pinned": True}
-        assert resources.personal({"operation": "list"}, str(tmp_path))["skills"][0]["pinned"] is True
+    if operation == "skill_reorder":
+        assert result["order"] == ["report"]
+        assert resources.personal({"operation": "list"}, str(tmp_path))["order_version"] == result["order_version"]
     elif operation == "skill_update":
         assert result["version"] != first["version"]
         assert (tmp_path / "skills/report/SKILL.md").read_text() == "updated"
@@ -225,13 +227,13 @@ def test_skill_mutations_do_not_depend_on_toggle_settings(resources, tmp_path, o
     assert settings.is_symlink() == (settings_state == "symlink")
 
 
-@pytest.mark.parametrize("operation", ["skill_pin", "skill_update", "skill_uninstall"])
+@pytest.mark.parametrize("operation", ["skill_reorder", "skill_update", "skill_uninstall"])
 def test_new_skill_operations_reject_symlink_targets(resources, tmp_path, operation):
     (tmp_path / "skills").mkdir()
     outside = tmp_path / "outside"
     outside.mkdir()
     (outside / "SKILL.md").write_text("untouched")
     (tmp_path / "skills/report").symlink_to(outside, target_is_directory=True)
-    with pytest.raises(OSError):
-        resources.personal({"operation": operation, "name": "report", "pinned": True, "version": "stale", "content": "bad"}, str(tmp_path))
+    with pytest.raises(ValueError if operation == "skill_reorder" else OSError):
+        resources.personal({"operation": operation, "name": "report", "order": ["report"], "order_version": None, "version": "stale", "content": "bad"}, str(tmp_path))
     assert (outside / "SKILL.md").read_text() == "untouched"

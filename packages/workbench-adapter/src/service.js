@@ -2,6 +2,7 @@ import { platformToolNames } from '@gxzs/dsh-workbench-mcp-tools/names'
 import { readSkillDefinition, skillDisplayName } from '@gxzs/dsh-workbench-sandbox-skills/definition'
 import { randomUUID } from 'node:crypto'
 import path from 'node:path'
+import { isDeepStrictEqual } from 'node:util'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { decodeSessionReferenceUri, formatSessionReferenceMention } from '@deepseek-ai/dsh-session-reference'
 import { admitSandboxAttachments, prepareNativeFiles } from './attachments.js'
@@ -11,7 +12,7 @@ import { httpError } from './http.js'
 import { decodeCursor } from './cursor.js'
 import { resolveWorkspacePath } from './paths.js'
 import { forkChat } from './fork-chat.js'
-import { toAnswer } from './human-input.js'
+import { inputSupplement, toAnswer } from './human-input.js'
 import { requireDatabaseModel } from './database-models.js'
 import { currentExecutionRun, fenceMcpExecutions } from './scheduler.js'
 import { nativeTurn } from './native-turn.js'
@@ -651,6 +652,7 @@ export class WorkbenchService {
         const issue = issues.find(issue => issue.id === `personal:mcp:${item.id}`)
         return issue ? { ...item, error: `${issue.name}：${issue.error}` } : item
       }),
+      skill_order_version: personal.order_version ?? null, mcp_order_version: mcp.order_version ?? null,
       plugin_name_issues: issues,
       warnings: [...(personal.warnings ?? []), ...(mcp.warnings ?? []), ...skills.filter(skill => skill.error).map(skill => skill.error),
         ...issues.map(issue => `${issue.name}：${issue.error}`)],
@@ -691,7 +693,7 @@ export class WorkbenchService {
       }
       return this.fileManager.personalMcp(body)
     }
-    if (!['skill_import', 'skill_update', 'skill_uninstall', 'skill_toggle', 'skill_pin'].includes(operation))
+    if (!['skill_import', 'skill_update', 'skill_uninstall', 'skill_toggle', 'skill_reorder'].includes(operation))
       throw httpError(400, '不支持的个人资源操作')
     return this.fileManager.personalResources(body)
   }
@@ -1108,20 +1110,27 @@ export class WorkbenchService {
     const input = typeof body.request_id === 'string' && body.request_id
       ? this.database.getPendingInput(owner.ownerId, sourceRunId, body.request_id) : null
     if (!input) throw httpError(404, '问题不存在')
-    if (input.answer?.supplement_run_id) return this.getRun(owner, input.answer.supplement_run_id)
-    if (!['skipped', 'timeout', 'aborted'].includes(input.status)) throw httpError(409, '只有已跳过的问题可以补答')
     const nativeAnswer = toAnswer(input.payload.questions ?? [], body)
+    if (input.answer?.supplement_run_id) {
+      if (!isDeepStrictEqual(input.answer.answers, nativeAnswer.answers))
+        throw httpError(409, '该补答请求已使用不同的回答')
+      return this.getRun(owner, input.answer.supplement_run_id)
+    }
+    if (!['skipped', 'timeout', 'aborted'].includes(input.status)) throw httpError(409, '只有已跳过的问题可以补答')
     const answer = nativeAnswer.answers.map((item) => [...item.selected, item.custom].filter(Boolean).join('\n')).filter(Boolean).join('\n')
     if (!answer) throw httpError(400, '补充回答不能为空')
     const chat = this.requireChat(owner, source.chatId)
     const requestKey = `input-supplement:${input.requestId}`
     const existing = this.database.findRunByRequestKey(owner.ownerId, chat.id, requestKey)
-    if (existing && existing.query !== answer) throw httpError(409, '该补答请求已使用不同的回答')
+    if (existing && (existing.query !== answer || (existing.selection?.input_supplement
+      && !isDeepStrictEqual(existing.selection.input_supplement, inputSupplement(input.payload.questions ?? [], nativeAnswer.answers)))))
+      throw httpError(409, '该补答请求已使用不同的回答')
     const active = currentExecutionRun(this.database, this.agents, chat.sessionId)
     const { run, created } = this.database.createRun({
       ownerId: owner.ownerId, chatId: chat.id, sessionId: chat.sessionId,
       query: answer, mcpTools: existing?.mcpTools ?? (active ? active.mcpTools : await this.freezeMcpTools(owner, [])),
-      selection: { ...chat.selection, silent_resume: false, is_continuation: false, prompt_mode: 'steer' }, requestKey,
+      selection: { ...chat.selection, silent_resume: false, is_continuation: false, prompt_mode: 'steer',
+        input_supplement: inputSupplement(input.payload.questions ?? [], nativeAnswer.answers) }, requestKey,
       parentRunId: source.id,
     })
     if (created || (run.status === 'queued' && !run.messageId)) {
@@ -1131,9 +1140,10 @@ export class WorkbenchService {
       // A newer native question released its admission while waiting. Close it
       // through the same bridge as the Skip button, then let the scheduler
       // reacquire admission and DSH choose the current step or next turn.
-      const pending = active && this.database.getPendingInput(owner.ownerId, active.id)
-      if (pending?.status === 'pending' && pending.requestId !== input.requestId)
-        this.humanInput.skip(owner.ownerId, active.id, pending.requestId)
+      const pending = active ? this.database.listPendingInputs(owner.ownerId, active.id) : []
+      for (const question of pending)
+        if (question.status === 'pending' && question.requestId !== input.requestId)
+          this.humanInput.skip(owner.ownerId, active.id, question.requestId)
       if (this.scheduler) await this.scheduler.enqueue(run, content)
       else await this.sessions.prompt({ requestId: run.id, sessionId: run.sessionId, mode: 'steer', content }, new AbortController().signal)
     }
@@ -1288,14 +1298,17 @@ export class WorkbenchService {
     const steering = steeringSnapshot ?? (events.length ? events.filter(event => event.event === 'workbench_steering' || event.event === 'workbench_steered')
       : this.database.steeringEvents(owner.ownerId, run.id))
     return {
-      ...runDto({ ...run, errorCode: run.errorCode ?? (run.error ? this.database.runErrorCode(owner.ownerId, run.id) : undefined) }, events, inputs.at(-1)),
+      ...runDto({ ...run, errorCode: run.errorCode ?? (run.error ? this.database.runErrorCode(owner.ownerId, run.id) : undefined) }, events,
+        inputs.findLast(input => input.status === 'pending') ?? inputs.at(-1)),
       context_usage: context ? presentRunEvent(context) : undefined,
+      input_supplement: this.inputSupplement(run),
       ...this.database.runTiming(owner.ownerId, run.id),
       steer_target_run_id: steering.find((event) => event.event === 'workbench_steered')?.steer_target_run_id,
       steering_messages: steering.filter((event) => event.event === 'workbench_steering').map((event) => {
         const message = this.database.getRun(owner.ownerId, event.steering_id)
         const mentions = message ? runDto(message).mentioned_resources : []
         return { id: event.steering_id, query: event.query, attachments: event.attachments ?? [],
+          ...(message ? { input_supplement: this.inputSupplement(message) } : {}),
           ...(mentions.length ? { mentioned_resources: mentions } : {}),
           created_at: (message?.createdAt / 1000) || event.created_at }
       }),
@@ -1309,6 +1322,15 @@ export class WorkbenchService {
         }
       }),
     }
+  }
+
+  inputSupplement(run) {
+    if (run.selection?.input_supplement) return run.selection.input_supplement
+    if (!run.parentRunId || run.selection?.prompt_mode !== 'steer') return undefined
+    // Older persisted supplements can use the original question/answer receipt.
+    const input = this.database.listPendingInputs(run.ownerId, run.parentRunId)
+      .find(input => input.answer?.supplement_run_id === run.id)
+    return input ? inputSupplement(input.payload.questions ?? [], input.answer.answers ?? []) : undefined
   }
 
   requireChat(owner, chatId) {
@@ -1368,18 +1390,22 @@ function normalizeSelection(value) {
 
 export function runDto(run, events = [], pending = null) {
   const waiting = pending?.status === 'pending' ? pending : null
+  const forkEnd = run.sourceEndSeq ?? run.selection?.fork_source?.endSeq
   return {
     id: run.id, chat_id: run.chatId, revision_id: run.id, version: 1, query: run.query,
     created_at: run.createdAt / 1000,
-    can_fork: ['completed', 'failed', 'cancelled', 'interrupted'].includes(run.status) && Number.isInteger(run.selection?.fork_source?.endSeq ?? run.sourceEndSeq),
+    can_fork: ['completed', 'failed', 'cancelled', 'interrupted'].includes(run.status) && Number.isSafeInteger(forkEnd) && forkEnd >= 0,
     resource_mentions: normalizeResourceMentions(run.selection?.resource_mentions),
     mentioned_resources: groupPluginMentions(run.selection?.mentioned_resources ?? [], run.mcpTools ?? []),
+    ...(run.selection?.input_supplement ? { input_supplement: run.selection.input_supplement } : {}),
     ...(run.selection?.command ? { command: run.selection.command } : {}),
     ...(run.selection?.silent_resume || run.selection?.is_continuation ? { is_continuation: true } : {}),
     ...(run.selection?.native_source === 'schedule' ? { source: { kind: 'schedule', titles: run.selection.schedule_titles ?? [], schedule_ids: run.selection.schedule_ids ?? [] } } : {}),
     ...(run.selection?.native_notice && run.selection.native_source !== 'tool-jobs' ? { source: { kind: run.selection.native_source ?? 'agent-message' } } : {}),
     status: run.status, error: run.error ? runFailure({ message: run.error, code: run.errorCode }).message : run.error,
-    feedback: run.feedback ?? null, events: events.map(presentRunEvent), events_cursor: `${run.seq}-0`,
+    feedback: run.feedback ?? null,
+    events: events.filter(event => !run.selection?.fork_source || event.event !== 'workbench_changes').map(presentRunEvent),
+    events_cursor: `${run.seq}-0`,
     stop_confirmation: run.stopConfirmation ?? null,
     queue_order: run.queueOrder, parent_run_id: run.parentRunId ?? null,
     activity_protocol: 1, followup_protocol: 1, message_id: run.messageId ?? null, attachments: run.attachments ?? [],

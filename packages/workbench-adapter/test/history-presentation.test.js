@@ -84,6 +84,21 @@ it('maps inherited native message identities to forked runs without duplicating 
   expect(result.events).toHaveLength(1)
   expect(result.events[0].event).toMatchObject({ steering_id: 'fork-supplement', query: 'extra' })
 })
+it('hides inherited file comparisons in fork snapshots and keeps new-turn comparisons and deliverables', () => {
+  const inherited = { ...run, id: 'inherited', selection: { fork_source: { sessionId: 'source', endSeq: 5 } } }
+  const own = { ...run, id: 'own' }
+  const view = new HistoryPresentation('fork', turn => turn === 1 ? inherited : own)
+  const result = view.accept(snapshot([
+    durable(1, 'workspace/changes', { turn: 1 }),
+    durable(2, 'deliverables/presented', { turn: 1, files: [{ path: 'report.md' }] }),
+    durable(6, 'workspace/changes', { turn: 2 }),
+  ])).events
+  expect(result.map(item => item.event.event)).toEqual(['workbench_presented', 'workbench_changes'])
+  expect(result[1]).toMatchObject({ run_id: 'own', event: { source_seq: 6, turn: 2 } })
+  expect(view.accept(durable(7, 'workspace/changes', { turn: 2 })).events).toMatchObject([
+    { run_id: 'own', event: { event: 'workbench_changes', source_seq: 7 } },
+  ])
+})
 it('uses the same consumed user-message position in a snapshot and live follow even without a turn on the message', () => {
   const records = [durable(1, 'turn/start', { turn: 1 }),
     durable(2, 'assistant/message', { turn: 1, step: 1, message: { content: [{ type: 'text', text: 'before' }] } }),

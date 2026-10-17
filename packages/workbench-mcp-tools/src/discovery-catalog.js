@@ -69,7 +69,9 @@ export class ToolDiscoveryCatalog extends Service {
     tools.sort((a, b) => a.id.localeCompare(b.id))
     const authorityKey = validRun ? `${runtime.ownerId}\0${run.id}` : ''
     stamps.sort((a, b) => a[0].localeCompare(b[0]))
-    const revision = createHash('sha256').update(JSON.stringify([authorityKey, ready, stamps, [...preferred].sort(), [...plugins.values()]]))
+    // Personal card order is presentation only, not a capability change.
+    const pluginStamps = [...plugins.values()].sort((a, b) => a.id.localeCompare(b.id))
+    const revision = createHash('sha256').update(JSON.stringify([authorityKey, ready, stamps, [...preferred].sort(), pluginStamps]))
       .digest('hex')
     return { authorityKey, revision, ready, tools, plugins: [...plugins.values()] }
   }

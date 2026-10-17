@@ -43,6 +43,22 @@ it.each([false,true])('preserves native events and historical comparison with gi
     const diff=await service.diff('session',events[0].seq,0,new AbortController().signal)
     expect(diff.kind).toBe('text')
     expect(diff.hunks[0].lines).toEqual(['-before','+after'])
+    // A fork shares cwd/files, but native comparison captures belong to its own Session.
+    const childEvents=[]
+    const child={id:'fork',header:{cwd,parentSession:session.id,isSeeded:true},append(type,data){const event={type,data,seq:20+childEvents.length};childEvents.push(event);return event}}
+    expect(service.summary(child.id,events[0].seq)).toBeUndefined()
+    handlers.get('session/event')(child,{type:'turn/start',data:{turn:2}})
+    const childExecution={agent:{session:child},name:'write',arguments:{file_path:'file.txt',content:'fork edit\n'}}
+    await handlers.get('tools/pre-execute')(childExecution,async()=>{
+      await handlers.get('fs/write-intent')(join(cwd,'file.txt'),childExecution,()=>undefined)
+      await writeFile(join(cwd,'file.txt'),'fork edit\n')
+    })
+    handlers.get('session/event')(child,{type:'tool/result',seq:20,data:{turn:2}})
+    await handlers.get('agent/turn-stopping')({agent:{session:child},turn:2})
+    expect(service.summary(child.id,childEvents[0].seq)).toMatchObject({total:1,files:[{path:'file.txt'}]})
+    const childDiff=await service.diff(child.id,childEvents[0].seq,0,new AbortController().signal)
+    expect(childDiff.hunks[0].lines).toEqual(['-later edit','+fork edit'])
+    expect((await service.diff(session.id,events[0].seq,0,new AbortController().signal)).hunks[0].lines).toEqual(['-before','+after'])
   }finally{
     for(const cleanup of effects)await cleanup()
     await rm(cwd,{recursive:true,force:true})

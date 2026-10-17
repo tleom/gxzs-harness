@@ -28,6 +28,22 @@ function setup({ authorized = true } = {}) {
 }
 
 describe('platform MCP proxy tools', () => {
+  it('keeps discovery revision and registered tools stable when personal card order changes', async () => {
+    const { ctx, platform, definitions } = setup()
+    const agent = { id: 'chat', session: { id: 'chat' } }
+    ctx.workbenchRuntime.executionRun = () => ({ id: 'run-1', ownerId: 't:1', status: 'running', mcpTools: [catalogTool] })
+    const plugins = ['server', 'other'].map(name => ({ id: `personal:mcp:${name}`, name, scope: 'personal', available: false }))
+    platform.json.mockResolvedValueOnce({ tools: [catalogTool], plugins })
+    await apply(ctx, { discovery: true })
+    const first = ctx.toolDiscoveryCatalog.snapshot(agent)
+    const definition = definitions.get('search')
+    platform.json.mockResolvedValueOnce({ tools: [catalogTool], plugins: [...plugins].reverse() })
+    await ctx.workbenchRuntime.refreshMcpCatalog()
+    const reordered = ctx.toolDiscoveryCatalog.snapshot(agent)
+    expect(reordered.revision).toBe(first.revision)
+    expect(reordered.tools).toEqual(first.tools)
+    expect(definitions.get('search')).toBe(definition)
+  })
   it('keeps the registered definition across reordered catalog object members', async () => {
     const { ctx, platform, definitions } = setup()
     await apply(ctx)

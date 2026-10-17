@@ -20,6 +20,47 @@ function setup(timeoutSeconds = 60) {
 }
 
 describe('durable human input bridge', () => {
+  it('deduplicates identical answers but rejects a changed answer from an older form', async () => {
+    const { database, chat, run, bridge, request } = setup()
+    const waiting = bridge.handleRequest(request, vi.fn())
+    const body = { request_id: database.getPendingInput(chat.ownerId, run.id).requestId,
+      answers: [{ id: 'environment', selected: ['staging'] }] }
+    bridge.resume(chat.ownerId, run.id, body)
+    expect(bridge.resume(chat.ownerId, run.id, body).answer.answers).toEqual(body.answers)
+    expect(() => bridge.resume(chat.ownerId, run.id, { ...body,
+      answers: [{ id: 'environment', selected: ['prod'] }],
+    })).toThrow('该问题已提交不同的回答')
+    await expect(waiting).resolves.toEqual({ answers: body.answers })
+  })
+  it('settles concurrent questions by their own request IDs and keeps the remaining question pending', async () => {
+    const { database, chat, run, bridge, request } = setup()
+    const first = bridge.handleRequest(request, vi.fn())
+    const firstId = database.getPendingInput(chat.ownerId, run.id).requestId
+    const second = bridge.handleRequest({ ...request, questions: [{ id: 'format', question: '格式？' }] }, vi.fn())
+    const secondId = database.getPendingInput(chat.ownerId, run.id).requestId
+    bridge.skip(chat.ownerId, run.id, secondId)
+    await expect(second).resolves.toEqual({ answers: [{ id: 'format', selected: [] }] })
+    expect(database.getRun(chat.ownerId, run.id).status).toBe('waiting_input')
+    expect(database.getPendingInput(chat.ownerId, run.id).requestId).toBe(firstId)
+    bridge.skip(chat.ownerId, run.id, firstId)
+    await expect(first).resolves.toEqual({ answers: [{ id: 'environment', selected: [] }] })
+    expect(database.getRun(chat.ownerId, run.id).status).toBe('running')
+    expect(bridge.pendings.size).toBe(0)
+  })
+
+  it('expires overlapping questions without an uncaught timer error or approving either question', async () => {
+    vi.useFakeTimers()
+    try {
+      const { database, chat, run, bridge, request } = setup()
+      const first = bridge.handleRequest(request, vi.fn())
+      const second = bridge.handleRequest({ ...request, questions: [{ id: 'format', question: '格式？' }] }, vi.fn())
+      await vi.advanceTimersByTimeAsync(60_000)
+      await expect(first).resolves.toEqual({ answers: [{ id: 'environment', selected: [] }] })
+      await expect(second).resolves.toEqual({ answers: [{ id: 'format', selected: [] }] })
+      expect(database.listPendingInputs(chat.ownerId, run.id).map(input => input.status)).toEqual(['timeout', 'timeout'])
+      expect(bridge.pendings.size).toBe(0)
+    } finally { vi.useRealTimers() }
+  })
   it('rejects obsolete field/action answers without settling the native question', async () => {
     const { database, chat, run, bridge, request } = setup()
     expect(() => toAnswer(request.questions, { values: { environment: 'prod' }, action: 'submit' })).toThrow('回答与原始问题不匹配')
@@ -119,7 +160,7 @@ describe('durable human input bridge', () => {
     const pending = database.getPendingInput(chat.ownerId, run.id)
     bridge.resume(chat.ownerId, run.id, { request_id: pending.requestId, answers: [{ id: 'environment', selected: ['prod'] }] })
     await waiting
-    expect(() => bridge.resume(chat.ownerId, run.id, { request_id: pending.requestId, answers: [{ id: 'environment', selected: ['staging'] }] })).not.toThrow()
+    expect(() => bridge.resume(chat.ownerId, run.id, { request_id: pending.requestId, answers: [{ id: 'environment', selected: ['prod'] }] })).not.toThrow()
     expect(database.getPendingInput(chat.ownerId, run.id)?.answer).toEqual({ answers: [{ id: 'environment', selected: ['prod'] }] })
 
     const next = setup()

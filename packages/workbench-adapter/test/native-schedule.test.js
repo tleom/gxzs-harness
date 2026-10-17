@@ -30,14 +30,15 @@ it('uses the published native JSON domain, delivers once and preserves rule/hist
     ctx.effect(() => async () => facility.closeAll())
     const session = ctx.sessions.create(chat.sessionId)
     const agent = { id: session.id, session, ctx, options: {}, followup: delivered, status: 'idle' }
-    ctx.provide('sessionController', { resolveAgent: async () => ({ agent }) })
+    const resolveAgent = vi.fn(async () => ({ agent }))
+    ctx.provide('sessionController', { resolveAgent })
     ctx.provide('sessionPersistence', {})
     ctx.on('session/flush', () => {})
     await ctx.plugin(Schedule)
     const scope = createScope(ctx, agent)
     await scope.ctx.plugin(ToolSchedule)
-    const service = { requireChat: () => chat }
-    return { ctx, agent, gateway: new WorkbenchSchedules({ native: ctx.schedule, database: db, service }) }
+    const service = { requireChat: (who, id) => db.getChat(who.ownerId, id) }
+    return { ctx, agent, resolveAgent, gateway: new WorkbenchSchedules({ native: ctx.schedule, database: db, service }) }
   }
   try {
     const first = await start()
@@ -51,7 +52,19 @@ it('uses the published native JSON domain, delivers once and preserves rule/hist
     await first.gateway.delete(owner, modelCreated.id)
     const daily = await first.gateway.create(owner, chat.id, { title: '每天提醒', prompt: '中文内容', daily: { time: '08:00:00', time_zone: 'Asia/Shanghai' } })
     const once = await first.gateway.create(owner, chat.id, { title: '立即验证', prompt: '只投递一次', after_seconds: 1 })
+    const forkSession = first.ctx.sessions.fork(first.agent.session)
+    const fork = db.createChat({ ownerId: owner.ownerId, sessionId: forkSession.id, selection: {} })
+    expect(await first.ctx.schedule.list({ sessionId: fork.sessionId })).toEqual([])
+    expect((await first.ctx.schedule.list({ sessionId: chat.sessionId })).map(task => task.id)).toEqual([daily.id, once.id])
+    expect(await first.gateway.task(owner, daily.id)).toMatchObject({ sessionId: chat.sessionId, chat_id: chat.id })
+    // A schedule created after the fork belongs only to the fork. Stopping it must not stop the source reminders.
+    const own = await first.gateway.create(owner, fork.id, { title: '分叉的新提醒', prompt: '仅新对话', after_seconds: 3600 })
+    expect(await first.gateway.task(owner, own.id)).toMatchObject({ sessionId: fork.sessionId, chat_id: fork.id })
+    await first.ctx.parallel('workspace/session-stop', { sessionId: fork.sessionId })
+    expect(await first.ctx.schedule.list({ sessionId: fork.sessionId })).toEqual([])
+    expect(await first.gateway.task(owner, daily.id)).toMatchObject({ sessionId: chat.sessionId, chat_id: chat.id })
     await vi.waitFor(() => expect(delivered).toHaveBeenCalledOnce(), { timeout: 3500 })
+    expect(first.resolveAgent).toHaveBeenCalledExactlyOnceWith(chat.sessionId)
     expect(delivered.mock.calls[0][0].source.kind).toBe('schedule')
     // Delivery acceptance precedes the asynchronous durable receipt commit.
     await vi.waitFor(async () => expect((await first.gateway.history(owner, once.id)).records).toHaveLength(1), { timeout: 3500 })

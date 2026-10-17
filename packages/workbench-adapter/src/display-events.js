@@ -60,6 +60,9 @@ export function nativePresentation(run, event, { streamed = false, toolName = ''
     case 'deliverables/presented':
       return [{ event: 'workbench_presented', native: event, files: event.data?.files ?? [] }]
     case 'workspace/changes':
+      // DSH does not copy the source recorder's captures into a fork.
+      // Preserve inherited text/files, but offer comparisons only for own turns.
+      if (run.selection?.fork_source) return []
       return [{ event: 'workbench_changes', turn: event.data?.turn, source_seq: event.seq }]
     case 'tool/call':
       return [{ event: 'workbench_activity', native: event, backend_run_id: run.id,

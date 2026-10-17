@@ -15,7 +15,7 @@ import uuid
 from urllib.parse import urlsplit
 
 from file_ops import parent_fd, read_file, version
-from resource_ops import SETTINGS, PINS, atomic_write, directory, resource_directory
+from resource_ops import SETTINGS, ORDER, atomic_write, directory, resource_directory, read_order, order_items, reorder_resources
 
 MAX_CONFIG = 65536
 MAX_MANIFEST = 1024 * 1024
@@ -205,7 +205,7 @@ def manifest_version(tools):
 def mapping(rootfd, name):
     value = json.loads(read_file(rootfd, name) or b"{}")
     if not isinstance(value, dict) or any(not isinstance(v, bool) for v in value.values()):
-        raise ValueError("MCP 开关或置顶设置格式无效")
+        raise ValueError("MCP 开关设置格式无效")
     return value
 
 
@@ -237,10 +237,10 @@ def snapshot(rootfd, selected=None):
             settings, settings_valid = {}, False
             warnings.append("MCP 开关文件无效，个人 MCP 暂时停用")
         try:
-            pins = mapping(mcpfd, PINS)
+            order, order_version = read_order(mcpfd)
         except (ValueError, OSError):
-            pins = {}
-            warnings.append("MCP 置顶文件无效")
+            order, order_version = {}, None
+            warnings.append("MCP 排序文件无效")
         cachefd = directory(mcpfd, ".cache")
         items = []
         try:
@@ -255,7 +255,6 @@ def snapshot(rootfd, selected=None):
                     "readonly": False,
                     "path": "/workspace/mcp/" + name,
                     "enabled": settings_valid and settings.get(name, True),
-                    "pinned": pins.get(name, False),
                     "version": None,
                     "tools": [],
                     "status": "unverified",
@@ -295,7 +294,7 @@ def snapshot(rootfd, selected=None):
                 except (ValueError, OSError, RecursionError):
                     warnings.append(f"个人 MCP {name} 的目录缓存无效，正在重新发现")
                 items.append(item)
-            return {"mcp": items, "warnings": warnings}
+            return {"mcp": order_items(items, order), "order_version": order_version, "warnings": warnings}
         finally:
             os.close(cachefd)
     finally:
@@ -310,6 +309,8 @@ def personal_mcp(payload, root="/workspace"):
         statefd = resource_directory(rootfd, "mcp")
         if operation == "mcp_list":
             return snapshot(rootfd, payload.get('name'))
+        if operation == "mcp_reorder":
+            return reorder_resources(statefd, payload)
         name = server_name(payload.get("name"))
         target_name = name
         if operation == "mcp_save":
@@ -329,11 +330,11 @@ def personal_mcp(payload, root="/workspace"):
             if payload.get("include_discovery_state"):
                 result["discovered_at"] = snapshot(rootfd, name)["mcp"][0].get("discovered_at")
             return result
-        if operation in {"mcp_toggle", "mcp_pin"}:
+        if operation == "mcp_toggle":
             if operation == "mcp_toggle" and payload.get("enabled") is True:
                 plugin_name(name)
             load(rootfd, name)
-            field, filename = ("enabled", SETTINGS) if operation == "mcp_toggle" else ("pinned", PINS)
+            field, filename = "enabled", SETTINGS
             if not isinstance(payload.get(field), bool):
                 raise ValueError("MCP 设置需为布尔值")
             values = mapping(statefd, filename)
@@ -409,7 +410,7 @@ def personal_mcp(payload, root="/workspace"):
                     try:
                         atomic_write(fd, "mcp.json", data)
                         if renamed:
-                            for filename in (SETTINGS, PINS):
+                            for filename in (SETTINGS, ORDER):
                                 previous = read_file(statefd, filename)
                                 if previous is None:
                                     continue
@@ -468,25 +469,43 @@ def personal_mcp(payload, root="/workspace"):
                     return {"id": target_name, "version": version(data)}
                 if operation == "mcp_delete":
                     backups = directory(statefd, ".backups")
+                    backup_name = name + "-" + uuid.uuid4().hex
+                    changed_settings = []
+                    moved = False
                     try:
-                        os.rename(name, name + "-" + uuid.uuid4().hex, src_dir_fd=mcpfd, dst_dir_fd=backups)
+                        os.rename(name, backup_name, src_dir_fd=mcpfd, dst_dir_fd=backups)
+                        moved = True
+                        for setting in (SETTINGS, ORDER):
+                            try:
+                                values = read_order(statefd)[0] if setting == ORDER else mapping(statefd, setting)
+                            except (ValueError, OSError):
+                                continue
+                            if name not in values:
+                                continue
+                            previous = read_file(statefd, setting)
+                            values.pop(name)
+                            changed_settings.append((setting, previous))
+                            atomic_write(statefd, setting, json.dumps(values).encode())
+                        os.fsync(mcpfd)
+                        os.fsync(backups)
+                        cachefd = directory(statefd, ".cache")
+                        try:
+                            try:
+                                os.unlink(name + ".json", dir_fd=cachefd)
+                            except FileNotFoundError:
+                                pass
+                        finally:
+                            os.close(cachefd)
+                    except BaseException:
+                        if moved:
+                            os.rename(backup_name, name, src_dir_fd=backups, dst_dir_fd=mcpfd)
+                        for setting, previous in changed_settings:
+                            # An atomic write can fail before changing the file.
+                            if read_file(statefd, setting) != previous:
+                                atomic_write(statefd, setting, previous)
+                        raise
                     finally:
                         os.close(backups)
-                    cachefd = directory(statefd, ".cache")
-                    try:
-                        try:
-                            os.unlink(name + ".json", dir_fd=cachefd)
-                        except FileNotFoundError:
-                            pass
-                    finally:
-                        os.close(cachefd)
-                    for setting in (SETTINGS, PINS):
-                        try:
-                            values = mapping(statefd, setting)
-                        except (ValueError, OSError):
-                            continue
-                        values.pop(name, None)
-                        atomic_write(statefd, setting, json.dumps(values).encode())
                     return {"id": name, "removed": True}
                 if operation == "mcp_cache_failure":
                     cachefd = directory(statefd, ".cache")
