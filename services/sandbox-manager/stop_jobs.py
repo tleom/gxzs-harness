@@ -9,13 +9,16 @@ from urllib.request import Request, urlopen
 from uuid import UUID
 
 binding = str(UUID(json.load(sys.stdin)["binding_id"]))
-home = "/home/gxzs/" + binding
+homes = {base + "/" + binding for base in ("/home/gxzs", "/home/dify")}
 stopped = 0
-for entry in Path("/home/gxzs/.local/share/shellctl/jobs").glob("*"):
+roots = {Path(base + "/.local/share/shellctl/jobs").resolve() for base in ("/home/gxzs", "/home/dify")}
+# The new image aliases /home/dify to /home/gxzs. Resolve before scanning so
+# an old job is handled once, including while the previous image still runs.
+for entry in (entry for root in roots for entry in root.glob("*")):
     environment = entry / ".job-env.json"
     if entry.is_symlink() or environment.is_symlink() or not environment.is_file():
         continue
-    if json.loads(environment.read_text()).get("HOME") != home:
+    if json.loads(environment.read_text()).get("HOME") not in homes:
         continue
     request = Request("http://127.0.0.1:5004/v1/jobs/" + quote(entry.name, safe="") + "?force=true&grace_seconds=1",
         method="DELETE", headers={"Authorization": "Bearer " + os.environ["SHELLCTL_AUTH_TOKEN"]})
