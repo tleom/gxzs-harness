@@ -61,7 +61,7 @@ def remove_container(name, *, docker):
         raise RuntimeError("无法确认调查容器已停止")
 
 
-def copy_global_resources(source, destination):
+def copy_global_resources(source, destination, manager_python):
     """Stream the trusted global tree; never buffer a resource archive in RAM."""
     with tempfile.TemporaryFile() as errors:
         export = subprocess.Popen(
@@ -78,12 +78,15 @@ def copy_global_resources(source, destination):
                     "0",
                     "-i",
                     destination,
-                    "/bin/tar",
-                    "--no-same-owner",
-                    "-xf",
-                    "-",
-                    "-C",
-                    "/opt/workbench-global",
+                    *manager_python,
+                    "-c",
+                    # GNU tar assumes UID 0 can write through restored 0555
+                    # directories. This container deliberately drops that
+                    # capability. Python defers directory attributes and the
+                    # data filter also rejects escaping archive members.
+                    "import sys,tarfile; "
+                    "archive=tarfile.open(fileobj=sys.stdin.buffer,mode='r|'); "
+                    "archive.extractall('/opt/workbench-global',filter='data')",
                 ],
                 stdin=export.stdout,
                 capture_output=True,
@@ -250,7 +253,7 @@ def inspect_plan(
             )
             created = True
             docker("start", name)
-        copy_global_resources(owner, name)
+        copy_global_resources(owner, name, manager_python)
         helper = (
             Path(__file__).with_name("planning_exec.py").read_text(encoding="utf-8")
         )

@@ -39,6 +39,7 @@ for attempt in {1..15}; do
   sleep 1
 done
 python3 "$script_dir/smoke-sandbox-ssh.py" "$container_id" "$host_image"
+python3 "$script_dir/smoke-planning-resources.py" "$manager_image" "$sandbox_image" "$container_id"
 docker exec -i "$container_id" node < "$script_dir/smoke-browser-observation.cjs"
 docker exec -i "$container_id" node < "$script_dir/smoke-browser-navigation.cjs"
 docker exec -i "$container_id" node < "$script_dir/smoke-browser-display.cjs"
