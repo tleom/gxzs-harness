@@ -55,6 +55,7 @@ export function agentDeletionSource(source) {
 
 export function persistenceDeletionSource(source) {
   if (source.includes('async deleteSessionPermanently(id)')) return source
+  source = replaceOnce(source, '\t\t\tname: "session-persistence-jsonl-service",', '\t\t\tname: "session-persistence-jsonl-service",\n\t\t\tinject: ["sessions"],')
   source = replaceOnce(source, '\tasync read(offset = 0, length = Number.MAX_SAFE_INTEGER, options) {', `\tasync read(offset = 0, length = Number.MAX_SAFE_INTEGER, options) {
 \t\treturn this.storage.withDeletionFence(this.id, () => this.readBeforeDeletion(offset, length, options));
 \t}

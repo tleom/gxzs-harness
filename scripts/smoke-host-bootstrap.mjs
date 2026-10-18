@@ -10,6 +10,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { createRequire } from 'node:module'
+import { DatabaseSync } from 'node:sqlite'
 import { pathToFileURL } from 'node:url'
 import { createContext, runInContext } from 'node:vm'
 
@@ -71,6 +72,13 @@ const fixtureFiles = new Map()
 const remote = (command) => execFileSync('ssh', ['-T', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=5',
   process.env.GXZS_SANDBOX_SSH_HOST, command], { encoding: 'utf8', timeout: 10_000 })
 const remoteDirectories = new Set()
+// Exercise the manager's actual descriptor-relative filesystem implementation
+// inside the isolated Sandbox, including absent intermediate directories.
+const fileOps = (await readFile('/smoke-file-ops.py')).toString('base64')
+function sandboxFileOperation(payload) {
+  const input = Buffer.from(JSON.stringify(payload)).toString('base64')
+  return JSON.parse(remote(`printf '%s' '${input}' | base64 -d | /usr/local/bin/python -I -S -c "import base64;exec(compile(base64.b64decode('${fileOps}'), 'file_ops.py', 'exec'))"`))
+}
 
 const sanitize = (text) => secrets.reduce((value, secret) => value.replaceAll(secret, '[fixture-redacted]'), String(text))
   .replace(/Bearer\s+[^\s"']+/gi, 'Bearer [redacted]')
@@ -158,6 +166,10 @@ const manager = fixture(async (req, res) => {
   if (req.url === `${base}personal-mcp`) { respond(res, 200, { mcp: [] }); return }
   if (req.url === `${base}files`) {
     const value = req.fixtureBody
+    if (['stat', 'delete'].includes(value?.operation)) {
+      assert.match(value.path, /^(?:conversations\/\d{4}-\d{2}-\d{2}\/[a-f0-9-]{36}|\.agent-output\/[a-f0-9]{32})$/)
+      respond(res, 200, sandboxFileOperation(value)); return
+    }
     if (nativeAttachments && ['upload', 'get'].includes(value?.operation)) {
       assert.match(value.path, /^conversations\/\d{4}-\d{2}-\d{2}\/[a-f0-9-]{36}\/native-evidence\.(txt|png)$/)
       if (value.operation === 'upload') {
@@ -717,6 +729,49 @@ try {
     assert.deepEqual(await readdir(`/workspace/${chat.file_directory}`), [], 'Host cwd remains an empty placeholder')
     const detail = await signedRequest('GET', `/chats/${chat.id}`)
     assert.equal(detail.status, 200)
+    // Root-context unit tests cannot detect missing Cordis service injection.
+    // Use the complete composed Host and real Sandbox file operations here.
+    for (const persisted of [false, true]) {
+      const created = await signedRequest('POST', '/chats')
+      assert.equal(created.status, 201)
+      const disposable = (await created.json()).data
+      if (persisted) assert.equal((await signedRequest('PATCH', `/chats/${disposable.id}`, { title: 'Deletion fixture' })).status, 200)
+      if (persisted) {
+        const db = new DatabaseSync(path.join(env.DSH_HOME, 'workbench.sqlite3'), { readOnly: true })
+        let id
+        try { id = db.prepare('SELECT session_id FROM chats WHERE id = ?').get(disposable.id).session_id }
+        finally { db.close() }
+        let recorded = false
+        const deadline = Date.now() + 5000
+        while (!recorded && Date.now() < deadline) {
+          const files = await readdir(path.join(env.DSH_HOME, 'sessions'), { recursive: true })
+          for (const file of files) if (file.split(path.sep).includes(id) && /\.(?:jsonl|zstd)$/.test(file))
+            recorded ||= (await stat(path.join(env.DSH_HOME, 'sessions', file))).size > 0
+          if (!recorded) await delay(50)
+        }
+        assert.ok(recorded, 'The persisted deletion fixture must have a nonempty native log before deletion')
+      }
+      assert.equal(remote('test ! -e /workspace/.agent-output && printf absent'), 'absent')
+      const erased = await signedRequest('DELETE', `/chats/${disposable.id}`)
+      if (fixtureFailure) throw fixtureFailure
+      assert.equal(erased.status, 204, `Composed Host deletion failed: ${await erased.text()}`)
+      assert.equal((await signedRequest('GET', `/chats/${disposable.id}`)).status, 404)
+      assert.equal((await signedRequest('DELETE', `/chats/${disposable.id}`)).status, 204)
+      assert.equal(sandboxFileOperation({ operation: 'stat', path: disposable.file_directory }).kind, 'missing')
+      const db = new DatabaseSync(path.join(env.DSH_HOME, 'workbench.sqlite3'), { readOnly: true })
+      try {
+        const deletion = db.prepare('SELECT session_ids_json, completed_at FROM chat_deletions WHERE chat_id = ?').get(disposable.id)
+        assert.ok(deletion?.completed_at, 'Deletion must finish, not just hide the chat')
+        assert.equal(db.prepare('SELECT COUNT(*) AS n FROM chats WHERE id = ?').get(disposable.id).n, 0)
+        const ids = JSON.parse(deletion.session_ids_json)
+        const files = await readdir(path.join(env.DSH_HOME, 'sessions'), { recursive: true })
+        assert.ok(files.every(name => ids.every(id => !name.split(path.sep).slice(0, -1).includes(id)) || path.basename(name) === 'session.lock'),
+          'Deleted native session directories must contain only the stable writer lock')
+      } finally { db.close() }
+      assert.equal((await signedRequest('GET', `/chats/${chat.id}`)).status, 200)
+    }
+    assert.equal(modelCalls, 0, 'Deletion must not call the model')
+    console.log('PASS composed Host deletion: new/persisted chats, absent spill root, physical cleanup, idempotent retry and retained neighbor')
     const nativeCommand = async (command) => {
       const response = await signedRequest('POST', `/chats/${chat.id}/commands`, {command, request_key:randomUUID()})
       assert.equal(response.status, 200, `Native command ${command} must be available in the composed host`)

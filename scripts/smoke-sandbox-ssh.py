@@ -146,6 +146,7 @@ def verify(container, host_image=None):
                     '--user', '1000:1000', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges:true',
                     '--memory', '1g', '--cpus', '2', '--pids-limit', '256',
                     '-v', str(scripts) + ':/smoke:ro', '-e', 'GXZS_SANDBOX_SSH_HOST=fixture-sandbox',
+                    '-v', str(source.parent / 'file_ops.py') + ':/smoke-file-ops.py:ro',
                     '-e', 'GXZS_SANDBOX_HELPER_HASH=' + helper_hash,
                     '-e', 'GXZS_SMOKE_LONG_SECONDS=' + str(long_seconds),
                     *attachment_args, *legacy_args,

@@ -74,6 +74,31 @@ def test_versions_create_conflict_atomic_replace_and_delete(root):
     assert not list((Path(root)/'conversations/test-chat').glob('.upload-*'))
 
 
+@pytest.mark.parametrize('path', ['.agent-output/missing', 'conversations/deleted/child/file.txt'])
+def test_stat_returns_missing_when_a_parent_directory_is_absent(root, path):
+    assert module.operate({'operation': 'stat', 'path': path}, root) == {'path': path, 'kind': 'missing'}
+    with pytest.raises(FileNotFoundError):
+        module.operate({'operation': 'get', 'path': path}, root)
+
+
+def test_stat_missing_parent_does_not_hide_invalid_root_or_unsafe_traversal(root, tmp_path, monkeypatch):
+    with pytest.raises(FileNotFoundError):
+        module.operate({'operation': 'stat', 'path': 'missing/child'}, str(tmp_path / 'absent-root'))
+    os.symlink(tmp_path / 'absent-target', Path(root) / 'escape')
+    with pytest.raises(OSError):
+        module.operate({'operation': 'stat', 'path': 'escape/child'}, root)
+    with pytest.raises(ValueError):
+        module.operate({'operation': 'stat', 'path': 'missing/../secret'}, root)
+    original = module.os.open
+    def denied(path, flags, *args, **kwargs):
+        if path == 'denied':
+            raise PermissionError('fixture denies traversal')
+        return original(path, flags, *args, **kwargs)
+    monkeypatch.setattr(module.os, 'open', denied)
+    with pytest.raises(PermissionError):
+        module.operate({'operation': 'stat', 'path': 'denied/child'}, root)
+
+
 def test_large_file_can_be_deleted_without_reading_its_content(root, monkeypatch):
     target = Path(root) / 'large.bin'
     with target.open('wb') as stream:

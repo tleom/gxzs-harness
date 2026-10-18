@@ -17,7 +17,7 @@ MAX_MANIFEST_FILE_BYTES = 2 * 1024 * 1024 * 1024
 MAX_MANIFEST_TREE_BYTES = 10 * 1024 * 1024 * 1024
 
 
-def parent_fd(root, path):
+def parent_fd(root, path, *, missing_ok=False):
     parts = path.split("/")
     if not path or any(part in ("", ".", "..") or "\\" in part or "\x00" in part for part in parts):
         raise ValueError("Invalid file path")
@@ -28,6 +28,11 @@ def parent_fd(root, path):
             os.close(fd)
             fd = child
         return fd, parts[-1]
+    except FileNotFoundError:
+        os.close(fd)
+        if missing_ok:
+            return None, parts[-1]
+        raise
     except BaseException:
         os.close(fd)
         raise
@@ -225,7 +230,9 @@ def operate(payload, root="/workspace"):
     if path == ".":
         fd, name = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW), "."
     else:
-        fd, name = parent_fd(root, path)
+        fd, name = parent_fd(root, path, missing_ok=operation == "stat")
+        if fd is None:
+            return {"path": path, "kind": "missing"}
     try:
         if operation == "mkdir":
             try:
