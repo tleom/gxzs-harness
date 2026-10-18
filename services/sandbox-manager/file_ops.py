@@ -52,6 +52,49 @@ def version(data):
     return hashlib.sha256(data).hexdigest() if data is not None else None
 
 
+def file_identity(info):
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+def large_file_version(info):
+    # An opaque deletion token: large files never need to be loaded or hashed
+    # into memory just to remove them. Small file upload tokens stay unchanged.
+    return version(json.dumps(('metadata-v1', *file_identity(info))).encode())
+
+
+def conflict(message="文件已改变，请刷新后重试"):
+    return {"conflict": True, "code": "FILE_VERSION_CONFLICT", "message": message}
+
+
+def delete_file(fd, name, payload):
+    try:
+        item = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+    except FileNotFoundError:
+        return {"deleted": True} if "version" in payload and payload["version"] is None else conflict()
+    with os.fdopen(item, "rb") as stream:
+        before = os.fstat(stream.fileno())
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError("Only regular files can be deleted")
+        if before.st_size > MAX_BYTES:
+            fingerprint = large_file_version(before)
+        else:
+            data = stream.read(MAX_BYTES + 1)
+            if len(data) > MAX_BYTES:
+                return conflict()
+            fingerprint = version(data)
+        if payload.get("version") != fingerprint or file_identity(before) != file_identity(os.fstat(stream.fileno())):
+            return conflict()
+        try:
+            current = os.stat(name, dir_fd=fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return conflict()
+        if file_identity(before) != file_identity(current):
+            return conflict()
+        os.unlink(name, dir_fd=fd)
+        os.fsync(fd)
+        return {"deleted": True}
+
+
 def tree_entries(fd, prefix="", result=None):
     """Fingerprint metadata without following links or reading every file on listing."""
     result = [] if result is None else result
@@ -119,6 +162,8 @@ def entry_metadata(fd, name, path, info, *, shallow=False):
     data = read_file(fd, name) if kind == "file" and info.st_size <= MAX_BYTES else None
     fingerprint = version(data)
     downloadable = kind == "file" and fingerprint is not None
+    if kind == "file" and info.st_size > MAX_BYTES:
+        fingerprint = large_file_version(info)
     if kind == "directory":
         child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
         try:
@@ -214,7 +259,7 @@ def operate(payload, root="/workspace"):
                     try:
                         previous = json.loads(base64.urlsafe_b64decode(cursor).decode())
                         if previous['snapshot'] != snapshot:
-                            return {'conflict': True, 'message': '目录已改变，请刷新后重试'}
+                            return conflict('目录已改变，请刷新后重试')
                         offset = bisect.bisect_right(names, previous['after'])
                     except (ValueError, TypeError, KeyError) as error:
                         raise ValueError('目录分页参数无效') from error
@@ -241,31 +286,29 @@ def operate(payload, root="/workspace"):
                 if operation == "get":
                     data = archive(child)
                     if fingerprint != tree_version(child):
-                        return {"conflict": True}
+                        return conflict()
                     return {"data": base64.b64encode(data).decode(), "version": fingerprint,
                             "kind": "directory", "name": name + ".zip"}
                 if operation != "delete":
                     raise ValueError("A folder cannot be overwritten by an uploaded file")
                 if payload.get("version") != fingerprint:
-                    return {"conflict": True}
+                    return conflict()
                 remove_contents(child)
             finally:
                 os.close(child)
             os.rmdir(name, dir_fd=fd)
             return {"deleted": True}
+        if operation == "delete":
+            return delete_file(fd, name, payload)
         old = read_file(fd, name)
         if operation == "get":
             if old is None:
                 raise FileNotFoundError(path)
             return {"data": base64.b64encode(old).decode(), "version": version(old), "name": name}
-        if operation not in ("upload", "delete"):
+        if operation != "upload":
             raise ValueError("Unknown operation")
         if "version" not in payload or payload["version"] != version(old):
-            return {"conflict": True, "message": "文件已改变，请刷新后重试"}
-        if operation == "delete":
-            if old is not None:
-                os.unlink(name, dir_fd=fd)
-            return {"deleted": True}
+            return conflict()
         data = base64.b64decode(payload["data"], validate=True)
         if len(data) > MAX_BYTES:
             raise ValueError("Upload exceeds 20 MiB")

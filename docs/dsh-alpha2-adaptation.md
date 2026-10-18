@@ -1,5 +1,7 @@
 # DSH 0.2.1-alpha.2 适配核对
 
+本文保留 alpha.2 阶段的历史核对记录。当前运行基线已升级为 `0.2.1-rc.2`，以 `profiles/workbench/package.json`、`package-lock.json`、构建补丁检查及镜像实际安装结果为准。下述版本和阶段测试数字不代表当前发布状态。
+
 上游版本：`dsh-v0.2.1-alpha.2`，源码提交 `d743267`。Workbench profile 与所有 DSH 原生包固定为 `0.2.1-alpha.2`，Cordis 固定为 `4.0.5-alpha.1`。上游发布说明：<https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.2.1-alpha.2>。
 
 ## 能力归属及变化

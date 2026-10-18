@@ -169,7 +169,8 @@ def statistics():
 
 def catalog(source=SOURCE):
     import hashlib
-    sys.path.insert(0, source)
+    if source not in sys.path:
+        sys.path.insert(0, source)
     from md_cg.mcp_server import KERNEL_TOOLS
     tools = platform_tools(KERNEL_TOOLS)
     manifest = hashlib.sha256(json.dumps(tools, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
@@ -200,7 +201,8 @@ def validate(name, arguments):
 def execute(name, arguments, *, root=ROOT, source=SOURCE):
     """root/source are deployment inputs, never accepted from tool arguments."""
     validate(name, arguments)
-    sys.path.insert(0, source)
+    if source not in sys.path:
+        sys.path.insert(0, source)
     from md_cg import tokens
     from md_cg.mdcos import MdCGSecure
     from md_cg.mcp_server import call_tool

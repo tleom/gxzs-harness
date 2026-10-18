@@ -21,6 +21,24 @@ function setup() {
   return { db, sessions, scheduler, platform, create, agent, diagnostics, permit: () => { permitted = true } }
 }
 
+it('retains queued work under storage pressure while release and later admission remain available', async () => {
+  const { scheduler, platform, create, db, sessions, permit, diagnostics } = setup()
+  const run = create('wait for storage')
+  scheduler.assertStorageWritable = () => { throw Object.assign(new Error('storage full'), { status: 503, code: 'STORAGE_PRESSURE' }) }
+  await scheduler.enqueue(run, [{ type: 'text', text: run.query }])
+  await scheduler.tick()
+  expect(db.getRun('t:1', run.id).status).toBe('queued')
+  expect(sessions.prompt).not.toHaveBeenCalled()
+  expect(diagnostics.mock.calls.map(([line]) => JSON.parse(line)))
+    .toContainEqual(expect.objectContaining({ operation: 'dispatch_failed', code: 'STORAGE_PRESSURE', status: 503 }))
+  await scheduler.request(run, 'release')
+  expect(JSON.parse(platform.json.mock.calls.at(-1)[0].body).action).toBe('release')
+  scheduler.assertStorageWritable = () => {}
+  permit()
+  await scheduler.tick()
+  expect(sessions.prompt).toHaveBeenCalledOnce()
+})
+
 it('holds one root ticket for native background children until the last owned execution ends', async () => {
   const { db, scheduler, platform, sessions, agent, create, permit } = setup()
   permit(); const run = create('spawn child')

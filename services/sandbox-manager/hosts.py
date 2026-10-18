@@ -3,7 +3,7 @@ import json
 import hashlib
 import hmac
 import secrets
-from resource_limits import cgroup_args, owner_cgroup, pid_pressure, ResourceUnavailable
+from resource_limits import cgroup_args, owner_cgroup, pid_pressure, ResourceUnavailable, assert_storage_writable
 import logging
 from concurrent.futures import Future, ThreadPoolExecutor
 import ipaddress
@@ -90,6 +90,30 @@ class Hosts:
         names = account_names(owner, payload.get('account_name'))
         if not re.fullmatch(r'[^:\s/]+:\d+', owner) or not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_.-]{0,100}', instance) or generation < 1:
             raise ValueError('Invalid host identity')
+        record = self.root / workspace / 'host.json'
+        with self.lock(workspace):
+            observed = json.loads(record.read_text()) if record.exists() else {}
+        if observed.get('state') == 'degraded':
+            if (observed['owner_id'], observed['generation'], observed['instance_id']) != (owner, generation, instance):
+                raise ValueError('Host identity changed; fence the previous generation before replacement')
+            if observed.get('account_name') and names and observed['account_name'] != names['account_name']:
+                raise ValueError('Runtime account binding cannot change')
+            # An ensure result renews the platform heartbeat. A durable degraded
+            # record is not fresh liveness evidence; probe outside the owner lock.
+            info = self._upgrade_inspect(host_name(observed))
+            labels = (info or {}).get('Config', {}).get('Labels') or {}
+            expected = {'gxzs.owner': owner, 'gxzs.workspace': workspace, 'gxzs.generation': str(generation)}
+            if labels.get('gxzs.instance') is not None:
+                expected['gxzs.instance'] = instance
+            live = (info is not None and info.get('State', {}).get('Running') is True
+                    and all(labels.get(key) == value for key, value in expected.items())
+                    and info.get('Image') == observed.get('image_digest')
+                    and observed.get('endpoint') and self.alive(observed['endpoint']))
+            with self.lock(workspace):
+                current = json.loads(record.read_text())
+                if not live or current != observed or 'profile_upgrade' in current:
+                    raise ResourceUnavailable('个人工作环境正在恢复，请稍后重试', 'HOST_NOT_READY', 2)
+                return current
         with self.lock(workspace):
             folder = self.root / workspace
             folder.mkdir(mode=0o750, exist_ok=True)
@@ -107,6 +131,8 @@ class Hosts:
                 # A ready generation can temporarily be unavailable while the
                 # manager restarts its host/sandbox pair. Never regress the
                 # platform's monotonic ready state back to provisioning.
+                if current.get('state') == 'degraded':
+                    raise ResourceUnavailable('个人工作环境正在恢复，请稍后重试', 'HOST_NOT_READY', 2)
                 if current.get('state') == 'ready' and current.get('ready') is False:
                     return current
             else:
@@ -147,7 +173,8 @@ class Hosts:
                     raise ValueError('Host network rollout requires draining before replacement')
                 if not existing['State']['Running']:
                     # Restart only after fencing any surviving tool processes.
-                    self.docker('stop', '--time', '10', sandbox)
+                    self._stop_pair({**current, 'owner_id': owner, 'workspace_id': workspace,
+                                     'generation': generation, 'instance_id': instance})
                     self._fence(workspace, owner, instance)
             # Only a new owner with neither container receives the first-use UI.
             # Retain that fact across bootstrap retries; recovery of an existing
@@ -341,8 +368,7 @@ class Hosts:
         # Probe outside the workspace lock because Host plugins can call back
         # into this manager. Future schedules and UI leases survive replacement
         # through native recovery; they are not in-flight task admission.
-        inspected = self.docker('inspect', host_name(observed), timeout=5, check=False)
-        info = json.loads(inspected.stdout)[0] if not inspected.returncode else None
+        info = self._upgrade_inspect(host_name(observed))
         if info and info['State']['Running']:
             activity = self.native_activity(observed.get('endpoint')) if observed.get('endpoint') else None
             if activity is None or any(activity[key] for key in ('runningAgents', 'pendingMessages', 'runningJobs', 'activeSettingsWrites')):
@@ -358,16 +384,8 @@ class Hosts:
             from global_memory import invalidate as cancel_memory
             cancel_memory(workspace)
             sandbox, _ = self.identity(workspace)
-            inspected_containers = []
-            for container in (host_name(current), sandbox):
-                inspect = self.docker('inspect', container, check=False)
-                if not inspect.returncode:
-                    previous = json.loads(inspect.stdout)[0]
-                    self._verify_named_container(current, previous, sandbox=container == sandbox)
-                    inspected_containers.append(container)
-            for container in inspected_containers:
-                self.docker('stop', '--time', '10', container)
-            # Capacity is freed only after both stop operations succeeded.
+            self._stop_pair(current)
+            # Capacity is freed only after both containers are confirmed stopped.
             self._fence(workspace, current['owner_id'], expected[1])
             # Logical instances remain unique across generations. The readable
             # Docker name is reusable only after the old generation is stopped.
@@ -434,7 +452,27 @@ class Hosts:
         message = getattr(inspected, 'stderr', '').lower()
         if 'no such object' in message or 'no such container' in message:
             return None
-        raise ValueError('Profile upgrade container state could not be verified')
+        raise ValueError('Container state could not be verified')
+
+    def _stop_pair(self, item):
+        """Do not release admission or tool fences until physical stop is proved."""
+        sandbox, _ = self.identity(item['workspace_id'])
+        containers = (host_name(item), sandbox)
+        inspected = []
+        for container in containers:
+            info = self._upgrade_inspect(container)
+            self._verify_named_container(item, info, sandbox=container == sandbox)
+            if info is not None:
+                inspected.append(container)
+        for container in inspected:
+            self.docker('stop', '--time', '10', container, check=True)
+        # A successful CLI exit is insufficient (daemon races, asynchronous
+        # wrappers). Unknown inspection is not evidence that a container vanished.
+        for container in containers:
+            info = self._upgrade_inspect(container)
+            self._verify_named_container(item, info, sandbox=container == sandbox)
+            if info is not None and info.get('State', {}).get('Running') is not False:
+                raise ValueError('Container stop could not be confirmed')
 
     def profile_upgrade(self, workspace, payload):
         """Root-only maintenance barrier; only explicit replacement can resume this owner."""
@@ -534,11 +572,7 @@ class Hosts:
             invalidate(workspace)
             cancel_memory(workspace)
             sandbox, _ = self.identity(workspace)
-            for container in (host_name(marker), sandbox):
-                self._verify_named_container(current, self._upgrade_inspect(container), sandbox=container == sandbox)
-            for container in (host_name(marker), sandbox):
-                if self._upgrade_inspect(container) is not None:
-                    self.docker('stop', '--time', '10', container)
+            self._stop_pair(current)
             self._upgrade_stopped(workspace, marker)
             self._fence(workspace, current['owner_id'], marker['instance_id'])
             marker['phase'] = 'preparing'
@@ -603,7 +637,7 @@ class Hosts:
             return False
 
     def dependency_degraded(self, endpoint):
-        """Return true only for a live host blocked by an external catalog.
+        """Return true only for a live host blocked by a recoverable dependency.
 
         The Workbench health endpoint deliberately reports 503 while its MCP
         catalog is unavailable. Restarting the owner Host/Sandbox pair cannot
@@ -621,6 +655,8 @@ class Hosts:
                 return False
         except Exception:
             return False
+        if payload.get('live') is True and payload.get('runtime_error') == 'STORAGE_PRESSURE':
+            return True
         catalog_blocked = (payload.get('recovery') == 'ready'
                            or (payload.get('recovery') == 'failed'
                                and payload.get('recovery_dependency') == 'mcp_catalog'))
@@ -799,6 +835,8 @@ class Hosts:
                     raise ValueError('Scheduling host is stopped')
             if managed and payload['action'] == 'acquire' and item.get('ready') is not True and not draining_ticket:
                 raise ResourceUnavailable('个人工作环境正在恢复，任务等待准入', 'HOST_NOT_READY', 2)
+            if payload['action'] == 'acquire':
+                assert_storage_writable(self.root)
             (self.root.parent / workspace).touch()
             return self.admission.request(payload['owner_id'], int(payload['generation']), payload['instance_id'],
                                           payload.get('ticket_id') or payload['run_id'], payload['chat_id'], payload['action'], bool(payload.get('retry')))
@@ -817,11 +855,9 @@ class Hosts:
                 observed = dict(item)
             # Both Docker inspection and health checks can be slow. In
             # particular, plugin readiness may call back into this workspace.
-            host_result = self.docker('inspect', host_name(item), check=False)
-            info = json.loads(host_result.stdout)[0] if not host_result.returncode else None
+            info = self._upgrade_inspect(host_name(item))
             sandbox, _ = self.identity(item['workspace_id'])
-            sandbox_result = self.docker('inspect', sandbox, check=False)
-            sandbox_info = json.loads(sandbox_result.stdout)[0] if not sandbox_result.returncode else None
+            sandbox_info = self._upgrade_inspect(sandbox)
             self._verify_named_container(item, info)
             self._verify_named_container(item, sandbox_info, sandbox=True)
             sandbox_running = bool(sandbox_info and sandbox_info['State']['Running'])
@@ -836,11 +872,8 @@ class Hosts:
                     current = json.loads(record.read_text())
                     if current != observed or self.admission.busy(current['owner_id']):
                         return
-                    if host_running:
-                        self.docker('stop', '--time', '10', host_name(current))
-                    if sandbox_running:
-                        self.docker('stop', '--time', '10', sandbox)
                     if host_running or sandbox_running:
+                        self._stop_pair(current)
                         self._fence(current['workspace_id'], current['owner_id'], current['instance_id'])
                         heartbeats.append((dict(current), 'stopped'))
                     self.failures.pop(current['instance_id'], None)
@@ -877,8 +910,7 @@ class Hosts:
                         and time.time() - activity.stat().st_mtime > 1800
                         and not self.admission.busy(item['owner_id']) and native_idle)
                 if host_running and idle:
-                    self.docker('stop', '--time', '10', host_name(item))
-                    self.docker('stop', '--time', '10', sandbox, check=False)
+                    self._stop_pair(item)
                     self._fence(item['workspace_id'], item['owner_id'], item['instance_id'])
                     item.update(state='stopped', ready=False)
                     self._save(record, item)
@@ -910,9 +942,15 @@ class Hosts:
                 if (dependency_degraded or process_pressure) and failed_transport_activity is None:
                     self.failures.pop(item['instance_id'], None)
                     self.recoveries.pop(item['instance_id'], None)
-                    if item.get('ready') is not False:
-                        item['ready'] = False
+                    next_state = 'degraded' if alive and item.get('state') in {'ready', 'degraded'} else item.get('state')
+                    if item.get('ready') is not False or item.get('state') != next_state:
+                        item.update(ready=False, state=next_state)
                         self._save(record, item)
+                    # Publish liveness separately from admission. The platform
+                    # may route existing reads/stops to this identity, but must
+                    # not authorize new execution from a degraded heartbeat.
+                    if alive:
+                        heartbeats.append((dict(item), next_state))
                     return
 
                 # Pause new work as soon as either half of the pair is
@@ -965,8 +1003,7 @@ class Hosts:
                 # Preserve all named volumes. Fencing invalidates in-flight
                 # tools, then the same containers restart with the same owner
                 # and generation. Readiness is published by a later probe.
-                self.docker('stop', '--time', '10', host_name(item), check=failed_transport_activity is not None)
-                self.docker('stop', '--time', '10', sandbox, check=failed_transport_activity is not None)
+                self._stop_pair(item)
                 self._fence(item['workspace_id'], item['owner_id'], item['instance_id'], preserve_pending=True)
                 self.ensure_sandbox(item['workspace_id'])
                 self._ssh(record.parent, sandbox)

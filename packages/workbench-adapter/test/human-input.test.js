@@ -20,6 +20,59 @@ function setup(timeoutSeconds = 60) {
 }
 
 describe('durable human input bridge', () => {
+  it.each(['settlePendingInput', 'appendEvent'])('rolls back %s failure and preserves the live waiter for retry', async method => {
+    const { database, chat, run, bridge, request } = setup()
+    const waiting = bridge.handleRequest(request, vi.fn())
+    const request_id = database.getPendingInput(chat.ownerId, run.id).requestId
+    const body = { request_id, answers: [{ id: 'environment', selected: ['staging'] }] }
+    const original = database[method].bind(database)
+    const fail = vi.spyOn(database, method).mockImplementationOnce((...args) => {
+      original(...args)
+      throw new Error('injected storage failure after write')
+    })
+    expect(() => bridge.resume(chat.ownerId, run.id, body)).toThrow('storage failure')
+    expect(database.getPendingInput(chat.ownerId, run.id, request_id).status).toBe('pending')
+    expect(bridge.pendings.get(request_id).settled).toBe(false)
+    expect(database.getRun(chat.ownerId, run.id).status).toBe('waiting_input')
+    fail.mockRestore()
+    bridge.resume(chat.ownerId, run.id, body)
+    await expect(waiting).resolves.toEqual({ answers: body.answers })
+    expect(bridge.pendings.size).toBe(0)
+  })
+
+  it('rolls back pending creation when its status event cannot be persisted', async () => {
+    const { database, chat, run, bridge, request } = setup()
+    vi.spyOn(database, 'appendEvent').mockImplementation(() => { throw new Error('disk full') })
+    await expect(bridge.handleRequest(request, vi.fn())).rejects.toThrow('disk full')
+    expect(bridge.pendings.size).toBe(0)
+    expect(database.listPendingInputs(chat.ownerId, run.id)).toEqual([])
+    expect(database.getRun(chat.ownerId, run.id).status).not.toBe('waiting_input')
+  })
+
+  it('always rejects an aborted native waiter even when storage is unavailable', async () => {
+    const { database, bridge, request } = setup()
+    const controller = new AbortController()
+    const waiting = bridge.handleRequest({ ...request, signal: controller.signal }, vi.fn())
+    const rejected = expect(waiting).rejects.toMatchObject({ code: 'ASK_ABORTED', cause: expect.any(Error) })
+    vi.spyOn(database, 'settlePendingInput').mockImplementation(() => { throw new Error('disk full') })
+    controller.abort()
+    await rejected
+    expect(bridge.pendings.size).toBe(0)
+  })
+
+  it('contains timer storage failure and never converts it into an answer', async () => {
+    vi.useFakeTimers()
+    try {
+      const { database, bridge, request } = setup()
+      const waiting = bridge.handleRequest(request, vi.fn())
+      const rejected = expect(waiting).rejects.toMatchObject({ code: 'ASK_STORAGE_ERROR' })
+      vi.spyOn(database, 'settlePendingInput').mockImplementation(() => { throw new Error('disk full') })
+      await vi.advanceTimersByTimeAsync(60_000)
+      await rejected
+      expect(bridge.pendings.size).toBe(0)
+    } finally { vi.useRealTimers() }
+  })
+
   it('treats reordered questions and multi-select labels as the same answer on retry', async () => {
     const { database, chat, run, bridge, request } = setup()
     request.questions.push({ id: 'format', question: '格式', multiSelect: true, options: [{ label: 'Word' }, { label: 'PDF' }] })

@@ -26,7 +26,7 @@ it('shares one bounded screenshot deadline across quality retries', async () => 
   expect(page.screenshot.mock.calls.map(([value])=>value.timeout)).toEqual([5000,3000,1000])
 })
 
-function worker(displayFactory) {
+function worker(displayFactory, options = {}) {
   const page = Object.assign(new EventEmitter(), {
     url: () => 'https://example.com', viewportSize: () => ({width:1000,height:700}), isClosed: () => false,
     screenshot: vi.fn(async () => Buffer.from('jpeg')), title: async () => 'Example',
@@ -39,13 +39,34 @@ function worker(displayFactory) {
   const input = new PassThrough(), output = new PassThrough(), frames = [], exit = vi.fn()
   output.on('data',chunk=>frames.push(JSON.parse(String(chunk))))
   const launch=vi.fn(async()=>browser)
-  const runtime = runWorker({chromium:{launch},input,output,exit,displayFactory:displayFactory ?? null})
+  const runtime = runWorker({chromium:{launch},input,output,exit,displayFactory:displayFactory ?? null,...options})
   const command = async (id,action,extra={}) => {
     input.write(JSON.stringify({id,action,...extra})+'\n')
     await vi.waitFor(()=>expect(frames.some(frame=>frame.type==='result' && frame.id===id)).toBe(true))
   }
   return {page,browser,runtime,frames,exit,command,input,context,launch}
 }
+
+it.each([true, false])('terminates a stuck observation before any queued mutation (cancel=%s)', async cancel => {
+  const value = worker(null, { commandTimeoutMs: cancel ? 2000 : 100, cancelGraceMs: 50 })
+  let release
+  value.page.evaluate = vi.fn(() => new Promise(resolve => { release = resolve }))
+  value.page.frames = () => []
+  try {
+    await value.command(1, 'init', { width: 1000, height: 700 })
+    value.input.write(JSON.stringify({ id: 2, action: 'snapshot' }) + '\n')
+    await vi.waitFor(() => expect(value.page.evaluate).toHaveBeenCalled())
+    value.input.write(JSON.stringify({ id: 3, action: 'text', text: 'must not run' }) + '\n')
+    if (cancel) value.input.write(JSON.stringify({ action: 'cancel', cancel_id: 2 }) + '\n')
+    await vi.waitFor(() => expect(value.exit).toHaveBeenCalledWith(2))
+    expect(value.browser.close).toHaveBeenCalledOnce()
+    expect(value.frames.some(frame => frame.type === 'fatal')).toBe(true)
+    release({ text: '', elements: [], viewport: {} })
+    await new Promise(resolve => setImmediate(resolve))
+    expect(value.page.keyboard.insertText).not.toHaveBeenCalled()
+    expect(value.frames.some(frame => frame.id === 2 || frame.id === 3)).toBe(false)
+  } finally { await value.runtime.shutdown() }
+})
 
 function navigationFixture({ commit = true, readable = true, errorName = 'TimeoutError' } = {}) {
   const value = worker(), url = 'https://example.com/loaded'

@@ -14,7 +14,7 @@ export function platformToolName(tool) {
   return publicToolName(`${tool.scope}_${tool.server_id}`, tool.tool_name)
 }
 
-export function platformToolNames(tools) {
+export function platformToolNames(tools, reserved = () => false) {
   const counts = new Map()
   for (const tool of tools) {
     const name = platformToolName(tool)
@@ -24,9 +24,16 @@ export function platformToolNames(tools) {
   const used = new Set()
   for (const tool of tools) {
     let name = platformToolName(tool)
-    if (counts.get(name) > 1) {
+    if (counts.get(name) > 1 || reserved(name)) {
       const hash = createHash('sha256').update(`${tool.scope}\0${tool.server_id}\0${tool.tool_name}`).digest('hex').slice(0, 12)
       name = `${name.slice(0, 51)}_${hash}`
+    }
+    // Never replace a native tool, including one whose name already resembles
+    // an alias. The identity, not catalog order, determines the fallback name.
+    for (let attempt = 1; reserved(name); attempt++) {
+      if (attempt > 64) throw new Error('MCP public tool namespace is unavailable')
+      const hash = createHash('sha256').update(`${tool.scope}\0${tool.server_id}\0${tool.tool_name}\0${attempt}`).digest('hex').slice(0, 12)
+      name = `${platformToolName(tool).slice(0, 51)}_${hash}`
     }
     if (used.has(name) || names.has(tool.id)) throw new Error('MCP public tool names must be unique')
     used.add(name)

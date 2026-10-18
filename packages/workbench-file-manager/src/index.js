@@ -65,7 +65,14 @@ export class FileManagerClient {
         redirect: 'error',
       })
       const result = await managerJson(response, this.maxResponseBytes)
-      if (response.status === 409 || result.conflict) throw Object.assign(new Error(result.message || '内容已改变，请刷新后重试'), { status: 409, code: 'RESOURCE_CONFLICT' })
+      const metadata = {
+        code: typeof result.code === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/.test(result.code) ? result.code : undefined,
+        request_id: typeof result.request_id === 'string' && /^[a-zA-Z0-9_-]{1,128}$/.test(result.request_id) ? result.request_id : undefined,
+        retry_after: Number.isInteger(result.retry_after) && result.retry_after >= 0 && result.retry_after <= 60 ? result.retry_after : undefined,
+      }
+      if (response.status === 409 || result.conflict) throw Object.assign(new Error(
+        typeof (result.message ?? result.error) === 'string' ? (result.message ?? result.error).slice(0, 2048) : '内容已改变，请刷新后重试'),
+      { ...metadata, status: 409, code: metadata.code ?? 'RESOURCE_CONFLICT' })
       // MANAGER_BUSY is issued before dispatch, so this exact request has not
       // run. Transport failures and other errors may have executed a mutation.
       if (response.status === 503 && result.code === 'MANAGER_BUSY' && attempt < 3) {
@@ -74,9 +81,7 @@ export class FileManagerClient {
       }
       if (!response.ok) throw Object.assign(new Error(result.error || '工作台资源操作失败'), {
         status: [400, 401, 403, 404, 413, 429, 503, 504].includes(response.status) ? response.status : 502,
-        code: typeof result.code === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/.test(result.code) ? result.code : undefined,
-        request_id: typeof result.request_id === 'string' && /^[a-zA-Z0-9_-]{1,128}$/.test(result.request_id) ? result.request_id : undefined,
-        retry_after: Number.isInteger(result.retry_after) && result.retry_after >= 0 && result.retry_after <= 60 ? result.retry_after : undefined,
+        ...metadata,
       })
       return result
     }

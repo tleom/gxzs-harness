@@ -65,13 +65,52 @@ def test_versions_create_conflict_atomic_replace_and_delete(root):
     def call(**payload):
         return module.operate({'path':'conversations/test-chat/中文.txt'}|payload,root)
     created=call(operation='upload',version=None,data=base64.b64encode(b'first').decode())
-    assert call(operation='upload',version=None,data='')=={'conflict':True,'message':'文件已改变，请刷新后重试'}
+    assert call(operation='upload',version=None,data='')=={'conflict':True,'code':'FILE_VERSION_CONFLICT','message':'文件已改变，请刷新后重试'}
     assert call(operation='get')['data']==base64.b64encode(b'first').decode()
     updated=call(operation='upload',version=created['version'],data=base64.b64encode(b'second').decode())
     assert updated['version']!=created['version']
     assert call(operation='delete',version=created['version'])['conflict']
     assert call(operation='delete',version=updated['version'])=={'deleted':True}
     assert not list((Path(root)/'conversations/test-chat').glob('.upload-*'))
+
+
+def test_large_file_can_be_deleted_without_reading_its_content(root, monkeypatch):
+    target = Path(root) / 'large.bin'
+    with target.open('wb') as stream:
+        stream.truncate(1024 * 1024 * 1024)
+    monkeypatch.setattr(module, 'read_file', lambda *args: pytest.fail('large deletion must not read file content'))
+    metadata = module.operate({'operation': 'stat', 'path': target.name}, root)
+    assert len(metadata['version']) == 64 and metadata['downloadable'] is False
+    assert module.operate({'operation': 'delete', 'path': target.name, 'version': metadata['version']}, root) == {'deleted': True}
+    assert not target.exists()
+
+
+def test_large_file_rejects_stale_delete_and_remains_bounded_for_download(root):
+    target = Path(root) / 'large.bin'
+    with target.open('wb') as stream:
+        stream.truncate(module.MAX_BYTES + 1)
+    metadata = module.operate({'operation': 'stat', 'path': target.name}, root)
+    with target.open('ab') as stream:
+        stream.write(b'changed')
+    result = module.operate({'operation': 'delete', 'path': target.name, 'version': metadata['version']}, root)
+    assert result['code'] == 'FILE_VERSION_CONFLICT' and target.exists()
+    with pytest.raises(ValueError, match='20 MiB'):
+        module.operate({'operation': 'get', 'path': target.name}, root)
+
+
+def test_delete_detects_a_replaced_file_after_open(root, monkeypatch):
+    target = Path(root) / 'changed.txt'
+    target.write_bytes(b'first')
+    metadata = module.operate({'operation': 'stat', 'path': target.name}, root)
+    original = module.version
+    def replace(data):
+        result = original(data)
+        target.unlink()
+        target.write_bytes(b'replacement')
+        return result
+    monkeypatch.setattr(module, 'version', replace)
+    assert module.operate({'operation': 'delete', 'path': target.name, 'version': metadata['version']}, root)['conflict']
+    assert target.read_bytes() == b'replacement'
 
 
 @pytest.mark.parametrize('path',['../secret','conversations/test-chat/../secret','conversations/test-chat//file','conversations/test-chat/./file','/etc/passwd','conversations/test-chat\\secret'])

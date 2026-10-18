@@ -454,6 +454,12 @@ def personal(payload, root="/workspace"):
             try:
                 write_package(staging, files)
                 fingerprint = tree_version(staging)
+            except BaseException:
+                # Only this uncommitted staging directory is disposable. User
+                # packages and rollback backups retain their existing policy.
+                remove_contents(staging)
+                os.rmdir(staging_name, dir_fd=rootfd)
+                raise
             finally:
                 os.close(staging)
             backups, backup_name = None, None

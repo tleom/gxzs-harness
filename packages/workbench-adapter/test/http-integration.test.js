@@ -9,6 +9,14 @@ import { apply, waitSessionActivity } from '../src/index.js'
 import { WorkbenchDatabase } from '../src/persistence.js'
 import { publishedModels } from './model-fixture.js'
 
+// The HTTP fixture models /workspace through workbenchFileManager, without a
+// real mount. Give only that virtual root a real temporary filesystem's stats.
+vi.mock('node:fs', async (original) => {
+  const fs = await original()
+  const { tmpdir } = await import('node:os')
+  return { ...fs, statfsSync: (path, ...args) => fs.statfsSync(path === '/workspace' ? tmpdir() : path, ...args) }
+})
+
 const cleanups = []
 afterEach(() => cleanups.splice(0).forEach((cleanup) => cleanup()))
 
@@ -111,6 +119,36 @@ async function call(handler, key, method, route, value, authenticated = true, us
 }
 
 describe('authenticated workbench HTTP handler', () => {
+  it('correlates unexpected failures without logging secrets and bounds repeated diagnostics', async () => {
+    const { handler, key, context } = setup()
+    context.skills.list.mockRejectedValue(new TypeError('Bearer private-token /private/config'))
+    let response
+    for (let index = 0; index < 8; index++) response = await call(handler, key, 'GET', '/catalog?token=private-query')
+    expect(response.status).toBe(500)
+    expect(response.body.request_id).toMatch(/^[0-9a-f-]{36}$/)
+    expect(context.logger.warn).toHaveBeenCalledTimes(5)
+    const diagnostic = JSON.parse(context.logger.warn.mock.calls[0][1])
+    expect(diagnostic).toMatchObject({ status: 500, code: 'INTERNAL_ERROR', error_type: 'TypeError',
+      route: '^\\/catalog$', method: 'GET', owner_id: 't:42' })
+    expect(JSON.stringify(context.logger.warn.mock.calls)).not.toMatch(/private|Bearer|token=|x-gxzs-assertion/)
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 60_001)
+    try {
+      response = await call(handler, key, 'GET', '/catalog')
+      const resumed = JSON.parse(context.logger.warn.mock.calls.at(-1)[1])
+      expect(resumed.suppressed).toBe(3)
+      expect(resumed.request_id).toBe(response.body.request_id)
+    } finally { clock.mockRestore() }
+  })
+
+  it('keeps expected authorization failures quiet and preserves a reply when logging fails', async () => {
+    const { handler, key, context } = setup()
+    expect((await call(handler, key, 'GET', '/catalog', undefined, false)).status).toBe(401)
+    expect(context.logger.warn).not.toHaveBeenCalled()
+    context.skills.list.mockRejectedValue(new Error('secret'))
+    context.logger.warn.mockImplementation(() => { throw new Error('logger unavailable') })
+    expect((await call(handler, key, 'GET', '/catalog')).status).toBe(500)
+  })
+
   it('pages terminal history through a fixed cursor and retains owner authorization', async () => {
     const { handler, key, context } = setup()
     const { database } = context.reflect.provide.mock.calls.find(([name]) => name === 'workbenchRuntime')[1]

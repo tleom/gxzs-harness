@@ -23,7 +23,7 @@
     "immer": "10.1.1",
     "zustand": "4.5.7",
     "esbuild": "0.28.2",
-    "ajv": "8.17.1",
+    "ajv": "8.20.0",
     "@deepseek-ai/dsh": "0.2.1-rc.2",
     "@deepseek-ai/dsh-client-ui-primitives": "0.2.1-rc.2",
     "@deepseek-ai/dsh-client-store": "0.2.1-rc.2",
@@ -43,6 +43,7 @@
     "@gxzs/dsh-tool-discovery": "file:../../packages/tool-discovery"
   },
   "overrides": {
-    "@earendil-works/pi-ai": "1.1.0"
+    "@earendil-works/pi-ai": "1.1.0",
+    "fflate": "0.8.3"
   }
 }

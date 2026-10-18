@@ -45,12 +45,15 @@ export class AssertionVerifier {
       if (claims[name] !== value) throw unauthorized(`工作台身份断言未绑定当前请求：${name}`)
 
     if (claims.sub !== `${claims.tenant_id}:${claims.user_id}`) throw unauthorized('工作台身份断言主体无效')
-    if (this.replayCache.consume(claims.jti, claims.exp, now) === false) throw unauthorized('工作台身份断言已被使用')
+    if (claims.request_deadline_ms !== undefined && (!Number.isSafeInteger(claims.request_deadline_ms) || claims.request_deadline_ms < 0))
+      throw unauthorized('工作台请求期限无效')
+    if (this.replayCache.consume(claims.jti, claims.exp + this.clockSkewSeconds, now) === false) throw unauthorized('工作台身份断言已被使用')
     return {
       ownerId: claims.sub,
       tenantId: String(claims.tenant_id),
       userId: String(claims.user_id),
       name: typeof claims.name === 'string' ? claims.name : '',
+      ...(claims.request_deadline_ms === undefined ? {} : { deadlineMs: claims.request_deadline_ms }),
     }
   }
 }

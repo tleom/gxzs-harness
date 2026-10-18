@@ -8,7 +8,8 @@ On the Linux host that can reach the sandbox Docker network, export values witho
 
 ```bash
 export HARNESS=/path/to/gxzs/harness
-export DSH_HOME=/srv/gxzs/harness-validation/user-42
+export GXZS_VALIDATION_ROOT=/srv/gxzs/harness-validation
+export DSH_HOME="$GXZS_VALIDATION_ROOT/user-42"
 export GXZS_HOST_OWNER_ID='<tenant-id>:<user-id>'
 export GXZS_ASSERTION_ISSUER='gxzs'
 export GXZS_ASSERTION_SIGNING_KEY='<base64 key, at least 32 decoded bytes>'
@@ -35,7 +36,9 @@ Also export the model provider variables required by the selected DSH model prof
 
 ## 2. Install the locked profile
 
-The preparation script replaces `profiles/workbench` and the three gxzs package directories under the selected `$DSH_HOME`. Use a disposable validation home only:
+The preparation script replaces `profiles/workbench` and the bundled package directories under the selected `$DSH_HOME`. Use a disposable validation home only. The home must be a strict descendant of `$GXZS_VALIDATION_ROOT`, with no overlap with the source repository. GNU `realpath` is required to resolve symlinked parents before checking this boundary.
+
+A new or empty home receives a path-bound `.gxzs-disposable-validation-home` marker. Repeated preparations require that marker to match the resolved home path. Existing nonempty, unmarked homes, copied markers from another path, and symlinked `profiles`, `packages`, or `scripts` directories are rejected before replacement. Select a fresh disposable home for an old unmarked validation installation:
 
 ```bash
 sh "$HARNESS/scripts/prepare-live-home.sh"

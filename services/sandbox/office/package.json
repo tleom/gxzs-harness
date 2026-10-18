@@ -27,9 +27,16 @@
     "react-dom": "19.3.0",
     "react-icons": "5.7.0",
     "sass": "1.104.1",
-    "sharp": "0.35.4",
+    "sharp": "0.35.5",
     "tailwindcss": "4.3.3",
     "typescript": "7.0.2",
     "ws": "8.22.0"
+  },
+  "overrides": {
+    "image-size": "2.0.3",
+    "brace-expansion@<2": "1.1.21",
+    "brace-expansion@>=2 <3": "2.1.7",
+    "source-map-js": "1.2.2",
+    "uuid": "11.1.1"
   }
 }

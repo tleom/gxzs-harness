@@ -14,6 +14,18 @@ function create(fetchImpl) {
 }
 
 describe('restricted sandbox-manager file client', () => {
+  it.each(['PROFILE_UPGRADE_PREPARING', 'FILE_VERSION_CONFLICT'])('preserves %s conflict identity without retrying a mutation', async code => {
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ error: '当前状态冲突', code, request_id: 'request-1', retry_after: 5 }), { status: 409 }))
+    await expect(create(fetchImpl).operate({ operation: 'delete', path: 'large.bin', version: 'old' }))
+      .rejects.toMatchObject({ status: 409, code, request_id: 'request-1', retry_after: 5, message: '当前状态冲突' })
+    expect(fetchImpl).toHaveBeenCalledOnce()
+  })
+
+  it('bounds untrusted conflict metadata and retains the legacy fallback', async () => {
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ conflict: true, code: 'bad\ncode', request_id: 'x'.repeat(129), retry_after: 999 })))
+    await expect(create(fetchImpl).operate({ operation: 'delete' }))
+      .rejects.toMatchObject({ status: 409, code: 'RESOURCE_CONFLICT', request_id: undefined, retry_after: undefined })
+  })
   it('checks the current owner Host lifecycle through a fixed non-model operation and requires explicit acceptance', async () => {
     const fetchImpl=vi.fn(async()=>new Response(JSON.stringify({writable:true})))
     const manager=create(fetchImpl)

@@ -20,6 +20,15 @@ async function main() {
     require(name)
   }
   const presentation = new PptxGenJS()
+  const sharp = require('sharp')
+  const png = await sharp(Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" width="32" height="24"><rect width="32" height="24" fill="blue"/></svg>')).png().toBuffer()
+  const dimensions = require('image-size').imageSize(png)
+  if (dimensions.width !== 32 || dimensions.height !== 24) throw new Error('Image metadata regression')
+  const workbook = new (require('exceljs').Workbook)()
+  const sheet = workbook.addWorksheet('validation')
+  sheet.getCell('A1').value = 12
+  sheet.addConditionalFormatting({ ref: 'A1:A2', rules: [{ type: 'iconSet', iconSet: '3Arrows', cfvo: [{ type: 'percent', value: 0 }, { type: 'percent', value: 33 }, { type: 'percent', value: 67 }] }] })
+  await workbook.xlsx.writeFile(path.join(out, 'workbook.xlsx'))
   presentation.layout = 'LAYOUT_WIDE'
   presentation.addSlide().addText('中文预览验证', {
     x: 1,
@@ -29,6 +38,7 @@ async function main() {
     fontSize: 32,
     fontFace: 'Noto Sans CJK SC',
   })
+  presentation.addSlide().addImage({ data: 'image/png;base64,' + png.toString('base64'), x: 1, y: 1, w: 2, h: 1.5 })
   await presentation.writeFile({ fileName: path.join(out, 'slides.pptx') })
   const browser = await chromium.launch({
     executablePath: process.env.CHROME_BIN || '/usr/bin/chromium',
@@ -47,7 +57,7 @@ async function main() {
     await page.pdf({ path: path.join(out, 'chrome-node.pdf') })
     fs.writeFileSync(
       path.join(out, 'node-result.json'),
-      JSON.stringify({ ok: true, chrome: browser.version(), pptx: true, browserInteraction: true }),
+      JSON.stringify({ ok: true, chrome: browser.version(), pptx: true, xlsx: true, imageMetadata: true, sharp: sharp.versions, browserInteraction: true }),
     )
   } finally {
     await browser.close()

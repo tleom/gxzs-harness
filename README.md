@@ -1,6 +1,6 @@
 # gxzs Harness
 
-`gxzs-harness` replaces the current custom Dify Agent runtime with DeepSeek Harness while keeping upstream `@deepseek-ai/*` packages unmodified.
+`gxzs-harness` provides the GXZS Agent runtime on DeepSeek Harness. The Workbench profile uses DSH `0.2.1-rc.2`, with exact dependency versions recorded in its manifest and lockfile. Version-guarded preparation scripts and compatibility patches, their validation entry points, and removal criteria are listed in the [DSH preparation register](docs/dsh-preparation-register.md).
 
 ## Product boundary
 
