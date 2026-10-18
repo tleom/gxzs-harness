@@ -155,6 +155,24 @@ it('does not evict unchanged live indexes when another workspace searches betwee
   expect(new Set([...ids(first), ...ids(second)]).size).toBe(2)
 })
 
+it.each(['cold', 'live'])('preserves %s pagination across first-time foreign indexing while rejecting actual scope changes', async kind => {
+  const records = [record('a', '/a'), record('b', '/a'), record('c', '/b')]
+  const { ctx } = await boot(kind === 'cold' ? records : [])
+  const sessions = kind === 'live' ? records.map(({ header }) => {
+    const session = ctx.sessions.create(undefined, { meta: { cwd: header.cwd } })
+    session.append('user/message', createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'needle' }] }), { surfaceOp: 'append' })
+    return session
+  }) : []
+  const first = await query(ctx, '/a', { limit: 1 })
+  expect(first.nextCursor).toBeDefined()
+  await query(ctx, '/b')
+  const second = await query(ctx, '/a', { limit: 1, cursor: first.nextCursor })
+  expect(new Set([...ids(first), ...ids(second)]).size).toBe(2)
+  if (kind === 'cold') records[0] = { ...record('a', '/a', 'needle changed'), revision: '2' }
+  else sessions[0].append('user/message', createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'needle changed' }] }), { surfaceOp: 'append' })
+  await expect(query(ctx, '/a', { limit: 1, cursor: first.nextCursor })).rejects.toMatchObject({ code: 'SESSION_QUERY_STALE_CURSOR' })
+})
+
 it('applies the version-pinned source transformation idempotently', async () => {
   const source = await readFile(require.resolve('@deepseek-ai/dsh-session-query-sqlite'), 'utf8')
   const patched = sessionSearchSource(source)

@@ -10,6 +10,31 @@ export function sessionSearchSource(source) {
     ['materializeSessionResultFilters, readColdSessionLog', 'materializeSessionResultFilters, filterSessionResults, readColdSessionLog'],
     ['const persistenceBinding = await this._reconcile(signal);\n\t\t\tassertNotAborted(signal);\n\t\t\tconst generation', 'const persistenceBinding = await this._reconcile(signal, normalized.sessionFilters);\n\t\t\tassertNotAborted(signal);\n\t\t\tconst generation'],
     ['const persistenceBinding = await this._reconcile(signal);\n\t\t\tassertNotAborted(signal);\n\t\t\tconst target', 'const persistenceBinding = await this._reconcile(signal, [{ kind: "id", values: [normalized.sessionId] }]);\n\t\t\tassertNotAborted(signal);\n\t\t\tconst target'],
+    ['const generation = String(this._globalGeneration);', 'const generation = this._scopedGeneration(normalized.sessionFilters, persistenceBinding);'],
+    ['\t_querySessions(request, offset, persistenceBinding) {\n\t\tconst selected = selectedDocumentsSql();', `	_scopedGeneration(filters, persistenceBinding) {
+		const where = buildSessionWhere(filters);
+		const visible = persistenceBinding.service !== void 0 ? 1 : 0;
+		const bindings = [visible, visible, ...where.params];
+		assertPortableBindingCount(bindings.length);
+		// Hash only metadata from the authoritative rows in this scope. Other
+		// workspaces can build their indexes without invalidating this cursor.
+		const rows = this._requireDb().prepare(\`WITH corpus AS (
+      SELECT id AS session_id, cwd, created_at, parent_session,
+        0 AS live, 1 AS persisted, generation
+      FROM persisted_sessions AS ps
+      WHERE ? = 1 AND NOT EXISTS (SELECT 1 FROM temp.live_sessions AS ls WHERE ls.id = ps.id)
+      UNION ALL
+      SELECT id AS session_id, cwd, created_at, parent_session,
+        1 AS live, CASE WHEN ? = 1 THEN persisted ELSE 0 END AS persisted, generation
+      FROM temp.live_sessions
+    ) SELECT session_id, live, persisted, generation FROM corpus
+      \${where.sql.length === 0 ? "" : \`WHERE \${where.sql}\`}
+      ORDER BY session_id\`).all(...bindings);
+		return createHash("sha256").update(JSON.stringify([this._persistenceEpoch, rows])).digest("hex");
+	}
+	_querySessions(request, offset, persistenceBinding) {
+		// Retain the native full-text result query and ordering.
+		const selected = selectedDocumentsSql();`],
     ['async _reconcile(signal) {', 'async _reconcile(signal, filters = []) {'],
     ['const observation = await this._observeStable(persistedById, signal);', 'const headerFilters = filters.filter((filter) => filter.kind !== "availability");\n\t\tconst includes = (header) => filterSessionResults([{ header, live: true, persisted: true }], headerFilters).length !== 0;\n\t\tconst observation = await this._observeStable(persistedById, signal, includes);'],
     ['const persistentDeletes = observation.persistenceBinding.service === void 0 ? [] : persistedRows.filter((row) => !observation.persisted.has(row.id));', 'const pointerChanged = this._lastPersistenceIdentity !== void 0 && this._lastPersistenceIdentity !== observation.persistenceBinding.identity;\n\t\tconst persistentDeletes = observation.persistenceBinding.service === void 0 ? [] : persistedRows.filter((row) => pointerChanged || !observation.persisted.has(row.id));'],
