@@ -151,6 +151,7 @@ it('composes all four official bundles once and retains their native providers a
     openAt: 'first-search',
     path: { __jsExpr: "(process.env.DSH_HOME ?? process.cwd()) + '/session-search.sqlite'" },
   })
+  expect(all.find(row => row.id === 'optional-tool-session-query').config).toMatchObject({ searchTimeoutMs: 120000 })
 })
 
 it('holds the Host for isolated native PTYs, observes pending creation and releases its observer on unload', async () => {

@@ -50,6 +50,7 @@ function setup() {
   const service = new WorkbenchService({ database, sessionController, agents, commands, skills, fileManager, platformClient: publishedClient, workspace: '/workspace' })
   service.workingDirectory = { ensure: vi.fn(async () => '/workspace/current') }
   service.onGoalChanged = vi.fn(() => vi.fn())
+  service.permanentDeletion = { prepare: vi.fn(async chat => [chat.sessionId]), erase: vi.fn(async () => {}) }
   return { database, owner, chat, service, sessionController, agents, commands, skills, fileManager, platformClient, agent }
 }
 
@@ -1261,7 +1262,7 @@ describe('followup and control service', () => {
     expect(() => service.feedback({ ownerId: 'other:user' }, run.id, 'like')).toThrow('任务不存在')
   })
 
-  it('returns reasoning parameter rules and hides soft-deleted chats and runs', async () => {
+  it('returns reasoning parameter rules and permanently deletes chats and runs', async () => {
     const { database, owner, chat, service } = setup()
     expect(await service.modelParameters('p/m')).toMatchObject({ reasoning_effort: { options: ['low', 'high'], default: 'low' } })
     const { run } = database.createRun({ ownerId: owner.ownerId, chatId: chat.id, sessionId: chat.sessionId, query: 'q', selection: {} })
@@ -1269,15 +1270,32 @@ describe('followup and control service', () => {
     await service.deleteChat(owner, chat.id)
     expect(service.listChats(owner)).toEqual([])
     expect(() => service.getRun(owner, run.id)).toThrow('任务不存在')
+    expect(database.db.prepare('SELECT id FROM chats WHERE id = ?').get(chat.id)).toBeUndefined()
+    expect(database.db.prepare('SELECT id FROM runs WHERE id = ?').get(run.id)).toBeUndefined()
+    await service.deleteChat(owner, chat.id)
   })
 
-  it('deletes the checked directory version and preserves chat on a conflict', async () => {
-    const { owner, chat, service, fileManager } = setup()
+  it('keeps a retry receipt after native erasure fails and never reports successful deletion early', async () => {
+    const { database, owner, chat, service } = setup()
+    service.permanentDeletion.erase.mockRejectedValueOnce(new Error('storage unavailable'))
+    await expect(service.deleteChat(owner, chat.id)).rejects.toThrow('storage unavailable')
+    expect(database.chatDeletion(owner.ownerId, chat.id).completedAt).toBeNull()
+    expect(database.deletionChat(owner.ownerId, chat.id)).toBeDefined()
+    await service.deleteChat(owner, chat.id)
+    expect(database.chatDeletion(owner.ownerId, chat.id).completedAt).toEqual(expect.any(Number))
+    expect(database.deletionChat(owner.ownerId, chat.id)).toBeUndefined()
+    await expect(service.deleteChat({ ownerId: 'another' }, chat.id)).rejects.toMatchObject({ status: 404 })
+  })
+
+  it('retains a durable deletion for retry on a directory conflict', async () => {
+    const { database, owner, chat, service, fileManager } = setup()
     fileManager.operate.mockResolvedValueOnce({ kind: 'directory', version: 'tree-v2' })
+      .mockResolvedValueOnce({ kind: 'directory', version: 'tree-v2' })
       .mockRejectedValueOnce(Object.assign(new Error('changed'), { status: 409 }))
     await expect(service.deleteChat(owner, chat.id)).rejects.toMatchObject({ status: 409 })
     expect(fileManager.operate).toHaveBeenLastCalledWith({ operation: 'delete', path: `conversations/${chat.id}`, version: 'tree-v2' })
-    expect(service.listChats(owner)).toHaveLength(1)
+    expect(database.chatDeletion(owner.ownerId, chat.id).completedAt).toBeNull()
+    expect(service.permanentDeletion.erase).not.toHaveBeenCalled()
     fileManager.operate.mockResolvedValueOnce({ kind: 'missing' })
     await service.deleteChat(owner, chat.id)
     expect(service.listChats(owner)).toHaveLength(0)
@@ -1322,7 +1340,7 @@ describe('followup and control service', () => {
     await vi.waitFor(()=>expect(service.waitSessionActivity).toHaveBeenCalledWith(chat.sessionId))
     expect(fileManager.operate).not.toHaveBeenCalled()
     settled();await deletion
-    expect(actions).toEqual([['archive', { sessionId: chat.sessionId, stopActivity: true }], ['terminals', chat.sessionId], ['settled', chat.sessionId], ['stat'], ['delete']])
+    expect(actions).toEqual([['archive', { sessionId: chat.sessionId, stopActivity: true }], ['terminals', chat.sessionId], ['settled', chat.sessionId], ['stat'], ['stat'], ['delete']])
     expect(service.listChats(owner)).toEqual([])
   })
 
@@ -2089,7 +2107,7 @@ describe('forked conversations', () => {
     const { service, owner, chat, database, second, sessionController } = history()
     sessionController.fork.mockResolvedValueOnce({ sessionId: 'child-1' }).mockResolvedValueOnce({ sessionId: 'child-2' })
     const first = await service.fork(owner, second.id, { request_key: 'a' })
-    database.deleteChat(owner.ownerId, chat.id)
+    database.db.prepare('UPDATE chats SET deleted_at = 1 WHERE id = ?').run(chat.id)
     database.updateChat(owner.ownerId, first.id, { directory: 'cases/moved' })
     service.sessionQuery = { observeSession: vi.fn(async id => {
       if (id !== 'child-1') throw new Error('original session unavailable')
@@ -2264,7 +2282,7 @@ describe('forked conversations', () => {
     database.transitionRun(owner.ownerId, second.id, 'running')
     await expect(service.fork(owner, second.id, { request_key: 'x' })).rejects.toMatchObject({ status: 409 })
     database.transitionRun(owner.ownerId, second.id, 'completed')
-    database.deleteChat(owner.ownerId, chat.id)
+    database.db.prepare('UPDATE chats SET deleted_at = 1 WHERE id = ?').run(chat.id)
     await expect(service.fork(owner, second.id, { request_key: 'x' })).rejects.toMatchObject({ status: 404 })
     expect(sessionController.fork).not.toHaveBeenCalled()
   })

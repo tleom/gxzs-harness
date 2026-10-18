@@ -13,6 +13,7 @@ import { resolveWorkspacePath } from './paths.js'
 import { claimNeedsResources, createAssistantStreamProjector, prepareRecoveredInboxes, projectInboxClaim, projectSessionEvent, reconcileNativeSessions, settleNativeIdle } from './projection.js'
 import { WorkbenchRuntime } from './runtime.js'
 import { WorkbenchService } from './service.js'
+import { ChatDeletion } from './chat-deletion.js'
 import { TaskScheduler } from './scheduler.js'
 import { registerDatabasePrompt } from './database-prompt.js'
 import { registerModelToolCallGuard } from './model-tool-call-guard.js'
@@ -40,7 +41,7 @@ import { WorkbenchSubagentSettings } from './settings.js'
 import { setTimeout as delay } from 'node:timers/promises'
 
 export const name = 'workbench-adapter'
-export const inject = ['connection', 'typertGateway', 'webServer', 'sessionController', 'workspaceController', 'sessionReferenceResolver', 'fileReferences', 'workspaceChanges', 'workingDirectory', 'agents', 'commands', 'skills', 'systemPrompt', 'tokenMeter', 'workbenchFileManager', 'workbenchPlatformClient', 'sessionQuery', 'sessionProjections', 'agentPresets', 'agentDefaultModel', 'settings', 'attachments', 'fileUploads', 'goals', 'terminalController', 'subagents', 'subprocess', 'jobs', 'jobController', 'tools']
+export const inject = ['sessionPersistence', 'sessions', 'connection', 'typertGateway', 'webServer', 'sessionController', 'workspaceController', 'sessionReferenceResolver', 'fileReferences', 'workspaceChanges', 'workingDirectory', 'agents', 'commands', 'skills', 'systemPrompt', 'tokenMeter', 'workbenchFileManager', 'workbenchPlatformClient', 'sessionQuery', 'sessionProjections', 'agentPresets', 'agentDefaultModel', 'settings', 'attachments', 'fileUploads', 'goals', 'terminalController', 'subagents', 'subprocess', 'jobs', 'jobController', 'tools']
 
 export const Config = z.object({
   basePath: z.string().default('/ai/workbench'),
@@ -89,6 +90,7 @@ export function apply(ctx, config) {
   scheduler.executionRun = (sessionId) => runtime.executionRun(sessionId)
   const service = new WorkbenchService({ database, sessionController: ctx.sessionController, agents: ctx.agents, commands: ctx.commands, skills: ctx.skills, fileManager: ctx.workbenchFileManager, platformClient: ctx.workbenchPlatformClient, workspace: config.workspace, sessionQuery: ctx.sessionQuery, agentPresets: ctx.agentPresets, agentDefaultModel: ctx.agentDefaultModel, modelSettings: ctx.settings, scheduler, attachments: ctx.attachments, goals: ctx.goals, fileUploads: ctx.fileUploads, nativeFileAttachments: process.env.GXZS_NATIVE_FILE_ATTACHMENTS === '1' })
   service.workspaceChanges = ctx.workspaceChanges
+  service.permanentDeletion = new ChatDeletion(ctx, database, config.ownerId)
   service.workingDirectory = ctx.workingDirectory
   service.onGoalChanged = listener => ctx.on('goal/changed', listener, { prepend: true })
   service.workspaces = workspaces
@@ -144,6 +146,10 @@ export function apply(ctx, config) {
     recovering = true
     recovered = false
     recovery = (async () => {
+      for (const deletion of database.pendingChatDeletions(config.ownerId)) {
+        try { await service.completeChatDeletion({ ownerId: config.ownerId }, deletion) }
+        catch { ctx.logger.warn('Permanent chat deletion remains pending; retry the delete request') }
+      }
       const queued = await reconcileNativeSessions(database, ctx.sessionQuery, config.ownerId, () => {
         // Missing autonomous receipts need a fresh frozen catalog. Retry
         // recovery until its first verified sync; an unavailable read is not empty.

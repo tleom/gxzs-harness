@@ -228,7 +228,14 @@ export class WorkbenchService {
 
   async deleteChat(owner, chatId) {
     return this.withChatMutation(chatId, async () => {
-      const chat = this.requireChat(owner, chatId)
+      const pending = this.database.chatDeletion(owner.ownerId, chatId)
+      if (pending) {
+        if (!pending.completedAt) await this.completeChatDeletion(owner, pending, { refreshFiles: true })
+        return
+      }
+      const chat = this.database.deletionChat(owner.ownerId, chatId)
+      if (!chat) throw httpError(404, '会话不存在或已被删除')
+      if (!this.permanentDeletion) throw httpError(503, '会话删除服务尚未就绪')
       this.scheduler?.deletingChats.add(chatId)
       try {
         // Drain an in-flight admission before cancelling; otherwise its prompt
@@ -265,15 +272,32 @@ export class WorkbenchService {
         // Allocated task directories are private; selected workspaces and forks retain shared files.
         const shared = this.database.listChats(owner.ownerId).some((other) => other.id !== chat.id && (other.directory ?? `conversations/${other.id}`) === path)
         const allocated = path === `conversations/${chat.id}` || /^conversations\/\d{4}-\d{2}-\d{2}\//.test(path) && path.split('/').at(-1) === chat.id
-        if (shared || !allocated || path === '.') { this.database.deleteChat(owner.ownerId, chatId); return }
-        const entry = await this.fileManager.operate({ operation: 'stat', path })
-        if (entry.kind !== 'missing')
-          await this.fileManager.operate({ operation: 'delete', path, version: entry.version })
-        this.database.deleteChat(owner.ownerId, chatId)
+        const sessionIds = await this.permanentDeletion.prepare(chat)
+        let fileDeletion
+        if (!shared && allocated && path !== '.') {
+          const entry = await this.fileManager.operate({ operation: 'stat', path })
+          if (entry.kind !== 'missing') fileDeletion = { path, version: entry.version }
+        }
+        const deletion = this.database.beginChatDeletion(owner.ownerId, chatId, sessionIds, fileDeletion)
+        await this.completeChatDeletion(owner, deletion)
       } finally {
         this.scheduler?.deletingChats.delete(chatId)
       }
     })
+  }
+
+  async completeChatDeletion(owner, deletion, { refreshFiles = false } = {}) {
+    if (!this.permanentDeletion) throw httpError(503, '会话删除服务尚未就绪')
+    if (deletion.fileDeletion) {
+      const { path, version } = deletion.fileDeletion
+      const shared = this.database.listChats(owner.ownerId).some(chat => (chat.directory ?? `conversations/${chat.id}`) === path)
+      if (!shared) {
+        const entry = await this.fileManager.operate({ operation: 'stat', path })
+        if (entry.kind !== 'missing') await this.fileManager.operate({ operation: 'delete', path, version: refreshFiles ? entry.version : version })
+      }
+    }
+    await this.permanentDeletion.erase(deletion)
+    this.database.finishChatDeletion(owner.ownerId, deletion.chatId)
   }
 
   async withChatMutation(chatId, operation) {
