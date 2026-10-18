@@ -15,6 +15,22 @@ import global_memory as memory
 from global_memory import operate
 
 
+class ImportPathTests(unittest.TestCase):
+    def test_repeated_catalog_refresh_does_not_accumulate_source_paths(self):
+        from types import SimpleNamespace
+        source = '/fixture/fixed-memory-source'
+        initial = list(sys.path)
+        try:
+            with patch.dict(sys.modules, {'md_cg.mcp_server': SimpleNamespace(KERNEL_TOOLS=[])}):
+                first = memory.catalog(source)
+                for _ in range(1000):
+                    self.assertEqual(memory.catalog(source), first)
+                self.assertEqual(sys.path.count(source), 1)
+                self.assertEqual(len(sys.path), len(initial) + 1)
+        finally:
+            sys.path[:] = initial
+
+
 class InstallTests(unittest.TestCase):
     def test_installs_runtime_entry_dependencies_without_unrelated_repository_files(self):
         archive = io.BytesIO()

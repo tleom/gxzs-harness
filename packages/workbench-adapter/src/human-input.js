@@ -20,11 +20,19 @@ export class HumanInputBridge {
     const deadlineAt = planReview ? null : Date.now() + this.timeoutSeconds * 1000
     const payload = pendingPayload(id, request.questions ?? [])
     const pending = { id, ownerId: chat.ownerId, runId: run.id, questions: request.questions ?? [], settled: false }
+    this.database.transaction(() => {
+      this.database.createPendingInput(chat.ownerId, run.id, { requestId: id, payload, deadlineAt })
+      this.database.appendEvent(chat.ownerId, run.id, { event: 'workbench_status', status: 'waiting_input' })
+    })()
     const answer = new Promise((resolve, reject) => Object.assign(pending, { resolve, reject }))
     this.pendings.set(id, pending)
-    this.database.createPendingInput(chat.ownerId, run.id, { requestId: id, payload, deadlineAt })
-    this.database.appendEvent(chat.ownerId, run.id, { event: 'workbench_status', status: 'waiting_input' })
-    if (deadlineAt !== null) pending.timer = setTimeout(() => this.timeout(chat.ownerId, run.id, id), this.timeoutSeconds * 1000)
+    if (deadlineAt !== null) pending.timer = setTimeout(() => {
+      try { this.timeout(chat.ownerId, run.id, id) }
+      catch (cause) {
+        this.abort(pending, Object.assign(new Error('Question persistence failed', { cause }),
+          { name: 'UserQuestionError', code: 'ASK_STORAGE_ERROR' }))
+      }
+    }, this.timeoutSeconds * 1000)
     pending.timer?.unref?.()
     const abort = () => this.abort(pending)
     request.signal?.addEventListener('abort', abort, { once: true })
@@ -72,8 +80,8 @@ export class HumanInputBridge {
   touch(ownerId, runId, requestId) {
     const resolved = this.resolve(ownerId, runId, requestId)
     const pending = resolved.pending
-    if (pending?.timer) { clearTimeout(pending.timer); pending.timer = undefined }
     this.database.touchPendingInput(ownerId, runId, requestId)
+    if (pending?.timer) { clearTimeout(pending.timer); pending.timer = undefined }
     return this.database.getPendingInput(ownerId, runId, requestId)
   }
 
@@ -95,24 +103,34 @@ export class HumanInputBridge {
 
   settle(pending, outcome, answer) {
     if (pending.settled) return false
+    // The answer and its status event share a durable commit. A failed event
+    // write must not leave a submitted receipt with an unresolved native waiter.
+    const resumeRun = this.database.transaction(() => {
+      this.database.settlePendingInput(pending.ownerId, pending.runId, pending.id, outcome, answer)
+      const resume = !this.database.listPendingInputs(pending.ownerId, pending.runId).some(input => input.status === 'pending')
+      this.database.appendEvent(pending.ownerId, pending.runId, {
+        event: 'workbench_status', status: this.database.getRun(pending.ownerId, pending.runId).status,
+      })
+      return resume
+    })()
+    pending.resumeRun = resumeRun
     pending.settled = true
     clearTimeout(pending.timer)
     this.pendings.delete(pending.id)
-    this.database.settlePendingInput(pending.ownerId, pending.runId, pending.id, outcome, answer)
-    pending.resumeRun = !this.database.listPendingInputs(pending.ownerId, pending.runId).some(input => input.status === 'pending')
-    this.database.appendEvent(pending.ownerId, pending.runId, {
-      event: 'workbench_status', status: this.database.getRun(pending.ownerId, pending.runId).status,
-    })
     return true
   }
 
-  abort(pending) {
+  abort(pending, error = Object.assign(new Error('ask_user_question was aborted'), { name: 'UserQuestionError', code: 'ASK_ABORTED' })) {
     if (pending.settled) return
+    // Cancellation must finish the native waiter even when durable storage is
+    // unavailable. The existing pending receipt remains recoverable after restart.
+    try {
+      this.database.settlePendingInput(pending.ownerId, pending.runId, pending.id, 'aborted', undefined, Date.now(), { resumeRun: false })
+    } catch (cause) { error.cause ??= cause }
     pending.settled = true
     clearTimeout(pending.timer)
     this.pendings.delete(pending.id)
-    this.database.settlePendingInput(pending.ownerId, pending.runId, pending.id, 'aborted', undefined, Date.now(), { resumeRun: false })
-    pending.reject(Object.assign(new Error('ask_user_question was aborted'), { name: 'UserQuestionError', code: 'ASK_ABORTED' }))
+    pending.reject(error)
   }
 }
 

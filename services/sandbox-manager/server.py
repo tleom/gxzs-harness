@@ -18,7 +18,7 @@ from concurrent.futures import ThreadPoolExecutor
 from urllib.request import ProxyHandler, Request, build_opener
 
 from admission import Admission
-from resource_limits import cgroup_args, owner_cgroup, ResourceUnavailable
+from resource_limits import cgroup_args, owner_cgroup, ResourceUnavailable, storage_status
 from owner_networks import OwnerNetworks
 from owner_auth import authorize as authorize_request
 from office_conversions import OfficeConversions
@@ -190,6 +190,70 @@ def save_operation(path, value):
     os.replace(temporary, path)
 
 
+def environment_status(key, request_id, *, now=None):
+    """Inspect outside the owner lock; never infer rollback from a lost client."""
+    now = time.time() if now is None else now
+    record, installer = operation_file(key, request_id)
+    with lock(key):
+        if not record.exists():
+            return {'status': 'failed', 'message': '安装请求未执行'}
+        value = json.loads(record.read_text())
+        if value.get('status') not in {'installing', 'unknown'}:
+            return value
+    unknown = {**value, 'status': 'unknown', 'message': '安装结果待核实，请查询状态后再更新环境'}
+    try:
+        def inspect():
+            result = docker('inspect', installer, check=False, timeout=5)
+            if result.returncode:
+                message = getattr(result, 'stderr', '').lower()
+                if 'no such object' in message or 'no such container' in message:
+                    return None
+                raise ValueError('Installer state is unknown')
+            return json.loads(result.stdout)[0]
+        info = inspect()
+        stopped = False
+        if info and info.get('State', {}).get('Running') is True:
+            if now <= float(value.get('deadline', 0)):
+                return value
+            docker('stop', '--time', '5', installer, timeout=15)
+            info = inspect()
+            if info and info.get('State', {}).get('Running') is not False:
+                raise ValueError('Installer stop is unconfirmed')
+            stopped = True
+        elif info is not None and info.get('State', {}).get('Running') is not False:
+            raise ValueError('Installer state is unknown')
+        elif info is not None:
+            # Docker may have created the container while its start request is
+            # still delayed. Running=false alone cannot fence that late start.
+            stopped = info.get('State', {}).get('Status') in {'exited', 'dead'}
+            if not stopped:
+                raise ValueError('Installer start or exit is unconfirmed')
+        elif info is None and now <= float(value.get('deadline', 0)) and value.get('status') == 'installing':
+            # The request may have persisted just before starting docker run.
+            return value
+        name, _ = identity(key)
+        current = docker('exec', '--user', '1000', name, *MANAGER_PYTHON, '-c',
+                         "from pathlib import Path; p=Path('/opt/user-env/current/request.json'); print(p.read_text() if p.exists() else '{}')",
+                         check=False, timeout=10)
+        if current.returncode:
+            raise ValueError('Current environment cannot be inspected')
+        applied = json.loads(current.stdout).get('request_id') == request_id
+        # An absent --rm container without this commit receipt may also mean
+        # docker run has not reached the daemon yet. Keep the durable gate until
+        # there is positive completion/stop evidence, not just an expired clock.
+        output = ({**value, 'status': 'ready' if applied else 'failed',
+                   'message': '环境已更新' if applied else '安装未完成，请检查共享环境'}
+                  if applied or stopped else unknown)
+    except (ValueError, OSError, subprocess.SubprocessError):
+        output = unknown
+    with lock(key):
+        latest = json.loads(record.read_text())
+        if latest.get('status') not in {'installing', 'unknown'}:
+            return latest
+        save_operation(record, output)
+    return output
+
+
 def ensure(key, *, track_activity=True, allow_existing_image=False):
     skills_mount = global_skill_mounts()
     pids_limit = int(os.environ.get('WORKBENCH_SANDBOX_PIDS_LIMIT', '1024'))
@@ -357,7 +421,8 @@ def operation(key, action, payload):
     if action == 'diagnostics':
         from mcp_runtime import statistics
         from global_memory import statistics as memory_statistics
-        return {"mcp": statistics(), "memory": memory_statistics(), "workspace_locks": len(LOCKS)}
+        return {"mcp": statistics(), "memory": memory_statistics(), "workspace_locks": len(LOCKS),
+                "storage": storage_status(STATE)}
     if action == 'schedule':
         required = {'owner_id', 'generation', 'instance_id', 'run_id', 'chat_id', 'action'}
         if not required.issubset(payload):
@@ -543,54 +608,48 @@ def operation(key, action, payload):
             host_record = HOSTS.root / key / 'host.json'
             volumes = volume_prefix(json.loads(host_record.read_text()) if host_record.exists() else {}, name)
             request_id = payload.get("request_id", "")
-            if not request_id or len(request_id) > 128:
+            if not isinstance(request_id, str) or not request_id or len(request_id) > 128:
                 raise ValueError("Environment update requires a stable request ID")
             record, installer = operation_file(key, request_id)
-            if record.exists():
-                return operation(key, "environment-status", {"request_id": request_id})
-            installing = {"status": "installing", "deadline": time.time() + INSTALL_TIMEOUT + 30}
-            save_operation(record, installing)
-            script = Path(__file__).with_name("environment.py").read_text()
-            # No Home, files, Docker socket or credentials are mounted into the installer.
-            try:
-                result = docker("run", "--rm", "--name", installer, *cgroup_args(key), "--user", "1000", "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true",
-                    "--memory", "1g", "--cpus", "1", "--pids-limit", "256", "--entrypoint", MANAGER_PYTHON[0],
-                    "-v", volumes + "-env:/opt/user-env", "-i", IMAGE, *MANAGER_PYTHON[1:], "-c", script,
-                    stdin=json.dumps(payload), timeout=INSTALL_TIMEOUT)
-                output = json.loads(result.stdout)
-            except subprocess.TimeoutExpired:
-                # The installer may still be running. Keep the gate closed until its outcome is known.
-                return installing
-            except Exception as error:
-                # Installer stderr contains package diagnostics, never sandbox credentials.
-                record.with_suffix(".error.log").write_text(str(error)[-12000:])
-                output = {"status": "failed", "message": "安装失败，原共享环境已保留。"}
-            save_operation(record, output)
-            return output
-    if action == "environment-status":
-        record, installer = operation_file(key, payload.get("request_id", ""))
-        if not record.exists():
-            return {"status": "failed", "message": "安装请求未执行，原环境已保留。"}
-        value = json.loads(record.read_text())
-        if value.get("status") != "installing":
-            return value
-        result = docker("inspect", "--format", "{{.State.Running}}", installer, check=False)
-        if result.returncode == 0 and result.stdout.strip() == "true":
-            if time.time() > float(value.get('deadline', 0)):
-                docker('rm', '-f', installer, check=False)
-                value = {"status": "failed", "message": "安装超时，原环境已保留。"}
-                save_operation(record, value)
-            return value
-        # Recover a switch that completed just before a manager restart.
-        current = docker("exec", "--user", "1000", name, *MANAGER_PYTHON, "-c",
-                         "from pathlib import Path; p=Path('/opt/user-env/current/request.json'); print(p.read_text() if p.exists() else '{}')", check=False)
+            existing = record.exists()
+            if not existing:
+                for pending in STATE.glob('op-*'):
+                    if len(pending.name) != 67 or not pending.is_file():
+                        continue
+                    state = json.loads(pending.read_text())
+                    if (state.get('workspace_id') in {None, key}
+                            and state.get('status') in {'installing', 'unknown'}):
+                        raise ResourceUnavailable('共享环境更新尚未确认完成', 'ENVIRONMENT_UPDATE_PENDING', 5)
+                installing = {'status': 'installing', 'deadline': time.time() + INSTALL_TIMEOUT + 30,
+                              'workspace_id': key, 'request_id': request_id}
+                save_operation(record, installing)
+        if existing:
+            return environment_status(key, request_id)
+        script = Path(__file__).with_name("environment.py").read_text()
+        # The durable gate serializes installers, while owner control/stop can
+        # still acquire its lock during this bounded, long-running operation.
         try:
-            applied = json.loads(current.stdout).get("request_id") == payload.get("request_id")
-        except ValueError:
-            applied = False
-        value = {"status": "ready" if applied else "failed", "message": "环境已更新。" if applied else "安装中断，原环境已保留。"}
-        save_operation(record, value)
-        return value
+            result = docker("run", "--rm", "--name", installer, *cgroup_args(key), "--user", "1000", "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true",
+                "--memory", "1g", "--cpus", "1", "--pids-limit", "256", "--entrypoint", MANAGER_PYTHON[0],
+                "-v", volumes + "-env:/opt/user-env", "-i", IMAGE, *MANAGER_PYTHON[1:], "-c", script,
+                stdin=json.dumps(payload), timeout=INSTALL_TIMEOUT)
+            output = json.loads(result.stdout)
+            if not isinstance(output, dict) or output.get('status') != 'ready':
+                raise ValueError('Installer completion was not confirmed')
+        except subprocess.TimeoutExpired:
+            return installing
+        except Exception as error:
+            record.with_suffix(".error.log").write_text(str(error)[-12000:])
+            output = {'status': 'unknown', 'message': '安装结果待核实，请查询状态后再更新环境'}
+        with lock(key):
+            latest = json.loads(record.read_text())
+            if latest.get('status') in {'installing', 'unknown'}:
+                save_operation(record, {**installing, **output})
+            else:
+                output = latest
+        return output
+    if action == "environment-status":
+        return environment_status(key, payload.get('request_id', ''))
     if action == "clean-binding":
         from planning import scratch_name
 
@@ -783,12 +842,15 @@ def reap_operations(now=None):
             continue
         try:
             value = json.loads(record.read_text())
-            if value.get('status') == 'installing' and now > float(value.get('deadline', 0)):
-                installer = PREFIX + '-install-' + record.name[3:27]
-                docker('rm', '-f', installer, check=False)
-                save_operation(record, {'status': 'failed', 'message': '安装超时，原环境已保留。'})
-                value = {'status': 'failed'}
-            if value.get('status') != 'installing' and now - record.stat().st_mtime > OPERATION_RETENTION:
+            if value.get('status') in {'installing', 'unknown'} and now > float(value.get('deadline', 0)):
+                if value.get('workspace_id') and value.get('request_id'):
+                    value = environment_status(value['workspace_id'], value['request_id'], now=now)
+                else:
+                    # Old records cannot identify their environment commit. Keep
+                    # the receipt for operator reconciliation rather than TTL it.
+                    value = {**value, 'status': 'unknown', 'message': '历史安装结果待核实'}
+                    save_operation(record, value)
+            if value.get('status') in {'ready', 'failed'} and now - record.stat().st_mtime > OPERATION_RETENTION:
                 record.unlink(missing_ok=True)
                 record.with_suffix('.error.log').unlink(missing_ok=True)
         except (ValueError, OSError, sqlite3.Error):

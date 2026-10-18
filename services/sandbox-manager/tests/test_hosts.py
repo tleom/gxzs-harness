@@ -1,4 +1,6 @@
 import json
+import copy
+import os
 from pathlib import Path
 import sys
 import threading
@@ -29,12 +31,71 @@ def maintain(host):
         future.result(timeout=5)
 
 
+@pytest.mark.parametrize('failure', ['stop_error', 'still_running', 'inspect_unknown', 'partial_stop'])
+def test_idle_shutdown_preserves_fences_until_both_containers_are_confirmed_stopped(tmp_path, monkeypatch, failure):
+    host, docker, _, payload, created = setup(tmp_path, monkeypatch)
+    host.ensure('workspace', payload)
+    maintain(host)
+    record = host.root / 'workspace' / 'host.json'
+    before = json.loads(record.read_text())
+    containers = {'host-1': copy.deepcopy(created), 'sandbox-workspace': copy.deepcopy(created)}
+    original = docker.side_effect
+    stopped = []
+    def operate(*args, **kwargs):
+        if args[0] == 'inspect':
+            if failure == 'inspect_unknown' and stopped:
+                return SimpleNamespace(returncode=1, stdout='', stderr='Cannot connect to the Docker daemon')
+            return SimpleNamespace(returncode=0, stdout=json.dumps([containers[args[1]]]))
+        if args[0] == 'stop':
+            stopped.append(args[-1])
+            if failure == 'stop_error':
+                raise RuntimeError('daemon stop failed')
+            if failure not in {'still_running', 'partial_stop'} or args[-1] == 'host-1' and failure == 'partial_stop':
+                containers[args[-1]]['State']['Running'] = False
+            return SimpleNamespace(returncode=0, stdout='')
+        return original(*args, **kwargs)
+    docker.side_effect = operate
+    activity = host.root.parent / 'workspace'
+    activity.touch()
+    os.utime(activity, (time.time() - 3600, time.time() - 3600))
+    maintain(host)
+    assert stopped
+    host.admission.fence.assert_not_called()
+    assert json.loads(record.read_text()) == before
+    assert not any(call.args[1] == 'stopped' for call in host.heartbeat.call_args_list)
+
+
 def test_missing_host_port_has_a_stable_startup_error(tmp_path, monkeypatch):
     host, control, _, payload, created = setup(tmp_path, monkeypatch)
     created.update(State={'Running':False,'ExitCode':1},NetworkSettings={'Ports':{}})
     with pytest.raises(ResourceUnavailable) as error:
         host._container_identity(payload, '10.16.9.237')
     assert error.value.code == 'HOST_START_PENDING'
+
+
+@pytest.mark.parametrize('alive', [True, False])
+def test_ensure_does_not_renew_stale_degraded_state_without_current_liveness(tmp_path, monkeypatch, alive):
+    from concurrent.futures import ThreadPoolExecutor
+    host, _, _, payload, _ = setup(tmp_path, monkeypatch)
+    host.ensure('workspace', payload)
+    record = host.root / 'workspace' / 'host.json'
+    item = json.loads(record.read_text())
+    item.update(state='degraded', ready=False)
+    host._save(record, item)
+    def probe(endpoint):
+        def control():
+            with host.lock('workspace'):
+                return True
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            assert pool.submit(control).result(timeout=1)
+        return alive
+    host.alive = probe
+    if alive:
+        assert host.ensure('workspace', payload) == item
+    else:
+        with pytest.raises(ResourceUnavailable) as error:
+            host.ensure('workspace', payload)
+        assert error.value.code == 'HOST_NOT_READY'
 
 
 def setup(tmp_path, monkeypatch):
@@ -50,7 +111,10 @@ def setup(tmp_path, monkeypatch):
         if args[:2] == ('image', 'inspect'):
             return SimpleNamespace(returncode=0, stdout=json.dumps([{'Id': 'sha256:test'}]))
         if args[0] == 'inspect':
-            return SimpleNamespace(returncode=0 if created else 1, stdout=json.dumps([created]) if created else '')
+            return SimpleNamespace(returncode=0 if created else 1, stdout=json.dumps([created]) if created else '',
+                                   stderr='' if created else 'Error: No such object: ' + args[1])
+        if args[0] in {'stop', 'start'} and created:
+            created['State']['Running'] = args[0] == 'start'
         if args[0] == 'create':
             created.update(Id='c' * 64, Image='sha256:test', Config={'Image': 'host:test', 'Labels': {'gxzs.owner': 't:1', 'gxzs.workspace': 'workspace', 'gxzs.generation': '1', 'gxzs.credentials': 'owner-v1'}}, State={'Running': True}, NetworkSettings={'Ports': {'3081/tcp': [{'HostPort': '32001'}]}, 'Networks': {'owner-network': {}}})
         return SimpleNamespace(returncode=0, stdout='')
@@ -651,8 +715,9 @@ def test_external_catalog_degradation_pauses_admission_without_restarting_pair(t
 
     assert not any(call.args[0] == 'stop' for call in docker.call_args_list)
     host.admission.fence.assert_not_called()
-    host.heartbeat.assert_not_called()
-    assert json.loads(record.read_text()) == {**item, 'ready': False}
+    host.heartbeat.assert_called_once()
+    assert host.heartbeat.call_args.args[1] == 'degraded'
+    assert json.loads(record.read_text()) == {**item, 'ready': False, 'state': 'degraded'}
     assert 'host-1' not in host.failures
     assert 'host-1' not in host.recoveries
 
@@ -671,6 +736,7 @@ def test_current_pid_pressure_pauses_admission_and_recovers_without_restart(tmp_
     maintain(host)
     assert not any(call.args[0] in ('stop','rename','create') for call in docker.call_args_list)
     assert json.loads(record.read_text())['ready'] is False
+    assert host.heartbeat.call_args.args[1] == 'degraded'
     monkeypatch.setattr('hosts.pid_pressure', lambda info: False)
     maintain(host)
     assert json.loads(record.read_text())['ready'] is True

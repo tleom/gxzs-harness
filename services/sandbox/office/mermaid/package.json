@@ -4,5 +4,9 @@
   "private": true,
   "dependencies": {
     "@mermaid-js/mermaid-cli": "11.17.0"
+  },
+  "overrides": {
+    "dompurify": "3.4.16",
+    "katex": "0.18.7"
   }
 }

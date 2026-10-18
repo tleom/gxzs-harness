@@ -6,6 +6,26 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from resource_limits import cgroup_args, owner_cgroup, pid_pressure
 
 
+def test_storage_watermark_protects_bytes_and_inodes_and_reports_unknown(tmp_path, monkeypatch):
+    import resource_limits
+    from types import SimpleNamespace
+    monkeypatch.setenv('GXZS_STORAGE_MIN_FREE_BYTES', '256')
+    monkeypatch.setenv('GXZS_STORAGE_MIN_FREE_INODES', '10')
+    monkeypatch.setattr(resource_limits.shutil, 'disk_usage', lambda path: SimpleNamespace(free=300))
+    monkeypatch.setattr(resource_limits.os, 'statvfs', lambda path: SimpleNamespace(f_files=100, f_favail=9), raising=False)
+    with pytest.raises(resource_limits.ResourceUnavailable) as error:
+        resource_limits.assert_storage_writable(tmp_path)
+    assert error.value.code == 'STORAGE_PRESSURE'
+    monkeypatch.setattr(resource_limits.os, 'statvfs', lambda path: SimpleNamespace(f_files=100, f_favail=20))
+    resource_limits.assert_storage_writable(tmp_path)
+    monkeypatch.setattr(resource_limits.shutil, 'disk_usage', lambda path: SimpleNamespace(free=255))
+    assert resource_limits.storage_status(tmp_path)['blocked']
+    def unavailable(path):
+        raise OSError('unavailable')
+    monkeypatch.setattr(resource_limits.shutil, 'disk_usage', unavailable)
+    assert resource_limits.storage_status(tmp_path)['status'] == 'unknown'
+
+
 def test_owner_slice_is_shared_and_validated(monkeypatch):
     monkeypatch.setenv('GXZS_OWNER_CGROUP_PREFIX', 'gxzs-workbench')
     workspace = 'c6a1f026-7b8d-415f-bdd8-c48caa6589b9'

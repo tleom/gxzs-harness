@@ -433,14 +433,16 @@ describe('platform MCP proxy tools', () => {
   it('rejects invalid JSON schemas before registering a partial catalog', async () => {
     const { ctx } = setup()
     ctx.workbenchPlatformClient.json.mockResolvedValueOnce({ tools: [{ ...catalogTool, inputSchema: { type: 'string' } }] })
-    await expect(apply(ctx)).rejects.toThrow()
+    await apply(ctx)
+    expect(ctx.workbenchRuntime.mcpCatalogState.status).not.toBe('ready')
     expect(ctx.tools.register).not.toHaveBeenCalled()
   })
 
   it('rejects duplicate runtime names without registering a partial catalog', async () => {
     const { ctx } = setup()
     ctx.workbenchPlatformClient.json.mockResolvedValueOnce({ tools: [catalogTool, { ...catalogTool, id: 'global:other:search' }] })
-    await expect(apply(ctx)).rejects.toThrow('unique')
+    await apply(ctx)
+    expect(ctx.workbenchRuntime.mcpCatalogState.status).not.toBe('ready')
     expect(ctx.tools.register).not.toHaveBeenCalled()
   })
 
@@ -461,13 +463,33 @@ describe('platform MCP proxy tools', () => {
     }
   })
 
-  it('rejects an existing native tool collision before replacing any definitions', async () => {
-    const { ctx, definitions } = setup()
+  it('aliases a native tool collision while preserving its upstream identity', async () => {
+    const { ctx, definitions, platform } = setup()
     const builtin = { name: 'search' }
     definitions.set('search', builtin)
-    await expect(apply(ctx)).rejects.toThrow('conflicts with an existing tool')
-    expect(ctx.tools.register).not.toHaveBeenCalled()
+    await apply(ctx)
     expect(definitions.get('search')).toBe(builtin)
+    const alias = platformToolNames([catalogTool], name => name === 'search').get(catalogTool.id)
+    expect(alias).not.toBe('search')
+    await definitions.get(alias).execute({ query: 'q' }, { callId: 'alias-call', agent: { id: 's1' }, signal: new AbortController().signal })
+    expect(JSON.parse(platform.json.mock.calls.at(-1)[0].body)).toMatchObject({ resource_id: catalogTool.id, tool_name: 'search' })
+    await ctx.workbenchRuntime.refreshMcpCatalog()
+    expect(definitions.size).toBe(2)
+    expect(definitions.has(alias)).toBe(true)
+  })
+
+  it('recovers automatically when the first invalid catalog is repaired', async () => {
+    vi.useFakeTimers()
+    try {
+      const { ctx, definitions } = setup()
+      ctx.workbenchPlatformClient.json.mockResolvedValueOnce({ tools: [{ ...catalogTool, inputSchema: { type: 'string' } }] })
+      await apply(ctx)
+      expect(definitions.size).toBe(0)
+      expect(ctx.workbenchRuntime.mcpCatalogState.status).not.toBe('ready')
+      await vi.advanceTimersByTimeAsync(5000)
+      expect(ctx.workbenchRuntime.mcpCatalogState.status).toBe('ready')
+      expect(definitions.has('search')).toBe(true)
+    } finally { vi.useRealTimers() }
   })
 
   it('only exposes frozen selected tools to the model and refreshes native scope restrictions', async () => {

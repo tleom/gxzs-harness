@@ -86,7 +86,7 @@ function observePage() {
     viewport: { x: scrollX, y: scrollY, width: innerWidth, height: innerHeight }, text: parts.join('\n').slice(0,20000), elements }
 }
 
-function runWorker({ chromium, input = process.stdin, output = process.stdout, exit = code => process.exit(code), displayFactory = displayAvailable() ? startDisplay : undefined }) {
+function runWorker({ chromium, input = process.stdin, output = process.stdout, exit = code => process.exit(code), displayFactory = displayAvailable() ? startDisplay : undefined, commandTimeoutMs = 30_000, cancelGraceMs = 1_000 }) {
   let browser, context, page, session, watching = false, capturing = false, closed = false
   let display
   let legacyPixels = false
@@ -94,6 +94,7 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
   let timer, notice = '', navigation = 0, hasFrame = false, navigating = false, lastFrame
   let captureFinished = Promise.resolve(), finishCapture = () => {}
   let shutdownPromise
+  let commandDeadline, cancellationDeadline
   const pages = new Map()
   let pageId, pendingPopup, frameSequence = 0, activeCommand, revision = 0
   const streams = new Map(), cancelled = new Set(), pressedButtons = new Set(), pressedModifiers = new Set()
@@ -162,6 +163,7 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
     return true
   }
   function assertCurrent(value) {
+    if (closed) throw new Error('browser_closed')
     if (cancelled.has(value.id)) throw new Error('operation_cancelled')
   }
   async function releaseInput() {
@@ -550,6 +552,8 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
     if (shutdownPromise) return shutdownPromise
     closed = true
     clearInterval(timer)
+    clearTimeout(commandDeadline)
+    clearTimeout(cancellationDeadline)
     shutdownPromise = (async () => {
       await Promise.all([...streams.values()].map(value => value.dispose()))
       await browser?.close().catch(() => {})
@@ -563,11 +567,18 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
     if (line.length > 256 * 1024) { void shutdown().finally(() => exit(2)); return }
     let request
     try { request = JSON.parse(line) } catch { return }
+    if (closed) return
     if (request.action === 'cancel') {
       cancelled.add(request.cancel_id)
       if (cancelled.size > 512) cancelled.delete(cancelled.values().next().value)
       if (activeCommand?.id === request.cancel_id && ['navigate', 'reload', 'back', 'forward'].includes(activeCommand.action))
         void session?.send('Page.stopLoading').catch(() => {})
+      if (activeCommand?.id === request.cancel_id && !cancellationDeadline) {
+        const cancelledCommand = activeCommand
+        cancellationDeadline = setTimeout(() => {
+          if (activeCommand === cancelledCommand) fatal('浏览器操作未能结束，请重新打开浏览器')
+        }, cancelGraceMs)
+      }
       return
     }
     if (['ack', 'watch', 'release-input', 'display-open', 'display-write', 'display-close'].includes(request.action)) {
@@ -581,6 +592,10 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
         value = request
         activeCommand = value
         assertCurrent(value)
+        // A stuck renderer cannot be released with Promise.race: its old
+        // operation may still act later. End this worker and let the Host wait
+        // for subprocess exit before allocating another browser for the owner.
+        commandDeadline = setTimeout(() => fatal('浏览器操作超时，请重新打开浏览器'), commandTimeoutMs)
         const result = await operation(value)
         if (!closed) await send({ type: 'result', id: value.id, ...(result === undefined ? {} : { value: result }) })
       } catch (failure) {
@@ -593,7 +608,13 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
         notice = error
         await send({ type: 'result', id: value?.id, error })
         if (!streams.get(page)?.active) await frame()
-      } finally { cancelled.delete(value?.id); activeCommand = undefined }
+      } finally {
+        clearTimeout(commandDeadline)
+        clearTimeout(cancellationDeadline)
+        commandDeadline = cancellationDeadline = undefined
+        cancelled.delete(value?.id)
+        activeCommand = undefined
+      }
     })
   })
   lines.on('close', () => { void shutdown().finally(() => exit()) })

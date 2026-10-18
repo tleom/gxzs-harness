@@ -30,6 +30,17 @@ def package(text="---\nname: report\ndescription: Verify reports\n---\n# Report 
     return {"files": [{"path": "SKILL.md", "data": base64.b64encode(text.encode()).decode()}]}
 
 
+def test_failed_import_removes_only_its_uncommitted_stage(resources, tmp_path, monkeypatch):
+    def fail(fd, files, **kwargs):
+        target = os.open('partial.txt', os.O_CREAT | os.O_WRONLY, 0o600, dir_fd=fd)
+        os.close(target)
+        raise OSError('ENOSPC injected')
+    monkeypatch.setattr(resources, 'write_package', fail)
+    with pytest.raises(OSError, match='ENOSPC'):
+        resources.personal({'operation': 'skill_import', 'name': 'report', 'version': None, **package()}, str(tmp_path))
+    assert not list(tmp_path.glob('.skill-import-*'))
+
+
 def test_removed_memory_operation_is_rejected(resources, tmp_path):
     with pytest.raises(ValueError):
         resources.personal({"operation": "memory_update", "content": "removed"}, str(tmp_path))

@@ -35,15 +35,20 @@ export function sendJson(res, status, value) {
 }
 
 export function sendError(res, error) {
+  const { status, body } = errorResponse(error)
+  sendJson(res, status, body)
+}
+
+export function errorResponse(error) {
   if (error?.name === 'ScheduleInputError') {
     const message = { invalid_prompt: '请填写有效的任务名称和内容', not_future: '运行时间必须在未来',
       invalid_time_zone: '请选择有效的时区', invalid_rule: '定时规则无效', invalid_selector: '请选择一种运行规则',
       frequency_too_high: '重复间隔至少为一分钟', time_out_of_range: '运行时间超出支持范围', subagent_session: '请在主对话中创建定时任务' }[error.code]
-    if (message) return sendJson(res, 400, { code: error.code, message })
+    if (message) return { status: 400, body: { code: error.code, message } }
   }
   if (Object.hasOwn(GOAL_ERRORS, error?.code ?? '')) {
     const [status, message] = GOAL_ERRORS[error.code]
-    return sendJson(res, status, { code: error.code, message })
+    return { status, body: { code: error.code, message } }
   }
   const remote = nativeError(error)
   const explicitStatus = Number(error?.status)
@@ -56,7 +61,7 @@ export function sendError(res, error) {
   const metadata = {}
   if (typeof error?.request_id === 'string' && /^[a-zA-Z0-9_-]{1,128}$/.test(error.request_id)) metadata.request_id = error.request_id
   if (Number.isInteger(error?.retry_after) && error.retry_after >= 0 && error.retry_after <= 60) metadata.retry_after = error.retry_after
-  sendJson(res, status, { code, message, ...metadata })
+  return { status, body: { code, message, ...metadata } }
 }
 
 const GOAL_ERRORS = {

@@ -30,7 +30,7 @@ async function startDisplay({ width, height, emit, onExit }) {
     '-FrameRate', '20', '-AcceptSetDesktopSize', '0', '-MaxVideoResolution', '3840x2160',
     '-DLP_ClipAcceptMax', '32768', '-DLP_ClipSendMax', '32768', '-DLP_ClipTypes', 'text/plain',
     '-httpd', '/usr/share/kasmvnc/www'], { env: { ...process.env, HOME: home }, stdio: ['ignore', 'ignore', 'pipe'] })
-  let stopping = false, failure, log = '', relay, pendingBytes = 0, delivery = Promise.resolve()
+  let stopping = false, failure, log = '', relay
   let currentMode
   const size = { width, height }
   child.stderr.on('data', bytes => { log = (log + bytes).slice(-4096) })
@@ -101,21 +101,21 @@ async function startDisplay({ width, height, emit, onExit }) {
         origin: `http://127.0.0.1:${port}`, perMessageDeflate: false, maxPayload: 8 * 1024 * 1024,
       })
       socket.binaryType = 'arraybuffer'
-      const current = { socket, connection }
+      const current = { socket, connection, pendingBytes: 0, delivery: Promise.resolve() }
       relay = current
       socket.onopen = () => { if (relay === current) void emit({ type: 'display', connection, event: 'open' }) }
       socket.onmessage = event => {
         if (relay !== current) return
         const bytes = Buffer.from(event.data)
-        pendingBytes += bytes.length
         // RFB is ordered: a slow viewer is disconnected, never served partial/dropped deltas.
-        if (pendingBytes > 8 * 1024 * 1024) { closeRelay(); void emit({ type: 'display', connection, event: 'close' }); return }
-        delivery = delivery.then(async () => {
+        if (current.pendingBytes + bytes.length > 8 * 1024 * 1024) { closeRelay(); void emit({ type: 'display', connection, event: 'close' }); return }
+        current.pendingBytes += bytes.length
+        current.delivery = current.delivery.then(async () => {
           try {
             for (let offset = 0; offset < bytes.length && relay === current; offset += 65536)
               await emit({ type: 'display', connection, event: 'data', data: bytes.subarray(offset, offset + 65536).toString('base64') })
-          } finally { pendingBytes -= bytes.length }
-        }).catch(() => closeRelay())
+          } finally { current.pendingBytes -= bytes.length }
+        }).catch(() => { if (relay === current) closeRelay() })
       }
       socket.onerror = () => socket.close()
       socket.onclose = () => { if (relay === current) { relay = undefined; void emit({ type: 'display', connection, event: 'close' }) } }

@@ -22,6 +22,31 @@ function seed(database, ownerId = 'user-a') {
 }
 
 describe('workbench durable projection', () => {
+  it('indexes state metadata without scanning unrelated history payloads', () => {
+    const database = open()
+    const { chat, ownerId } = seed(database)
+    const { run } = database.createRun({ ownerId, chatId: chat.id, sessionId: chat.sessionId, query: 'q', selection: {}, now: 2 })
+    database.appendEvent(ownerId, run.id, { event: 'workbench_status', status: 'running' }, 1000)
+    database.appendEvent(ownerId, run.id, { event: 'workbench_context', used_tokens: 7 }, 1100)
+    for (let i = 0; i < 64; i++) database.appendEvent(ownerId, run.id, { event: 'text', text: 'x'.repeat(128 * 1024) }, 1200 + i)
+    database.appendEvent(ownerId, run.id, { event: 'workbench_end' }, 2000)
+    database.transitionRun(ownerId, run.id, 'running')
+    database.transitionRun(ownerId, run.id, 'completed')
+    const queries = []
+    const prepare = database.db.prepare.bind(database.db)
+    database.db.prepare = sql => { queries.push(sql); return prepare(sql) }
+    expect(database.runTiming(ownerId, run.id)).toEqual({ started_at: 1, completed_at: 2, elapsed_seconds: 1 })
+    expect(database.latestContextEvent(ownerId, run.id)).toMatchObject({ used_tokens: 7 })
+    expect(database.steeringEvents(ownerId, run.id)).toEqual([])
+    database.db.prepare = prepare
+    const indexes = []
+    for (const sql of queries.filter(sql => sql.includes('json_extract'))) {
+      const params = sql.startsWith('WITH endings') ? [run.id, run.id, run.id] : sql.includes('seq <= ?') ? [run.id, Number.MAX_SAFE_INTEGER] : [run.id]
+      indexes.push(...prepare('EXPLAIN QUERY PLAN ' + sql).all(...params).map(row => row.detail))
+    }
+    for (const name of ['run_events_end', 'run_events_started', 'run_events_context', 'run_events_steering'])
+      expect(indexes.some(detail => detail.includes(name)), indexes.join('\n')).toBe(true)
+  })
   it('keeps inherited-history markers on copied rows only, never on new goal or child runs', () => {
     const database = open()
     const { chat, ownerId } = seed(database)

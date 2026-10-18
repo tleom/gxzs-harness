@@ -8,7 +8,7 @@ import { nativeError } from './http.js'
 const TERMINAL = new Set(['completed', 'cancelled', 'failed', 'interrupted', 'discarded', 'steered'])
 const DIAGNOSTIC_CODES = new Set(['ADMISSION_TICKET_FENCED', 'DEADLINE_EXCEEDED', 'UPSTREAM_RESPONSE_TOO_LARGE',
   'CANCEL_UNCONFIRMED', 'HOST_NOT_REGISTERED', 'UNAUTHORIZED', 'FORBIDDEN', 'INVALID_REQUEST',
-  'UPSTREAM_ERROR', 'UNAVAILABLE', 'RATE_LIMITED', 'INTERNAL_ERROR'])
+  'UPSTREAM_ERROR', 'UNAVAILABLE', 'RATE_LIMITED', 'STORAGE_PRESSURE', 'INTERNAL_ERROR'])
 const DIAGNOSTIC_STATES = new Set(['running', 'waiting', 'done', 'retry', 'fenced', 'missing'])
 const DIAGNOSTIC_REASONS = new Set(['request_failed', 'unfenced', 'renew_state', 'dispatch_error'])
 const DIAGNOSTIC_ACTIONS = new Set(['acquire', 'renew', 'release', 'cancel', 'dispatch'])
@@ -61,8 +61,8 @@ async function waitForAdmission(pending, signal) {
 
 /** Durable admission tickets. After dispatch DSH owns the Session inbox and turns. */
 export class TaskScheduler {
-  constructor({ database, sessions, platformClient, ownerId, agents, modelSettings, goals, prepareContent, generation = process.env.GXZS_HOST_GENERATION ?? 'local' }) {
-    Object.assign(this, { database, sessions, platformClient, ownerId, agents, modelSettings, goals, generation })
+  constructor({ database, sessions, platformClient, ownerId, agents, modelSettings, goals, prepareContent, assertStorageWritable = () => {}, generation = process.env.GXZS_HOST_GENERATION ?? 'local' }) {
+    Object.assign(this, { database, sessions, platformClient, ownerId, agents, modelSettings, goals, generation, assertStorageWritable })
     this.prepareContent = prepareContent ?? (async (_sessionId, content) => content)
     this.pendingTick = null
     this.closed = false
@@ -127,6 +127,7 @@ export class TaskScheduler {
   }
 
   async request(run, action, retry = false, signal, rotated = false) {
+    if (action === 'acquire') this.assertStorageWritable()
     this.database.ensureTicketGeneration(this.ownerId, run.id, this.generation)
     const ticketId = this.database.submission(this.ownerId, run.id)?.ticketId
     // An explicit queue action can retire an undispatched submission while a

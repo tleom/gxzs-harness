@@ -1,8 +1,11 @@
 import z from '@deepseek-ai/schemastery'
+import { dirname } from 'node:path'
+import { randomUUID } from 'node:crypto'
+import { storageStatus, assertStorageWritable } from './storage-pressure.js'
 import { AssertionVerifier } from './assertion.js'
 import { RunEventBus } from './events.js'
 import { HumanInputBridge } from './human-input.js'
-import { httpError, parseJson, readBody, sendError, sendJson, withResponseSignal } from './http.js'
+import { errorResponse, httpError, parseJson, readBody, sendJson, withResponseSignal } from './http.js'
 import { streamRunEvents } from './sse.js'
 import { streamHistoryEvents, streamNativeEvents } from './history-events.js'
 import { WorkbenchDatabase } from './persistence.js'
@@ -75,8 +78,10 @@ export function apply(ctx, config) {
     if (event.event === 'workbench_end') ctx.emit('workbench/completion')
   } })
   const runtime = new WorkbenchRuntime(ctx, database, config.ownerId)
+  const storage = () => storageStatus({ home: config.databasePath === ':memory:' ? undefined : dirname(config.databasePath), workspace: config.workspace })
   const workspaces = new WorkbenchWorkspaces({ controller: ctx.workspaceController, database, root: resolveWorkspacePath(config.workspace, 'conversations'), fileManager: ctx.workbenchFileManager, sessions: ctx.sessionController })
   const scheduler = new TaskScheduler({ database, sessions: ctx.sessionController, platformClient: ctx.workbenchPlatformClient, ownerId: config.ownerId, agents: ctx.agents, modelSettings: ctx.settings, goals: ctx.goals,
+    assertStorageWritable: () => assertStorageWritable(storage()),
     prepareContent: (sessionId, content) => prepareNativeFiles(ctx.fileUploads, sessionId, content) })
   runtime.scheduler = scheduler
   scheduler.hasOwnedWork = sessionId => runtime.hasOwnedWork(sessionId)
@@ -294,6 +299,8 @@ export function apply(ctx, config) {
       owner: context.owner, method: context.req.method, route, query: context.url.search,
       body: context.body, contentType: context.req.headers['content-type'] ?? '',
       signal,
+      ...(route === 'audio' ? { timeoutMs: 100000,
+        deadlineMs: Math.min(context.owner.deadlineMs ?? Infinity, Date.now() + 100000) } : {}),
       ...(route === 'files/preview' && context.req.method !== 'DELETE' ? { timeoutMs: 120000 } : {}),
     })
     signal.throwIfAborted()
@@ -660,25 +667,34 @@ export function apply(ctx, config) {
     }],
   ]
 
+  // One bounded bucket per Host, not a growing map keyed by user input.
+  let diagnosticWindow = 0, diagnosticCount = 0, diagnosticSuppressed = 0
   const handler = async (req, res) => {
+    let diagnosticRoute = 'bootstrap'
     try {
       if (req.method === 'GET' && req.url === config.basePath + '/health') {
+        diagnosticRoute = 'health'
         const available = recovered && !database.streamFlushError
         const activity = available ? await nativeHostActivity(ctx, runtime.sidebarActivity, () => subagentSettings.activeWrites) : { protocol: 1, status: 'unknown' }
         // Sample the non-reconnecting native transport after the activity await.
         // A completed bootstrap does not make a subsequently closed SSH usable.
         const ssh = ctx.get('ssh')
         const transportFailed = ssh?.closed === true || Boolean(ssh?.failure) || ssh?.lifetime?.signal.aborted === true
-        const ready = available && !transportFailed && runtime.mcpCatalogState?.ready === true
+        const disk = storage()
+        const ready = available && !transportFailed && !disk.blocked && runtime.mcpCatalogState?.ready === true
         sendJson(res, ready ? 200 : 503, { live: true, ready, recovery: recovered ? 'ready' : recoveryError ? 'failed' : 'recovering',
           recovery_dependency: recoveryError?.code === 'MCP_CATALOG_UNAVAILABLE' ? 'mcp_catalog' : undefined,
           resources: runtime.mcpCatalogState?.status ?? 'initializing',
-          runtime_error: transportFailed ? 'SSH_UNAVAILABLE' : undefined,
+          mcp_capabilities: { protocol: 'platform-tools-v1', tools: true, server_instructions: false,
+            resources: false, resource_templates: false },
+          runtime_error: transportFailed ? 'SSH_UNAVAILABLE' : disk.blocked ? 'STORAGE_PRESSURE' : undefined,
+          storage: disk,
           activity })
         return
       }
       await recovery
       if (recoveryError) throw Object.assign(httpError(503, '原生会话恢复尚未完成'), { code: 'RECOVERY_UNAVAILABLE' })
+      diagnosticRoute = 'authentication'
       const body = await readBody(req)
       const url = new URL(req.url ?? '/', 'http://workbench.local')
       const path = url.pathname.slice(config.basePath.length) || '/'
@@ -695,14 +711,40 @@ export function apply(ctx, config) {
         const match = pattern.exec(path)
         if (!match) continue
         if (method !== req.method) { methodNotAllowed = true; continue }
+        diagnosticRoute = pattern.source
         await route(context, res, match)
         return
       }
       if (methodNotAllowed) throw httpError(405, '方法不允许')
       throw httpError(501, '该工作台能力尚未迁移')
     } catch (error) {
+      const failure = errorResponse(error)
+      if (failure.status >= 500) {
+        const requestId = randomUUID()
+        if (failure.status === 500) failure.body.request_id = requestId
+        const now = Date.now()
+        if (now - diagnosticWindow >= 60_000 || now < diagnosticWindow) {
+          diagnosticWindow = now
+          diagnosticCount = 0
+        }
+        if (diagnosticCount < 5) {
+          diagnosticCount++
+          const generation = Number(process.env.GXZS_HOST_GENERATION)
+          const diagnostic = { request_id: requestId, route: diagnosticRoute,
+            method: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'].includes(req.method) ? req.method : 'OTHER',
+            status: failure.status, code: failure.status === 500 ? 'INTERNAL_ERROR' : `HTTP_${failure.status}`,
+            error_type: ['Error', 'TypeError', 'RangeError', 'SyntaxError', 'AbortError', 'TimeoutError'].includes(error?.name) ? error.name : 'Error',
+            owner_id: /^[a-zA-Z0-9_-]{1,64}:[0-9]{1,64}$/.test(config.ownerId) ? config.ownerId : 'configured-owner',
+            ...(Number.isSafeInteger(generation) && generation > 0 ? { generation } : {}),
+            suppressed: diagnosticSuppressed }
+          diagnosticSuppressed = 0
+          // Never log URL/query, request bodies/headers, raw error messages,
+          // stack frames or remote error codes. Logging must not break replies.
+          try { ctx.logger?.warn('Workbench request failed %s', JSON.stringify(diagnostic)) } catch {}
+        } else diagnosticSuppressed = Math.min(Number.MAX_SAFE_INTEGER, diagnosticSuppressed + 1)
+      }
       if (res.destroyed || res.writableEnded) return
-      if (!res.headersSent) sendError(res, error)
+      if (!res.headersSent) sendJson(res, failure.status, failure.body)
       else res.end()
     }
   }

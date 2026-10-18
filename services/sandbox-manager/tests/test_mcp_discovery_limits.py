@@ -84,6 +84,23 @@ def test_empty_pages_with_distinct_large_cursors_are_byte_bounded(modules):
     assert error.value.code == "MCP_DISCOVERY_TOO_LARGE"
 
 
+def test_resources_only_connection_stays_empty_tools_and_does_not_invent_a_tool(modules, tmp_path):
+    ops, worker = modules
+    client = Client([Page([])])
+    client.server_instructions = 'Resource context is not a tool declaration'
+    client.resources = [{'uri': 'fixture://resource', 'name': 'resource'}]
+    tools = asyncio.run(worker.discover(client))
+    assert tools == []
+    assert client.requests == [{"cursor": None, "cache_mode": "refresh"}]
+    saved = ops.personal_mcp({"operation": "mcp_save", "name": "context-only",
+                             "content": json.dumps({"url": "https://example.com/mcp"})}, str(tmp_path))
+    ops.personal_mcp({"operation": "mcp_cache", "name": "context-only", "version": saved["version"],
+                      "tools": tools}, str(tmp_path))
+    item = ops.personal_mcp({"operation": "mcp_list"}, str(tmp_path))["mcp"][0]
+    assert item['status'] == 'ready'  # Connection discovery succeeded; UI must check tools.length.
+    assert item['tools'] == []
+
+
 def test_duplicate_names_and_cursor_loops_are_rejected(modules):
     ops, worker = modules
     with pytest.raises(ops.ManifestError, match="重复"):

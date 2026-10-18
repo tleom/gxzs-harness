@@ -414,6 +414,11 @@ export async function reconcileNativeSessions(database, sessionQuery, ownerId, c
     }
     try {
       const events = observed.events ?? []
+      // Observe may yield while native timers bind new receipts. Capture the
+      // message index after it returns, then reuse it during this synchronous
+      // replay rather than decoding every run once for every user message.
+      const byMessage = new Map(database.listRuns(chat.ownerId, chat.id)
+        .filter(run => run.messageId).map(run => [run.messageId, run]))
       const inbox = { 'next-turn': [], 'next-step': [] }
       let turn
       // Claims are transient notifications. Reconstruct the turn relation from
@@ -429,7 +434,7 @@ export async function reconcileNativeSessions(database, sessionQuery, ownerId, c
           const admitted = message.source?.kind === 'schedule' ? adoptMessage(database, chat.sessionId, message, resources(message))
             : message.source?.kind === 'tool-jobs' ? (database.runForTurn(chat.sessionId, turn) ?? adoptJobNotice(database, chat, message, resources(message)))
             : isNativeNotice(message) ? (database.runForTurn(chat.sessionId, turn) ?? adoptNativeNotice(database, chat, message, resources(message)))
-            : database.listRuns(chat.ownerId, chat.id).find(item => item.messageId === message.id)
+            : byMessage.get(message.id)
           if (isNativeNotice(message) && admitted) database.bindNativeTurn(admitted, turn)
           if (message.source?.kind === 'tool-jobs' && admitted) database.bindNativeTurn(admitted, turn)
           if (message.source?.kind === 'schedule' && admitted)
@@ -469,7 +474,7 @@ export async function reconcileNativeSessions(database, sessionQuery, ownerId, c
           : message.source?.kind === 'schedule' ? adoptMessage(database, chat.sessionId, message, resources(message))
           : message.source?.kind === 'tool-jobs' ? adoptJobNotice(database, chat, message, resources(message))
           : isNativeNotice(message) ? adoptNativeNotice(database, chat, message, resources(message))
-          : database.listRuns(chat.ownerId, chat.id).find(item => item.messageId === message.id)
+          : byMessage.get(message.id)
         if (run && run.sessionId === chat.sessionId) {
           queued.push(run.id)
           database.adoptInboxMessage(chat.sessionId, run.id, message.id)

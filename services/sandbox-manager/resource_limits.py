@@ -1,6 +1,7 @@
 """Host and sandbox containers share a deployment-provisioned owner slice."""
 import os
 import re
+import shutil
 from uuid import UUID
 from pathlib import Path
 
@@ -9,6 +10,30 @@ class ResourceUnavailable(RuntimeError):
     def __init__(self, message, code='RESOURCE_BUSY', retry_after=2):
         super().__init__(message)
         self.code, self.retry_after = code, retry_after
+
+
+def storage_status(path):
+    minimum = int(os.environ.get('GXZS_STORAGE_MIN_FREE_BYTES', '268435456'))
+    minimum_inodes = int(os.environ.get('GXZS_STORAGE_MIN_FREE_INODES', '1024'))
+    if minimum < 0 or minimum_inodes < 0:
+        raise ValueError('Storage watermarks must be non-negative integers')
+    result = {'min_free_bytes': minimum, 'min_free_inodes': minimum_inodes}
+    try:
+        result['free_bytes'] = shutil.disk_usage(path).free
+        result['blocked'] = result['free_bytes'] < minimum
+        if hasattr(os, 'statvfs'):
+            info = os.statvfs(path)
+            if info.f_files > 0:
+                result['free_inodes'] = info.f_favail
+                result['blocked'] = result['blocked'] or info.f_favail < minimum_inodes
+    except OSError:
+        result.update(blocked=True, status='unknown')
+    return result
+
+
+def assert_storage_writable(path):
+    if storage_status(path)['blocked']:
+        raise ResourceUnavailable('管理服务存储空间不足或暂不可用，请整理后重试', 'STORAGE_PRESSURE', 5)
 
 
 def pid_pressure(info):

@@ -99,7 +99,10 @@ export async function apply(ctx, config = {}) {
       throw error
     }
     if (disposed) return
-    const catalog = normalizeCatalog(payload.data?.tools ?? payload.tools ?? [])
+    const catalog = normalizeCatalog(payload.data?.tools ?? payload.tools ?? [], name => {
+      const existing = ctx.tools.get?.(name)
+      return Boolean(existing && ![...registrations.values()].some(item => item.definition === existing))
+    })
     const plugins = payload.data?.plugins ?? payload.plugins ?? []
     if (!Array.isArray(plugins) || plugins.some(plugin => !plugin || typeof plugin.id !== 'string' || typeof plugin.name !== 'string'
       || !['global', 'personal'].includes(plugin.scope))) throw new Error('invalid MCP plugin inventory')
@@ -216,7 +219,9 @@ export async function apply(ctx, config = {}) {
     clear()
     state(false)
   }, 'gxzs MCP proxy tools')
-  await synchronize()
+  // An invalid first catalog must fail admission, while keeping the refresh
+  // loop alive so a repaired provider can recover without restarting the Host.
+  await refresh()
   schedule()
 }
 
@@ -256,7 +261,7 @@ async function callProxy(ctx, tool, args, exec) {
   throw new Error('Platform MCP response is missing CallToolResult.content')
 }
 
-function normalizeCatalog(value) {
+function normalizeCatalog(value, reserved) {
   if (!Array.isArray(value)) throw new Error('platform MCP catalog must be an array')
   const runtimeNames = new Set()
   const ids = new Set()
@@ -273,7 +278,7 @@ function normalizeCatalog(value) {
     ids.add(tool.id)
     return { ...tool, definitionStamp: definitionStamp(tool), sourceInputSchema: tool.inputSchema, inputSchema: adapted.schema, validateArguments: adapted.validate, manifest_version: tool.manifest_version ?? '' }
   })
-  const names = platformToolNames(tools)
+  const names = platformToolNames(tools, reserved)
   return tools.map(tool => {
     const definitionStamp = JSON.stringify([tool.definitionStamp, names.get(tool.id)])
     return { ...tool, public_name: names.get(tool.id), definitionStamp,

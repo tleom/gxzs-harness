@@ -110,6 +110,17 @@ export class WorkbenchDatabase {
         created_at INTEGER NOT NULL,
         PRIMARY KEY(run_id, seq)
       );
+      -- These additive indexes are also usable by older readers. Materialize
+      -- event classification once at insertion/migration, not on every state poll.
+      CREATE INDEX IF NOT EXISTS run_events_end ON run_events(run_id, seq DESC, created_at)
+        WHERE json_extract(payload_json, '$.event') = 'workbench_end';
+      CREATE INDEX IF NOT EXISTS run_events_started ON run_events(run_id, seq, created_at)
+        WHERE json_extract(payload_json, '$.status') = 'running'
+          OR json_extract(payload_json, '$.event') = 'workbench_activity';
+      CREATE INDEX IF NOT EXISTS run_events_context ON run_events(run_id, seq DESC)
+        WHERE json_extract(payload_json, '$.event') = 'workbench_context';
+      CREATE INDEX IF NOT EXISTS run_events_steering ON run_events(run_id, seq)
+        WHERE json_extract(payload_json, '$.event') IN ('workbench_steering', 'workbench_steered');
       CREATE TABLE IF NOT EXISTS command_receipts (
         owner_id TEXT NOT NULL,
         chat_id TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
@@ -313,7 +324,7 @@ export class WorkbenchDatabase {
   }
 
   runErrorCode(ownerId, id) {
-    const row = this.db.prepare(`SELECT e.payload_json FROM run_events e JOIN runs r ON r.id=e.run_id
+    const row = this.db.prepare(`SELECT e.payload_json FROM run_events e INDEXED BY run_events_end JOIN runs r ON r.id=e.run_id
       WHERE e.run_id=? AND r.owner_id=? AND json_extract(e.payload_json, '$.event')='workbench_end'
       ORDER BY e.seq DESC LIMIT 1`).get(id, ownerId)
     return row ? JSON.parse(row.payload_json).error_code : undefined
@@ -714,10 +725,10 @@ export class WorkbenchDatabase {
     const run = this.getRun(ownerId, runId)
     if (!run) throw notFound('任务不存在')
     const timing = this.db.prepare(`WITH endings AS (
-      SELECT seq, created_at FROM run_events WHERE run_id=? AND json_extract(payload_json, '$.event')='workbench_end'
+      SELECT seq, created_at FROM run_events INDEXED BY run_events_end WHERE run_id=? AND json_extract(payload_json, '$.event')='workbench_end'
       ORDER BY seq DESC LIMIT 2
     ) SELECT
-      (SELECT created_at FROM run_events WHERE run_id=?
+      (SELECT created_at FROM run_events INDEXED BY run_events_started WHERE run_id=?
         AND seq>COALESCE((SELECT seq FROM endings LIMIT 1 OFFSET 1), -1)
         AND seq<=COALESCE((SELECT seq FROM endings LIMIT 1), 9223372036854775807)
         AND (json_extract(payload_json, '$.status')='running' OR json_extract(payload_json, '$.event')='workbench_activity')

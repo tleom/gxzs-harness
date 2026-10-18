@@ -1,9 +1,22 @@
 import { createHash, createHmac } from 'node:crypto'
+import { spawnSync } from 'node:child_process'
+import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
 import { AssertionVerifier } from '../src/assertion.js'
 
 const key = Buffer.alloc(32, 7).toString('base64')
 const now = 1_700_000_000
+
+it('accepts the maintenance signing script defaults with the current route and audience', () => {
+  const result = spawnSync(process.execPath, [fileURLToPath(new URL('../../../scripts/sign-request.mjs', import.meta.url))], {
+    encoding: 'utf8', windowsHide: true,
+    env: { ...process.env, GXZS_ASSERTION_ISSUER: 'script-test', GXZS_HOST_OWNER_ID: 'tenant:1', GXZS_ASSERTION_SIGNING_KEY: key },
+  })
+  expect(result.status, result.stderr).toBe(0)
+  expect(new AssertionVerifier({ issuer: 'script-test', signingKey: key }).verify(result.stdout, {
+    method: 'GET', target: '/ai/workbench/identity', body: Buffer.alloc(0), contentType: 'application/json', lastEventId: '',
+  })).toMatchObject({ ownerId: 'tenant:1' })
+})
 
 function sign(overrides = {}) {
   const body = overrides.body ?? Buffer.from('{"query":"test"}')
@@ -47,6 +60,28 @@ describe('gateway assertion verifier', () => {
     const { token, body } = sign()
     verifier.verify(token, request(body))
     expect(() => verifier.verify(token, request(body))).toThrow('已被使用')
+  })
+
+  it('retains replay protection throughout the inclusive clock-skew acceptance window', () => {
+    let clock = now
+    const verifier = new AssertionVerifier({ issuer: 'gxzs-backend', signingKey: key, now: () => clock })
+    const { token, body } = sign()
+    verifier.verify(token, request(body))
+    for (clock of [now + 60, now + 61, now + 65])
+      expect(() => verifier.verify(token, request(body))).toThrow('已被使用')
+    clock = now + 66
+    expect(() => verifier.verify(token, request(body))).toThrow('已过期')
+  })
+
+  it('accepts only a signed integer deadline without changing legacy identity output', () => {
+    const deadline = (now + 110) * 1000
+    const verifier = new AssertionVerifier({ issuer: 'gxzs-backend', signingKey: key, now: () => now })
+    const { token, body } = sign({ claims: { request_deadline_ms: deadline } })
+    expect(verifier.verify(token, request(body)).deadlineMs).toBe(deadline)
+    for (const value of ['1700000000000', -1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+      const signed = sign({ claims: { request_deadline_ms: value } })
+      expect(() => verifier.verify(signed.token, request(signed.body))).toThrow('请求期限无效')
+    }
   })
 
   it('rejects expired, wrong issuer and tampered assertions', () => {

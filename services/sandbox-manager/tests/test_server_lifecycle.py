@@ -402,18 +402,124 @@ def test_health_checks_workers_database_and_docker(server, monkeypatch):
     assert request().send_response.call_args.args[0] == 503
 
 
-def test_expired_installer_is_killed_and_record_is_bounded(server, monkeypatch):
+def test_legacy_unknown_installer_receipt_is_retained_for_reconciliation(server, monkeypatch):
     record = server.STATE / ('op-' + 'a' * 64)
     server.save_operation(record, {'status': 'installing', 'deadline': 1})
     calls = []
     monkeypatch.setattr(server, 'docker', lambda *args, **kwargs: (calls.append(args), SimpleNamespace(returncode=0, stdout=''))[1])
     server.reap_operations(now=2)
-    assert calls == [('rm', '-f', server.PREFIX + '-install-' + 'a' * 24)]
-    assert json.loads(record.read_text())['status'] == 'failed'
+    assert calls == []
+    assert json.loads(record.read_text())['status'] == 'unknown'
     os.utime(record, (1, 1))
     monkeypatch.setattr(server, 'OPERATION_RETENTION', 1)
     server.reap_operations(now=3)
-    assert not record.exists()
+    assert record.exists()
+
+
+def test_environment_install_releases_owner_lock_but_keeps_a_durable_single_installer_gate(server, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    key = str(uuid4())
+    monkeypatch.setattr(server, 'ensure', lambda key: None)
+    def docker(*args, **kwargs):
+        if args[0] == 'run':
+            def control():
+                with server.lock(key):
+                    return True
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                assert pool.submit(control).result(timeout=1)
+                with pytest.raises(server.ResourceUnavailable) as error:
+                    pool.submit(server.operation, key, 'environment', {'request_id': 'second'}).result(timeout=1)
+                assert error.value.code == 'ENVIRONMENT_UPDATE_PENDING'
+            return SimpleNamespace(returncode=0, stdout='{"status":"ready","version":"v1"}')
+        raise AssertionError(args)
+    monkeypatch.setattr(server, 'docker', docker)
+    assert server.operation(key, 'environment', {'request_id': 'first'})['status'] == 'ready'
+    assert server.operation(key, 'environment', {'request_id': 'first'})['status'] == 'ready'
+
+
+@pytest.mark.parametrize('applied', [True, False])
+def test_expired_installer_checks_the_committed_environment_after_confirmed_stop(server, monkeypatch, applied):
+    key = str(uuid4())
+    record, installer = server.operation_file(key, 'request-1')
+    server.save_operation(record, {'status': 'installing', 'deadline': 1, 'workspace_id': key, 'request_id': 'request-1'})
+    running = True
+    def docker(*args, **kwargs):
+        nonlocal running
+        if args[0] == 'inspect':
+            return SimpleNamespace(returncode=0, stdout=json.dumps([{'State': {'Running': running}}]))
+        if args[0] == 'stop':
+            assert args[-1] == installer
+            running = False
+            return SimpleNamespace(returncode=0, stdout='')
+        if args[0] == 'exec':
+            assert not running
+            return SimpleNamespace(returncode=0, stdout=json.dumps({'request_id': 'request-1' if applied else 'previous'}))
+        raise AssertionError(args)
+    monkeypatch.setattr(server, 'docker', docker)
+    output = server.environment_status(key, 'request-1', now=2)
+    assert output['status'] == ('ready' if applied else 'failed')
+    assert '保留' not in output['message']
+
+
+@pytest.mark.parametrize('failure', ['inspect', 'stop', 'current'])
+def test_environment_unknown_outcomes_keep_the_gate_and_receipt(server, monkeypatch, failure):
+    import subprocess
+    key = str(uuid4())
+    record, _ = server.operation_file(key, 'request-1')
+    server.save_operation(record, {'status': 'installing', 'deadline': 1, 'workspace_id': key, 'request_id': 'request-1'})
+    calls = []
+    def docker(*args, **kwargs):
+        calls.append(args[0])
+        if args[0] == 'inspect':
+            if failure == 'inspect':
+                return SimpleNamespace(returncode=1, stdout='', stderr='daemon disconnected')
+            return SimpleNamespace(returncode=0, stdout=json.dumps([{'State': {'Running': failure == 'stop'}}]))
+        if args[0] == 'stop':
+            raise subprocess.TimeoutExpired('docker stop', 15)
+        return SimpleNamespace(returncode=1, stdout='')
+    monkeypatch.setattr(server, 'docker', docker)
+    assert server.environment_status(key, 'request-1', now=2)['status'] == 'unknown'
+    server.reap_operations(now=server.OPERATION_RETENTION + 10)
+    assert record.exists() and json.loads(record.read_text())['status'] == 'unknown'
+    if failure != 'current':
+        assert 'exec' not in calls
+
+
+@pytest.mark.parametrize('visibility', ['absent', 'created'])
+def test_late_installer_start_cannot_be_mistaken_for_a_failed_completed_request(server, monkeypatch, visibility):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+    key = str(uuid4())
+    arrived, release = Event(), Event()
+    monkeypatch.setattr(server, 'ensure', lambda key: None)
+    launched = []
+    def docker(*args, **kwargs):
+        if args[0] == 'run':
+            launched.append(json.loads(kwargs['stdin'])['request_id'])
+            arrived.set()
+            assert release.wait(5)
+            return SimpleNamespace(returncode=0, stdout='{"status":"ready","version":"v1"}')
+        if args[0] == 'inspect':
+            return (SimpleNamespace(returncode=1, stdout='', stderr='No such container') if visibility == 'absent'
+                    else SimpleNamespace(returncode=0, stdout='[{"State":{"Running":false,"Status":"created"}}]'))
+        if args[0] == 'exec':
+            return SimpleNamespace(returncode=0, stdout='{}')
+        raise AssertionError(args)
+    monkeypatch.setattr(server, 'docker', docker)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        first = pool.submit(server.operation, key, 'environment', {'request_id': 'late'})
+        try:
+            assert arrived.wait(2)
+            record, _ = server.operation_file(key, 'late')
+            deadline = json.loads(record.read_text())['deadline']
+            assert server.environment_status(key, 'late', now=deadline + 1)['status'] == 'unknown'
+            with pytest.raises(server.ResourceUnavailable) as error:
+                server.operation(key, 'environment', {'request_id': 'next'})
+            assert error.value.code == 'ENVIRONMENT_UPDATE_PENDING'
+        finally:
+            release.set()
+            assert first.result(timeout=2)['status'] == 'ready'
+    assert launched == ['late']
 
 
 @pytest.mark.parametrize('reason', ['capacity', 'thread', 'process'])
