@@ -44,9 +44,9 @@ const plugin = async (stageName, implementation, config) => {
   await ctx.plugin(implementation, config)
 }
 const text = result => (result.content ?? []).filter(item => item.type === 'text').map(item => item.text).join('\n')
-const execute = async (name, args) => {
+const execute = async (name, args, agent) => {
   stage = name
-  const result = await ctx.tools.execute({ callId: `fixture-${randomUUID()}`, name, arguments: args, signal: AbortSignal.timeout(Math.max(20_000, (args.timeoutMs ?? args.timeout_ms ?? 0) + 10_000)) })
+  const result = await ctx.tools.execute({ callId: `fixture-${randomUUID()}`, name, arguments: args, agent, signal: AbortSignal.timeout(Math.max(20_000, (args.timeoutMs ?? args.timeout_ms ?? 0) + 10_000)) })
   if (result.isError) console.log(JSON.stringify({ event: 'fixture_tool_failed', tool: name,
     timed_out: /timeout|timed out/i.test(text(result)), disconnected: /disconnect|socket|connection/i.test(text(result)) }))
   assert.notEqual(result.isError, true, `fixture_${name}_failed`)
@@ -83,6 +83,39 @@ try {
   await plugin('search-tools', SearchTools, { sampleOverCapGlobResults: false })
   await execute('bash', { command: `mkdir -m 700 -- '${directory}'`, description: 'Create isolated tool fixture', workdir: '/tmp', timeoutMs: 10_000 })
   created = true
+  // Exercise the optional native PTY tools through the same remote subprocess
+  // provider as production, including retained shell state and exact-Agent access.
+  await plugin('agents', (await native('dsh-agent')).default)
+  await plugin('persistent-terminal-registry', (await native('dsh-terminal')).default)
+  await plugin('persistent-terminal-bash', await native('dsh-terminal-bash'))
+  await plugin('persistent-terminal-tools', await native('dsh-tool-terminal'))
+  const session = ctx.sessions.create(undefined, { meta: { cwd: directory } })
+  const agent = { id: session.id, ctx, session, options: {}, status: 'idle' }
+  ctx.agents.register(agent)
+  const otherSession = ctx.sessions.create(undefined, { meta: { cwd: directory } })
+  const other = { id: otherSession.id, ctx, session: otherSession, options: {}, status: 'idle' }
+  ctx.agents.register(other)
+  const opened = await execute('terminal_open', { type: 'shell', name: 'native-pty-fixture' }, agent)
+  const sessionId = opened.value.sessionId
+  assert.equal(ctx.terminals.hasOwnerActivity(agent), true)
+  await execute('terminal_send', { sessionId, text: 'export GXZS_PTY_FIXTURE=retained-state' }, agent)
+  const retained = await execute('terminal_send', { sessionId, text: 'printf "value=%s uid=%s\\n" "$GXZS_PTY_FIXTURE" "$(id -u)"; pwd' }, agent)
+  assert.match(text(retained), /value=retained-state uid=1000/)
+  assert.ok(text(retained).includes(directory))
+  assert.equal((await execute('terminal_list', {}, agent)).value.length, 1)
+  assert.deepEqual((await execute('terminal_list', {}, other)).value, [])
+  const denied = await ctx.tools.execute({ callId: randomUUID(), name: 'terminal_read', arguments: { sessionId }, agent: other, signal: AbortSignal.timeout(5000) })
+  assert.equal(denied.isError, true)
+  const background = await execute('terminal_send', { sessionId, text: 'sleep 0.2; printf "native-pty-background\\n"', run_in_background: true }, agent)
+  assert.equal(background.value.kind, 'background')
+  const collected = await execute('job_output', { job_id: background.value.jobId, wait: true, timeout_ms: 10_000 }, agent)
+  assert.equal(collected.value.job.status, 'completed')
+  assert.match(text(collected), /native-pty-background/)
+  assert.match(text(await execute('terminal_read', { sessionId }, agent)), /native-pty-background/)
+  await execute('terminal_close', { sessionId }, agent)
+  assert.equal(ctx.terminals.hasOwnerActivity(agent), false)
+  assert.deepEqual((await execute('terminal_list', {}, agent)).value, [])
+  checked.push('persistent-terminal-owner-isolation')
   const dependencies = text(await execute('bash', {
     command: `python3 -c "import defusedxml,reportlab,pypdf,pptx,docx,openpyxl; print('native-office-python-ok')" && node -e "require('pptxgenjs'); require('sharp'); console.log('native-office-node-ok')"`,
     description: 'Verify bundled dependencies through the real native bash tool', workdir: directory, timeoutMs: 10_000,

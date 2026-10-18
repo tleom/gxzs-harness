@@ -25,6 +25,13 @@
   config:
     default: standard
 
+# The official bundle keeps a separate owner-scoped PTY registry. Include its
+# live resources in the Host idle check without merging it with sidebar PTYs.
+- id: optional-persistent-terminals
+  insert:
+    - id: gxzs-persistent-terminal-activity
+      name: '@gxzs/dsh-workbench-adapter/persistent-terminal-activity'
+
 - id: sandbox
   disabled: true
 

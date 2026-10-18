@@ -205,6 +205,10 @@ const model = fixture((req, res) => {
   for (const name of ['bash', 'job_output', 'job_kill', 'schedule_create', 'schedule_list', 'schedule_update', 'schedule_delete', 'working_directory']) {
     assert.ok(tools.has(name), `Native standard preset must expose ${name} to the model; received: ${JSON.stringify([...tools.keys()])}`)
   }
+  for (const name of ['session_search', 'session_event_search', 'session_trace', 'session_event_trace', 'session_event_read',
+    'ralph', 'terminal_open', 'terminal_list', 'terminal_send', 'terminal_read', 'terminal_signal', 'terminal_close']) {
+    assert.ok(tools.has(name), `Enabled official bundle must expose ${name}`)
+  }
   if (malformedToolProbe) {
     const probe = malformedToolProbe
     probe.calls++

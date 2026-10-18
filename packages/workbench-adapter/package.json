@@ -6,6 +6,7 @@
   "exports": {
     ".": "./src/index.js",
     "./client": "./lib/client.js",
+    "./persistent-terminal-activity": "./src/persistent-terminal-activity.js",
     "./package.json": "./package.json",
     "./persistence": "./src/persistence.js",
     "./cursor": "./src/cursor.js",
