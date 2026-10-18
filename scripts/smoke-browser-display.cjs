@@ -6,9 +6,7 @@ const { chromium } = require('/opt/office/node/node_modules/playwright')
 const { runWorker } = require('/opt/workbench/packages/workbench-adapter/src/browser-worker.cjs')
 const { startDisplay } = require('/opt/workbench/packages/workbench-adapter/src/browser-display.cjs')
 
-async function assertWhiteRoot() {
-  const display = await startDisplay({ width: 320, height: 240, emit: async () => {}, onExit: () => {} })
-  const probe = String.raw`import ctypes,os,json,sys
+const probe = String.raw`import ctypes,os,json,sys
 x=ctypes.CDLL('libX11.so.6');ptr=ctypes.c_void_p;integer=ctypes.c_int;word=ctypes.c_ulong
 x.XOpenDisplay.argtypes=[ctypes.c_char_p];x.XOpenDisplay.restype=ptr
 x.XDefaultRootWindow.argtypes=[ptr];x.XDefaultRootWindow.restype=word
@@ -18,17 +16,20 @@ x.XDestroyImage.argtypes=[ptr];x.XCloseDisplay.argtypes=[ptr]
 d=x.XOpenDisplay(os.environ['DISPLAY'].encode());assert d
 try:
  root=x.XDefaultRootWindow(d);pixels=[]
- for px,py in [(0,0),(int(sys.argv[1])-1,int(sys.argv[2])-1)]:
+ for px,py in [(0,0),(int(sys.argv[1])-int(sys.argv[3]),int(sys.argv[2])-int(sys.argv[3]))]:
   image=x.XGetImage(d,root,px,py,1,1,word(-1).value,2);assert image
   try:pixels.append(x.XGetPixel(image,0,0))
   finally:x.XDestroyImage(image)
  print(json.dumps(pixels))
 finally:x.XCloseDisplay(d)`
-  const pixels = (width, height) => JSON.parse(execFileSync('/usr/bin/python3', ['-I', '-S', '-c', probe, String(width), String(height)], { env: display.env, encoding: 'utf8' }))
+const pixels = (display, width, height, inset = 1) => JSON.parse(execFileSync('/usr/bin/python3', ['-I', '-S', '-c', probe, String(width), String(height), String(inset)], { env: display.env, encoding: 'utf8' }))
+
+async function assertWhiteRoot() {
+  const display = await startDisplay({ width: 320, height: 240, emit: async () => {}, onExit: () => {} })
   try {
-    assert.deepEqual(pixels(640, 480), [0xffffff, 0xffffff], 'New X display root must be white')
+    assert.deepEqual(pixels(display, 640, 480), [0xffffff, 0xffffff], 'New X display root must be white')
     await display.resize(400, 300)
-    assert.deepEqual(pixels(800, 600), [0xffffff, 0xffffff], 'Resized X display root must stay white')
+    assert.deepEqual(pixels(display, 800, 600), [0xffffff, 0xffffff], 'Resized X display root must stay white')
   } finally { await display.stop() }
 }
 
@@ -36,7 +37,7 @@ async function main() {
   await assertWhiteRoot()
   const server = createServer((_request, response) => {
     response.setHeader('content-type', 'text/html; charset=utf-8')
-    response.end('<!doctype html><meta charset=utf-8><input id="value" aria-label="Value">')
+    response.end('<!doctype html><meta charset=utf-8><style>body{background:#fff}#edge{position:fixed;right:0;bottom:0;width:30px;height:30px;background:#c24;border:0;padding:0}</style><input id="value" aria-label="Value"><a id="popup" href="/popup" target="_blank">Open</a><button id="edge" onclick="this.textContent=Number(this.textContent)+1;this.style.background=Number(this.textContent)%2?\'#2c4\':\'#c24\'">0</button>')
   })
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
   const input = new PassThrough(), output = new PassThrough(), pending = new Map(), packets = []
@@ -54,7 +55,9 @@ async function main() {
       else if (frame.type === 'fatal') for (const task of pending.values()) task.reject(new Error(frame.error))
     }
   })
-  const worker = runWorker({ chromium, input, output, exit: () => {} })
+  let display
+  const worker = runWorker({ chromium, input, output, exit: () => {},
+    displayFactory: async options => { display = await startDisplay(options); return display } })
   async function call(action, value = {}) {
     const id = ++sequence
     let timer
@@ -76,6 +79,43 @@ async function main() {
     assert.equal(snapshot.viewport.width, 823)
     assert.equal(snapshot.viewport.height, 617)
     assert.equal(snapshot.elements.find(element => element.selector === '#value').value, '可见浏览器中文验收')
+    let clicks = 0
+    for (const [width, height] of [[320, 240], [361, 521], [499, 544], [500, 521], [1920, 1080], [320, 240], [823, 617]]) {
+      await call('resize', { width, height })
+      // A transient matching size must not hide a later minimum-window clamp.
+      await new Promise(resolve => setTimeout(resolve, 250))
+      const resized = await call('snapshot')
+      assert.equal(resized.viewport.width, width)
+      assert.equal(resized.viewport.height, height)
+      assert.equal(resized.notice, undefined)
+      await call('element-click', { selector: '#edge', expected_revision: resized.revision })
+      clicks++
+      assert.equal((await call('snapshot')).elements.find(element => element.selector === '#edge').label, String(clicks))
+      const expected = clicks % 2 ? 0x22cc44 : 0xcc2244
+      let actual
+      for (let attempt = 0; attempt < 30; attempt++) {
+        actual = pixels(display, width * 2, height * 2, 8)
+        if (actual[1] === expected) break
+        await new Promise(resolve => setTimeout(resolve, 50))
+      }
+      assert.deepEqual(actual, [0xffffff, expected], 'Layout and edge clicks must match actual desktop pixels')
+    }
+    await call('resize', { width: 361, height: 521 })
+    await call('navigate', { url: `http://127.0.0.1:${server.address().port}/next` })
+    const navigated = await call('snapshot')
+    assert.deepEqual(navigated.viewport, { x: 0, y: 0, width: 361, height: 521 })
+    await call('element-click', { selector: '#popup', expected_revision: navigated.revision })
+    let popup = await call('snapshot')
+    // The target-created event can arrive after the input acknowledgement.
+    for (let attempt = 0; attempt < 50 && !popup.url.endsWith('/popup'); attempt++) {
+      await new Promise(resolve => setTimeout(resolve, 50))
+      popup = await call('snapshot')
+    }
+    assert(popup.url.endsWith('/popup'))
+    assert.equal(popup.page_id, navigated.page_id)
+    assert.deepEqual(popup.viewport, { x: 0, y: 0, width: 361, height: 521 })
+    await call('element-text', { selector: '#value', text: '可见浏览器中文验收' })
+    await call('resize', { width: 823, height: 617 })
     const connection = '12345678-1234-1234-1234-123456789abc'
     await call('display-open', { connection })
     for (let attempt = 0; attempt < 100 && !packets.some(packet => packet.event === 'data'); attempt++)
@@ -85,7 +125,7 @@ async function main() {
     assert.match(greeting, /^RFB /)
     await call('display-close', { connection })
     assert.equal((await call('snapshot')).elements[0].value, '可见浏览器中文验收')
-    console.log('PASS private Kasm display: visible Chromium, arbitrary resize, AI Unicode edit, RFB handshake and view-only disconnect')
+    console.log('PASS private Kasm display: narrow/wide resize, desktop pixels and edge clicks, AI Unicode edit, RFB handshake and view-only disconnect')
   } finally {
     await worker.shutdown()
     server.closeAllConnections()

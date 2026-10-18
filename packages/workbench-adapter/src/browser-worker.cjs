@@ -253,6 +253,11 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
     await cdp.send('Browser.setWindowBounds', { windowId: window.windowId,
       bounds: { left: 0, top: 0, ...display.size } })
     await cdp.send('Browser.setWindowBounds', { windowId: window.windowId, bounds: { windowState: 'fullscreen' } })
+    // Chromium enforces a minimum outer-window width even in kiosk mode. Keep
+    // layout and input coordinates aligned with the visible X display below it.
+    await cdp.send('Emulation.setDeviceMetricsOverride', {
+      ...display.size, deviceScaleFactor: 2, mobile: false,
+    })
   }
   async function bind(target, id) {
     const cdp = await context.newCDPSession(target)
