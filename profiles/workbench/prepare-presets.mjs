@@ -8,6 +8,7 @@ import { prepareSessionClient } from '../../scripts/prepare-session-client.mjs'
 import { prepareSubagentPrompt } from '../../scripts/prepare-subagent-prompt.mjs'
 import { prepareSessionReferences } from '../../scripts/prepare-session-references.mjs'
 import { prepareSessionDeletion } from '../../scripts/prepare-session-deletion.mjs'
+import { prepareSessionSearch } from '../../scripts/prepare-session-search.mjs'
 import { prepareWorkbenchClient } from '../../scripts/prepare-workbench-client.mjs'
 import { prepareDshStreamArguments } from '../../scripts/prepare-dsh-stream-arguments.mjs'
 import { prepareDshAgentInbox } from '../../scripts/prepare-dsh-agent-inbox.mjs'
@@ -15,6 +16,7 @@ import { prepareTerminalCleanup } from '../../scripts/prepare-terminal-cleanup.m
 
 const root = dirname(fileURLToPath(import.meta.url))
 await prepareSessionDeletion(root)
+await prepareSessionSearch(root)
 await prepareWorkspaceChanges(root)
 await prepareSessionClient(root)
 await prepareSubagentPrompt(root)

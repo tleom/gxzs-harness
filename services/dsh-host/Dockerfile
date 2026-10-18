@@ -28,6 +28,7 @@ COPY scripts/prepare-dsh-agent-inbox.mjs /opt/workbench/scripts/prepare-dsh-agen
 COPY scripts/prepare-terminal-cleanup.mjs /opt/workbench/scripts/prepare-terminal-cleanup.mjs
 COPY scripts/prepare-session-references.mjs /opt/workbench/scripts/prepare-session-references.mjs
 COPY scripts/prepare-session-deletion.mjs /opt/workbench/scripts/prepare-session-deletion.mjs
+COPY scripts/prepare-session-search.mjs /opt/workbench/scripts/prepare-session-search.mjs
 COPY scripts/prepare-workbench-client.mjs /opt/workbench/scripts/prepare-workbench-client.mjs
 COPY scripts/native-settings-controllers.mjs /opt/workbench/scripts/native-settings-controllers.mjs
 COPY scripts/migrate-platform-patch.mjs /opt/workbench/scripts/migrate-platform-patch.mjs
