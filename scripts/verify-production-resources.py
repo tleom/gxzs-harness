@@ -10,7 +10,10 @@ import subprocess
 
 def verify_skill_source(root):
     root = Path(root).resolve(strict=True)
-    manifest = json.loads((root / 'skills-manifest.json').read_text(encoding='utf-8'))
+    manifest_path = root / 'skills-manifest.json'
+    if manifest_path.is_symlink():
+        raise ValueError('Published skill resources must not contain symlinks')
+    manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
     skills = root / 'skills'
     if skills.is_symlink():
         raise ValueError('Published skill resources must not contain symlinks')

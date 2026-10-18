@@ -2,6 +2,7 @@ import hashlib
 import importlib.util
 import json
 from pathlib import Path
+import sys
 
 import pytest
 
@@ -86,6 +87,23 @@ def test_rejects_symlinked_font_archive(tmp_path, target):
     try:
         original.symlink_to(destination, target_is_directory=target == 'fonts')
     except OSError as exc:
+        if sys.platform != 'win32':
+            raise
         pytest.skip('Symlinks unavailable: ' + str(exc))
     with pytest.raises(ValueError, match='symlinks'):
         resources.verify_font_source(tmp_path)
+
+
+def test_rejects_symlinked_skill_manifest(tmp_path):
+    published(tmp_path)
+    manifest = tmp_path/'skills-manifest.json'
+    external = tmp_path/'external-manifest.json'
+    manifest.rename(external)
+    try:
+        manifest.symlink_to(external)
+    except OSError as exc:
+        if sys.platform != 'win32':
+            raise
+        pytest.skip('Symlinks unavailable: ' + str(exc))
+    with pytest.raises(ValueError, match='symlinks'):
+        resources.verify_skill_source(tmp_path)
