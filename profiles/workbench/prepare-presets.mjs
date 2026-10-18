@@ -7,6 +7,7 @@ import { prepareWorkspaceChanges } from '../../scripts/prepare-workspace-changes
 import { prepareSessionClient } from '../../scripts/prepare-session-client.mjs'
 import { prepareSubagentPrompt } from '../../scripts/prepare-subagent-prompt.mjs'
 import { prepareSessionReferences } from '../../scripts/prepare-session-references.mjs'
+import { prepareSessionSearch } from '../../scripts/prepare-session-search.mjs'
 import { prepareWorkbenchClient } from '../../scripts/prepare-workbench-client.mjs'
 import { prepareDshStreamArguments } from '../../scripts/prepare-dsh-stream-arguments.mjs'
 import { prepareDshAgentInbox } from '../../scripts/prepare-dsh-agent-inbox.mjs'
@@ -17,6 +18,7 @@ await prepareWorkspaceChanges(root)
 await prepareSessionClient(root)
 await prepareSubagentPrompt(root)
 await prepareSessionReferences(root)
+await prepareSessionSearch(join(root, 'node_modules/@deepseek-ai/dsh-session-query-sqlite'))
 await prepareWorkbenchClient(root)
 await prepareDshStreamArguments(root)
 await prepareDshAgentInbox(root)
