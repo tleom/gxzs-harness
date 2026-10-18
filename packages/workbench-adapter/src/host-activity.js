@@ -12,8 +12,9 @@ export async function nativeHostActivity(ctx, sidebarActivity = () => ({ browser
       for (const job of ctx.jobs.list(agent.id)) jobs.set(job.id, job)
     }
     const sidebar = sidebarActivity()
+    const persistentTerminals = ctx.bail?.('gxzs/persistent-terminal-activity') ?? 0
     const activeSettingsWrites = settingsActivity()
-    if (![sidebar.browser, sidebar.terminal, activeSettingsWrites].every(value => Number.isSafeInteger(value) && value >= 0))
+    if (![sidebar.browser, sidebar.terminal, persistentTerminals, activeSettingsWrites].every(value => Number.isSafeInteger(value) && value >= 0))
       return { protocol: 1, status: 'unknown' }
     return {
       protocol: 1, status: 'ready',
@@ -25,7 +26,7 @@ export async function nativeHostActivity(ctx, sidebarActivity = () => ({ browser
         ? 0 : agent.inbox.nextTurn.length + agent.inbox.nextStep.length), 0),
       runningJobs: [...jobs.values()].filter(job => job.status === 'running' || job.status === 'stopping').length,
       activeSchedules: tasks.filter(task => task.status === 'active').length,
-      activeSidebarResources: sidebar.browser + sidebar.terminal,
+      activeSidebarResources: sidebar.browser + sidebar.terminal + persistentTerminals,
       activeSettingsWrites,
     }
   } catch {

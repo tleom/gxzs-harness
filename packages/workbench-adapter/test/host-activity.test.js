@@ -73,3 +73,11 @@ it('samples pending native settings writes after the async catalog read and neve
   expect((await nativeHostActivity(test.ctx,undefined,()=>writes)).activeSettingsWrites).toBe(1)
   expect(await nativeHostActivity(test.ctx,undefined,()=>undefined)).toEqual({protocol:1,status:'unknown'})
 })
+
+it('fails closed when a persistent terminal registry cannot be sampled', async () => {
+  const test = fixture()
+  test.ctx.bail = () => { throw new Error('terminal registry unavailable') }
+  expect(await nativeHostActivity(test.ctx)).toEqual({ protocol: 1, status: 'unknown' })
+  test.ctx.bail = () => NaN
+  expect(await nativeHostActivity(test.ctx)).toEqual({ protocol: 1, status: 'unknown' })
+})
