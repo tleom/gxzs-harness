@@ -17,6 +17,7 @@ COPY scripts/prepare-dsh-stream-arguments.mjs /opt/workbench/scripts/prepare-dsh
 COPY scripts/prepare-dsh-agent-inbox.mjs /opt/workbench/scripts/prepare-dsh-agent-inbox.mjs
 COPY scripts/prepare-terminal-cleanup.mjs /opt/workbench/scripts/prepare-terminal-cleanup.mjs
 COPY scripts/prepare-session-references.mjs /opt/workbench/scripts/prepare-session-references.mjs
+COPY scripts/prepare-session-deletion.mjs /opt/workbench/scripts/prepare-session-deletion.mjs
 COPY scripts/prepare-workbench-client.mjs /opt/workbench/scripts/prepare-workbench-client.mjs
 COPY scripts/native-settings-controllers.mjs /opt/workbench/scripts/native-settings-controllers.mjs
 COPY scripts/check-runtime-imports.mjs ./check-runtime-imports.mjs

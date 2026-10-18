@@ -126,7 +126,7 @@ it('uses the owning native Session and preserves compare-and-update without acce
 })
 it('keeps retained receipts owner-scoped after a chat is soft-deleted', async () => {
   const test = fixture()
-  test.db.deleteChat(test.owner.ownerId, test.chat.id)
+  test.db.db.prepare('UPDATE chats SET deleted_at = 1 WHERE id = ?').run(test.chat.id)
   expect(await test.gateway.catalog(test.owner)).toEqual([expect.objectContaining({ id: 'task', chat_deleted: true })])
   await test.gateway.history(test.owner, 'task')
   expect(test.native.history).toHaveBeenCalledWith({ sessionId: test.chat.sessionId, id: 'task', limit: 50 })

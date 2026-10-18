@@ -5,7 +5,7 @@ const fs=require('node:fs/promises');
 (async()=>{
   let input='';for await(const chunk of process.stdin)input+=chunk;
   const {operation,args}=JSON.parse(input);
-  if(!['copyFile','mkdir','mkdtemp','readFile','realpath','rm'].includes(operation))throw new Error('Unsupported snapshot operation');
+  if(!['copyFile','mkdir','mkdtemp','readdir','readFile','realpath','rm'].includes(operation))throw new Error('Unsupported snapshot operation');
   if(operation==='readFile'){
     const handle=await fs.open(args[0],'r');
     try{
@@ -41,6 +41,7 @@ export function createChangesIo(subprocess,{node,cwd,home,tempRoot,signal}) {
     realpath:path=>call('realpath',[path]),
     mkdir:(path,options)=>call('mkdir',[path,options]),
     mkdtemp:prefix=>call('mkdtemp',[prefix]),
+    readdir:path=>call('readdir',[path]),
     copyFile:(from,to)=>call('copyFile',[from,to]),
     rm:(path,options)=>call('rm',[path,options]),
     readFile:(path,options)=>call('readFile',[path],typeof options==='object'?options.signal:undefined),

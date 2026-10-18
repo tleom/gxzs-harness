@@ -228,9 +228,19 @@ export class WorkbenchService {
 
   async deleteChat(owner, chatId) {
     return this.withChatMutation(chatId, async () => {
-      const chat = this.requireChat(owner, chatId)
+      const pending = this.database.chatDeletion(owner.ownerId, chatId)
+      if (pending) {
+        if (!pending.completedAt) await this.completeChatDeletion(owner, pending, { refreshFiles: true })
+        return
+      }
+      const chat = this.database.deletionChat(owner.ownerId, chatId)
+      if (!chat) throw httpError(404, '会话不存在或已被删除')
+      if (!this.permanentDeletion) throw httpError(503, '会话删除服务尚未就绪')
       this.scheduler?.deletingChats.add(chatId)
       try {
+        // Legacy soft-deleted rows remain hidden to callers, but deletion must
+        // still drain their native activity, fences and admission tickets.
+        const access = { includeDeleted: true }
         // Drain an in-flight admission before cancelling; otherwise its prompt
         // could arrive after cancellation and restart the deleted conversation.
         await this.scheduler?.pendingTick
@@ -238,12 +248,12 @@ export class WorkbenchService {
         const cancelling = this.database.listRuns(owner.ownerId, chatId)
           .filter(run => ['running', 'waiting_input', 'stopping'].includes(run.status) || this.database.submission(owner.ownerId, run.id)?.dispatched
             || this.hasOwnedWork?.(chat.sessionId, run.id)
-            || this.database.pendingRunFences(owner.ownerId).some(value => value.id === run.id))
+            || this.database.pendingRunFences(owner.ownerId, access).some(value => value.id === run.id))
         // Native archive commits the wake-up fence before stopping schedules, jobs and children.
         await this.workspaces?.controller?.archiveSession?.({ sessionId: chat.sessionId, stopActivity: true })
         await this.closeTerminals?.(chat.sessionId)
         const agent = this.agents.get(chat.sessionId)
-        for (const run of cancelling) this.database.requireRunFence(owner.ownerId, run.id)
+        for (const run of cancelling) this.database.requireRunFence(owner.ownerId, run.id, access)
         if (agent) {
           const goal = this.goals?.get(agent)
           if (goal?.phase === 'active') this.goals.pause(agent, { id: goal.id, revision: goal.revision })
@@ -252,28 +262,45 @@ export class WorkbenchService {
         const confirmation = await fenceMcpExecutions(this.platformClient, owner, cancelling.map(run => run.id))
         if (agent) await agent.whenIdle()
         await this.waitSessionActivity?.(chat.sessionId)
-        for (const run of cancelling) this.database.confirmRunFence(owner.ownerId, run.id, confirmation)
+        for (const run of cancelling) this.database.confirmRunFence(owner.ownerId, run.id, confirmation, access)
         for (const run of this.database.listRuns(owner.ownerId, chatId)) {
           if (['queued', 'running', 'waiting_input', 'stopping'].includes(run.status))
-            this.database.transitionRun(owner.ownerId, run.id, 'cancelled')
+            this.database.transitionRun(owner.ownerId, run.id, 'cancelled', undefined, Date.now(), access)
           if (this.scheduler && this.database.submission(owner.ownerId, run.id)) {
             await this.scheduler.request(run, 'release')
-            this.database.finishSubmission(owner.ownerId, run.id)
+            this.database.finishSubmission(owner.ownerId, run.id, access)
           }
         }
         const path = chat.directory ?? `conversations/${chat.id}`
         // Allocated task directories are private; selected workspaces and forks retain shared files.
         const shared = this.database.listChats(owner.ownerId).some((other) => other.id !== chat.id && (other.directory ?? `conversations/${other.id}`) === path)
         const allocated = path === `conversations/${chat.id}` || /^conversations\/\d{4}-\d{2}-\d{2}\//.test(path) && path.split('/').at(-1) === chat.id
-        if (shared || !allocated || path === '.') { this.database.deleteChat(owner.ownerId, chatId); return }
-        const entry = await this.fileManager.operate({ operation: 'stat', path })
-        if (entry.kind !== 'missing')
-          await this.fileManager.operate({ operation: 'delete', path, version: entry.version })
-        this.database.deleteChat(owner.ownerId, chatId)
+        const sessionIds = await this.permanentDeletion.prepare(chat)
+        let fileDeletion
+        if (!shared && allocated && path !== '.') {
+          const entry = await this.fileManager.operate({ operation: 'stat', path })
+          if (entry.kind !== 'missing') fileDeletion = { path, version: entry.version }
+        }
+        const deletion = this.database.beginChatDeletion(owner.ownerId, chatId, sessionIds, fileDeletion)
+        await this.completeChatDeletion(owner, deletion)
       } finally {
         this.scheduler?.deletingChats.delete(chatId)
       }
     })
+  }
+
+  async completeChatDeletion(owner, deletion, { refreshFiles = false } = {}) {
+    if (!this.permanentDeletion) throw httpError(503, '会话删除服务尚未就绪')
+    if (deletion.fileDeletion) {
+      const { path, version } = deletion.fileDeletion
+      const shared = this.database.listChats(owner.ownerId).some(chat => (chat.directory ?? `conversations/${chat.id}`) === path)
+      if (!shared) {
+        const entry = await this.fileManager.operate({ operation: 'stat', path })
+        if (entry.kind !== 'missing') await this.fileManager.operate({ operation: 'delete', path, version: refreshFiles ? entry.version : version })
+      }
+    }
+    await this.permanentDeletion.erase(deletion)
+    this.database.finishChatDeletion(owner.ownerId, deletion.chatId)
   }
 
   async withChatMutation(chatId, operation) {

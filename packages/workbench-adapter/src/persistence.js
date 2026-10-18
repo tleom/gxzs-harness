@@ -45,6 +45,14 @@ export class WorkbenchDatabase {
         deleted_at INTEGER
       );
       CREATE INDEX IF NOT EXISTS chats_owner_updated ON chats(owner_id, updated_at DESC);
+      CREATE TABLE IF NOT EXISTS chat_deletions (
+        chat_id TEXT PRIMARY KEY,
+        owner_id TEXT NOT NULL,
+        session_ids_json TEXT NOT NULL,
+        file_deletion_json TEXT,
+        created_at INTEGER NOT NULL,
+        completed_at INTEGER
+      );
       CREATE TABLE IF NOT EXISTS runs (
         id TEXT PRIMARY KEY,
         owner_id TEXT NOT NULL,
@@ -275,10 +283,60 @@ export class WorkbenchDatabase {
     return this.getChat(ownerId, chatId)
   }
 
-  deleteChat(ownerId, chatId, now = Date.now()) {
-    if (!this.getChat(ownerId, chatId)) throw notFound('会话不存在或已被删除')
-    if (this.activeRun(ownerId, chatId)) throw Object.assign(new Error('会话正在执行任务，请停止后再删除'), { status: 409 })
-    this.db.prepare('UPDATE chats SET deleted_at = ?, updated_at = ? WHERE id = ? AND owner_id = ?').run(now, now, chatId, ownerId)
+  deletionChat(ownerId, chatId) {
+    const row = this.db.prepare('SELECT * FROM chats WHERE id = ? AND owner_id = ?').get(chatId, ownerId)
+    return row ? decodeChat(row) : undefined
+  }
+
+  chatDeletion(ownerId, chatId) {
+    const row = this.db.prepare('SELECT * FROM chat_deletions WHERE owner_id = ? AND chat_id = ?').get(ownerId, chatId)
+    return row ? { chatId: row.chat_id, sessionIds: JSON.parse(row.session_ids_json), fileDeletion: parseNullable(row.file_deletion_json), completedAt: row.completed_at } : undefined
+  }
+
+  pendingChatDeletions(ownerId) {
+    return this.db.prepare('SELECT chat_id FROM chat_deletions WHERE owner_id = ? AND completed_at IS NULL')
+      .all(ownerId).map(row => this.chatDeletion(ownerId, row.chat_id))
+  }
+
+  retainedRunInputs(ownerId) {
+    return this.db.prepare(`SELECT r.query, r.attachments_json, s.content_json FROM runs r
+      JOIN chats c ON c.id = r.chat_id LEFT JOIN run_submissions s ON s.run_id = r.id
+      WHERE c.owner_id = ? AND c.deleted_at IS NULL`).iterate(ownerId)
+  }
+
+  beginChatDeletion(ownerId, chatId, sessionIds, fileDeletion, now = Date.now()) {
+    return this.transaction(() => {
+      const chat = this.deletionChat(ownerId, chatId)
+      if (!chat) throw notFound('会话不存在或已被删除')
+      if (this.db.prepare("SELECT id FROM runs WHERE chat_id = ? AND status IN ('queued','running','waiting_input','stopping') LIMIT 1").get(chatId))
+        throw Object.assign(new Error('会话任务尚未停止'), { status: 409 })
+      const ids = [...new Set([chat.sessionId, ...sessionIds])]
+      for (const id of ids) if (this.db.prepare('SELECT id FROM chats WHERE session_id = ? AND id <> ?').get(id, chatId))
+        throw new Error('Cannot delete another conversation session')
+      this.db.prepare('INSERT OR IGNORE INTO chat_deletions(chat_id,owner_id,session_ids_json,file_deletion_json,created_at) VALUES (?,?,?,?,?)')
+        .run(chatId, ownerId, JSON.stringify(ids), fileDeletion ? JSON.stringify(fileDeletion) : null, now)
+      this.db.prepare('UPDATE chats SET deleted_at = ?, updated_at = ? WHERE id = ?').run(now, now, chatId)
+      return this.chatDeletion(ownerId, chatId)
+    })()
+  }
+
+  finishChatDeletion(ownerId, chatId, now = Date.now()) {
+    this.flushStreamEvents()
+    this.transaction(() => {
+      const deletion = this.chatDeletion(ownerId, chatId)
+      if (!deletion) throw new Error('Missing permanent deletion receipt')
+      this.db.exec('PRAGMA secure_delete = ON')
+      for (const sessionId of deletion.sessionIds) {
+        this.db.prepare('DELETE FROM pending_turns WHERE session_id = ?').run(sessionId)
+        this.db.prepare('DELETE FROM projected_native_events WHERE session_id = ?').run(sessionId)
+      }
+      // Runs, events, inputs, receipts and control state share this FK cascade.
+      this.db.prepare('DELETE FROM chats WHERE id = ? AND owner_id = ?').run(chatId, ownerId)
+      this.db.prepare('UPDATE chat_deletions SET file_deletion_json = NULL WHERE chat_id = ? AND owner_id = ?').run(chatId, ownerId)
+    })()
+    const checkpoint = this.db.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get()
+    if (checkpoint.busy) throw new Error('Conversation deletion is waiting for a reader; retry deletion')
+    this.db.prepare('UPDATE chat_deletions SET completed_at = ? WHERE chat_id = ? AND owner_id = ?').run(now, chatId, ownerId)
   }
 
   findRunByRequestKey(ownerId, chatId, requestKey) {
@@ -316,10 +374,10 @@ export class WorkbenchDatabase {
     return create()
   }
 
-  getRun(ownerId, id) {
+  getRun(ownerId, id, { includeDeleted = false } = {}) {
     this.flushStreamEvents()
     const row = this.db.prepare(`SELECT r.*, f.result_json AS stop_confirmation_json FROM runs r JOIN chats c ON c.id = r.chat_id LEFT JOIN run_fences f ON f.run_id=r.id
-      WHERE r.id = ? AND r.owner_id = ? AND c.deleted_at IS NULL`).get(id, ownerId)
+      WHERE r.id = ? AND r.owner_id = ? AND (? OR c.deleted_at IS NULL)`).get(id, ownerId, Number(includeDeleted))
     return row ? { ...decodeRun(row), ...(row.error ? { errorCode: this.runErrorCode(ownerId, id) } : {}) } : undefined
   }
 
@@ -843,8 +901,8 @@ export class WorkbenchDatabase {
     return true
   }
 
-  finishSubmission(ownerId, runId) {
-    if (!this.getRun(ownerId, runId)) throw notFound('任务不存在')
+  finishSubmission(ownerId, runId, access) {
+    if (!this.getRun(ownerId, runId, access)) throw notFound('任务不存在')
     this.db.prepare('DELETE FROM run_submissions WHERE run_id=?').run(runId)
   }
 
@@ -852,38 +910,39 @@ export class WorkbenchDatabase {
     this.db.prepare('DELETE FROM run_submissions WHERE run_id=?').run(runId)
   }
 
-  transitionRun(ownerId, runId, status, error, now = Date.now()) {
-    return this.transaction(() => this.transitionRunRecord(ownerId, runId, status, error, now))()
+  transitionRun(ownerId, runId, status, error, now = Date.now(), access) {
+    return this.transaction(() => this.transitionRunRecord(ownerId, runId, status, error, now, access))()
   }
 
-  transitionRunRecord(ownerId, runId, status, error, now) {
-    const before = this.getRun(ownerId, runId)
+  transitionRunRecord(ownerId, runId, status, error, now, access) {
+    const before = this.getRun(ownerId, runId, access)
+    if (!before) throw notFound('任务不存在')
     const result = this.db.prepare('UPDATE runs SET status = ?, error = ?, updated_at = ? WHERE id = ? AND owner_id = ?')
       .run(status, error ?? null, now, runId, ownerId)
     if (result.changes !== 1) throw notFound('任务不存在')
     if (TERMINAL.has(status) && !['completed', 'discarded', 'steered'].includes(status)
       && (before.turnNumber !== undefined || ['running', 'waiting_input', 'stopping'].includes(before.status)))
-      this.requireRunFence(ownerId, runId)
+      this.requireRunFence(ownerId, runId, access)
     if (status === 'discarded' || status === 'steered') {
-      const removed = this.getRun(ownerId, runId)
+      const removed = this.getRun(ownerId, runId, access)
       this.db.prepare('UPDATE runs SET parent_run_id = ? WHERE owner_id = ? AND chat_id = ? AND parent_run_id = ?')
         .run(removed.parentRunId ?? null, ownerId, removed.chatId, runId)
     }
-    return this.getRun(ownerId, runId)
+    return this.getRun(ownerId, runId, access)
   }
 
-  requireRunFence(ownerId, runId) {
-    if (!this.getRun(ownerId, runId)) throw notFound('任务不存在')
+  requireRunFence(ownerId, runId, access) {
+    if (!this.getRun(ownerId, runId, access)) throw notFound('任务不存在')
     this.db.prepare('INSERT INTO run_fences(run_id) VALUES (?) ON CONFLICT(run_id) DO UPDATE SET confirmed=0').run(runId)
   }
 
-  pendingRunFences(ownerId) {
+  pendingRunFences(ownerId, { includeDeleted = false } = {}) {
     return this.db.prepare(`SELECT r.* FROM runs r JOIN run_fences f ON r.id=f.run_id JOIN chats c ON c.id=r.chat_id
-      WHERE r.owner_id=? AND f.confirmed=0 AND c.deleted_at IS NULL`).all(ownerId).map(decodeRun)
+      WHERE r.owner_id=? AND f.confirmed=0 AND (? OR c.deleted_at IS NULL)`).all(ownerId, Number(includeDeleted)).map(decodeRun)
   }
 
-  confirmRunFence(ownerId, runId, confirmation = { fenced: true, uncertain: false }) {
-    if (!this.getRun(ownerId, runId)) throw notFound('任务不存在')
+  confirmRunFence(ownerId, runId, confirmation = { fenced: true, uncertain: false }, access) {
+    if (!this.getRun(ownerId, runId, access)) throw notFound('任务不存在')
     const row = this.db.prepare('SELECT result_json FROM run_fences WHERE run_id=?').get(runId)
     const previous = parseNullable(row?.result_json)
     // Java/manager only fence platform tools. Native tools such as bash may

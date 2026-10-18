@@ -2,6 +2,7 @@ import {readFile,writeFile} from 'node:fs/promises'
 import {createRequire} from 'node:module'
 import {dirname,join} from 'node:path'
 import {fileURLToPath} from 'node:url'
+import {workspaceChangesDeletionSource} from './prepare-session-deletion.mjs'
 
 /** Keep the installed native recorder intact; generate an instance-scoped IO factory. */
 export function workspaceChangesFactory(source) {
@@ -10,7 +11,7 @@ export function workspaceChangesFactory(source) {
   const exports='export { Config, apply, inject, name };'
   if(!source.includes(fsImport)||!source.includes(osImport)||!source.includes(exports))
     throw new Error('DSH workspace-changes IO contract changed; inspect upstream before upgrading')
-  source=source.replace(fsImport,'').replace(osImport,'').replace(exports,'return { Config, apply, inject, name };')
+  source=source.replace(fsImport,'').replace('import { readdir } from "node:fs/promises";','').replace(osImport,'').replace(exports,'return { Config, apply, inject, name };')
   const start=source.indexOf('async function captureFile(absolute, directory, maxBytes) {')
   const end=source.indexOf('function sameCapture(a, b) {',start)
   if(start<0||end<0)throw new Error('DSH workspace-changes capture contract changed')
@@ -19,7 +20,7 @@ export function workspaceChangesFactory(source) {
   source=source.replace(/^import .*;\r?\n/gm,line=>{imports.push(line);return ''})
   if(/node:fs|node:os/.test(source)||/\b(?:open|writeFile)\(/.test(source))throw new Error('Unadapted native file operation')
   return '// Generated from the installed DSH workspace-changes package (MIT).\n'+imports.join('')+
-    '\nexport function createWorkspaceChanges(io) {\nconst {copyFile,mkdir,mkdtemp,readFile,realpath,rm,homedir,tmpdir}=io;\n'+source+'\n}\n'
+    '\nexport function createWorkspaceChanges(io) {\nconst {copyFile,mkdir,mkdtemp,readdir,readFile,realpath,rm,homedir,tmpdir}=io;\n'+source+'\n}\n'
 }
 
 export async function prepareWorkspaceChanges(profile) {
@@ -33,7 +34,7 @@ export async function prepareWorkspaceChanges(profile) {
   for(const target of new Set([entry,runtimeEntry])) {
     const version=JSON.parse(await readFile(join(dirname(target),'../package.json'),'utf8')).version
     if(version!==metadata.version)throw new Error('Workspace recorder dependency versions differ')
-    await writeFile(join(dirname(target),'gxzs-sandbox.js'),workspaceChangesFactory(await readFile(target,'utf8')))
+    await writeFile(join(dirname(target),'gxzs-sandbox.js'),workspaceChangesFactory(workspaceChangesDeletionSource(await readFile(target,'utf8'))))
   }
   return join(dirname(entry),'gxzs-sandbox.js')
 }

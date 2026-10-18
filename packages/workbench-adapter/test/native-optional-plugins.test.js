@@ -147,6 +147,11 @@ it('composes all four official bundles once and retains their native providers a
   expect(all.find(row => row.id === 'session-title-llm').disabled).toBe(true)
   expect(all.find(row => row.id === 'optional-session-title-all-prompts').config).toMatchObject({ maxInputBytes: 4096, maxOutputTokens: 64 })
   expect(all.find(row => row.id === 'tool-ralph').config).toMatchObject({ subagentProvider: 'spawn', maxRounds: 64 })
+  expect(all.find(row => row.id === 'optional-session-query-sqlite').config).toMatchObject({
+    openAt: 'first-search',
+    path: { __jsExpr: "(process.env.DSH_HOME ?? process.cwd()) + '/session-search.sqlite'" },
+  })
+  expect(all.find(row => row.id === 'optional-tool-session-query').config).toMatchObject({ searchTimeoutMs: 120000 })
 })
 
 it('holds the Host for isolated native PTYs, observes pending creation and releases its observer on unload', async () => {

@@ -25,6 +25,19 @@
   config:
     default: standard
 
+# Derived search data belongs to the same owner home as the original sessions.
+# Retain completed indexing across Host recreation; DSH validates revisions.
+- id: optional-session-query-sqlite
+  config:
+    path: !!js (process.env.DSH_HOME ?? process.cwd()) + '/session-search.sqlite'
+    openAt: first-search
+
+# Native reconciliation can take over 30 seconds when building a cold index.
+# Keep the official search scope and reconciliation algorithm unchanged.
+- id: optional-tool-session-query
+  config:
+    searchTimeoutMs: 120000
+
 # The official bundle keeps a separate owner-scoped PTY registry. Include its
 # live resources in the Host idle check without merging it with sidebar PTYs.
 - id: optional-persistent-terminals
