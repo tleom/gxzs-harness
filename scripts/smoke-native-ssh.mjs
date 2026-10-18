@@ -5,6 +5,7 @@ import { createRequire } from 'node:module'
 import { pathToFileURL } from 'node:url'
 import { promisify } from 'node:util'
 import fs from 'node:fs'
+import { deadline, withCleanup } from './smoke-deadline.mjs'
 const require = createRequire('/opt/workbench/profiles/workbench/package.json')
 const { Context } = await import(require.resolve('@deepseek-ai/cordis'))
 const { default: WorkbenchSubprocess } = await import('/opt/workbench/packages/workbench-sandbox-runtime/src/subprocess.js')
@@ -17,13 +18,15 @@ const config = {host:process.env.GXZS_SANDBOX_SSH_HOST,launch:{kind:'node-script
 const ctx = new Context(); const ssh = new WorkbenchSsh(ctx,config)
 const execFileAsync=promisify(execFile)
 const checks=[]
-async function check(name, fn){ const started=Date.now(); await fn(); checks.push(name); console.log(JSON.stringify({check:name,passed:true,elapsed_ms:Date.now()-started})) }
+let currentCheck='SSH ready', phase='ready', busyCycle
+async function check(name, fn){ currentCheck=name;phase='running';busyCycle=undefined;const started=Date.now();console.log(JSON.stringify({begin:name}));await fn();checks.push(name);console.log(JSON.stringify({check:name,passed:true,elapsed_ms:Date.now()-started})) }
+function reportFailure(kind,error){console.log(JSON.stringify({failure:kind,check:currentCheck,phase,busyCycle,error:String(error?.message??error).slice(0,1000),bridges:ssh.bridges?.size,operations:ssh.operations?.size,sockets:ssh.sockets?.size,pending:ssh.rpc?.pending?.size}))}
 async function drained(){ for(let i=0;i<100 && ssh.bridges.size;i++) await new Promise(r=>setTimeout(r,20)); assert.equal(ssh.bridges.size,0) }
 async function remoteBridges(){
  const {stdout}=await execFileAsync('ssh',['-T','-S',ssh.controlPath(),'-o','BatchMode=yes',config.host,'pgrep -af /tmp/dsh-ssh- || true'],{timeout:3000,maxBuffer:65536})
  return stdout.split('\n').filter(line=>line.includes("node -e const net=require('node:net');")).length
 }
-try {
+await withCleanup(async()=>{
  const hello=await ssh.ready
  const runtime=new WorkbenchSubprocess(ctx, {ripgrepExecutable:'/usr/bin/rg'})
  await check('ordinary_stdout_stderr_and_cleanup',async()=>{
@@ -63,10 +66,10 @@ try {
    const victim=[...ssh.bridges][0]
    const disconnectedAt=Date.now()
    victim.child.kill('SIGKILL')
-   await Promise.race([victim.closed,new Promise((_,reject)=>setTimeout(()=>reject(new Error('Local SSH child did not close within three seconds')),3000))])
-   const deadline=disconnectedAt+3000
+   await deadline('Local SSH child close',3000,()=>victim.closed)
+   const closeDeadline=disconnectedAt+3000
    let remote=await remoteBridges()
-   while(remote!==ssh.bridges.size&&Date.now()<deadline){await new Promise(r=>setTimeout(r,50));remote=await remoteBridges()}
+   while(remote!==ssh.bridges.size&&Date.now()<closeDeadline){await new Promise(r=>setTimeout(r,50));remote=await remoteBridges()}
    assert.equal(remote,ssh.bridges.size,'Remote bridge outlived its local SSH child for more than three seconds')
    assert.ok(Date.now()-disconnectedAt<3000,'Remote bridge cleanup exceeded three seconds')
   } finally {
@@ -92,7 +95,7 @@ try {
   const p=runtime.spawn({argv:['/bin/sh','-c','printf running; sleep 30'],cwd:'/workspace',stdio:{stdin:'ignore',stdout:'pipe',stderr:'pipe'},graceMs:200,signal:controller.signal})
   p.stdout.on('error',()=>{});p.stderr.on('error',()=>{})
   const ready=new Promise(r=>p.stdout.once('data',r));p.stderr.resume();await ready;controller.abort()
-  await Promise.race([p.done.catch(()=>{}),new Promise((_,reject)=>{const t=setTimeout(()=>reject(new Error('cancel_exceeded_5s')),5000);t.unref()})]);assert.equal(await p.waitForExit(AbortSignal.timeout(3000)),true);await drained()
+  await deadline('cancel',5000,()=>p.done.catch(()=>{}));assert.equal(await p.waitForExit(AbortSignal.timeout(3000)),true);await drained()
  })
  // Exercise the configured thin adapter: upstream leaves an open stdin stream
  // after cancellation; WorkbenchSubprocess closes streams at the native done boundary.
@@ -139,19 +142,22 @@ try {
  })
  await check('closing_busy_pty_stops_queued_commands_without_orphans',async()=>{
   for(let cycle=0;cycle<4;cycle++){
+   busyCycle=cycle;phase='spawn'
    const p=await runtime.spawnTerminal({argv:['/bin/sh'],cwd:'/workspace',rows:40,cols:120,terminalType:'xterm',graceMs:200})
    p.output.on('error',()=>{});p.output.resume()
    // A live shell must not launch replacement children while cleanup drains them.
+   phase='write'
    for(let index=0;index<100;index++) await p.write(`node -e 'console.log("busy-${cycle}-${index}")'\r`)
-   await p.terminate()
-   await Promise.race([p.done,new Promise((_,reject)=>{const timer=setTimeout(()=>reject(new Error('Busy PTY survived close')),3000);timer.unref()})])
-   await drained()
+   await deadline(`Busy PTY cycle ${cycle} close`,3000,async()=>{
+    phase='terminate';await p.terminate();phase='done';await p.done
+   })
+   phase='drained';await drained()
   }
  })
  await check('dispose_stops_active_streams',async()=>{
   const p=runtime.spawn({argv:['/bin/sh','-c','printf running; sleep 30'],cwd:'/workspace',stdio:{stdin:'ignore',stdout:'pipe',stderr:'pipe'},graceMs:200})
-  p.stdout.on('error',()=>{});p.stderr.on('error',()=>{});p.stderr.resume();await new Promise(r=>p.stdout.once('data',r));const d=Date.now();await Promise.race([ssh.dispose(),new Promise((_,reject)=>{const t=setTimeout(()=>reject(new Error('dispose_exceeded_5s')),5000);t.unref()})]);console.log(JSON.stringify({stage:'dispose_returned',elapsed_ms:Date.now()-d}));await p.done.catch(()=>{});console.log(JSON.stringify({stage:'done_returned',elapsed_ms:Date.now()-d}));assert.equal(ssh.bridges.size,0)
+  p.stdout.on('error',()=>{});p.stderr.on('error',()=>{});p.stderr.resume();await new Promise(r=>p.stdout.once('data',r));const d=Date.now();await deadline('dispose',5000,()=>ssh.dispose());console.log(JSON.stringify({stage:'dispose_returned',elapsed_ms:Date.now()-d}));await p.done.catch(()=>{});console.log(JSON.stringify({stage:'done_returned',elapsed_ms:Date.now()-d}));assert.equal(ssh.bridges.size,0)
   await assert.rejects(ssh.connectStream({path:hello.root+'/unused',capability:'a'.repeat(64)}))
  })
- console.log(JSON.stringify({checks,passed:checks.length,credentials_printed:false}))
-} finally {await ssh.dispose()}
+},()=>deadline('Final SSH cleanup',5000,()=>ssh.dispose()),reportFailure)
+console.log(JSON.stringify({checks,passed:checks.length,credentials_printed:false}))
