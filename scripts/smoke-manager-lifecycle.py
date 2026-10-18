@@ -2,6 +2,7 @@
 import concurrent.futures
 import hashlib
 import ipaddress
+import importlib.util
 import json
 import os
 import secrets
@@ -23,6 +24,14 @@ host_probe = prefix + '-host'
 host_home = prefix + '-host-home'
 token = secrets.token_hex(32)
 workspaces = [str(uuid.uuid4()), str(uuid.uuid4())]
+resource_args = []
+skill_manifest = None
+if os.environ.get('GXZS_GLOBAL_RESOURCES_DIR'):
+    spec = importlib.util.spec_from_file_location('production_resources', Path(__file__).with_name('verify-production-resources.py'))
+    resources = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(resources)
+    skill_root, skill_manifest = resources.verify_skill_source(os.environ['GXZS_GLOBAL_RESOURCES_DIR'])
+    resource_args = ['-e', 'GXZS_GLOBAL_SKILL_HOST_DIR=' + str(skill_root)]
 
 
 def interrupted(signum, frame):
@@ -81,6 +90,28 @@ def files(workspace, operation, **values):
     return result['body']
 
 
+def verify_managed_skills(container, image):
+    if skill_manifest is None:
+        return
+    mounts = json.loads(docker('inspect', container).stdout)[0]['Mounts']
+    mount = next(item for item in mounts if item['Destination'] == '/opt/workbench-global/skills')
+    assert mount['Type'] == 'bind' and mount['Source'] == str(skill_root) and mount['RW'] is False
+    script = """
+const fs=require('fs'),p=require('path'),c=require('crypto');
+const root='/opt/workbench-global/skills',files={};
+function visit(dir){for(const e of fs.readdirSync(dir,{withFileTypes:true})){
+ const f=p.join(dir,e.name);
+ if(e.isSymbolicLink())throw Error('Skill symlink');
+ if(e.isDirectory())visit(f);
+ else if(e.isFile())files[p.relative(root,f)]=c.createHash('sha256').update(fs.readFileSync(f)).digest('hex');
+}}
+visit(root);console.log(JSON.stringify(files));
+"""
+    result = docker('run', '--rm', '--network', 'none', '--volumes-from', container + ':ro',
+                    '--entrypoint', 'node', image, '-e', script)
+    assert json.loads(result.stdout) == skill_manifest['files']
+
+
 try:
     docker('run', '-d', '--name', manager, '--network', 'none', '--memory', '1g', '--cpus', '2',
            '-v', '/var/run/docker.sock:/var/run/docker.sock',
@@ -89,7 +120,7 @@ try:
            '-e', 'WORKBENCH_SANDBOX_NETWORK=' + prefix,
            '-e', 'WORKBENCH_SANDBOX_ADDRESS_POOL=' + os.environ.get('GXZS_SMOKE_ADDRESS_POOL', '10.249.253.0/24'),
            '-e', 'WORKBENCH_SANDBOX_SUBNET_PREFIX=27',
-           '-e', 'WORKBENCH_SANDBOX_IMAGE=' + sandbox_image, manager_image)
+           '-e', 'WORKBENCH_SANDBOX_IMAGE=' + sandbox_image, *resource_args, manager_image)
     healthy()
     # Optional explicit test ranges avoid consuming the daemon's production pool.
     if os.environ.get('GXZS_SMOKE_SUBNETS'):
@@ -180,6 +211,10 @@ HOSTS._create_container(value['item'], folder, value['image'], 'none', [], PureP
         sandbox_files = next(item for item in sandbox_mounts if item['Destination'] == '/workspace')
         host_files = next(item for item in host_mounts if item['Destination'] == '/workspace')
         assert sandbox_files['Source'] == host_files['Source'] and host_files['RW'] is False
+        verify_managed_skills(prefix + '-' + workspaces[0], sandbox_image)
+        verify_managed_skills(host_probe, host_image)
+        if skill_manifest is not None:
+            print('PASS manager-created Host and Sandbox: complete global skills mounted read-only', flush=True)
         docker('run', '--rm', '--network', 'none', '--volumes-from', host_probe + ':ro', '--entrypoint', 'node', host_image,
                '-e', "const fs=require('node:fs');if(fs.readFileSync('/workspace/probe/data.bin').toString('base64')!=='AP8BAg==')process.exit(1)")
         docker('rm', '-f', host_probe)

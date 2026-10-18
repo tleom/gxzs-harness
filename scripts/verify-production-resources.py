@@ -28,6 +28,8 @@ def verify_skill_source(root):
 
 def verify_font_source(root):
     root = Path(root) / 'fonts'
+    if root.is_symlink() or (root / 'manifest.json').is_symlink():
+        raise ValueError('Published font resources must not contain symlinks')
     manifest = json.loads((root / 'manifest.json').read_text(encoding='utf-8'))
     files = set()
     for item in manifest['files']:
@@ -38,6 +40,14 @@ def verify_font_source(root):
                 or hashlib.sha256(path.read_bytes()).hexdigest() != item['sha256']):
             raise ValueError('Published font asset differs from its release manifest')
         files.add(name)
+    actual = set()
+    for path in root.rglob('*'):
+        if path.is_symlink():
+            raise ValueError('Published font resources must not contain symlinks')
+        if path.is_file() and path.suffix.lower() in {'.ttf', '.otf', '.ttc', '.otc'}:
+            actual.add(path.relative_to(root).as_posix())
+    if actual != files:
+        raise ValueError('Published font assets differ from their release manifest')
     generation = hashlib.sha256('\n'.join(sorted(files)).encode()).hexdigest()
     if not files or len(files) != manifest['uniqueFiles'] or generation != manifest['generation']:
         raise ValueError('Published font generation differs from its release manifest')

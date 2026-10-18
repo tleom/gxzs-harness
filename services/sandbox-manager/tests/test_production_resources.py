@@ -50,7 +50,7 @@ def test_accepts_verified_production_font_release():
     resources.verify_font_runtime({'fonts': 350, 'font_generation': 'release'}, {'uniqueFiles': 350, 'generation': 'release'})
 
 
-@pytest.mark.parametrize('change', ['valid', 'corrupt', 'missing', 'changed-generation'])
+@pytest.mark.parametrize('change', ['valid', 'corrupt', 'missing', 'changed-generation', 'extra-font', 'nested-font'])
 def test_persistent_font_archive_is_available_for_future_builds(tmp_path, change):
     fonts = tmp_path/'fonts'
     fonts.mkdir()
@@ -62,9 +62,30 @@ def test_persistent_font_archive_is_available_for_future_builds(tmp_path, change
     if change == 'corrupt': (fonts/name).write_bytes(b'corrupt')
     if change == 'missing': (fonts/name).unlink()
     if change == 'changed-generation': manifest['generation'] = 'other'
+    if change == 'extra-font': (fonts/'unexpected.TTF').write_bytes(b'extra')
+    if change == 'nested-font':
+        (fonts/'nested').mkdir()
+        (fonts/'nested'/name).write_bytes(b'font-fixture')
     (fonts/'manifest.json').write_text(json.dumps(manifest), encoding='utf-8')
     if change == 'valid':
         assert resources.verify_font_source(tmp_path) == manifest
     else:
         with pytest.raises((ValueError, FileNotFoundError)):
             resources.verify_font_source(tmp_path)
+
+
+@pytest.mark.parametrize('target', ['fonts', 'manifest.json'])
+def test_rejects_symlinked_font_archive(tmp_path, target):
+    fonts = tmp_path/'fonts'
+    fonts.mkdir()
+    manifest = fonts/'manifest.json'
+    manifest.write_text('{}', encoding='utf-8')
+    original = fonts if target == 'fonts' else manifest
+    destination = tmp_path/('external-' + target)
+    original.rename(destination)
+    try:
+        original.symlink_to(destination, target_is_directory=target == 'fonts')
+    except OSError as exc:
+        pytest.skip('Symlinks unavailable: ' + str(exc))
+    with pytest.raises(ValueError, match='symlinks'):
+        resources.verify_font_source(tmp_path)
