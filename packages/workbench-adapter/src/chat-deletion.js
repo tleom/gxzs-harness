@@ -57,6 +57,12 @@ export class ChatDeletion {
     const files = this.ctx.get('workbenchFileManager')
     if (!files) return
     const paths = new Set([...ids].map(id => `.agent-output/${createHash('sha256').update(id).digest('hex').slice(0, 32)}`))
+    // Most sessions never spill tool output. Avoid decoding retained histories
+    // when there is no directory to delete; shutdown already fenced all writers.
+    for (const path of paths) {
+      if ((await files.operate({ operation: 'stat', path })).kind === 'missing') paths.delete(path)
+    }
+    if (!paths.size) return
     // A fork keeps its copied transcript, including paths to full tool results.
     // Scan surviving native history instead of assuming parentSession is a reference count.
     const preserve = value => {

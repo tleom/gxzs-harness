@@ -1275,6 +1275,25 @@ describe('followup and control service', () => {
     await service.deleteChat(owner, chat.id)
   })
 
+  it.each([false, true])('preserves a retained nested workspace during deletion, pending=%s', async pending => {
+    const { database, owner, chat, service, fileManager } = setup()
+    const directory = `conversations/${chat.id}`
+    if (pending) database.beginChatDeletion(owner.ownerId, chat.id, [chat.sessionId], { path: directory, version: 'old' })
+    const retained = database.createChat({ ownerId: owner.ownerId, sessionId: 'retained', selection: {}, directory: `${directory}/sub/../nested` })
+    await service.deleteChat(owner, chat.id)
+    expect(fileManager.operate).not.toHaveBeenCalled()
+    expect(database.chatDeletion(owner.ownerId, chat.id).completedAt).toEqual(expect.any(Number))
+    expect(database.getChat(owner.ownerId, retained.id)).toBeDefined()
+  })
+
+  it('does not confuse a neighboring directory prefix with a shared workspace', async () => {
+    const { database, owner, chat, service, fileManager } = setup()
+    const directory = `conversations/${chat.id}`
+    database.createChat({ ownerId: owner.ownerId, sessionId: 'retained', selection: {}, directory: `${directory}-other` })
+    await service.deleteChat(owner, chat.id)
+    expect(fileManager.operate).toHaveBeenCalledWith({ operation: 'delete', path: directory, version: 'tree-v1' })
+  })
+
   it('keeps a retry receipt after native erasure fails and never reports successful deletion early', async () => {
     const { database, owner, chat, service } = setup()
     service.permanentDeletion.erase.mockRejectedValueOnce(new Error('storage unavailable'))

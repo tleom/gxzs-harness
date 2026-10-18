@@ -10,7 +10,7 @@ import { normalizeResourceMentions, appendResourceInstructions, pluginId, plugin
 import { appendSkillInvocations, assertSkillInvocationClaims, resolveSkillInvocations, skillGestureNames, skillInvocationClaims } from './skill-invocations.js'
 import { httpError } from './http.js'
 import { decodeCursor } from './cursor.js'
-import { resolveWorkspacePath } from './paths.js'
+import { containsWorkspacePath, resolveWorkspacePath } from './paths.js'
 import { forkChat } from './fork-chat.js'
 import { inputSupplement, toAnswer } from './human-input.js'
 import { requireDatabaseModel } from './database-models.js'
@@ -273,7 +273,7 @@ export class WorkbenchService {
         }
         const path = chat.directory ?? `conversations/${chat.id}`
         // Allocated task directories are private; selected workspaces and forks retain shared files.
-        const shared = this.database.listChats(owner.ownerId).some((other) => other.id !== chat.id && (other.directory ?? `conversations/${other.id}`) === path)
+        const shared = this.database.listChats(owner.ownerId).some((other) => other.id !== chat.id && containsWorkspacePath(path, other.directory ?? `conversations/${other.id}`))
         const allocated = path === `conversations/${chat.id}` || /^conversations\/\d{4}-\d{2}-\d{2}\//.test(path) && path.split('/').at(-1) === chat.id
         const sessionIds = await this.permanentDeletion.prepare(chat)
         let fileDeletion
@@ -293,7 +293,7 @@ export class WorkbenchService {
     if (!this.permanentDeletion) throw httpError(503, '会话删除服务尚未就绪')
     if (deletion.fileDeletion) {
       const { path, version } = deletion.fileDeletion
-      const shared = this.database.listChats(owner.ownerId).some(chat => (chat.directory ?? `conversations/${chat.id}`) === path)
+      const shared = this.database.listChats(owner.ownerId).some(chat => containsWorkspacePath(path, chat.directory ?? `conversations/${chat.id}`))
       if (!shared) {
         const entry = await this.fileManager.operate({ operation: 'stat', path })
         if (entry.kind !== 'missing') await this.fileManager.operate({ operation: 'delete', path, version: refreshFiles ? entry.version : version })
