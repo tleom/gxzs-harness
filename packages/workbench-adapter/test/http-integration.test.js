@@ -88,6 +88,19 @@ it('refuses new admission while native MCP registration is unavailable', async (
   expect(runtime.database.listRuns('t:42', chat.id)).toEqual([])
 })
 
+it('serializes absent native changes as null without hiding ownership or diff failures', async () => {
+  const summary = vi.fn(() => undefined)
+  const { handler, key } = setup({ configure: context => {
+    context.workspaceChanges = { summary, diff: vi.fn(async () => undefined) }
+  } })
+  const chat = (await call(handler, key, 'POST', '/chats', {})).body.data
+  const route = `/chats/${chat.id}/changes?seq=10`
+  expect(await call(handler, key, 'GET', route)).toMatchObject({ status: 200, body: { data: null } })
+  expect((await call(handler, key, 'GET', `${route}&index=0`)).status).toBe(404)
+  expect((await call(handler, key, 'GET', route, undefined, true, 'other')).status).toBe(403)
+  expect(summary).toHaveBeenCalledTimes(1)
+})
+
 async function call(handler, key, method, route, value, authenticated = true, userId = '42', extraHeaders = {}, onResponse) {
   const body = value === undefined ? Buffer.alloc(0) : Buffer.from(JSON.stringify(value))
   const now = Math.floor(Date.now() / 1000)

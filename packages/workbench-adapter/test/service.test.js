@@ -2393,7 +2393,11 @@ it('serves only the owning session native summary and strips host metadata',asyn
   await expect(service.changes({...owner,ownerId:'other'},chat.id,'10',null)).rejects.toMatchObject({status:404})
   await expect(service.changes(owner,chat.id,'1e2',null)).rejects.toMatchObject({status:400})
   service.workspaceChanges.summary.mockReturnValue(undefined)
-  await expect(service.changes(owner,chat.id,'10',null)).rejects.toMatchObject({status:404})
+  expect(await service.changes(owner,chat.id,'10',null)).toBeNull()
+  service.workspaceChanges.diff.mockResolvedValue(undefined)
+  await expect(service.changes(owner,chat.id,'10','0',signal)).rejects.toMatchObject({status:404})
+  service.workspaceChanges=undefined
+  await expect(service.changes(owner,chat.id,'10',null)).rejects.toMatchObject({status:503})
 })
 
 it('resolves review file open paths against the recorded cwd inside the owner workspace',async()=>{
