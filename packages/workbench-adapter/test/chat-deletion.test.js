@@ -151,6 +151,15 @@ it('retries removal of staging artifacts after the canonical log was already rem
   await expect(readFile(path + '.retry.tmp')).rejects.toMatchObject({ code: 'ENOENT' })
 })
 
+it('skips all retained history reads when deleted sessions have no private output directory', async () => {
+  const files = { operate: vi.fn(async () => ({ kind: 'missing' })) }
+  const unavailable = vi.fn(() => { throw new Error('History must not be scanned') })
+  const ctx = { get: () => files, sessions: { list: unavailable }, sessionPersistence: { list: unavailable, open: unavailable } }
+  await new ChatDeletion(ctx, { retainedRunInputs: unavailable }, 'owner').erasePrivateOutputs(new Set(['parent', 'child']))
+  expect(files.operate).toHaveBeenCalledTimes(2)
+  expect(unavailable).not.toHaveBeenCalled()
+})
+
 it('removes private full tool output but preserves output referenced by a surviving fork', async () => {
   const root = await directory(), ctx = await fixture(root)
   const path = id => `.agent-output/${createHash('sha256').update(id).digest('hex').slice(0, 32)}`
