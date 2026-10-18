@@ -87,6 +87,10 @@ if args.action=='up':
  save(manifest,config)
  credentials=root/'fixture-credentials.yaml';credentials.write_text('version: 1\nrefs:\n  GXZS_SIM_MODEL_KEY: '+config['token']+'\nrecords: {}\n')
  container_config={**config,'host':'0.0.0.0','port':args.model_port,'output':'/output'};save(root/'simulator-private.json',container_config)
+ # The production Host image runs as gxzs (UID/GID 1000). Keep private files
+ # private while allowing that user to read its config and persist fixture data.
+ os.chown(root/'simulator-private.json',1000,1000)
+ os.chown(root/'output',1000,1000)
  manager_env={'WORKBENCH_SANDBOX_MANAGER_TOKEN':config['token'],'WORKBENCH_SANDBOX_IMAGE':images['sandbox'],'WORKBENCH_SANDBOX_PREFIX':prefix+'-sbx','WORKBENCH_SANDBOX_NETWORK':prefix+'-net','WORKBENCH_SANDBOX_ADDRESS_POOL':config['pool'],'WORKBENCH_SANDBOX_SUBNET_PREFIX':'27','WORKBENCH_MANAGER_HOST_STATE':str(root/'state'),'GXZS_HOST_IMAGE':images['host'],'GXZS_HOST_PLATFORM_URL':config['publicURL']+'/internal/workbench','GXZS_HOST_MANAGER_URL':config['managerURL'],'GXZS_HOST_ADVERTISE_IP':'10.16.9.237','GXZS_HOST_BIND_IP':'10.16.9.237','GXZS_ORCHESTRATOR_TOKEN':config['token'],'GXZS_SANDBOX_HELPER_HASH':helper,'GXZS_HOST_CREDENTIALS_FILE':'/fixture-credentials.yaml','WORKBENCH_RUNTIME_CONTAINER':prefix+'-simulator','WORKBENCH_MCP_API_URL':config['publicURL']}
  for key in ['GXZS_HOST_CPUS','GXZS_HOST_MEMORY','WORKBENCH_SANDBOX_CPUS','WORKBENCH_SANDBOX_MEMORY','WORKBENCH_SANDBOX_PIDS_LIMIT','WORKBENCH_MANAGER_MAX_OPERATIONS']:
   if key in env:manager_env[key]=env[key]

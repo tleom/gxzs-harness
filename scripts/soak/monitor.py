@@ -50,7 +50,9 @@ while time.time() - start < args.minutes * 60:
         'memAvailableKiB': memory['MemAvailable'], 'load': pathlib.Path('/proc/loadavg').read_text().strip()}
     append('monitor.jsonl', sample)
     for name in names:
-        logs = docker('logs', '--since', previous, '--tail', '150', name)
+        # A busy tool loop can emit more than 150 lines per interval. Capture
+        # the whole bounded interval so an early error cannot be truncated.
+        logs = docker('logs', '--since', previous, '--until', str(int(now)), name)
         text = redact(logs.stdout + logs.stderr)
         if text.strip(): append('runtime-logs.jsonl', {'at': now, 'container': name, 'text': text})
     previous = str(int(now))
