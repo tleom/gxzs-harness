@@ -4,6 +4,12 @@ host_image=${1:?host image}
 manager_image=${2:?manager image}
 sandbox_image=${3:?sandbox image}
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# Public CI has no private assets. Production runs must supply this persistent
+# directory so CI-only fonts or incomplete skills cannot pass release acceptance.
+if [[ -n "${GXZS_GLOBAL_RESOURCES_DIR:-}" ]]; then
+  python3 "$script_dir/verify-production-resources.py" --resources "$GXZS_GLOBAL_RESOURCES_DIR" \
+    --host-image "$host_image" --sandbox-image "$sandbox_image"
+fi
 container_id=''
 attachment_volume=''
 cleanup() {

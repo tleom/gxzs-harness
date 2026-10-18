@@ -83,6 +83,19 @@ Host/Sandbox 目录与计划调查容器读取一致。个人技能仍保存在�
 的默认系统字体阶段替代。发布前后比较字体 manifest 的 generation、文件数与 SHA-256，
 验证字体匹配和中文文档转换；同时验证 Git、Python/Node、Office、OCR、浏览器及个人环境卷。
 
+生产镜像验收必须把资源根目录传给现有 smoke 入口（目录内含 `skills-manifest.json`、
+`skills/` 和 `fonts/manifest.json`），在切换 Manager 或用户运行环境前执行：
+
+```bash
+GXZS_GLOBAL_RESOURCES_DIR=/srv/gxzs/global-resources \
+  bash scripts/smoke-images.sh "$HOST_IMAGE" "$MANAGER_IMAGE" "$SANDBOX_IMAGE"
+```
+
+该入口对 Host/Sandbox 实际挂载的技能全量文件进行哈希核对，并运行 Sandbox 环境自检、
+比对生产字体数量和 generation；漏文件、内容变化或误用 `system-fonts` 均失败退出。
+发布技能或字体时先明确更新资源及对应清单，不能只修改清单来绕过核验。
+个人环境使用独立持久卷，重建容器时保留原有 home、workspace 和 environment 卷。
+
 ## 3. 每个owner一个DSH host
 
 ```dotenv
