@@ -1,5 +1,5 @@
 import { createRequire } from 'node:module'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, readdir, writeFile, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { expect, it, vi } from 'vitest'
@@ -80,10 +80,23 @@ it('uses the published native JSON domain, delivers once and preserves rule/hist
     expect(changed.updated).toBe(true)
     const stale = await restarted.gateway.update(owner, daily.id, { expected: daily, title: '过期写入' })
     expect(stale.code).toBe('schedule_conflict')
+    // A failed atomic publish can leave its private body in a UUID stage.
+    const stage = join(root, '.00000000-0000-4000-8000-000000000001.tmp')
+    const partial = join(root, '.00000000-0000-4000-8000-000000000002.tmp')
+    const other = join(root, '.00000000-0000-4000-8000-000000000003.tmp')
+    await writeFile(stage, await readFile(join(root, 'schedule.json')))
+    await writeFile(partial, '{"unit":{"name":"schedule","version":1},"tables":{"tasks":{"partial":"private')
+    await writeFile(other, '{"unit":{"name":"workspace","version":1},"global":"unrelated"}')
     await restarted.gateway.delete(owner, once.id)
     expect(await restarted.gateway.catalog(owner)).toHaveLength(1)
     await restarted.ctx.parallel('workspace/session-stop', { sessionId: chat.sessionId })
     expect(await restarted.gateway.catalog(owner)).toEqual([])
+    await restarted.ctx.schedule.deleteSessionPermanently(chat.sessionId)
+    expect(await readdir(root)).not.toContain(stage.split(/[\\/]/).at(-1))
+    await expect(readFile(partial)).rejects.toMatchObject({ code: 'ENOENT' })
+    expect(await readFile(other, 'utf8')).toContain('unrelated')
+    expect(await readFile(join(root, 'schedule.json'), 'utf8')).not.toContain('中文内容')
+    await restarted.ctx.schedule.deleteSessionPermanently(chat.sessionId)
     await restarted.ctx.parallel('workspace/session-stop', { sessionId: chat.sessionId })
     expect(delivered).toHaveBeenCalledOnce()
   } finally {

@@ -374,10 +374,10 @@ export class WorkbenchDatabase {
     return create()
   }
 
-  getRun(ownerId, id) {
+  getRun(ownerId, id, { includeDeleted = false } = {}) {
     this.flushStreamEvents()
     const row = this.db.prepare(`SELECT r.*, f.result_json AS stop_confirmation_json FROM runs r JOIN chats c ON c.id = r.chat_id LEFT JOIN run_fences f ON f.run_id=r.id
-      WHERE r.id = ? AND r.owner_id = ? AND c.deleted_at IS NULL`).get(id, ownerId)
+      WHERE r.id = ? AND r.owner_id = ? AND (? OR c.deleted_at IS NULL)`).get(id, ownerId, Number(includeDeleted))
     return row ? { ...decodeRun(row), ...(row.error ? { errorCode: this.runErrorCode(ownerId, id) } : {}) } : undefined
   }
 
@@ -901,8 +901,8 @@ export class WorkbenchDatabase {
     return true
   }
 
-  finishSubmission(ownerId, runId) {
-    if (!this.getRun(ownerId, runId)) throw notFound('任务不存在')
+  finishSubmission(ownerId, runId, access) {
+    if (!this.getRun(ownerId, runId, access)) throw notFound('任务不存在')
     this.db.prepare('DELETE FROM run_submissions WHERE run_id=?').run(runId)
   }
 
@@ -910,38 +910,39 @@ export class WorkbenchDatabase {
     this.db.prepare('DELETE FROM run_submissions WHERE run_id=?').run(runId)
   }
 
-  transitionRun(ownerId, runId, status, error, now = Date.now()) {
-    return this.transaction(() => this.transitionRunRecord(ownerId, runId, status, error, now))()
+  transitionRun(ownerId, runId, status, error, now = Date.now(), access) {
+    return this.transaction(() => this.transitionRunRecord(ownerId, runId, status, error, now, access))()
   }
 
-  transitionRunRecord(ownerId, runId, status, error, now) {
-    const before = this.getRun(ownerId, runId)
+  transitionRunRecord(ownerId, runId, status, error, now, access) {
+    const before = this.getRun(ownerId, runId, access)
+    if (!before) throw notFound('任务不存在')
     const result = this.db.prepare('UPDATE runs SET status = ?, error = ?, updated_at = ? WHERE id = ? AND owner_id = ?')
       .run(status, error ?? null, now, runId, ownerId)
     if (result.changes !== 1) throw notFound('任务不存在')
     if (TERMINAL.has(status) && !['completed', 'discarded', 'steered'].includes(status)
       && (before.turnNumber !== undefined || ['running', 'waiting_input', 'stopping'].includes(before.status)))
-      this.requireRunFence(ownerId, runId)
+      this.requireRunFence(ownerId, runId, access)
     if (status === 'discarded' || status === 'steered') {
-      const removed = this.getRun(ownerId, runId)
+      const removed = this.getRun(ownerId, runId, access)
       this.db.prepare('UPDATE runs SET parent_run_id = ? WHERE owner_id = ? AND chat_id = ? AND parent_run_id = ?')
         .run(removed.parentRunId ?? null, ownerId, removed.chatId, runId)
     }
-    return this.getRun(ownerId, runId)
+    return this.getRun(ownerId, runId, access)
   }
 
-  requireRunFence(ownerId, runId) {
-    if (!this.getRun(ownerId, runId)) throw notFound('任务不存在')
+  requireRunFence(ownerId, runId, access) {
+    if (!this.getRun(ownerId, runId, access)) throw notFound('任务不存在')
     this.db.prepare('INSERT INTO run_fences(run_id) VALUES (?) ON CONFLICT(run_id) DO UPDATE SET confirmed=0').run(runId)
   }
 
-  pendingRunFences(ownerId) {
+  pendingRunFences(ownerId, { includeDeleted = false } = {}) {
     return this.db.prepare(`SELECT r.* FROM runs r JOIN run_fences f ON r.id=f.run_id JOIN chats c ON c.id=r.chat_id
-      WHERE r.owner_id=? AND f.confirmed=0 AND c.deleted_at IS NULL`).all(ownerId).map(decodeRun)
+      WHERE r.owner_id=? AND f.confirmed=0 AND (? OR c.deleted_at IS NULL)`).all(ownerId, Number(includeDeleted)).map(decodeRun)
   }
 
-  confirmRunFence(ownerId, runId, confirmation = { fenced: true, uncertain: false }) {
-    if (!this.getRun(ownerId, runId)) throw notFound('任务不存在')
+  confirmRunFence(ownerId, runId, confirmation = { fenced: true, uncertain: false }, access) {
+    if (!this.getRun(ownerId, runId, access)) throw notFound('任务不存在')
     const row = this.db.prepare('SELECT result_json FROM run_fences WHERE run_id=?').get(runId)
     const previous = parseNullable(row?.result_json)
     // Java/manager only fence platform tools. Native tools such as bash may

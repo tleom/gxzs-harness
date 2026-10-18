@@ -238,6 +238,9 @@ export class WorkbenchService {
       if (!this.permanentDeletion) throw httpError(503, '会话删除服务尚未就绪')
       this.scheduler?.deletingChats.add(chatId)
       try {
+        // Legacy soft-deleted rows remain hidden to callers, but deletion must
+        // still drain their native activity, fences and admission tickets.
+        const access = { includeDeleted: true }
         // Drain an in-flight admission before cancelling; otherwise its prompt
         // could arrive after cancellation and restart the deleted conversation.
         await this.scheduler?.pendingTick
@@ -245,12 +248,12 @@ export class WorkbenchService {
         const cancelling = this.database.listRuns(owner.ownerId, chatId)
           .filter(run => ['running', 'waiting_input', 'stopping'].includes(run.status) || this.database.submission(owner.ownerId, run.id)?.dispatched
             || this.hasOwnedWork?.(chat.sessionId, run.id)
-            || this.database.pendingRunFences(owner.ownerId).some(value => value.id === run.id))
+            || this.database.pendingRunFences(owner.ownerId, access).some(value => value.id === run.id))
         // Native archive commits the wake-up fence before stopping schedules, jobs and children.
         await this.workspaces?.controller?.archiveSession?.({ sessionId: chat.sessionId, stopActivity: true })
         await this.closeTerminals?.(chat.sessionId)
         const agent = this.agents.get(chat.sessionId)
-        for (const run of cancelling) this.database.requireRunFence(owner.ownerId, run.id)
+        for (const run of cancelling) this.database.requireRunFence(owner.ownerId, run.id, access)
         if (agent) {
           const goal = this.goals?.get(agent)
           if (goal?.phase === 'active') this.goals.pause(agent, { id: goal.id, revision: goal.revision })
@@ -259,13 +262,13 @@ export class WorkbenchService {
         const confirmation = await fenceMcpExecutions(this.platformClient, owner, cancelling.map(run => run.id))
         if (agent) await agent.whenIdle()
         await this.waitSessionActivity?.(chat.sessionId)
-        for (const run of cancelling) this.database.confirmRunFence(owner.ownerId, run.id, confirmation)
+        for (const run of cancelling) this.database.confirmRunFence(owner.ownerId, run.id, confirmation, access)
         for (const run of this.database.listRuns(owner.ownerId, chatId)) {
           if (['queued', 'running', 'waiting_input', 'stopping'].includes(run.status))
-            this.database.transitionRun(owner.ownerId, run.id, 'cancelled')
+            this.database.transitionRun(owner.ownerId, run.id, 'cancelled', undefined, Date.now(), access)
           if (this.scheduler && this.database.submission(owner.ownerId, run.id)) {
             await this.scheduler.request(run, 'release')
-            this.database.finishSubmission(owner.ownerId, run.id)
+            this.database.finishSubmission(owner.ownerId, run.id, access)
           }
         }
         const path = chat.directory ?? `conversations/${chat.id}`

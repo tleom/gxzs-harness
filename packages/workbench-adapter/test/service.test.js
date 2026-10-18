@@ -1287,6 +1287,26 @@ describe('followup and control service', () => {
     await expect(service.deleteChat({ ownerId: 'another' }, chat.id)).rejects.toMatchObject({ status: 404 })
   })
 
+  it.each(['running', 'waiting_input', 'stopping', 'queued', 'completed'])('permanently deletes a legacy hidden %s run and releases its ticket without exposing it', async status => {
+    const { database, owner, chat, service, agent } = setup()
+    const { run } = database.createRun({ ownerId: owner.ownerId, chatId: chat.id, sessionId: chat.sessionId, query: 'private', selection: {} })
+    database.transitionRun(owner.ownerId, run.id, status)
+    database.saveSubmission(owner.ownerId, run.id, [])
+    database.dispatchSubmission(owner.ownerId, run.id)
+    database.db.prepare('UPDATE chats SET deleted_at=1 WHERE id=?').run(chat.id)
+    service.scheduler = { deletingChats: new Set(), request: vi.fn(async () => {
+      expect(service.listChats(owner)).toEqual([])
+      expect(database.getRun(owner.ownerId, run.id)).toBeUndefined()
+    }) }
+    await expect(service.deleteChat({ ownerId: 'another' }, chat.id)).rejects.toMatchObject({ status: 404 })
+    await service.deleteChat(owner, chat.id)
+    expect(agent.cancel).toHaveBeenCalled()
+    expect(service.scheduler.request).toHaveBeenCalledWith(expect.objectContaining({ id: run.id }), 'release')
+    expect(database.deletionChat(owner.ownerId, chat.id)).toBeUndefined()
+    expect(database.submission(owner.ownerId, run.id)).toBeUndefined()
+    expect(database.chatDeletion(owner.ownerId, chat.id).completedAt).toEqual(expect.any(Number))
+  })
+
   it('retains a durable deletion for retry on a directory conflict', async () => {
     const { database, owner, chat, service, fileManager } = setup()
     fileManager.operate.mockResolvedValueOnce({ kind: 'directory', version: 'tree-v2' })

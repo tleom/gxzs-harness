@@ -7,7 +7,7 @@ import { pathToFileURL } from 'node:url'
 import { createHash } from 'node:crypto'
 import { ChatDeletion } from '../src/chat-deletion.js'
 import { WorkbenchDatabase } from '../src/persistence.js'
-import { agentDeletionSource, persistenceDeletionSource, queryDeletionSource, projectionDeletionSource, domainDeletionSource, jsonStorageDeletionSource } from '../../../scripts/prepare-session-deletion.mjs'
+import { agentDeletionSource, persistenceDeletionSource, queryDeletionSource, projectionDeletionSource, domainDeletionSource, jsonStorageDeletionSource, scheduleDeletionSource, workspaceChangesDeletionSource } from '../../../scripts/prepare-session-deletion.mjs'
 
 const require = createRequire(new URL('../../../profiles/workbench/package.json', import.meta.url))
 const native = name => import(pathToFileURL(require.resolve('@deepseek-ai/' + name)).href)
@@ -114,6 +114,8 @@ it('revokes old-generation readers and observations and clears derived data, bac
   await writeFile(legacy, JSON.stringify({ unit: { name: 'session_projcache', version: 7 }, tables: { sessions: {
     deleted: { marker }, retained: { marker: 'retained value' },
   } } }))
+  const legacyStage = join(root, 'storages/.12345678-1234-1234-1234-123456789abc.tmp')
+  await writeFile(legacyStage, await readFile(legacy))
   await new ChatDeletion(ctx, {}, 'owner').erase({ sessionIds: ['deleted'] })
   await expect(reader.read()).rejects.toThrow()
   expect(reader.state.primed).toBeUndefined()
@@ -126,6 +128,7 @@ it('revokes old-generation readers and observations and clears derived data, bac
   expect(await readdir(join(root, 'storages/session_projcache/sessions'))).not.toContain('deleted.json')
   await expect(readFile(recordPath + '.bak.202610182100')).rejects.toMatchObject({ code: 'ENOENT' })
   await expect(readFile(stagingPath)).rejects.toMatchObject({ code: 'ENOENT' })
+  await expect(readFile(legacyStage)).rejects.toMatchObject({ code: 'ENOENT' })
   expect(JSON.parse(await readFile(legacy, 'utf8')).tables.sessions).toEqual({ retained: { marker: 'retained value' } })
   for (const name of ['search.sqlite', 'search.sqlite-wal']) {
     const bytes = await readFile(join(root, name)).catch(error => error.code === 'ENOENT' ? Buffer.alloc(0) : Promise.reject(error))
@@ -231,6 +234,7 @@ it('physically removes platform rows with cascade and retains only an idempotenc
 it.each([
   ['dsh-agent', agentDeletionSource], ['dsh-session-persistence-jsonl', persistenceDeletionSource], ['dsh-session-query-sqlite', queryDeletionSource],
   ['dsh-session-projection-cache', projectionDeletionSource], ['dsh-storage-domain', domainDeletionSource], ['dsh-storage-json', jsonStorageDeletionSource],
+  ['dsh-schedule', scheduleDeletionSource], ['dsh-workspace-changes', workspaceChangesDeletionSource],
 ])('pins the permanent deletion extension to reviewed %s source', async (name, transform) => {
   const source = await readFile(require.resolve('@deepseek-ai/' + name), 'utf8')
   expect(transform(source)).toBe(source)

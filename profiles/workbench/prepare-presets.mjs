@@ -14,11 +14,11 @@ import { prepareDshAgentInbox } from '../../scripts/prepare-dsh-agent-inbox.mjs'
 import { prepareTerminalCleanup } from '../../scripts/prepare-terminal-cleanup.mjs'
 
 const root = dirname(fileURLToPath(import.meta.url))
+await prepareSessionDeletion(root)
 await prepareWorkspaceChanges(root)
 await prepareSessionClient(root)
 await prepareSubagentPrompt(root)
 await prepareSessionReferences(root)
-await prepareSessionDeletion(root)
 await prepareWorkbenchClient(root)
 await prepareDshStreamArguments(root)
 await prepareDshAgentInbox(root)

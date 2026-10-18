@@ -228,6 +228,13 @@ export function projectionDeletionSource(source) {
 
 export function domainDeletionSource(source) {
   if (source.includes('deletePermanently(key)')) return source
+  source = replaceOnce(source, '\ttable(name) {', `\tpurgeOrphanStages() {
+\t\treturn this.enqueue(() => {
+\t\t\tif (typeof this.unit.purgeOrphanStages !== "function") throw new Error("Storage backend cannot purge orphan stages");
+\t\t\treturn this.unit.purgeOrphanStages();
+\t\t});
+\t}
+\ttable(name) {`)
   return replaceOnce(source, '\tdelete(key) {', `\tdeletePermanently(key) {
 \t\treturn this.host.enqueue(async () => {
 \t\t\tif (typeof this.host.unit.deleteRecordPermanently !== "function") throw new Error("Storage backend does not support permanent record deletion");
@@ -241,6 +248,29 @@ export function domainDeletionSource(source) {
 
 export function jsonStorageDeletionSource(source) {
   if (source.includes('async deleteRecordPermanently(table, key)')) return source
+  source = replaceOnce(source, 'var SingleJsonUnit = class {', `// Called with the owning domain's write queue held, never for another unit.
+async function purgeUnitStages(dir, unitName) {
+\tconst entries = await readdir(dir, { withFileTypes: true }).catch(error => { if (error.code !== "ENOENT") throw error; return []; });
+\tfor (const entry of entries) {
+\t\tif (!entry.isFile() || !/^\\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\.tmp$/i.test(entry.name)) continue;
+\t\tconst path = join(dir, entry.name);
+\t\tconst text = await readFile(path, "utf8").catch(error => { if (error.code !== "ENOENT") throw error; });
+\t\tif (!text) continue;
+\t\tconst header = text.match(/^\\s*\\{\\s*"unit"\\s*:\\s*\\{\\s*"name"\\s*:\\s*"([a-z0-9_-]+)"\\s*,/);
+\t\tif (header?.[1] === unitName) await rm(path, { force: true });
+\t}
+\tif (entries.length) await fsyncDirectory(dir);
+}
+var SingleJsonUnit = class {`)
+  const singleStart = source.indexOf('var SingleJsonUnit = class {')
+  const singleEnd = source.indexOf('var PerRecordJsonUnit = class {', singleStart)
+  if (singleStart < 0 || singleEnd < 0) throw new Error('Session deletion upstream anchor changed')
+  const single = replaceOnce(source.slice(singleStart, singleEnd), '\tasync setGlobal(value) {', `\tasync purgeOrphanStages() {
+\t\tthis.assertOpen();
+\t\tawait purgeUnitStages(dirname(this.path), this.descriptor.name);
+\t}
+\tasync setGlobal(value) {`)
+  source = source.slice(0, singleStart) + single + source.slice(singleEnd)
   return replaceOnce(source, '\t/**\n\t* Move one record\'s document aside', `\tasync deleteRecordPermanently(table, key) {
 \t\tthis.assertOpen();
 \t\tassertSafeKey(this.descriptor.name, key);
@@ -256,6 +286,7 @@ export function jsonStorageDeletionSource(source) {
 \t\t\t\tawait this.tracked(writeAtomic(legacy, JSON.stringify(document) + "\\n"));
 \t\t\t}
 \t\t}
+\t\tawait purgeUnitStages(dirname(this.dir), this.descriptor.name);
 \t\tconst entries = await readdir(dir).catch(error => { if (error.code !== "ENOENT") throw error; return []; });
 \t\t// The original domain write chain is drained; table-local UUID stages are orphaned.
 \t\tfor (const name of entries) if (name === key + ".json" || name.startsWith(key + ".json.bak.") || /^\\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\.tmp$/i.test(name))
@@ -266,6 +297,53 @@ export function jsonStorageDeletionSource(source) {
 \t* Move one record's document aside`)
 }
 
+export function scheduleDeletionSource(source) {
+  if (source.includes('async deleteSessionPermanently(sessionId)')) return source
+  return replaceOnce(source, '\t\tasync delete(request, signal) {', `\t\tasync deleteSessionPermanently(sessionId) {
+\t\t\treturn this.serialize(async () => {
+\t\t\t\tconst domain = await this.getDomain();
+\t\t\t\tconst tasks = domain.table("tasks");
+\t\t\t\tfor (const [id, task] of tasks.entries()) if (task.sessionId === sessionId) await tasks.delete(id);
+\t\t\t\t// Sweep even if archive or a failed earlier attempt removed all rows.
+\t\t\t\tawait domain.purgeOrphanStages();
+\t\t\t\tthis.emitChanged();
+\t\t\t\tthis.runtime?.requestDrive();
+\t\t\t});
+\t\t}
+\t\tasync delete(request, signal) {`)
+}
+
+export function workspaceChangesDeletionSource(source) {
+  if (source.includes('deleteSessionPermanently: async (id)')) return source
+  source = 'import { readdir } from "node:fs/promises";\n' + source
+  source = replaceOnce(source, '\t\tthis.scratch ??= mkdtemp(join(this.env.tempRoot, "dsh-workspace-changes-"));', '\t\tthis.scratch ??= mkdtemp(join(this.env.tempRoot, scratchPrefix(this.session.id)));')
+  source = replaceOnce(source, 'function apply(ctx, config) {', `function scratchPrefix(id) {
+\treturn "dsh-workspace-changes-" + createHash("sha256").update(id).digest("hex") + "-";
+}
+function apply(ctx, config) {`)
+  source = replaceOnce(source, '\tconst forget = (session) => {\n\t\tconst recorder = recorders.get(session);\n\t\trecorders.delete(session);\n\t\tbyId.delete(session.id);\n\t\treturn recorder?.dispose() ?? Promise.resolve();\n\t};', `\tconst disposals = new Map();
+\tconst forget = (session) => {
+\t\tif (disposals.has(session)) return disposals.get(session);
+\t\tconst recorder = recorders.get(session);
+\t\tbyId.delete(session.id);
+\t\tconst pending = Promise.resolve().then(() => recorder?.dispose()).then(() => {
+\t\t\tif (recorders.get(session) === recorder) recorders.delete(session);
+\t\t}).finally(() => disposals.delete(session));
+\t\tdisposals.set(session, pending);
+\t\treturn pending;
+\t};`)
+  source = replaceOnce(source, '\tctx.provide("workspaceChanges", {', `\tctx.provide("workspaceChanges", {
+\t\tdeleteSessionPermanently: async (id) => {
+\t\t\tfor (const session of recorders.keys()) if (session.id === id) await forget(session);
+\t\t\t// Cold deletion after Host restart can identify this Session's snapshots.
+\t\t\tconst prefix = scratchPrefix(id);
+\t\t\tconst entries = await readdir(tmpdir()).catch(error => { if (error.code !== "ENOENT") throw error; return []; });
+\t\t\tfor (const name of entries) if (name.startsWith(prefix) && /^[a-zA-Z0-9]{6}$/.test(name.slice(prefix.length)))
+\t\t\t\tawait rm(join(tmpdir(), name), { recursive: true, force: true });
+\t\t},`)
+  return replaceOnce(source, '\t\tforget(session);\n\t});', '\t\tvoid forget(session).catch(error => ctx.logger.warn("workspace-changes cleanup failed", error));\n\t});')
+}
+
 export async function prepareSessionDeletion(root) {
   for (const [name, transform] of [
     ['dsh-agent', agentDeletionSource],
@@ -274,6 +352,8 @@ export async function prepareSessionDeletion(root) {
     ['dsh-session-projection-cache', projectionDeletionSource],
     ['dsh-storage-domain', domainDeletionSource],
     ['dsh-storage-json', jsonStorageDeletionSource],
+    ['dsh-schedule', scheduleDeletionSource],
+    ['dsh-workspace-changes', workspaceChangesDeletionSource],
   ]) {
     const directory = join(root, 'node_modules/@deepseek-ai', name)
     const metadata = JSON.parse(await readFile(join(directory, 'package.json'), 'utf8'))

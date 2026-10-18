@@ -34,9 +34,16 @@ export class ChatDeletion {
     const results = await Promise.allSettled(releases)
     const failures = results.filter(result => result.status === 'rejected').map(result => result.reason)
     if (failures.length) throw new AggregateError(failures, 'Session shutdown failed during deletion')
+    const changes = this.ctx.get('workspaceChanges')
+    if (changes) {
+      if (typeof changes.deleteSessionPermanently !== 'function') throw new Error('Permanent workspace snapshot deletion is not installed')
+      for (const id of ids) await changes.deleteSessionPermanently(id)
+    }
     const schedule = this.ctx.get('schedule')
-    if (schedule) for (const task of await schedule.catalog()) if (ids.has(task.sessionId))
-      await schedule.delete({ sessionId: task.sessionId, id: task.id })
+    if (schedule) {
+      if (typeof schedule.deleteSessionPermanently !== 'function') throw new Error('Permanent schedule deletion is not installed')
+      for (const id of ids) await schedule.deleteSessionPermanently(id)
+    }
     await sessionQuery.deleteSessionsPermanently([...ids], async () => {
       const cache = this.ctx.get('sessionProjectionCache')
       if (cache && typeof cache.deleteSessionPermanently !== 'function') throw new Error('Permanent projection cache deletion is not installed')
