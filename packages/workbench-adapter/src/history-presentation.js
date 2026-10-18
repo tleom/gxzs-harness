@@ -1,6 +1,7 @@
 import { ClientAssistantStream } from './dsh/client-assistant-stream.js'
 import { fileToolPreparation, nativePresentation } from './projection.js'
 import { compactionSummary } from './native-command.js'
+import { historyDisplayEvent } from './history-transport.js'
 
 /** Map native publication decisions to existing Workbench display records. */
 export class HistoryPresentation {
@@ -67,7 +68,7 @@ export class HistoryPresentation {
       const callId = event.data?.message?.source?.callId ?? event.data?.message?.content?.[0]?.toolCallId
       for (const [index, value] of nativePresentation(run, event, { toolName: this.tools.get(`${run.id}:${callId}`) ?? this.resolveToolName(run, callId) ?? '',
         messageRun: event.type === 'user/message' ? this.resolveMessage(event.data?.id) : undefined }).entries())
-        display.events.push({ run_id: run.id, event: { ...value, _id: `history:${this.sessionId}:${event.seq}:${index}` } })
+        display.events.push({ run_id: run.id, event: { ...historyDisplayEvent(value), _id: `history:${this.sessionId}:${event.seq}:${index}` } })
     }
     if (frame.type === 'snapshot') {
       this.turn = undefined

@@ -19,6 +19,7 @@ import { nativeTurn } from './native-turn.js'
 import { hasEarlierContent, historyWindow, loadNativeHistoryPage } from './history-page.js'
 import { nativePresentation } from './projection.js'
 import { HistoryPresentation } from './history-presentation.js'
+import { historyDisplayEvent, historyEventMetadata, historyFrameMetadata } from './history-transport.js'
 import { withGoalUpdates } from './goal-updates.js'
 import { withNativeCommandRun, nativeCommandRecords } from './native-command.js'
 import { dispatchRunPrompt } from './native-prompt.js'
@@ -343,7 +344,7 @@ export class WorkbenchService {
       for (const [index, payload] of nativePresentation(run, event, { messageRun: event.type === 'user/message' ? this.database.runForMessage(chat.sessionId, event.data?.id) : undefined,
         toolName: tools.get(`${run.id}:${callId}`)
         ?? (callId ? this.database.toolCallName(owner.ownerId, run.id, callId) : '') ?? '' }).entries()) {
-        view.events.push({ ...payload, _id: `history:${chat.sessionId}:${event.seq}:${index}` })
+        view.events.push({ ...historyDisplayEvent(payload), _id: `history:${chat.sessionId}:${event.seq}:${index}` })
       }
     }
     // The live run uses its existing SSE snapshot/cursor as one atomic pair.
@@ -358,7 +359,7 @@ export class WorkbenchService {
       }
     }
     return { ...this.chatSummary(owner, chat), selection: chat.selection,
-      ...page, history_cursor: page.cursor,
+      ...page, records: page.records.map(({ event }) => ({ event: historyEventMetadata(event) })), history_cursor: page.cursor,
       runs: [...runs.values()].map(run => nativeLive ? { ...run, native_history: true } : run) }
   }
 
@@ -389,8 +390,8 @@ export class WorkbenchService {
         runs.set(run.id, this.inputRunDto(owner, run))
         bindings.push({ turn, run_id: run.id })
       }
-      // Headers and unrelated projection values may contain runtime paths or
-      // configuration. Only the native display log/stream crosses this boundary.
+      // Project the complete native frame locally. Only the display content and
+      // coordinates used by the UI cross the transport boundary, once each.
       const value = frame.type === 'snapshot' ? {
         type: frame.type, cursor: frame.cursor, records: frame.records,
         hasMore: frame.hasMore && await hasEarlierContent(this.sessions, chat.sessionId,
@@ -399,7 +400,7 @@ export class WorkbenchService {
       const updatesControl = frame.type === 'snapshot' || frame.type === 'goal-state'
         || (frame.type === 'event' && (['goal/change', 'plan/mode', 'command/run', 'command/done', 'turn/end', 'request/context', 'assistant/message', 'assistant/attempt', 'compaction/end'].includes(frame.event.type)
           || (frame.event.type === 'user/message' && ['goal', 'compact-checkpoint'].includes(frame.event.data?.source?.kind))))
-      yield { event: 'workbench_history', session_id: chat.sessionId, value, runs: [...runs.values()], bindings,
+      yield { event: 'workbench_history', session_id: chat.sessionId, value: historyFrameMetadata(value), runs: [...runs.values()], bindings,
         ...(updatesControl ? { control: await this.getControl(owner, chatId) } : {}),
         display: frame.type === 'goal-state' ? { events: [], replace: false, retire_attempts: [] } : presentation.accept(frame) }
     }
