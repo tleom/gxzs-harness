@@ -418,7 +418,9 @@ export class WorkbenchService {
       return value
     }
     const value = this.workspaceChanges.summary(chat.sessionId, seq)
-    if (!value) throw httpError(404, '该轮文件改动摘要已不可用')
+    // Native snapshots live only with the recording Host/Session. Absence after
+    // restart is normal; the UI must omit a card whose content no longer exists.
+    if (!value) return null
     const {turn, files, total, added, deleted} = value
     return {turn, files: files.map(file => {
       // Native paths are relative to the recorded turn's cwd, not the current UI folder.
