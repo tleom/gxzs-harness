@@ -130,3 +130,14 @@ it('keeps the native UI attachment writable while the Agent observes and writes 
   expect(controller.spawn).toHaveBeenCalledTimes(2)
   expect(patched).toContain('maxTerminals: z.number().step(1).min(0).default(0)')
 })
+
+it('reads the terminal selected by a sidebar reference without substituting another PTY', async () => {
+  const test=fixture()
+  const value=await test.definition.execute({action:'read',terminal_id:id,wait_ms:0},test.exec)
+  expect(value.screen).toBe('ready\n$ ')
+  expect(test.native.inspectForAgent).toHaveBeenCalledWith(test.agent,id,test.exec.signal)
+  expect(test.native.create).not.toHaveBeenCalled()
+  test.native.list.mockReturnValue([])
+  await expect(test.definition.execute({action:'read',terminal_id:id,wait_ms:0},test.exec)).rejects.toMatchObject({status:404})
+  expect(test.native.create).not.toHaveBeenCalled()
+})

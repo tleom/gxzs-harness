@@ -105,3 +105,14 @@ it('rejects fenced, unadmitted and foreign activations before browser creation',
   await expect(test.definition.execute({ action: 'snapshot' }, test.exec)).rejects.toMatchObject({ status: 403 })
   expect(test.browsers.create).not.toHaveBeenCalled()
 })
+
+it('reads the referenced browser and refuses replacement if it closes during admission', async () => {
+  const test=fixture(),id=test.chat.id
+  const result=await test.definition.execute({action:'snapshot',browser_id:id},test.exec)
+  expect(result.browser_id).toBe(id)
+  expect(test.browsers.create).toHaveBeenCalledWith({ownerId:'owner'},{id,chat_id:id,existing:true},test.exec.signal)
+  test.browsers.create.mockRejectedValueOnce(Object.assign(new Error('closed'),{status:404}))
+  test.browser.command.mockClear()
+  await expect(test.definition.execute({action:'snapshot',browser_id:id},test.exec)).rejects.toMatchObject({status:404})
+  expect(test.browser.command).not.toHaveBeenCalled()
+})
