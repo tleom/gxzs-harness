@@ -431,7 +431,7 @@ describe('followup and control service', () => {
       bindings:[{turn:1,run_id:run.id}],runs:[{id:run.id,events:[]}],value:{type:'snapshot',cursor:90,hasMore:true}})
     expect(snapshot.value).not.toHaveProperty('header')
     expect(snapshot.value).not.toHaveProperty('projections')
-    expect((await source.next()).value.value).toEqual({type:'assistant-stream',frame:{type:'chunk',revision:3}})
+    expect((await source.next()).value.value).toEqual({type:'assistant-stream'})
     await source.return()
     expect(disposed).toHaveBeenCalledOnce()
     expect(allEvents).not.toHaveBeenCalled()
