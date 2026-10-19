@@ -17,3 +17,8 @@ respect that setting and releases its peer, data channel and upgrade timer on
 disconnect. The bundled upstream MPL-2.0 license is kept
 next to the artifact; upstream source is available at
 https://github.com/kasmtech/noVNC/tree/475ecfa5356579ef222983c7ce4619a7576a3bce.
+
+The single-display adaptation releases decoded ImageBitmap/VideoFrame images
+after painting, on dropped frames, and on disconnect, including late decodes.
+It also closes the display BroadcastChannel. Desktop pixels use CSS resolution
+(at most 1920x1080) and the viewer requests 15 fps to bound animation work.

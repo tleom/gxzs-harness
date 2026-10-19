@@ -77,7 +77,48 @@ try {
           .replace('Log.Warn("This browser does not support multi-monitor setups.");', 'Log.Debug("Single browser display");'), resolveDir: dirname(args.path) }
       })
       plugin.onLoad({ filter: /core[\\/]display\.js$/ }, async args => {
-        const text = await readFile(args.path, 'utf8')
+        let text = await readFile(args.path, 'utf8')
+        const replace = (before, after) => {
+          if (text.split(before).length !== 2) throw new Error('Kasm bitmap lifecycle contract changed: ' + before.slice(0, 60))
+          text = text.replace(before, after)
+        }
+        // This product has one screen and uses ImageBitmap decoding. The pinned
+        // upstream only closes these images on its secondary-screen path.
+        replace('    dispose() {', `    dispose() {
+        this._disposed = true;
+        this._broadcastChannel?.close();
+        for (const rect of this._syncFrameQueue) this._releaseBitmap(rect);
+        this._syncFrameQueue = [];`)
+        replace('    _asyncRenderQPush(rect) {', `    _releaseBitmap(rect) {
+        if (rect.type === 'bitmap' || rect.type === 'vid') {
+            rect.img?.close();
+            rect.img = null;
+        }
+    }
+
+    _asyncRenderQPush(rect) {
+        if (this._disposed) {
+            this._releaseBitmap(rect);
+            rect.frame?.close();
+            return;
+        }`)
+        replace('            if (rect.frame_id < oldestFrameID) {', `            if (rect.frame_id < oldestFrameID) {
+                this._releaseBitmap(rect);`)
+        replace('                    for (const droppedRect of droppedFrame[2]) {', `                    for (const droppedRect of droppedFrame[2]) {
+                        this._releaseBitmap(droppedRect);`)
+        replace('                this._asyncFrameQueue.push([ rect.frame_id, rect_cnt, [ rect ], (rect_cnt == 1), 0, 0 ]);\n\n            }', `                this._asyncFrameQueue.push([ rect.frame_id, rect_cnt, [ rect ], (rect_cnt == 1), 0, 0 ]);
+
+            } else {
+                this._releaseBitmap(rect);
+                rect.frame?.close();
+            }`)
+        replace('            for (const rect of frame[2])\n                if', '            for (const rect of frame[2]) this._releaseBitmap(rect);\n            for (const rect of frame[2])\n                if')
+        replace('\n            if (this._renderer?.enableCanvasBuffer) {\n                if (primaryScreenRects > 0)', `
+            for (const rect of frame) this._releaseBitmap(rect);
+
+            if (this._renderer?.enableCanvasBuffer) {\n                if (primaryScreenRects > 0)`)
+        replace('    _pushAsyncFrame(force=false) {', '    _pushAsyncFrame(force=false) {\n        if (this._disposed) return;')
+        replace('    _pushSyncRects() {', '    _pushSyncRects() {\n        if (this._disposed) return;')
         const painted = 'this._flipCnt += 1;'
         if (text.split(painted).length !== 2) throw new Error('Kasm rendered-frame contract changed')
         return { contents: text.replace(painted,

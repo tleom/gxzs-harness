@@ -156,6 +156,21 @@ await withCleanup(async()=>{
    phase='drained';await drained()
   }
  })
+ await check('closing_backpressured_pty_releases_underlying_ssh_pipes',async()=>{
+  const p=await runtime.spawnTerminal({argv:['/bin/sh'],cwd:'/workspace',rows:40,cols:120,terminalType:'xterm',graceMs:200})
+  p.output.on('error',()=>{})
+  // A hidden/closed terminal may stop consuming output. Fill its buffer before
+  // terminating: a destroyed TLS wrapper must also release the child's stdout.
+  await p.write(`node -e 'process.stdout.write("x".repeat(1048576))'\r`)
+  await deadline('Fill paused PTY output',5000,async()=>{
+   while(p.output.readableLength<p.output.readableHighWaterMark) await new Promise(r=>setTimeout(r,20))
+  })
+  const bridges=[...ssh.bridges]
+  assert.ok(bridges.length>0)
+  await deadline('Backpressured PTY close',3000,async()=>{await p.terminate();await p.done})
+  await drained()
+  for(const bridge of bridges) assert.ok(bridge.child.stdio.every(pipe=>!pipe||pipe.destroyed),'SSH child retained an output pipe')
+ })
  await check('dispose_stops_active_streams',async()=>{
   const p=runtime.spawn({argv:['/bin/sh','-c','printf running; sleep 30'],cwd:'/workspace',stdio:{stdin:'ignore',stdout:'pipe',stderr:'pipe'},graceMs:200})
   p.stdout.on('error',()=>{});p.stderr.on('error',()=>{});p.stderr.resume();await new Promise(r=>p.stdout.once('data',r));const d=Date.now();await deadline('dispose',5000,()=>ssh.dispose());console.log(JSON.stringify({stage:'dispose_returned',elapsed_ms:Date.now()-d}));await p.done.catch(()=>{});console.log(JSON.stringify({stage:'done_returned',elapsed_ms:Date.now()-d}));assert.equal(ssh.bridges.size,0)

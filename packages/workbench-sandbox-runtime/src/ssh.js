@@ -72,6 +72,12 @@ export default class WorkbenchSsh extends SshConnection {
       stopped = true
       lifetime.removeEventListener('abort', abort)
       raw.destroy()
+      // A paused stdout can retain TLS tail bytes after the SSH child exits.
+      // Duplex.from().destroy() does not always close that underlying pipe,
+      // so ChildProcess.close (and dispose) would wait forever. This boundary
+      // already means TLS closed, failed or was cancelled; no output remains
+      // deliverable through it. Release every owned pipe explicitly.
+      for (const pipe of child.stdio) pipe?.destroy()
       child.kill('SIGTERM')
       if (child.exitCode === null && child.signalCode === null) {
         force = setTimeout(() => child.kill('SIGKILL'), 1000)

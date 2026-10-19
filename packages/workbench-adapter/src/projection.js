@@ -35,7 +35,7 @@ export function createAssistantStreamProjector(database, expectedOwnerId) {
     }
     const chunk = frame.chunk
     if (chunk?.type === 'tool-call-delta') {
-      const data = fileToolPreparation(run, attempt.tools, chunk)
+      const data = fileToolPreparation(run, attempt.tools, chunk, frame.time)
       if (!data) return undefined
       return database.appendStreamEvent(run.ownerId, run.id, {
         event: 'workbench_activity', backend_run_id: run.id,

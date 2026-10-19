@@ -4,7 +4,7 @@ const { randomUUID } = require('node:crypto')
 const { createScreencast } = require('./browser-screencast.cjs')
 const { startDisplay, displayAvailable } = require('./browser-display.cjs')
 const partialNavigationNotice = '页面已打开，但尚未完成加载；请根据当前页面内容继续操作'
-/** Prefer lossless text at 2x scale; bound photographic frames without low-quality encoding. */
+/** Prefer lossless text at the bounded CSS viewport size; bound photographic frames without low-quality encoding. */
 function createImageCapture({ now = Date.now, budgetMs = 8000 } = {}) {
   const formats = [{type:'png'}, ...[95,90,85].map(quality => ({type:'jpeg',quality}))]
   let key, start = 0
@@ -256,7 +256,7 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
     // Chromium enforces a minimum outer-window width even in kiosk mode. Keep
     // layout and input coordinates aligned with the visible X display below it.
     await cdp.send('Emulation.setDeviceMetricsOverride', {
-      ...display.size, deviceScaleFactor: 2, mobile: false,
+      ...display.size, deviceScaleFactor: 1, mobile: false,
     })
   }
   async function bind(target, id) {
@@ -375,11 +375,11 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
         onExit: () => fatal('沙盒浏览器显示服务已退出') })
       browser = await chromium.launch({ executablePath: '/usr/bin/chromium', headless: !display,
         ...(display ? { env: display.env } : {}),
-        args: ['--no-sandbox', '--disable-dev-shm-usage', ...(display ? ['--force-device-scale-factor=2', '--no-first-run',
+        args: ['--no-sandbox', '--disable-dev-shm-usage', ...(display ? ['--force-device-scale-factor=1', '--no-first-run',
           '--kiosk', '--window-position=0,0', `--window-size=${value.width},${value.height}`] : [])], timeout: 20000 })
       browser.on('disconnected', () => fatal('沙盒浏览器已退出，请重新打开浏览器'))
       context = await browser.newContext({ viewport: display ? null : { width: value.width, height: value.height },
-        ...(!display ? { deviceScaleFactor: 2 } : {}), locale: 'zh-CN', acceptDownloads: false, serviceWorkers: 'block' })
+        ...(!display ? { deviceScaleFactor: 1 } : {}), locale: 'zh-CN', acceptDownloads: false, serviceWorkers: 'block' })
       if (display) {
         await context.exposeBinding('__workbenchInputChanged', () => { revision++ })
         await context.addInitScript(() => {

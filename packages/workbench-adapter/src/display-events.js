@@ -1,3 +1,5 @@
+import { PartialArguments } from '@deepseek-ai/dsh-util-values'
+
 export const isNativeNotice = message => ['agent-message', 'subagent-settled'].includes(message?.source?.kind)
 
 export function contentText(content) {
@@ -11,21 +13,53 @@ export function contentText(content) {
   }).filter(Boolean).join('\n')
 }
 
-/** DSH FileMutationRow's preparation counter; raw arguments stay in the native stream. */
-export function fileToolPreparation(run, calls, chunk) {
+/** Count only newly decoded characters, including escaped newlines split across chunks. */
+function streamedLines(call, key) {
+  const text = call.args.text(key)
+  if (text === undefined) return 0
+  const cursor = call.lines.get(key) ?? { length: 0, breaks: 0 }
+  for (let index = cursor.length; index < text.length; index++) {
+    if (text.charCodeAt(index) === 10) cursor.breaks++
+  }
+  cursor.length = text.length
+  call.lines.set(key, cursor)
+  return cursor.breaks + (text.length > 0 && !text.endsWith('\n') ? 1 : 0)
+}
+
+/** Project a bounded filename/line summary at most once a second. Use native
+ * event time so live delivery, history replay and the browser agree. The input
+ * stays in DSH's incremental parser and is never copied into display events. */
+export function fileToolPreparation(run, calls, chunk, time = 0) {
   if (chunk?.type !== 'tool-call-delta') return undefined
-  const previous = calls.get(chunk.index) ?? { id: '', name: '', characters: 0 }
+  const previous = calls.get(chunk.index) ?? { id: '', name: '' }
   previous.id ||= String(chunk.id ?? '')
   previous.name = chunk.name ?? previous.name
-  previous.characters += chunk.argumentsDelta?.length ?? 0
   calls.set(chunk.index, previous)
+  if (previous.name && !['write', 'edit'].includes(previous.name)) {
+    delete previous.args
+    delete previous.lines
+    return undefined
+  }
+  previous.args ??= new PartialArguments()
+  previous.lines ??= new Map()
+  previous.args.append(chunk.argumentsDelta ?? '')
   if (!previous.id || !['write', 'edit'].includes(previous.name)) return undefined
-  const kilobytes = Math.ceil(previous.characters / 1024)
-  if (previous.publishedKilobytes === kilobytes) return undefined
-  previous.publishedKilobytes = kilobytes
+  const at = Number.isFinite(time) ? time : 0
+  if (previous.checkedAt !== undefined && at - previous.checkedAt < 1000) return undefined
+  previous.checkedAt = at
+  const pathKey = ['file_path', 'path'].find(key => previous.args.complete(key))
+  const path = pathKey ? previous.args.textPrefix(pathKey, 4096) ?? '' : ''
+  const addedKey = previous.name === 'write' ? 'content'
+    : previous.args.has('new_string') ? 'new_string' : 'new_text'
+  const removedKey = previous.args.has('old_string') ? 'old_string' : 'old_text'
+  const added = streamedLines(previous, addedKey)
+  const removed = previous.name === 'write' ? 0 : streamedLines(previous, removedKey)
+  const last = previous.published
+  if (last?.path === path && last.added === added && last.removed === removed) return undefined
+  previous.published = { path, added, removed }
   return { kind: 'tool', workbench_run_id: run.id, call_id: previous.id,
     tool_call_id: previous.id, tool_name: previous.name, activity_id: previous.id,
-    stage: 'preparing', argument_chars: previous.characters }
+    stage: 'preparing', file_progress: previous.published }
 }
 
 
