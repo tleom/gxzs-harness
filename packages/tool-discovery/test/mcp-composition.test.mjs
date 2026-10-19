@@ -47,6 +47,42 @@ async function setup(mode = 'native') {
   }
 }
 
+for (const mode of ['native', 'ptc']) test(`${mode}: publication reorder reaches runtime and model without losing active tools or duplicating history`, async () => {
+  const h = await setup(mode)
+  const tool = (name, order_num) => ({ ...catalog[0], id: `global:mcp:${name}:lookup`,
+    runtime_name: `global_${name}_lookup`, server_id: name, provider_call_name: name, order_num })
+  const first = [tool('alpha', 0), tool('beta', 10), tool('zeta', 20)]
+  h.setRun({ ...h.getRun(), mcpTools: first })
+  await h.setAvailable(first)
+  await h.remount()
+  const agent = await h.create(), zetaName = platformToolNames(first).get(first[2].id)
+  const catalogs = () => agent.session.snapshotEvents().filter(event => event.type === 'user/message' && event.data.source?.kind === 'mcp-catalog')
+  const modelNames = () => {
+    const text = JSON.stringify(h.adapter.requests.at(-1)).match(/<available_plugins>[\s\S]*?<\/available_plugins>/g)?.at(-1) ?? ''
+    return [...text.matchAll(/- `([^`]+)`/g)].map(match => match[1])
+  }
+  h.adapter.script = [call('mcp', { name: 'zeta', tools: ['lookup'] }, mode), call(zetaName, { query: 'before' }, mode), response()]
+  await h.send(agent)
+  assert.deepEqual(modelNames(), ['alpha', 'beta', 'zeta'])
+  assert.equal(h.calls.length, 1)
+  const moved = [first[0], tool('zeta', 5), first[1]]
+  await h.setAvailable(moved)
+  const admitted = await h.ctx.workbenchRuntime.refreshMcpCatalog()
+  assert.deepEqual(admitted.map(item => item.server_id), ['alpha', 'zeta', 'beta'])
+  assert.deepEqual(h.ctx.workbenchRuntime.mcpResources().map(item => item.server_id), ['alpha', 'zeta', 'beta'])
+  assert.ok(h.ctx.tools.get(zetaName, agent), 'an order-only refresh retains the loaded tool')
+  h.adapter.script = [call(zetaName, { query: 'after' }, mode), response(), response()]
+  await h.send(agent)
+  assert.deepEqual(modelNames(), ['alpha', 'zeta', 'beta'])
+  assert.equal(catalogs().length, 2)
+  assert.deepEqual(h.calls.map(item => item.arguments.query), ['before', 'after'])
+  assert.ok(h.calls.every(item => item.run_id === 'run-1' && item.resource_id === first[2].id))
+  await h.setAvailable(moved)
+  await h.send(agent)
+  assert.equal(catalogs().length, 2, 'an unchanged catalog never adds another history record')
+  assert.equal(h.calls.length, 2, 'refreshes never execute tools')
+})
+
 for (const mode of ['native', 'ptc']) test(`${mode}: unrelated plugin refreshes do not interrupt a multi-step task`, async () => {
   const h = await setup(mode); await h.remount()
   const agent = await h.create()

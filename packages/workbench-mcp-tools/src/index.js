@@ -135,6 +135,11 @@ export async function apply(ctx, config = {}) {
       })
       registrations.set(tool.runtime_name, { tool, definition, dispose: ctx.tools.register(definition) })
     }
+    // A refresh can move one provider without replacing the others. Rebuild the
+    // iteration order from the published catalog while retaining registrations.
+    const ordered = catalog.map(tool => [tool.runtime_name, registrations.get(tool.runtime_name)])
+    registrations.clear()
+    for (const [runtimeName, registration] of ordered) registrations.set(runtimeName, registration)
     pluginMetadata = plugins
     catalogLoaded = true
     state(true)
