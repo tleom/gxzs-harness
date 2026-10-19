@@ -550,14 +550,36 @@ describe('followup and control service', () => {
     expect(await service.referenceCandidates(owner, chat.id)).toEqual([])
     expect(await service.referenceCandidates(owner, chat.id, uri('child'))).toEqual([])
   })
+  it('hides native blank sessions in the picker without treating untitled conversations as blank', async () => {
+    const test = setup()
+    const { service, owner, chat, database } = test
+    for (const sessionId of ['empty', 'session-untitled']) database.createChat({ ownerId: owner.ownerId, sessionId, selection: {} })
+    const sessions = [{ sessionId: 'empty', blank: true }, { sessionId: 'session-untitled', blank: false }]
+    service.workspaces = { baseline: vi.fn(async () => ({ sessions })) }
+    service.fileReferences = { list: vi.fn(async () => [{ path: '材料.pdf', kind: 'file' }]) }
+    referenceResolver(test, [{ sessionId: 'empty', label: '已命名的空会话' }, { sessionId: 'session-untitled', label: 'session-untitled' }])
+    expect((await service.referenceCandidates(owner, chat.id)).map(item => item.sessionId ?? item.path))
+      .toEqual(['材料.pdf', 'session-untitled'])
+    expect((await service.referenceCandidates(owner, chat.id, 'empty')).some(item => item.sessionId === 'empty')).toBe(false)
+    const uri = `dsh-session:${Buffer.from(JSON.stringify('empty')).toString('base64url')}`
+    expect(await service.referenceCandidates(owner, chat.id, uri)).toMatchObject([{ sessionId: 'empty' }])
+    sessions[0].blank = false
+    expect((await service.referenceCandidates(owner, chat.id)).filter(item => item.sessionId)).toHaveLength(2)
+  })
   it('applies native candidate limits after archive, ownership and subagent filtering, resolving renamed mentions by native URI', async () => {
     const { service, owner, chat, database, agent } = setup()
-    const records = [], archivedSessionIds = []
+    const records = [], archivedSessionIds = [], sessions = []
     const cwd = service.chatDirectory(chat.id)
     for (let index = 0; index < 55; index++) {
       const sessionId = `archived-${index}`
       database.createChat({ ownerId: owner.ownerId, sessionId, selection: {} })
       archivedSessionIds.push(sessionId)
+      records.push({ header: { id: sessionId, cwd, createdAt: index } })
+    }
+    for (let index = 0; index < 55; index++) {
+      const sessionId = `blank-${index}`
+      database.createChat({ ownerId: owner.ownerId, sessionId, selection: {} })
+      sessions.push({ sessionId, blank: true })
       records.push({ header: { id: sessionId, cwd, createdAt: index } })
     }
     for (let index = 0; index < 55; index++) {
@@ -573,7 +595,7 @@ describe('followup and control service', () => {
       service.sessionQuery = ctx.sessionQuery
       agent.session = { header: { cwd } }
       service.sessionReferences = new SessionReferences(ctx)
-      service.workspaces = { baseline: async () => ({ archivedSessionIds }) }
+      service.workspaces = { baseline: async () => ({ archivedSessionIds, sessions }) }
       const candidates = await service.referenceCandidates(owner, chat.id)
       expect(candidates).toHaveLength(50)
       expect(candidates.every(item => item.sessionId.startsWith('visible-'))).toBe(true)
