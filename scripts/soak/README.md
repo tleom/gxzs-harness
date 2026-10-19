@@ -41,6 +41,7 @@ python3 terminal_check.py --root /home/jrgx/gxzs-simulated-soak-example
 
 候选验证支持 `--host-image`、`--sandbox-image`、`--manager-image`、`--account-names`。
 `--global-skills-dir` 可指定已核验的宿主机技能目录，让测试 Host 和 Sandbox 只读挂载同一资源；
+测试平台按该目录生成合成的 `global_skills` 发布清单，`id` 使用技能目录名，`order_num` 为 0；未挂载时发布空清单。
 候选 SSH helper 的哈希从指定镜像读取，Host 与 Sandbox 必须一致。
 多个测试栈必须指定不重叠的 `--pool` 和不同的 `--model-port`、`--manager-port`。
 名字验证使用独立 `GXZS_RUNTIME_PREFIX`，不会占用生产的 `gxzs-host-admin` 等名称。
