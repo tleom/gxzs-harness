@@ -31,6 +31,33 @@ def maintain(host):
         future.result(timeout=5)
 
 
+def test_waiting_owner_probe_is_coalesced_and_preserves_the_sweep_cursor(tmp_path, monkeypatch):
+    host, _, _, payload, _ = setup(tmp_path, monkeypatch)
+    host.ensure('workspace', payload)
+    other = host.root / 'other'
+    other.mkdir()
+    (other / 'host.json').write_text('{}')
+    entered, release = threading.Event(), threading.Event()
+    seen = []
+    def probe(record):
+        seen.append(record.parent.name)
+        entered.set()
+        assert release.wait(3)
+    monkeypatch.setattr(host, '_maintain_one', probe)
+    host._maintenance_cursor = 'before'
+    try:
+        first = host.maintain('workspace')
+        assert entered.wait(2)
+        second = host.maintain('workspace')
+        assert first == second
+        assert seen == ['workspace']
+        assert host._maintenance_cursor == 'before'
+    finally:
+        release.set()
+        for future in first:
+            future.result(timeout=3)
+
+
 @pytest.mark.parametrize('failure', ['stop_error', 'still_running', 'inspect_unknown', 'partial_stop'])
 def test_idle_shutdown_preserves_fences_until_both_containers_are_confirmed_stopped(tmp_path, monkeypatch, failure):
     host, docker, _, payload, created = setup(tmp_path, monkeypatch)

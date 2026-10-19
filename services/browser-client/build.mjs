@@ -48,7 +48,30 @@ try {
         if (text.split(encoders).length !== 2) throw new Error('Kasm video-encoder dispatch contract changed')
         const frameHook = 'this._display.onflush = this._onFlush.bind(this);'
         if (text.split(frameHook).length !== 2) throw new Error('Kasm frame observer contract changed')
+        const udpInit = "if (typeof RTCPeerConnection !== 'undefined' && this._isPrimaryDisplay) {"
+        const udpUpgrade = 'setTimeout(function() { this._sendUdpUpgrade() }.bind(this), 3000);'
+        const disconnect = 'Log.Debug(">> RFB.disconnect");'
+        for (const contract of [udpInit, udpUpgrade, disconnect]) {
+          if (text.split(contract).length !== 2) throw new Error('Kasm WebRTC lifecycle contract changed')
+        }
         return { contents: text.replace(declaration, 'this._supportsMultiMonitor = false;')
+          .replace(udpInit, "if (this._useUdp && typeof RTCPeerConnection !== 'undefined' && this._isPrimaryDisplay) {")
+          .replace(udpUpgrade, 'this._udpUpgradeTimeout = ' + udpUpgrade)
+          .replace(disconnect, disconnect + `
+        clearTimeout(this._udpUpgradeTimeout);
+        if (this._udpChannel) {
+            this._udpChannel.onerror = null;
+            this._udpChannel.onmessage = null;
+            this._udpChannel.close();
+            this._udpChannel = null;
+        }
+        if (this._udpPeer) {
+            this._udpPeer.onicecandidate = null;
+            this._udpPeer.ondatachannel = null;
+            this._udpPeer.close();
+            this._udpPeer = null;
+        }
+        this._udpBuffer?.clear();`)
           .replace(encoders, 'return this._handleServerVideoEncoders() !== false;')
           .replace(frameHook, frameHook + '\n        this._display.onframe = () => this.dispatchEvent(new CustomEvent("frame"));')
           .replace('Log.Warn("This browser does not support multi-monitor setups.");', 'Log.Debug("Single browser display");'), resolveDir: dirname(args.path) }

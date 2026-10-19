@@ -25,6 +25,26 @@ def server(tmp_path, monkeypatch):
     module.ADMISSION.close()
 
 
+@pytest.mark.parametrize('state,ready,expected', [
+    ('provisioning', False, True), ('ready', False, True),
+    ('ready', True, False), ('draining', False, False), ('fencing', False, False),
+])
+def test_ensure_host_probes_only_the_waiting_owner_after_provisioning(server, monkeypatch, state, ready, expected):
+    key = str(uuid4())
+    payload = {'owner_id': 'tenant:7'}
+    result = {'state': state, 'ready': ready}
+    ensure = Mock(return_value=result)
+    maintain = Mock()
+    monkeypatch.setattr(server.HOSTS, 'ensure', ensure)
+    monkeypatch.setattr(server.HOSTS, 'maintain', maintain)
+    assert server.operation(key, 'ensure-host', payload) == result
+    ensure.assert_called_once_with(key, payload)
+    if expected:
+        maintain.assert_called_once_with(key)
+    else:
+        maintain.assert_not_called()
+
+
 def test_profile_upgrade_route_uses_the_registered_host_authority(server, monkeypatch):
     key = str(uuid4())
     expected = {'fenced': False, 'phase': 'draining'}

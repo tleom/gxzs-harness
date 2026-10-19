@@ -47,11 +47,13 @@ await withCleanup(async()=>{
  })
  await check('completed_process_churn_releases_every_bridge',async()=>{
   for(let batch=0;batch<10;batch++){
-   const processes=Array.from({length:6},(_,index)=>runtime.spawn({argv:['/bin/sh','-c',`printf churn-${batch}-${index}`],cwd:'/workspace',stdio:{stdin:'ignore',stdout:'pipe',stderr:'pipe'},graceMs:200}))
+   // done uses graceMs as its output-drain deadline too. Match bash-local's
+   // production 3s budget under CI scheduling; bridge cleanup stays bounded below.
+   const processes=Array.from({length:6},(_,index)=>runtime.spawn({argv:['/bin/sh','-c',`printf churn-${batch}-${index}`],cwd:'/workspace',stdio:{stdin:'ignore',stdout:'pipe',stderr:'pipe'},graceMs:3000}))
    const outputs=processes.map(p=>{const chunks=[];p.stdout.on('data',b=>chunks.push(b));p.stderr.resume();return chunks})
    const results=await Promise.all(processes.map(p=>p.done))
    assert.ok(results.every(result=>result.exitCode===0))
-   assert.ok(outputs.every((chunks,index)=>Buffer.concat(chunks).toString()===`churn-${batch}-${index}`))
+   assert.deepEqual(outputs.map(chunks=>Buffer.concat(chunks).toString()),processes.map((_,index)=>`churn-${batch}-${index}`))
    await drained()
   }
  })
