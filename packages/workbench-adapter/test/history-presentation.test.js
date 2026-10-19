@@ -8,6 +8,42 @@ const run={id:'run',selection:{},mcpTools:[{runtime_name:'mcp__search',server_id
 const snapshot=(records=[],assistantStream={revision:0})=>({type:'snapshot',records,assistantStream})
 const durable=(seq,type,data)=>({type:'event',event:{seq,type,data,surfaceOp:'append'}})
 const frame=value=>({type:'assistant-stream',frame:value})
+it('uses current lightweight bindings for live text and file progress while keeping durable tool metadata', () => {
+  const full = vi.fn(() => run)
+  let binding = { id: 'run' }
+  const light = vi.fn(() => binding)
+  const view = new HistoryPresentation('session', full, undefined, undefined, light)
+  view.accept(snapshot())
+  view.accept(frame({ type: 'start', attemptId: 'a', revision: 1, turn: 1, step: 1, startedAfterSeq: 0 }))
+  for (let index = 0; index < 2000; index++) {
+    const result = view.accept(frame({ type: 'chunk', attemptId: 'a', revision: index + 2, index, time: index,
+      chunk: { type: 'reasoning-delta', index: 0, text: '思考' } }))
+    expect(result.events[0].run_id).toBe('run')
+  }
+  expect(full).not.toHaveBeenCalled()
+  expect(light).toHaveBeenCalledTimes(2000)
+  binding = { id: 'rebound' }
+  const file = view.accept(frame({ type: 'chunk', attemptId: 'a', revision: 2002, index: 2000, time: 2001,
+    chunk: { type: 'tool-call-delta', index: 1, id: 'write', name: 'write', argumentsDelta: '{"path":"a.txt","content":"one\\ntwo' } }))
+  expect(file.events[0]).toMatchObject({ run_id: 'rebound', event: { data: { file_progress: { path: 'a.txt', added: 2, removed: 0 } } } })
+  const tool = view.accept(durable(1, 'tool/call', { turn: 1, callId: 'plugin', name: 'mcp__search', arguments: '{}' }))
+  expect(tool.events[0].event.data).toMatchObject({ provider_name: '法律资料', display_name: '检索' })
+  expect(full).toHaveBeenCalledOnce()
+})
+it('keeps lightweight snapshot bindings separate from full durable bindings and does not cache missing runs across frames', () => {
+  const full = vi.fn(() => run)
+  const light = vi.fn(() => undefined)
+  const view = new HistoryPresentation('session', full, undefined, undefined, light)
+  const opening = { revision: 2, activeAttempt: { attemptId: 'a', turn: 1, step: 1, startedAfterSeq: 1, nextIndex: 1,
+    stream: [{ type: 'text-chunks', time0: 1, index: 0, dt: [], texts: ['before'] }] } }
+  const result = view.accept(snapshot([durable(1, 'tool/call', { turn: 1, callId: 'plugin', name: 'mcp__search', arguments: '{}' })], opening))
+  expect(result.events).toHaveLength(1)
+  expect(full).toHaveBeenCalledOnce()
+  expect(light).toHaveBeenCalledOnce()
+  light.mockReturnValue({ id: 'run' })
+  expect(view.accept(frame({ type: 'chunk', attemptId: 'a', revision: 3, index: 1, time: 2,
+    chunk: { type: 'text-delta', index: 0, text: ' after' } })).events[0].event.data.text).toBe(' after')
+})
 it('resolves each turn once during a large reconnect snapshot and refreshes on the next frame', () => {
   let current = run
   const resolve = vi.fn(turn => turn === 3 ? undefined : current)

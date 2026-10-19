@@ -5,11 +5,12 @@ import { historyDisplayEvent } from './history-transport.js'
 
 /** Map native publication decisions to existing Workbench display records. */
 export class HistoryPresentation {
-  constructor(sessionId, resolveRun, resolveToolName = () => undefined, resolveMessage = () => undefined) {
+  constructor(sessionId, resolveRun, resolveToolName = () => undefined, resolveMessage = () => undefined, resolveStreamRun = resolveRun) {
     this.sessionId = sessionId
     this.resolveRun = resolveRun
     this.resolveToolName = resolveToolName
     this.resolveMessage = resolveMessage
+    this.resolveStreamRun = resolveStreamRun
     this.stream = new ClientAssistantStream()
     this.attempts = new Map()
     this.tools = new Map()
@@ -23,14 +24,18 @@ export class HistoryPresentation {
     // A reconnect snapshot can replay thousands of chunks from the same turn.
     // Resolve its immutable view once per frame, not once per chunk. Keeping the
     // map local also re-observes changed bindings/presentation on the next frame.
-    const runs = new Map()
+    const runs = new Map(), streamRuns = new Map()
     const project = entry => {
       const event = entry.event
       if (event.type === 'compaction/summary') this.compactions.set(event.data.compactionId, event.data)
       if (Number.isInteger(event.data?.turn)) this.turn = event.data.turn
       const turn = event.data?.turn ?? this.turn
-      if (!runs.has(turn)) runs.set(turn, this.resolveRun(turn))
-      const run = runs.get(turn)
+      // A live chunk uses only run.id. Decoding its frozen MCP catalog on every
+      // token makes generation compete with health/catalog requests on the Host.
+      const live = event.type === 'assistant/live-chunk'
+      const cache = live ? streamRuns : runs
+      if (!cache.has(turn)) cache.set(turn, live ? this.resolveStreamRun(turn) : this.resolveRun(turn))
+      const run = cache.get(turn)
       if (!run) return
       const checkpoint = event.type === 'user/message' && event.surfaceOp?.op === 'replace' ? event.data.source : undefined
       if (checkpoint?.kind === 'compact-checkpoint' && !checkpoint.sourceCommandId) {
