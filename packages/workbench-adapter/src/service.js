@@ -105,12 +105,13 @@ export class WorkbenchService {
     // DSH owns matching and ranking. Apply its display limit after platform visibility.
     const candidates = await readSessions(sessionQuery, Math.max(1, metadata.length))
     const archived = new Set(workspace?.archivedSessionIds ?? [])
+    const blank = new Set((workspace?.sessions ?? []).filter(item => item.blank === true).map(item => item.sessionId))
     const allowed = ownedSessionRoots(this.database.listChats(owner.ownerId), metadata, archived)
     return [
       ...files.map(item => ({ ...item, group: 'files', label: item.path })),
       ...candidates.filter(item => allowed.has(item.sessionId) && (byIdentity
         ? item.sessionId === sessionQuery
-        : allowed.get(item.sessionId).rootSessionId === item.sessionId))
+        : !blank.has(item.sessionId) && allowed.get(item.sessionId).rootSessionId === item.sessionId))
         .slice(0, this.sessionReferences.config.candidateLimit)
         .map(({ cwd, ...item }) => ({ ...item, chatId: allowed.get(item.sessionId).chatId,
           ...(allowed.get(item.sessionId).rootSessionId !== item.sessionId ? {
