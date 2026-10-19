@@ -707,7 +707,7 @@ class Hosts:
             pass
         return None
 
-    def maintain(self):
+    def maintain(self, requested_workspace=None):
         # Do not wait for a whole batch: a slow owner must not delay the next
         # health read/heartbeat for owners whose previous check has finished.
         # Bound both running and queued work, and never probe an owner twice.
@@ -715,7 +715,9 @@ class Hosts:
             if self._maintenance_closed:
                 return ()
             self._reap_maintenance()
-            records = sorted(self.root.glob('*/host.json'))
+            records = ([self.root / requested_workspace / 'host.json'] if requested_workspace is not None
+                       else sorted(self.root.glob('*/host.json')))
+            records = [record for record in records if record.is_file()]
             start = next((index for index, record in enumerate(records)
                           if record.parent.name > self._maintenance_cursor), 0)
             for record in records[start:] + records[:start]:
@@ -741,7 +743,8 @@ class Hosts:
                     raise
                 # Resume after the last submitted owner when capacity returns,
                 # so saturated workers cannot permanently skip later records.
-                self._maintenance_cursor = workspace
+                if requested_workspace is None:
+                    self._maintenance_cursor = workspace
             return tuple(self._maintenance_pending.values())
 
     def _run_maintenance(self, record, future):

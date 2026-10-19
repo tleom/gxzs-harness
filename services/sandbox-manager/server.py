@@ -403,7 +403,12 @@ def operation(key, action, payload):
         return operate(key, payload, docker=docker, ensure=ensure, identity=identity,
                        lock=lock, authorize=authorize_mcp)
     if action == 'ensure-host':
-        return HOSTS.ensure(key, payload)
+        result = HOSTS.ensure(key, payload)
+        if not result.get('ready') and result.get('state') in {'provisioning', 'ready'}:
+            # Probe the waiting owner now, after ensure releases its lock. Reuse
+            # the bounded worker pool instead of waiting for the 10-second sweep.
+            HOSTS.maintain(key)
+        return result
     if action == 'replace-host':
         return HOSTS.replace(key, payload)
     if action == 'profile-upgrade':

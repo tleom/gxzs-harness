@@ -12,6 +12,8 @@ replaced viewer loses its display connection; the Chromium session survives.
 
 Build adaptations disable extra monitors, printer/smart-card relays and QOI worker creation. PNG/JPEG/WebP
 decoding remains upstream code. WebRTC, hardware video and binary clipboard are
-disabled by the product wrapper. The bundled upstream MPL-2.0 license is kept
+disabled by the product wrapper. The build also makes the WebRTC allocation
+respect that setting and releases its peer, data channel and upgrade timer on
+disconnect. The bundled upstream MPL-2.0 license is kept
 next to the artifact; upstream source is available at
 https://github.com/kasmtech/noVNC/tree/475ecfa5356579ef222983c7ce4619a7576a3bce.
