@@ -9,6 +9,10 @@ on:
 permissions:
   contents: read
 
+env:
+  # The runner is UID 0 only inside a user namespace, with no chown capability.
+  TAR_OPTIONS: --no-same-owner
+
 concurrency:
   group: verify-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -108,6 +112,14 @@ jobs:
           docker build --build-arg VCS_REF="$GITHUB_SHA" -t gxzs/verify-manager services/sandbox-manager
           docker build --build-arg VCS_REF="$GITHUB_SHA" --build-arg WORKBENCH_FONT_IMAGE=system-fonts -t gxzs/verify-sandbox -f services/sandbox/Dockerfile .
           bash scripts/smoke-images.sh gxzs/verify-host gxzs/verify-manager gxzs/verify-sandbox
+      - name: Bound disposable image and build cache storage
+        if: always() && runner.environment == 'self-hosted'
+        run: |
+          source .github/scripts/runner-build-lock.sh
+          # This path belongs only to the dedicated Harness CI daemon.
+          test "$(docker info --format '{{.DockerRootDir}}')" = /srv/gxzs-harness-ci/docker
+          docker image prune --force --filter label=org.opencontainers.image.source=https://github.com/tleom/gxzs-harness
+          docker builder prune --force --keep-storage 1GB
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:
