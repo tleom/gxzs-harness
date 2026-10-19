@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events'
 import { createServer, get } from 'node:http'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { WorkbenchDatabase } from '../src/persistence.js'
 import { RunEventBus } from '../src/events.js'
 import { streamRunEvents } from '../src/sse.js'
@@ -35,6 +35,41 @@ function entries(res) {
 }
 
 describe('durable SSE transport', () => {
+  it('streams large-catalog runs without parsing their frozen tools on each event', () => {
+    const { database, ownerId, run, res, stream } = setup()
+    const catalog = JSON.stringify([{ name: 'large-tool', schema: 'x'.repeat(1024 * 1024) }])
+    database.db.prepare('UPDATE runs SET mcp_tools_json=? WHERE id=?').run(catalog, run.id)
+    const parse = JSON.parse
+    let catalogReads = 0
+    const spy = vi.spyOn(JSON, 'parse').mockImplementation((text, ...args) => {
+      if (text === catalog) catalogReads++
+      return parse(text, ...args)
+    })
+    try {
+      stream()
+      for (let index = 0; index < 250; index++)
+        database.appendStreamEvent(ownerId, run.id, { event: 'text', text: String(index) }, 1, 1)
+      database.flushStreamEvents()
+      expect(entries(res).map(entry => entry.text)).toEqual(Array.from({ length: 250 }, (_, i) => String(i)))
+      expect(catalogReads).toBe(0)
+      expect(res.ended).toBe(false)
+      database.transitionRun(ownerId, run.id, 'completed')
+      database.appendEvent(ownerId, run.id, { event: 'workbench_end', status: 'completed' })
+      expect(entries(res).at(-1)).toMatchObject({ _id: '251-0', status: 'completed' })
+      expect(res.ended).toBe(true)
+    } finally { spy.mockRestore() }
+  })
+
+  it('stops an already-open stream after its conversation is deleted', () => {
+    const { database, ownerId, run, eventBus, res, stream } = setup()
+    stream()
+    database.db.prepare('UPDATE chats SET deleted_at=1 WHERE id=?').run(run.chatId)
+    eventBus.publish(run.id, { event: 'text', text: 'must not be delivered' })
+    expect(entries(res)).toEqual([])
+    expect(res.ended).toBe(true)
+    expect(() => database.eventsAfter(ownerId, run.id, 0)).toThrow('任务不存在')
+  })
+
   it('delivers headers and a comment on a real quiet connection before its heartbeat', async () => {
     const { database, eventBus, ownerId, run } = setup()
     const server = createServer((req, res) => {

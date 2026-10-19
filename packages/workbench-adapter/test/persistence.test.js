@@ -79,7 +79,19 @@ describe('workbench durable projection', () => {
     const { run } = database.createRun({ ownerId: 'user-a', chatId: chat.id, sessionId: chat.sessionId, query: 'q', selection: {}, now: 2 })
     expect(database.getChat('user-b', chat.id)).toBeUndefined()
     expect(database.getRun('user-b', run.id)).toBeUndefined()
+    expect(database.getRunState('user-b', run.id)).toBeUndefined()
     expect(() => database.eventsAfter('user-b', run.id, 0)).toThrow('任务不存在')
+  })
+
+  it('flushes accepted text before returning the current stream cursor and status', () => {
+    const database = open()
+    const { chat, ownerId } = seed(database)
+    const { run } = database.createRun({ ownerId, chatId: chat.id, sessionId: chat.sessionId, query: 'q', selection: {} })
+    database.appendStreamEvent(ownerId, run.id, { event: 'text', text: 'accepted tail' }, 1, 1)
+    expect(database.getRunState(ownerId, run.id)).toEqual({ id: run.id, status: 'queued', seq: 1 })
+    expect(database.eventsAfter(ownerId, run.id, 0)).toEqual([{ event: 'text', text: 'accepted tail', _id: '1-0' }])
+    database.transitionRun(ownerId, run.id, 'waiting_input')
+    expect(database.getRunState(ownerId, run.id)).toEqual({ id: run.id, status: 'waiting_input', seq: 1 })
   })
 
   it('allocates monotonic event cursors transactionally', () => {

@@ -6,7 +6,7 @@ const TERMINAL = new Set(['completed', 'failed', 'cancelled', 'interrupted', 'di
 
 export function streamRunEvents({ database, eventBus, ownerId, runId, cursor, req, res,
   heartbeatMs = 15_000, drainTimeoutMs = 30_000, pageSize = 256 }) {
-  const run = database.getRun(ownerId, runId)
+  const run = database.getRunState(ownerId, runId)
   if (!run) throw httpError(404, '任务不存在')
   let sequence = decodeCursor(cursor)
   if (sequence > run.seq) throw httpError(400, '事件游标超过任务最新位置')
@@ -57,7 +57,7 @@ export function streamRunEvents({ database, eventBus, ownerId, runId, cursor, re
         if (closed) return
         if (accepted === false) { pause(); return }
       }
-      const latest = database.getRun(ownerId, runId)
+      const latest = database.getRunState(ownerId, runId)
       if (!latest) { finish(); return }
       if (sequence < latest.seq) schedule()
       else if (TERMINAL.has(latest.status) || latest.status === 'waiting_input') finish()
