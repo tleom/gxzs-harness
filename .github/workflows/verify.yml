@@ -111,6 +111,7 @@ jobs:
           docker build --build-arg VCS_REF="$GITHUB_SHA" -t gxzs/verify-host -f services/dsh-host/Dockerfile .
           docker build --build-arg VCS_REF="$GITHUB_SHA" -t gxzs/verify-manager services/sandbox-manager
           docker build --build-arg VCS_REF="$GITHUB_SHA" --build-arg WORKBENCH_FONT_IMAGE=system-fonts -t gxzs/verify-sandbox -f services/sandbox/Dockerfile .
+          docker image inspect gxzs/verify-host gxzs/verify-manager gxzs/verify-sandbox --format '{{.Id}} {{index .Config.Labels "org.opencontainers.image.revision"}} {{.Size}}'
           bash scripts/smoke-images.sh gxzs/verify-host gxzs/verify-manager gxzs/verify-sandbox
       - name: Bound disposable image and build cache storage
         if: always() && runner.environment == 'self-hosted'
@@ -118,6 +119,11 @@ jobs:
           source .github/scripts/runner-build-lock.sh
           # This path belongs only to the dedicated Harness CI daemon.
           test "$(docker info --format '{{.DockerRootDir}}')" = /srv/gxzs-harness-ci/docker
+          # These images are disposable test outputs. Release images are built
+          # separately; keeping every full sandbox here exhausts this VPS disk.
+          for image in gxzs/verify-host gxzs/verify-manager gxzs/verify-sandbox; do
+            if docker image inspect "$image" >/dev/null 2>&1; then docker image rm "$image"; fi
+          done
           docker image prune --force --filter label=org.opencontainers.image.source=https://github.com/tleom/gxzs-harness
           docker builder prune --force --keep-storage 1GB
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
