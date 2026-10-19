@@ -1,5 +1,6 @@
 import { platformToolNames } from '@gxzs/dsh-workbench-mcp-tools/names'
 import { readSkillDefinition, skillDisplayName } from '@gxzs/dsh-workbench-sandbox-skills/definition'
+import { orderGlobalSkills } from '@gxzs/dsh-workbench-sandbox-skills/global'
 import { randomUUID } from 'node:crypto'
 import path from 'node:path'
 import { isDeepStrictEqual } from 'node:util'
@@ -27,12 +28,13 @@ import { goalFailureReason, presentRunEvent, resumeGoalSelection, runFailure } f
 import { ownedSessionRoots } from './owned-session-roots.js'
 
 export class WorkbenchService {
-  constructor({ database, sessionController, agents, commands, skills, workingDirectory, onGoalChanged, fileManager, platformClient, workspace, sessionQuery, agentPresets, agentDefaultModel, modelSettings, scheduler, attachments, goals, fileUploads, nativeFileAttachments = false }) {
+  constructor({ database, sessionController, agents, commands, skills, globalSkillOrder, workingDirectory, onGoalChanged, fileManager, platformClient, workspace, sessionQuery, agentPresets, agentDefaultModel, modelSettings, scheduler, attachments, goals, fileUploads, nativeFileAttachments = false }) {
     this.database = database
     this.sessions = sessionController
     this.agents = agents
     this.commands = commands
     this.skills = skills
+    this.globalSkillOrder = globalSkillOrder
     this.workingDirectory = workingDirectory
     this.onGoalChanged = onGoalChanged
     this.fileManager = fileManager
@@ -732,12 +734,13 @@ export class WorkbenchService {
   async listSkills(agent) {
     const cwd = agent && this.workingDirectory ? await this.workingDirectory.ensure(agent) : this.workspace
     const skills = await this.skills.list({ cwd, ...(agent ? { scope: agent } : {}) })
-    return skills.map((skill) => ({
+    const resources = skills.map((skill) => ({
       id: skill.name, name: skill.name, displayName: skillDisplayName(skill), metadata: skill.metadata, source: skill.source, invocation: skill.invocation, description: skill.description, path: skill.path ?? '',
       enabled: true, readonly: skill.provider !== 'gxzs-sandbox-personal',
       scope: skill.provider === 'gxzs-sandbox-personal' ? 'personal' : 'global',
       provider: skill.provider,
     }))
+    return this.globalSkillOrder ? orderGlobalSkills(resources, await this.globalSkillOrder()) : resources
   }
 
   async catalogSkills(owner, chatId) {
