@@ -371,7 +371,8 @@ export class WorkbenchService {
     const presentation = new HistoryPresentation(chat.sessionId, turn =>
       Number.isInteger(turn) ? this.database.runForTurn(chat.sessionId, turn) : undefined,
       (run, callId) => callId ? this.database.toolCallName(owner.ownerId, run.id, callId) : undefined,
-      messageId => this.database.runForMessage(chat.sessionId, messageId))
+      messageId => this.database.runForMessage(chat.sessionId, messageId),
+      turn => Number.isInteger(turn) ? this.database.streamRunForTurn(chat.sessionId, turn) : undefined)
     const source = this.sessions.follow({ address: { kind: 'session', sessionId: chat.sessionId },
       ...historyWindow, assistantStream: true }, signal)
     for await (const frame of withGoalUpdates(source, this.subscribeGoal
