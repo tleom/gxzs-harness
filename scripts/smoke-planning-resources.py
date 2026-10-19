@@ -1,5 +1,6 @@
 """Verify real readonly skill copying into an inspection container without capabilities."""
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -30,7 +31,7 @@ try:
     docker('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL',
         '--security-opt', 'no-new-privileges:true', '--memory', '256m', '--cpus', '1', '--pids-limit', '64',
         '--tmpfs', '/tmp:rw,nosuid,nodev,noexec,size=16m',
-        '-v', '/var/run/docker.sock:/var/run/docker.sock', '--entrypoint', 'python', manager_image,
+        '-v', os.environ.get('GXZS_SMOKE_DOCKER_SOCKET', '/var/run/docker.sock') + ':/var/run/docker.sock', '--entrypoint', 'python', manager_image,
         '-I', '-S', '-c', "import sys;sys.path.insert(0,'/app');from planning import copy_global_resources;"
         "copy_global_resources(sys.argv[1],sys.argv[2],('/usr/local/bin/python','-I','-S'))", source, destination)
     docker('exec', '--user', '1000', destination, '/usr/local/bin/python', '-I', '-S', '-c',
@@ -55,7 +56,7 @@ try:
         docker('run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL',
             '--memory', '256m', '--cpus', '1', '--pids-limit', '64',
             '--tmpfs', '/tmp:rw,nosuid,nodev,noexec,size=16m',
-            '-v', '/var/run/docker.sock:/var/run/docker.sock', '--entrypoint', 'python', manager_image,
+            '-v', os.environ.get('GXZS_SMOKE_DOCKER_SOCKET', '/var/run/docker.sock') + ':/var/run/docker.sock', '--entrypoint', 'python', manager_image,
             '-I', '-S', '-c', "import sys;sys.path.insert(0,'/app');from planning import copy_global_resources;"
             "copy_global_resources(sys.argv[1],sys.argv[2],('/usr/local/bin/python','-I','-S'))", mounted_source, mounted_target)
         docker('exec', '--user', '1000', mounted_target, '/usr/local/bin/python', '-I', '-S', '-c',

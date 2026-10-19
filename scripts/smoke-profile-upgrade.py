@@ -2,6 +2,7 @@
 """Exercise the formal image-baseline entry point against a disposable owner volume."""
 import importlib.util
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -90,7 +91,7 @@ def main(image, manager_image):
                        '--entrypoint', 'python', manager_pinned, '-I', '-S', '-c', STATE,
                        stdin=json.dumps(record).encode())
         upgrade.docker('create', '--name', manager, '--network', 'none', '--mount', state_mount,
-                       '--mount', 'type=bind,source=/var/run/docker.sock,destination=/var/run/docker.sock',
+                       '--mount', 'type=bind,source=' + os.environ.get('GXZS_SMOKE_DOCKER_SOCKET', '/var/run/docker.sock') + ',destination=/var/run/docker.sock',
                        '-e', 'WORKBENCH_SANDBOX_MANAGER_TOKEN=' + 'a' * 64,
                        '-e', 'GXZS_HOST_IMAGE=' + pinned, '--memory', '256m', '--pids-limit', '128', manager_pinned)
         upgrade.docker('start', manager)

@@ -114,7 +114,7 @@ visit(root);console.log(JSON.stringify(files));
 
 try:
     docker('run', '-d', '--name', manager, '--network', 'none', '--memory', '1g', '--cpus', '2',
-           '-v', '/var/run/docker.sock:/var/run/docker.sock',
+           '-v', os.environ.get('GXZS_SMOKE_DOCKER_SOCKET', '/var/run/docker.sock') + ':/var/run/docker.sock',
            '-e', 'WORKBENCH_SANDBOX_MANAGER_TOKEN=' + token,
            '-e', 'WORKBENCH_SANDBOX_PREFIX=' + prefix,
            '-e', 'WORKBENCH_SANDBOX_NETWORK=' + prefix,
