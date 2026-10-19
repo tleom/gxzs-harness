@@ -23,11 +23,11 @@ async function startDisplay({ width, height, emit, onExit }) {
   do { display = 100 + Math.floor(Math.random() * 50000) }
   while (existsSync(`/tmp/.X${display}-lock`) || existsSync(`/tmp/.X11-unix/X${display}`))
   const port = await availablePort()
-  const child = spawn('/usr/bin/Xvnc', [`:${display}`, '-geometry', `${width * 2}x${height * 2}`, '-depth', '24',
+  const child = spawn('/usr/bin/Xvnc', [`:${display}`, '-geometry', `${width}x${height}`, '-depth', '24',
     '-websocketPort', String(port), '-interface', '127.0.0.1', '-UseIPv6', '0', '-publicIP', '127.0.0.1',
     '-DisableBasicAuth', '1', '-SecurityTypes', 'None', '-sslOnly', '0', '-rfbport', '0', '-nolisten', 'tcp',
     '-s', '0', '-dpms', '-wr',
-    '-FrameRate', '20', '-AcceptSetDesktopSize', '0', '-MaxVideoResolution', '3840x2160',
+    '-FrameRate', '15', '-AcceptSetDesktopSize', '0', '-MaxVideoResolution', '1920x1080',
     '-DLP_ClipAcceptMax', '32768', '-DLP_ClipSendMax', '32768', '-DLP_ClipTypes', 'text/plain',
     '-httpd', '/usr/share/kasmvnc/www'], { env: { ...process.env, HOME: home }, stdio: ['ignore', 'ignore', 'pipe'] })
   let stopping = false, failure, log = '', relay
@@ -73,7 +73,7 @@ async function startDisplay({ width, height, emit, onExit }) {
     size,
     stop,
     async resize(width, height) {
-      const w = width * 2, h = height * 2, mode = `workbench-${w}x${h}`
+      const w = width, h = height, mode = `workbench-${w}x${h}`
       if (currentMode === mode) return
       const randr = args => run('/usr/bin/xrandr', ['--display', `:${display}`, ...args], { timeout: 5000 })
       // RandR must resize the output mode with its framebuffer. --fb alone clips/fails on shrink.

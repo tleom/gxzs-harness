@@ -27,9 +27,9 @@ const pixels = (display, width, height, inset = 1) => JSON.parse(execFileSync('/
 async function assertWhiteRoot() {
   const display = await startDisplay({ width: 320, height: 240, emit: async () => {}, onExit: () => {} })
   try {
-    assert.deepEqual(pixels(display, 640, 480), [0xffffff, 0xffffff], 'New X display root must be white')
+    assert.deepEqual(pixels(display, 320, 240), [0xffffff, 0xffffff], 'New X display root must be white')
     await display.resize(400, 300)
-    assert.deepEqual(pixels(display, 800, 600), [0xffffff, 0xffffff], 'Resized X display root must stay white')
+    assert.deepEqual(pixels(display, 400, 300), [0xffffff, 0xffffff], 'Resized X display root must stay white')
   } finally { await display.stop() }
 }
 
@@ -94,7 +94,7 @@ async function main() {
       const expected = clicks % 2 ? 0x22cc44 : 0xcc2244
       let actual
       for (let attempt = 0; attempt < 30; attempt++) {
-        actual = pixels(display, width * 2, height * 2, 8)
+        actual = pixels(display, width, height, 8)
         if (actual[1] === expected) break
         await new Promise(resolve => setTimeout(resolve, 50))
       }

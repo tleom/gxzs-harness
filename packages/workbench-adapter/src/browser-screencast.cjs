@@ -30,11 +30,11 @@ function createScreencast({ page, session, emit, nextId, onUnavailable = () => {
   async function configure() {
     const epoch = generation
     const { width, height } = page.viewportSize()
-    await session.send('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 2, mobile: false,
-      screenWidth: width * 2, screenHeight: height * 2, viewport: { x: 0, y: 0, width, height, scale: 1 } })
+    await session.send('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 1, mobile: false,
+      screenWidth: width, screenHeight: height, viewport: { x: 0, y: 0, width, height, scale: 1 } })
     if (epoch !== generation || !enabled || disposed) return false
     await session.send('Page.startScreencast', { format, ...(format === 'jpeg' ? { quality } : {}),
-      maxWidth: width * 2, maxHeight: height * 2, everyNthFrame: format === 'png' ? 1 : 2 })
+      maxWidth: width, maxHeight: height, everyNthFrame: 4 })
     if (epoch !== generation || !enabled || disposed) { await session.send('Page.stopScreencast').catch(() => {}); return false }
     return true
   }

@@ -3,15 +3,15 @@ import { createRequire } from 'node:module'
 import { expect, it, vi } from 'vitest'
 const { createScreencast } = createRequire(import.meta.url)('../src/browser-screencast.cjs')
 
-it('streams lossless 2x frames without changing the CSS viewport and waits for viewer receipts', async () => {
+it('streams bounded CSS-resolution frames without changing the viewport and waits for viewer receipts', async () => {
   const session = Object.assign(new EventEmitter(), {send:vi.fn(async()=>({}))})
   const emit = vi.fn(async()=>true)
   let sequence=0
   const stream = createScreencast({session,page:{viewportSize:()=>({width:1000,height:700})},emit,nextId:()=>++sequence})
   expect(await stream.start()).toBe(true)
   expect(session.send).toHaveBeenCalledWith('Emulation.setDeviceMetricsOverride',expect.objectContaining({
-    width:1000,height:700,deviceScaleFactor:2,viewport:{x:0,y:0,width:1000,height:700,scale:1}}))
-  expect(session.send).toHaveBeenCalledWith('Page.startScreencast',expect.objectContaining({format:'png',maxWidth:2000,maxHeight:1400}))
+    width:1000,height:700,deviceScaleFactor:1,viewport:{x:0,y:0,width:1000,height:700,scale:1}}))
+  expect(session.send).toHaveBeenCalledWith('Page.startScreencast',expect.objectContaining({format:'png',maxWidth:1000,maxHeight:700,everyNthFrame:4}))
   session.emit('Page.screencastFrame',{sessionId:7,data:'aA=='})
   await vi.waitFor(()=>expect(emit).toHaveBeenCalledOnce())
   expect(session.send.mock.calls.filter(([method])=>method==='Page.screencastFrameAck')).toHaveLength(0)

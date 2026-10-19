@@ -71,7 +71,42 @@ async function main() {
       const websiteBlackPixelPreserved = [...context.getImageData(0, 0, 1, 1).data].join(',') === '0,0,0,255'
       const whiteBackdrop = getComputedStyle(screen).backgroundColor === 'rgb(255, 255, 255)'
       const disabledWebRtcAllocatedNoPeers = peers.length === 0
+      const display = rfb._display
+      const bitmapSource = document.createElement('canvas')
+      bitmapSource.width = 1280; bitmapSource.height = 720
+      const bitmaps = []
+      const rect = async id => {
+        const img = await createImageBitmap(bitmapSource)
+        bitmaps.push(img)
+        return { type: 'bitmap', img, frame_id: id, width: 1280, height: 720,
+          screenLocations: [{ screenIndex: 0, x: 0, y: 0 }] }
+      }
+      display.clear()
+      for (let id = 1; id <= 120; id++) {
+        display._asyncRenderQPush(await rect(id))
+        display.flip(id, 2)
+        display._pushAsyncFrame()
+      }
+      const paintedBitmapsReleased = bitmaps.every(bitmap => bitmap.width === 0)
+      // Incomplete frames fill the three-slot queue; newer frames evict old ones.
+      for (const id of [200, 202, 204, 206]) display._asyncRenderQPush(await rect(id))
+      const evictedBitmapReleased = bitmaps.at(-4).width === 0
+      display._asyncRenderQPush(await rect(203))
+      const supersededFrameReleased = bitmaps.at(-1).width === 0
+      display._asyncRenderQPush(await rect(100))
+      const lateFrameReleased = bitmaps.at(-1).width === 0
+      display.clear()
+      const clearedBitmapsReleased = bitmaps.every(bitmap => bitmap.width === 0)
+      display._asyncRenderQPush(await rect(300))
+      // Simulate an already-running asynchronous decoder resolving after disposal.
+      const lateDecode = await rect(301)
+      let channelClosed = false
+      const broadcast = display._broadcastChannel
+      const closeBroadcast = broadcast.close.bind(broadcast)
+      broadcast.close = () => { channelClosed = true; closeBroadcast() }
       rfb.disconnect()
+      display._asyncRenderQPush(lateDecode)
+      const disposedBitmapsReleased = bitmaps.every(bitmap => bitmap.width === 0)
       const initialDisconnected = disconnected
       await tick()
       for (let i = 0; i < 20; i++) {
@@ -96,7 +131,8 @@ async function main() {
       const upgradeCancelled = rtc._udpPeer === null && rtc._udpChannel === null
       return { connected, disconnected: initialDisconnected, coalescedFenceReplied, incompleteDidNotReply, fragmentedFenceReplied,
         initialPixelsTransparent, resetPixelsTransparent, websiteBlackPixelPreserved, whiteBackdrop,
-        disabledWebRtcAllocatedNoPeers, reconnectsAllocatedNoPeers, reconnectsRemovedCanvases, enabledWebRtcClosed, upgradeCancelled }
+        disabledWebRtcAllocatedNoPeers, reconnectsAllocatedNoPeers, reconnectsRemovedCanvases, enabledWebRtcClosed, upgradeCancelled,
+        paintedBitmapsReleased, evictedBitmapReleased, supersededFrameReleased, lateFrameReleased, clearedBitmapsReleased, disposedBitmapsReleased, channelClosed }
     })
     assert.equal(result.connected, true)
     assert.equal(result.disconnected, false)
@@ -109,8 +145,11 @@ async function main() {
     assert.equal(result.whiteBackdrop, true)
     for (const key of ['disabledWebRtcAllocatedNoPeers', 'reconnectsAllocatedNoPeers', 'reconnectsRemovedCanvases', 'enabledWebRtcClosed', 'upgradeCancelled'])
       assert.equal(result[key], true, key)
+    for (const key of ['paintedBitmapsReleased', 'evictedBitmapReleased', 'supersededFrameReleased', 'lateFrameReleased', 'clearedBitmapsReleased', 'disposedBitmapsReleased', 'channelClosed'])
+      assert.equal(result[key], true, key)
     console.log('PASS bundled Kasm client: coalesced/fragmented ServerFence; initial and resized white backdrop; actual black webpage pixels preserved')
     console.log('PASS 20 reconnects: no unused WebRTC peers or retained canvases; enabled WebRTC peer and channel close on disconnect')
+    console.log('PASS 120 animated frames: decoded bitmaps released after paint, eviction, late arrival, clear and disconnect; display channel closed')
   } finally {
     await browser?.close()
     server.closeAllConnections()
