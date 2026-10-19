@@ -26,6 +26,12 @@ jobs:
         with:
           node-version: 24.20.0
           cache: pnpm
+      - name: Cache deployment profile package downloads
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-npm-profile-${{ hashFiles('profiles/workbench/package-lock.json') }}
+          restore-keys: ${{ runner.os }}-npm-profile-
       - run: pnpm install --frozen-lockfile
       - name: Install deployment profile
         working-directory: profiles/workbench
@@ -70,6 +76,8 @@ jobs:
         run: python -m pytest services/sandbox-manager/tests -q -rs
 
   images:
+    # Avoid spending image-build minutes on a revision that fails a required check.
+    needs: [verify, dependencies, manager]
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
