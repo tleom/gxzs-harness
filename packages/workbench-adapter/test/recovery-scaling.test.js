@@ -14,19 +14,24 @@ it.each([100, 250])('decodes at most two run inventories when recovering %s mess
         database.bindRunMessage(sessionId, id, i, messageId)
         database.transitionRun(ownerId, id, 'completed')
         for (const event of [
-          { seq: i * 3, type: 'turn/start', data: { turn: i } },
-          { seq: i * 3 + 1, type: 'user/message', data: { id: messageId, source: { kind: 'rpc', rpcId: id }, content: [] } },
-          { seq: i * 3 + 2, type: 'turn/end', data: { turn: i, reason: { kind: 'completed' } } },
+          { seq: i * 4, type: 'turn/start', data: { turn: i } },
+          { seq: i * 4 + 1, type: 'user/message', data: { id: messageId, source: { kind: 'rpc', rpcId: id }, content: [] } },
+          { seq: i * 4 + 2, type: 'assistant/message', data: { turn: i, step: 1, content: [] } },
+          { seq: i * 4 + 3, type: 'turn/end', data: { turn: i, reason: { kind: 'completed' } } },
         ]) { events.push(event); database.markProjectedEvent(sessionId, event.seq) }
-        database.setRunSourceSeq(ownerId, id, 'source_end_seq', i * 3 + 2)
+        database.setRunSourceSeq(ownerId, id, 'source_end_seq', i * 4 + 3)
       }
     })()
     let calls = 0, decoded = 0
     const original = database.listRuns.bind(database)
     database.listRuns = (...args) => { calls++; const rows = original(...args); decoded += rows.length; return rows }
+    let receiptReads = 0
+    const receipt = database.runForTurn.bind(database)
+    database.runForTurn = (...args) => { receiptReads++; return receipt(...args) }
     await reconcileNativeSessions(database, { observeSession: async () => ({ events, [Symbol.dispose]() {} }) }, ownerId)
     expect(calls).toBeLessThanOrEqual(2)
     expect(decoded).toBeLessThanOrEqual(count * 2)
+    expect(receiptReads).toBeLessThanOrEqual(count)
     expect(original(ownerId, chatId).every(run => run.status === 'completed')).toBe(true)
   } finally { database.close() }
 })
