@@ -22,7 +22,8 @@ describe('published global skills', () => {
     const test = fixture()
     const first = { name: 'a-first', locator: { directory: '/first-root/a-first' } }
     test.native.list.mockResolvedValue([first, { name: 'a-first', locator: { directory: '/second-root/a-first' } }])
-    expect((await test.provider.list()).candidates).toEqual([first])
+    expect((await test.provider.list()).candidates).toEqual([{ ...first, order_num: 10 }])
+    expect(first).not.toHaveProperty('order_num')
   })
 
   it('loads the real native SKILL.md definition with its original resource directory', async () => {
@@ -41,6 +42,8 @@ describe('published global skills', () => {
       const candidate = (await provider.list()).candidates[0]
       expect(candidate.name).toBe('pdf')
       const definition = await provider.get(candidate)
+      expect(candidate.order_num).toBe(10)
+      expect(definition.order_num).toBe(10)
       expect(definition.content).toContain('references/guide.txt')
       expect(definition.resourceBase).toEqual({ kind: 'directory', path: path.join(root, 'pdf') })
     } finally {
@@ -55,8 +58,17 @@ describe('published global skills', () => {
     const { provider } = fixture()
     const { candidates } = await provider.list()
     expect(candidates.map(skill => skill.name)).toEqual(['a-first', 'z-last'])
+    expect(candidates.map(skill => skill.order_num)).toEqual([10, 20])
     expect(await provider.get(candidates[0])).toMatchObject({ content: 'Native body',
       resourceBase: { path: '/opt/workbench-global/skills/a-first' } })
+  })
+
+  it('uses the current database order when loading a cached candidate', async () => {
+    const test = fixture()
+    const candidate = (await test.provider.list()).candidates[0]
+    test.setRows([{ id: 'a-first', order_num: -20 }])
+    expect(await test.provider.get(candidate)).toMatchObject({ name: 'a-first', order_num: -20 })
+    expect(candidate.order_num).toBe(10)
   })
 
   it('rechecks publication when loading an already advertised skill', async () => {

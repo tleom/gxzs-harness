@@ -1,5 +1,5 @@
 // The Workbench image pins DSH 0.2.1-rc.2. Patch its published projection
-// until upstream exposes metadata.display-name in SkillSummary and catalog text.
+// until upstream exposes display names and publication order in native catalogs.
 import { readFile, writeFile } from 'node:fs/promises'
 import { resolve } from 'node:path'
 
@@ -20,10 +20,20 @@ async function replaceExact(path, changes) {
   await writeFile(path, source)
 }
 
-await replaceExact(skill, [[
-  'const { name, description, whenToUse, invocation, source, provider, resourceBase } = skill;\n\treturn {\n\t\tname,',
-  'const { name, description, whenToUse, invocation, source, provider, resourceBase } = skill;\n\tconst label = skill.displayName ?? skill.metadata?.["display-name"] ?? skill.metadata?.displayName;\n\tconst displayName = typeof label === "string" && label.trim() && label.length <= 128 ? label.trim() : name;\n\treturn {\n\t\tname,\n\t\tdisplayName,',
-]])
+await replaceExact(skill, [
+  [
+    'const { name, description, whenToUse, invocation, source, provider, resourceBase } = skill;\n\treturn {\n\t\tname,',
+    'const { name, description, whenToUse, invocation, source, provider, resourceBase } = skill;\n\tconst label = skill.displayName ?? skill.metadata?.["display-name"] ?? skill.metadata?.displayName;\n\tconst displayName = typeof label === "string" && label.trim() && label.length <= 128 ? label.trim() : name;\n\treturn {\n\t\tname,\n\t\tdisplayName,',
+  ],
+  [
+    '\t\tdisplayName,\n\t\t...skill.path === void 0 ? {} : { path: skill.path },',
+    '\t\tdisplayName,\n\t\t...Number.isInteger(skill.order_num) && skill.order_num >= -2147483648 && skill.order_num <= 2147483647 ? { order_num: skill.order_num } : {},\n\t\t...skill.path === void 0 ? {} : { path: skill.path },',
+  ],
+  [
+    'function compareSkillSummary(left, right) {\n\treturn compareCodePoints(left.name, right.name);\n}',
+    'function compareSkillSummary(left, right) {\n\tconst leftOrder = left.order_num ?? Infinity;\n\tconst rightOrder = right.order_num ?? Infinity;\n\treturn (leftOrder === rightOrder ? 0 : leftOrder - rightOrder) || compareCodePoints(left.name, right.name);\n}',
+  ],
+])
 await replaceExact(catalog, [
   [
     '\t\tname: skill.name,\n\t\tdescription: catalogDescription(skill.description, descriptionMaxLength)',

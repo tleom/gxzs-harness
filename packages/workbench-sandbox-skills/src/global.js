@@ -44,7 +44,7 @@ export class GlobalSkillProvider {
     for (const candidate of candidates)
       if (path.basename(candidate.locator?.directory ?? '') === candidate.name && !byName.has(candidate.name))
         byName.set(candidate.name, candidate)
-    return { candidates: published.flatMap(row => byName.has(row.id) ? [byName.get(row.id)] : []),
+    return { candidates: published.flatMap(row => byName.has(row.id) ? [{ ...byName.get(row.id), order_num: row.order_num }] : []),
       complete: Array.isArray(snapshot) || snapshot.complete === true }
   }
 
@@ -53,7 +53,8 @@ export class GlobalSkillProvider {
     signal?.throwIfAborted()
     const published = await publishedGlobalSkills(this.platform, this.owner, signal)
     signal?.throwIfAborted()
-    if (!published.some(row => row.id === candidate.name)
+    const publication = published.find(row => row.id === candidate.name)
+    if (!publication
       || path.basename(candidate.locator?.directory ?? '') !== candidate.name) {
       this.control.invalidate()
       return undefined
@@ -61,7 +62,7 @@ export class GlobalSkillProvider {
     const skill = await this.native.get(candidate, { ...options, signal })
     signal?.throwIfAborted()
     if (skill?.name !== candidate.name) { this.control.invalidate(); return undefined }
-    return skill
+    return { ...skill, order_num: publication.order_num }
   }
 
   dispose() { return this.native.dispose() }

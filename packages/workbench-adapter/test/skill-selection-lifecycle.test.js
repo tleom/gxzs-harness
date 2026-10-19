@@ -9,6 +9,7 @@ import { TaskScheduler } from '../src/scheduler.js'
 import { WorkbenchRuntime } from '../src/runtime.js'
 import { projectInboxClaim, projectSessionEvent, settleNativeIdle } from '../src/projection.js'
 import { apply as personalSkills } from '../../workbench-sandbox-skills/src/index.js'
+import { GlobalSkillProvider } from '../../workbench-sandbox-skills/src/global.js'
 
 const req = createRequire(new URL('../../../profiles/workbench/package.json', import.meta.url))
 const native = name => import(pathToFileURL(req.resolve(`@deepseek-ai/${name}`)).href)
@@ -98,6 +99,49 @@ async function fixture(script = []) {
     flush: async () => { scheduler.pendingTick = null; await scheduler.tick(); await agent.whenIdle() } }
 }
 const injections = h => h.agent.session.snapshotEvents().filter(event => event.type === 'user/message' && event.data.source.kind === 'skill-invocation')
+
+test('native model catalog follows publication order and persists a reordered catalog only once', async () => {
+  const h = await fixture()
+  let rows = [{ id: 'a-later', order_num: 20 }, { id: 'z-earlier', order_num: 10 }]
+  const skills = rows.map(row => ({ ...definition(row.id, 'gxzs-filesystem'), rank: 100,
+    invocation: { userInvocable: true, modelInvocable: true }, locator: { directory: `/global/${row.id}` } }))
+  const platform = { json: async () => ({ data: { global_skills: rows } }) }
+  let invalidate
+  h.ctx.skills.registerProvider(control => {
+    invalidate = () => control.invalidate()
+    return new GlobalSkillProvider({ list: async () => skills, get: async candidate => skills.find(skill => skill.name === candidate.name) },
+      platform, h.owner, control)
+  })
+  const catalogs = () => h.agent.session.snapshotEvents()
+    .filter(event => event.type === 'user/message' && event.data.source.kind === 'skill-catalog')
+  const names = event => event.data.source.entries.map(entry => entry.name)
+  const assertModelOrder = expected => {
+    const request = JSON.stringify(h.model.requests.at(-1))
+    const catalog = request.match(/<available_skills>[\s\S]*?<\/available_skills>/g)?.at(-1)
+    assert.ok(catalog)
+    assert.deepEqual([...catalog.matchAll(/- `([^`]+)`/g)].map(match => match[1]), expected)
+  }
+
+  await h.submit([], '首轮'); await h.flush()
+  assert.equal(h.model.requests.length, 1)
+  assert.deepEqual(names(catalogs()[0]), ['z-earlier', 'a-later'])
+  assertModelOrder(['z-earlier', 'a-later'])
+
+  rows = [{ id: 'a-later', order_num: -10 }, { id: 'z-earlier', order_num: 10 }]
+  invalidate()
+  await h.submit([], '调整顺序'); await h.flush()
+  assert.equal(catalogs().length, 2)
+  assert.deepEqual(names(catalogs()[1]), ['a-later', 'z-earlier'])
+  assert.equal(catalogs()[1].data.source.update, true)
+  assertModelOrder(['a-later', 'z-earlier'])
+
+  invalidate()
+  await h.submit([], '顺序未变'); await h.flush()
+  assert.equal(h.model.requests.length, 3)
+  assert.equal(catalogs().length, 2)
+  assertModelOrder(['a-later', 'z-earlier'])
+})
+
 async function personal(h, name) {
   const item = { id: name, version: 'v1', enabled: true, content: `---\nname: ${name}\ndescription: Fixture\ndisable-model-invocation: true\n---\nBODY_FOR_${name}` }
   h.ctx.provide('workbenchFileManager', { personalResources: async () => ({ skills: [item] }) }); personalSkills(h.ctx)
