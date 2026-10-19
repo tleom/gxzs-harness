@@ -17,6 +17,17 @@ function referenceResolver(test, candidates) {
 }
 
 const opened = []
+it('uses database publication order for the global skill catalog', async () => {
+  const { service, skills } = setup()
+  skills.list.mockResolvedValue([
+    { name: 'z-last', provider: 'gxzs-filesystem', description: 'Last' },
+    { name: 'a-first', provider: 'gxzs-filesystem', description: 'First' },
+  ])
+  service.globalSkillOrder = async () => [{ id: 'z-last', order_num: 20 }, { id: 'a-first', order_num: 10 }]
+  expect((await service.listSkills()).map(skill => [skill.id, skill.order_num]))
+    .toEqual([['a-first', 10], ['z-last', 20]])
+})
+
 afterEach(() => opened.splice(0).forEach((database) => database.close()))
 
 function setup() {

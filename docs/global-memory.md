@@ -1,6 +1,6 @@
 # 全局记忆
 
-“全局记忆”（英文名 `global memory`，内部标识 `global-memory`）注册在现有 `gxzs_ai_mcp_global`，与联网搜索、法律检索使用相同的发布、启停、工具选择和任务授权链路。前端不增加独立入口。全局是能力的提供范围；每个用户的数据仍在自己的沙盒中。
+“全局记忆”（英文名 `global memory`，内部标识 `global-memory`）注册在现有 `gxzs_agent_mcp`，与联网搜索、法律检索使用相同的发布、启停、工具选择和任务授权链路。前端不增加独立入口。全局是能力的提供范围；每个用户的数据仍在自己的沙盒中。
 
 唯一专用运行文件是 `services/sandbox-manager/global_memory.py`。它将已授权的调用送往平台为当前用户确定的沙盒，并复用 dsh-memory 原生 MCP 的 `cg`、`stg` 工具定义和执行入口，不复制其记忆算法。工具参数不能设置用户身份或记忆根目录。上游固定为 v0.8.1（`32ac237fb56afa43f73d668f1dfe9b306d71b025`），安装时包含 `md_cg`、启动依赖 `utf8_boot.py`、版本元数据 `package.json` 和 MIT LICENSE。
 

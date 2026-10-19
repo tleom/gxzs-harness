@@ -5,7 +5,8 @@
   "type": "module",
   "exports": {
     ".": "./src/index.js",
-    "./definition": "./src/definition.js"
+    "./definition": "./src/definition.js",
+    "./global": "./src/global.js"
   },
   "engines": {
     "node": "^22.19.0 || >=24.0.0"

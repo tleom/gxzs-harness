@@ -136,12 +136,12 @@ const platform = fixture((req, res) => {
   if (req.method === 'GET' && req.url === '/internal/workbench/workbench/config') {
     // Readiness has no models; session checks use the local fixture provider.
     respond(res, 200, { data: sessionCreate ? {
-      enabled: true, system_prompt: '', models: { default: 'smoke/smoke', providers: { smoke: {
+      enabled: true, system_prompt: '', global_skills: [], models: { default: 'smoke/smoke', providers: { smoke: {
         api: 'openai-completions', apiKeyEnv: 'GXZS_SMOKE_MODEL_KEY', baseURL: `http://127.0.0.1:${modelPort ?? 1}/v1`,
         models: [{ id: 'smoke', name: 'Smoke', input: nativeAttachments ? ['text', 'image'] : ['text'], contextWindow: 131072, maxTokens: 1024 },
           ...(nativeAttachments ? [{ id: 'text-only', name: 'Text only', input: ['text'], contextWindow: 131072, maxTokens: 1024 }] : [])],
       } } },
-    } : { enabled: false, system_prompt: '', models: { providers: {}, default: '' } } })
+    } : { enabled: false, system_prompt: '', global_skills: [], models: { providers: {}, default: '' } } })
     return
   }
   throw new Error(`Unexpected platform fixture request: ${req.method} ${req.url}`)

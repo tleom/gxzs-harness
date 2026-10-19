@@ -84,6 +84,7 @@ if args.action=='up':
  assert all(not pool.overlaps(ipaddress.ip_network(item['Subnet'])) for network in networks for item in (network.get('IPAM',{}).get('Config') or []) if item.get('Subnet') and ':' not in item['Subnet'])
  (root/'output').mkdir(exist_ok=True);(root/'state').mkdir(exist_ok=True)
  config={'prefix':prefix,'token':secrets.token_hex(32),'assertionKey':base64.b64encode(secrets.token_bytes(32)).decode(),'publicURL':f'http://10.16.9.237:{args.model_port}','managerURL':f'http://10.16.9.237:{args.manager_port}','images':images,'pool':str(pool),'owners':[],'accountNames':args.account_names}
+ config['globalSkills']=[{'id':item.parent.name,'order_num':0} for item in sorted(skill_root.glob('*/SKILL.md'))] if args.global_skills_dir else []
  save(manifest,config)
  credentials=root/'fixture-credentials.yaml';credentials.write_text('version: 1\nrefs:\n  GXZS_SIM_MODEL_KEY: '+config['token']+'\nrecords: {}\n')
  container_config={**config,'host':'0.0.0.0','port':args.model_port,'output':'/output'};save(root/'simulator-private.json',container_config)

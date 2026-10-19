@@ -1,4 +1,5 @@
 import z from '@deepseek-ai/schemastery'
+import { publishedGlobalSkills } from '@gxzs/dsh-workbench-sandbox-skills/global'
 import { dirname } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { storageStatus, assertStorageWritable } from './storage-pressure.js'
@@ -88,7 +89,7 @@ export function apply(ctx, config) {
   scheduler.hasOwnedWork = sessionId => runtime.hasOwnedWork(sessionId)
   scheduler.cancelOwned = (sessionId, runId) => runtime.cancelOwned(sessionId, runId)
   scheduler.executionRun = (sessionId) => runtime.executionRun(sessionId)
-  const service = new WorkbenchService({ database, sessionController: ctx.sessionController, agents: ctx.agents, commands: ctx.commands, skills: ctx.skills, fileManager: ctx.workbenchFileManager, platformClient: ctx.workbenchPlatformClient, workspace: config.workspace, sessionQuery: ctx.sessionQuery, agentPresets: ctx.agentPresets, agentDefaultModel: ctx.agentDefaultModel, modelSettings: ctx.settings, scheduler, attachments: ctx.attachments, goals: ctx.goals, fileUploads: ctx.fileUploads, nativeFileAttachments: process.env.GXZS_NATIVE_FILE_ATTACHMENTS === '1' })
+  const service = new WorkbenchService({ database, sessionController: ctx.sessionController, agents: ctx.agents, commands: ctx.commands, skills: ctx.skills, globalSkillOrder: () => publishedGlobalSkills(ctx.workbenchPlatformClient, { ownerId: config.ownerId }), fileManager: ctx.workbenchFileManager, platformClient: ctx.workbenchPlatformClient, workspace: config.workspace, sessionQuery: ctx.sessionQuery, agentPresets: ctx.agentPresets, agentDefaultModel: ctx.agentDefaultModel, modelSettings: ctx.settings, scheduler, attachments: ctx.attachments, goals: ctx.goals, fileUploads: ctx.fileUploads, nativeFileAttachments: process.env.GXZS_NATIVE_FILE_ATTACHMENTS === '1' })
   service.workspaceChanges = ctx.workspaceChanges
   service.permanentDeletion = new ChatDeletion(ctx, database, config.ownerId)
   service.workingDirectory = ctx.workingDirectory

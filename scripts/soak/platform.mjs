@@ -63,7 +63,7 @@ const simulation = await createSimulator({ ...config, extraHandler: async ({ req
     json(res, fault.status, { code: 'FIXTURE_TRANSIENT', message: 'Injected transient dependency failure', retry_after: 1 }); return true
   }
   if (route === 'workbench/config') {
-    json(res, 200, { data: { enabled: true, system_prompt: '这是隔离的合成稳定性测试。模型响应由可控服务生成。', models: { default: 'simulator/gxzs-simulator', providers: { simulator: { api: 'openai-completions', baseURL: config.publicURL + '/v1', apiKeyEnv: 'GXZS_SIM_MODEL_KEY', compat: { supportsDeveloperRole: false }, models: [{ id: 'gxzs-simulator', name: '零费用模拟模型', input: ['text', 'image'], contextWindow: 1050000, maxTokens: 128000 }] } } } } }); return true
+    json(res, 200, { data: { enabled: true, system_prompt: '这是隔离的合成稳定性测试。模型响应由可控服务生成。', global_skills: config.globalSkills, models: { default: 'simulator/gxzs-simulator', providers: { simulator: { api: 'openai-completions', baseURL: config.publicURL + '/v1', apiKeyEnv: 'GXZS_SIM_MODEL_KEY', compat: { supportsDeveloperRole: false }, models: [{ id: 'gxzs-simulator', name: '零费用模拟模型', input: ['text', 'image'], contextWindow: 1050000, maxTokens: 128000 }] } } } } }); return true
   }
   if (route === 'mcp/catalog' || route === 'mcp/plugins') {
     const personal = await manager(binding, 'personal-mcp', { operation: 'mcp_list' })

@@ -114,13 +114,7 @@
     - id: gxzs-workspace-changes
       name: '@gxzs/dsh-workbench-sandbox-runtime/changes'
     - id: gxzs-skill-filesystem
-      name: '@deepseek-ai/dsh-skill-filesystem'
-      config:
-        providerName: gxzs-filesystem
-        includeDefaultRoots: false
-        dshHome: !!js process.env.DSH_HOME
-        customSkillDirs: !!js process.env.GXZS_GLOBAL_SKILL_DIR?.split(',').filter(Boolean) ?? []
-        watch: true
+      name: '@gxzs/dsh-workbench-sandbox-skills/global'
     - id: gxzs-workbench-control-commands
       name: '@gxzs/dsh-workbench-control-commands'
     - id: gxzs-workbench-file-manager

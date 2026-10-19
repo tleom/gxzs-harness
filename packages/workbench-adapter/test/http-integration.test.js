@@ -466,7 +466,7 @@ describe('authenticated workbench HTTP handler', () => {
     })
   })
 
-  it('publishes personal skills and registers only the database prompt extension', async () => {
+  it('publishes global skills before personal skills and registers the database prompt extension', async () => {
     const { handler, key, context } = setup()
     context.skills.list.mockResolvedValueOnce([
       { name: 'legal-draft', description: '法律文书', source: 'user-dsh', provider: 'gxzs-sandbox-personal' },
@@ -475,8 +475,8 @@ describe('authenticated workbench HTTP handler', () => {
     await expect(call(handler, key, 'GET', '/catalog')).resolves.toMatchObject({
       status: 200,
       body: { data: { skills: [
+        { id: 'global-skill', scope: 'global', order_num: 0 },
         { id: 'personal:legal-draft', scope: 'personal' },
-        { id: 'global-skill', scope: 'global' },
       ] } },
     })
     expect(context.systemPrompt.section.mock.calls.map(([section]) => section.name)).toEqual(['gxzs:sidebar-browser', 'gxzs:sidebar-terminal'])
