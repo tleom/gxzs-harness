@@ -381,6 +381,15 @@ export class WorkbenchDatabase {
     return row ? { ...decodeRun(row), ...(row.error ? { errorCode: this.runErrorCode(ownerId, id) } : {}) } : undefined
   }
 
+  /** Transport/receipt authorization needs no frozen tool/attachment payloads. */
+  getRunState(ownerId, id) {
+    this.flushStreamEvents()
+    this.runStreamStateStatement ??= this.db.prepare(`SELECT r.id, r.status, r.next_seq - 1 AS seq
+      FROM runs r JOIN chats c ON c.id=r.chat_id
+      WHERE r.id=? AND r.owner_id=? AND c.deleted_at IS NULL`)
+    return this.runStreamStateStatement.get(id, ownerId)
+  }
+
   runErrorCode(ownerId, id) {
     const row = this.db.prepare(`SELECT e.payload_json FROM run_events e INDEXED BY run_events_end JOIN runs r ON r.id=e.run_id
       WHERE e.run_id=? AND r.owner_id=? AND json_extract(e.payload_json, '$.event')='workbench_end'
@@ -654,38 +663,38 @@ export class WorkbenchDatabase {
   }
 
   markStreamedStep(ownerId, runId, turn, step) {
-    if (!this.getRun(ownerId, runId)) throw notFound('任务不存在')
+    if (!this.getRunState(ownerId, runId)) throw notFound('任务不存在')
     this.db.prepare('INSERT OR IGNORE INTO streamed_steps(run_id, turn_number, step_number) VALUES (?, ?, ?)')
       .run(runId, turn, step)
   }
 
   clearStreamedStep(ownerId, runId, turn, step) {
-    if (!this.getRun(ownerId, runId)) throw notFound('任务不存在')
+    if (!this.getRunState(ownerId, runId)) throw notFound('任务不存在')
     this.db.prepare('DELETE FROM streamed_steps WHERE run_id = ? AND turn_number = ? AND step_number = ?').run(runId, turn, step)
   }
 
   isStreamedStep(ownerId, runId, turn, step) {
-    if (!this.getRun(ownerId, runId)) throw notFound('任务不存在')
+    if (!this.getRunState(ownerId, runId)) throw notFound('任务不存在')
     return Boolean(this.db.prepare('SELECT 1 FROM streamed_steps WHERE run_id = ? AND turn_number = ? AND step_number = ?')
       .get(runId, turn, step))
   }
 
   startToolCall(ownerId, runId, callId, toolName) {
-    if (!this.getRun(ownerId, runId)) throw notFound('任务不存在')
+    if (!this.getRunState(ownerId, runId)) throw notFound('任务不存在')
     this.db.prepare(`INSERT INTO tool_calls(run_id, call_id, tool_name, status) VALUES (?, ?, ?, 'started')
       ON CONFLICT(run_id, call_id) DO UPDATE SET tool_name = excluded.tool_name`)
       .run(runId, callId, toolName)
   }
 
   finishToolCall(ownerId, runId, callId) {
-    if (!this.getRun(ownerId, runId)) throw notFound('任务不存在')
+    if (!this.getRunState(ownerId, runId)) throw notFound('任务不存在')
     const row = this.db.prepare('SELECT tool_name FROM tool_calls WHERE run_id = ? AND call_id = ?').get(runId, callId)
     this.db.prepare(`UPDATE tool_calls SET status = 'finished' WHERE run_id = ? AND call_id = ?`).run(runId, callId)
     return row?.tool_name
   }
 
   toolCallName(ownerId, runId, callId) {
-    if (!this.getRun(ownerId, runId)) throw notFound('任务不存在')
+    if (!this.getRunState(ownerId, runId)) throw notFound('任务不存在')
     return this.db.prepare('SELECT tool_name FROM tool_calls WHERE run_id = ? AND call_id = ?').get(runId, callId)?.tool_name
   }
 
@@ -756,7 +765,7 @@ export class WorkbenchDatabase {
 
   eventsAfter(ownerId, runId, after, limit = 1000, present = event => event,
     { through = Number.MAX_SAFE_INTEGER, maxBytes = 4 * 1024 * 1024 } = {}) {
-    const run = this.getRun(ownerId, runId)
+    const run = this.getRunState(ownerId, runId)
     if (!run) throw notFound('任务不存在')
     // Project each row before retaining the page. Old context events can hold
     // large tool catalogs; collecting raw JSON first can exhaust the Host heap.
