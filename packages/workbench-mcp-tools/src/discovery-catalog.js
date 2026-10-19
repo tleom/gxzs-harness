@@ -51,10 +51,12 @@ export class ToolDiscoveryCatalog extends Service {
     for (const { tool, definition } of this.registrations.values()) {
       if (!allowed.has(tool.public_name)) continue
       const pluginId = `${tool.scope}:mcp:${tool.server_id}`
+      const order = plugins.get(pluginId)?.order_num ?? tool.order_num
       plugins.set(pluginId, {
         id: pluginId, name: tool.provider_call_name ?? tool.server_id,
         displayName: tool.provider_name ?? tool.server_id,
         scope: tool.scope, description: tool.provider_description ?? '',
+        ...(tool.scope === 'global' && order !== undefined ? { order_num: order } : {}),
         preferred: preferred.has(pluginId) || preferred.has(tool.provider_call_name ?? tool.server_id),
       })
       tools.push({ id: tool.id, name: tool.public_name, rawName: tool.tool_name, pluginId,

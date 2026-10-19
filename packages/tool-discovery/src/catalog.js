@@ -44,6 +44,8 @@ export function buildCatalog(snapshot, config) {
     pluginNames.set(name, source.id)
     const plugin = { id: source.id, name, displayName: source.displayName ?? source['display-name'] ?? source.name ?? name,
       description: String(source.description ?? ''), preferred: source.preferred === true, available: source.available !== false,
+      scope: source.scope === 'personal' ? 'personal' : 'global',
+      order_num: Number.isInteger(source.order_num) && source.order_num >= -2147483648 && source.order_num <= 2147483647 ? source.order_num : 0,
       unavailableReason: source.unavailableReason, count: 0 }
     plugins.set(source.id, plugin)
     return plugin
@@ -75,7 +77,7 @@ export function buildCatalog(snapshot, config) {
     const definitionJson = JSON.stringify(definition)
     const plugin = plugins.get(source.pluginId) ?? addPlugin({ id: source.pluginId,
       name: source.pluginCallName ?? source.pluginId.split(':').at(-1), displayName: source.pluginName,
-      description: source.pluginDescription })
+      description: source.pluginDescription, scope: source.pluginScope, order_num: source.order_num })
     const rawName = source.rawName ?? source.name
     if (typeof rawName !== 'string' || !rawName || rawNames.has(`${source.pluginId}\0${rawName}`))
       throw new Error('插件包含无效或重复的工具名称')
@@ -144,6 +146,10 @@ export const pluginSummary = plugin => ({ name: plugin.name, 'display-name': plu
 // Keep the complete inventory for authorization and recovery; filter only
 // model-facing directory views, using the same rule for summaries and mcp({}).
 export const availablePlugins = catalog => catalog.plugins.filter(plugin => plugin.available && !plugin.unavailableReason)
+  .sort((a, b) => Number(b.preferred) - Number(a.preferred)
+    || Number(a.scope === 'personal') - Number(b.scope === 'personal')
+    || (a.scope === 'global' ? (a.order_num ?? 0) - (b.order_num ?? 0)
+      || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0) : a.name.localeCompare(b.name)))
 
 // Metadata remains complete; escaping prevents it from closing the catalog frame.
 const escapeText = value => String(value).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;')
@@ -151,8 +157,7 @@ const escapeText = value => String(value).replaceAll('&', '&amp;').replaceAll('<
 
 export function renderCatalog(catalog, _config, { searchAllowed = true, browseAllowed = true } = {}) {
   const ready = (searchAllowed || browseAllowed) && catalog?.ready
-  const plugins = ready ? availablePlugins(catalog)
-    .sort((a, b) => Number(b.preferred) - Number(a.preferred) || a.name.localeCompare(b.name)) : []
+  const plugins = ready ? availablePlugins(catalog) : []
   return ['插件提供可按需加载的工具。以下是当前会话的插件目录：',
     '',
     '<available_plugins>',

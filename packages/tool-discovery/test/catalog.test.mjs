@@ -1,11 +1,26 @@
 import { test } from 'vitest'
 import assert from 'node:assert/strict'
 import { Config } from '../src/index.js'
-import { activationEntry, buildCatalog, renderCatalog, search } from '../src/catalog.js'
+import { activationEntry, availablePlugins, buildCatalog, renderCatalog, search } from '../src/catalog.js'
 import { ACTIVE_EVENT, activeStateSchema, discoveryProjection } from '../src/projection.js'
 import { row } from './helpers.mjs'
 
 const config = Config({})
+test('model and browse directories use global publication order, stable ties, and explicit user preference', () => {
+  const catalog = buildCatalog({ ready: true, tools: [], plugins: [
+    { id: 'global:mcp:zeta', name: 'zeta', scope: 'global', order_num: -10 },
+    { id: 'global:mcp:omega', name: 'omega', scope: 'global', order_num: 10 },
+    { id: 'global:mcp:alpha', name: 'alpha', scope: 'global', order_num: 10 },
+    { id: 'global:mcp:a_b', name: 'a_b', scope: 'global', order_num: 10 },
+    { id: 'global:mcp:a-b', name: 'a-b', scope: 'global', order_num: 10 },
+    { id: 'personal:mcp:mine', name: 'mine', scope: 'personal', order_num: -100 },
+    { id: 'global:mcp:selected', name: 'selected', scope: 'global', order_num: 100, preferred: true },
+  ] }, config)
+  const expected = ['selected', 'zeta', 'a-b', 'a_b', 'alpha', 'omega', 'mine']
+  assert.deepEqual(availablePlugins(catalog).map(plugin => plugin.name), expected)
+  assert.deepEqual([...renderCatalog(catalog, config).matchAll(/- `([^`]+)`/g)].map(match => match[1]), expected)
+})
+
 const snapshot = tools => ({ ready: true, authorityKey: 'owner\0run', revision: 'r1', tools, plugins: [
   { id: 'global:mcp:records', name: '共享平台', callName: 'shared_records', description: '法律文书与裁判档案', scope: 'global' },
   { id: 'personal:mcp:records', name: '个人平台', callName: 'my_records', description: '客户沟通记录', scope: 'personal', preferred: true },

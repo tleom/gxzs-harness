@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { platformToolName, platformToolNames, publicToolName } from '../src/names.js'
 import { apply } from '../src/index.js'
+import { buildCatalog, renderCatalog } from '../../tool-discovery/src/catalog.js'
 
 const catalogTool = {
   id: 'personal:server:search', runtime_name: 'personal_mcp_search', version: 'v1', manifest_version: 'm1',
@@ -28,6 +29,42 @@ function setup({ authorized = true } = {}) {
 }
 
 describe('platform MCP proxy tools', () => {
+  it('updates live registration order when only one global plugin moves', async () => {
+    const { ctx, platform, definitions } = setup()
+    const tool = (name, order_num) => ({ ...catalogTool, id: `global:mcp:${name}:lookup`,
+      runtime_name: `global_${name}`, scope: 'global', server_id: name,
+      provider_call_name: name, order_num })
+    const first = [tool('alpha', 0), tool('beta', 10), tool('zeta', 20)]
+    platform.json.mockResolvedValue({ tools: first })
+    await apply(ctx)
+    const unchangedDefinition = definitions.get(platformToolNames(first).get(first[0].id))
+    expect(unchangedDefinition).toBeDefined()
+    const moved = [first[0], tool('zeta', 5), first[1]]
+    platform.json.mockResolvedValue({ tools: moved })
+    const admitted = await ctx.workbenchRuntime.refreshMcpCatalog()
+    expect(ctx.workbenchRuntime.mcpResources().map(item => item.server_id)).toEqual(['alpha', 'zeta', 'beta'])
+    expect(admitted.map(item => item.server_id)).toEqual(['alpha', 'zeta', 'beta'])
+    expect(definitions.get(platformToolNames(first).get(first[0].id))).toBe(unchangedDefinition)
+  })
+
+  it('carries SQL plugin order through authorized discovery into the model directory', async () => {
+    const { ctx, platform } = setup()
+    const agent = { id: 'chat', session: { id: 'chat' } }
+    const tool = (name, order_num) => ({ ...catalogTool, id: `global:mcp:${name}:lookup`,
+      runtime_name: `global_${name}`, scope: 'global', server_id: name,
+      provider_call_name: name, order_num })
+    const tools = [tool('zeta', -10), tool('alpha', 20)]
+    ctx.workbenchRuntime.executionRun = () => ({ id: 'run-1', ownerId: 't:1', status: 'running', mcpTools: tools })
+    const plugins = tools.map(item => ({ id: `global:mcp:${item.server_id}`, name: item.server_id,
+      scope: 'global', order_num: item.order_num }))
+    platform.json.mockResolvedValue({ tools, plugins })
+    await apply(ctx, { discovery: true })
+    const snapshot = ctx.toolDiscoveryCatalog.snapshot(agent)
+    expect(snapshot.plugins.map(item => item.order_num)).toEqual([-10, 20])
+    const catalog = buildCatalog(snapshot, { maxCatalogTools: 100, maxIndexBytes: 1_000_000 })
+    expect([...renderCatalog(catalog, {}).matchAll(/- `([^`]+)`/g)].map(match => match[1])).toEqual(['zeta', 'alpha'])
+  })
+
   it('keeps discovery revision and registered tools stable when personal card order changes', async () => {
     const { ctx, platform, definitions } = setup()
     const agent = { id: 'chat', session: { id: 'chat' } }
