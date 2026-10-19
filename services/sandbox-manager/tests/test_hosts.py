@@ -996,6 +996,7 @@ def failed_ssh_setup(tmp_path, monkeypatch):
     host.failures['host-1'] = 0
     host.admission.busy.return_value = 2
     docker.reset_mock()
+    host.heartbeat.reset_mock()
     return host, docker, sandbox, payload, created, record, item
 
 
@@ -1009,7 +1010,26 @@ def test_failed_ssh_preserves_actual_execution(tmp_path, monkeypatch, busy):
     maintain(host)
     assert not any(call.args[0] in ('stop', 'rename', 'create') for call in docker.call_args_list)
     host.admission.fence.assert_not_called()
-    assert json.loads(record.read_text()) == {**item, 'ready': False}
+    assert json.loads(record.read_text()) == {**item, 'ready': False, 'state': 'degraded'}
+    host.heartbeat.assert_called_once_with({**item, 'ready': False, 'state': 'degraded'}, 'degraded')
+
+
+def test_failed_ssh_keeps_control_routes_live_during_grace_and_recovers_after_drain(tmp_path, monkeypatch):
+    host, docker, _, _, _, record, item = failed_ssh_setup(tmp_path, monkeypatch)
+    host.failures.clear()
+    host.failed_transport_activity.return_value['runningAgents'] = 2
+    maintain(host)
+    assert json.loads(record.read_text())['state'] == 'degraded'
+    assert not any(call.args[0] in ('stop', 'rename', 'create') for call in docker.call_args_list)
+    host.failures['host-1'] = 0
+    host.failed_transport_activity.return_value['runningAgents'] = 0
+    maintain(host)
+    host.admission.fence.assert_called_once_with('t:1', 'host-1', preserve_pending=True)
+    assert any(call.args == ('start', 'host-1') for call in docker.call_args_list)
+    host.healthy.return_value = True
+    host.failed_transport_activity.return_value = None
+    maintain(host)
+    assert json.loads(record.read_text()) == item
 
 
 def test_failed_ssh_recovers_idle_pair_and_preserves_queued_tickets(tmp_path, monkeypatch):

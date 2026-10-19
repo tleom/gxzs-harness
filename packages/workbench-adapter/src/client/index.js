@@ -3,10 +3,40 @@ import { compactionSummary, contentText, fileToolPreparation, nativePresentation
 export const inject = []
 export function apply() {}
 
+/** One mounted native detail owns this cache. Immutable append-only prefixes
+ * reuse their decoded file arguments; paging, retirement and replacement reset
+ * them. No session data is retained by the presenter module after unmount. */
+export function createSessionWindowPresenter() {
+  let previous = [], prepared = []
+  const attempts = new Map()
+  return (entries, context) => {
+    if (previous.length > entries.length || previous.some((entry, index) => entry !== entries[index])) {
+      previous = []; prepared = []; attempts.clear()
+    }
+    for (let index = previous.length; index < entries.length; index++) {
+      const event = entries[index].event
+      const { chunk, attemptId, turn, step } = event.data ?? {}
+      let data
+      if (event.type === 'assistant/live-chunk' && chunk.type === 'tool-call-delta') {
+        let attempt = attempts.get(attemptId)
+        if (!attempt) attempts.set(attemptId, attempt = { turn, step, calls: new Map() })
+        data = fileToolPreparation({ id: '' }, attempt.calls, chunk, event.time)
+      } else if (event.type === 'assistant/message' || event.type === 'turn/end') {
+        for (const [id, attempt] of attempts) {
+          if (attempt.turn === turn && (event.type === 'turn/end' || attempt.step === step)) attempts.delete(id)
+        }
+      }
+      prepared.push(data)
+    }
+    previous = [...entries]
+    return presentSessionWindow(entries, context, prepared)
+  }
+}
+
 /** Pure Vue display projection of the original Session event window.
  * Window ownership, surface folding, transient retirement and pagination stay in DSH.
  */
-export function presentSessionWindow(entries, { sessionId, chatId, parentSessionId, running, selection = {}, mcpTools = [] }) {
+export function presentSessionWindow(entries, { sessionId, chatId, parentSessionId, running, selection = {}, mcpTools = [] }, prepared) {
   const runs = new Map(), tools = new Map(), preparations = new Map(), compactions = new Map()
   const streamedSteps = new Set(entries.filter(({ event }) => event.type === 'assistant/live-chunk').map(({ event }) => `${event.data.turn}:${event.data.step}`))
   let turn
@@ -22,7 +52,7 @@ export function presentSessionWindow(entries, { sessionId, chatId, parentSession
     }
     return run
   }
-  for (const { event } of entries) {
+  for (const [entryIndex, { event }] of entries.entries()) {
     if (event.type === 'compaction/summary') compactions.set(event.data.compactionId, event.data)
     const run = runFor(event)
     if (!run) continue
@@ -50,9 +80,14 @@ export function presentSessionWindow(entries, { sessionId, chatId, parentSession
       const { chunk, attemptId, step } = event.data
       let data
       if (chunk.type === 'tool-call-delta') {
-        let calls = preparations.get(attemptId)
-        if (!calls) preparations.set(attemptId, calls = new Map())
-        data = fileToolPreparation(run, calls, chunk)
+        if (prepared) {
+          const value = prepared[entryIndex]
+          if (value) data = { ...value, workbench_run_id: run.id }
+        } else {
+          let calls = preparations.get(attemptId)
+          if (!calls) preparations.set(attemptId, calls = new Map())
+          data = fileToolPreparation(run, calls, chunk, event.time)
+        }
       } else if (['text-delta', 'reasoning-delta'].includes(chunk.type) && chunk.text) {
         data = { kind: chunk.type === 'text-delta' ? 'text' : 'reasoning', workbench_run_id: run.id, text: chunk.text }
       }

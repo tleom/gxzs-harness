@@ -966,6 +966,19 @@ class Hosts:
                     heartbeats.append((dict(item), item['state']))
                 now = time.time()
                 since = self.failures.setdefault(item['instance_id'], now)
+                if (host_running and sandbox_running and failed_transport_activity is not None
+                        and (self.admission.active(item['owner_id']) or any(failed_transport_activity[key]
+                            for key in ('runningAgents', 'runningJobs', 'activeSettingsWrites')))):
+                    # The native session still runs on this live Host. Keep its
+                    # history and stop routes reachable while execution drains;
+                    # readiness remains false, so no new work can be admitted.
+                    # Without the degraded heartbeat the platform expires this
+                    # generation and repeatedly sends the UI through startup.
+                    if item.get('state') in {'ready', 'degraded'}:
+                        item['state'] = 'degraded'
+                        self._save(record, item)
+                        heartbeats.append((dict(item), 'degraded'))
+                    return
                 # A missing Docker object is definitive, unlike a transient
                 # readiness probe. Recover it quickly while retaining a short
                 # debounce for daemon/eventual-consistency races.
@@ -978,15 +991,8 @@ class Hosts:
                 # dead. Preserve admitted/native work, including when the busy
                 # event loop cannot answer the activity read. A stopped/missing
                 # container remains definitive evidence and can be recovered.
-                if host_running and sandbox_running:
-                    if failed_transport_activity is not None:
-                        # Pending inbox messages/schedules are durable; an SSH
-                        # session that has failed cannot heal by waiting for them.
-                        # Preserve actual execution and settings writes until idle.
-                        if (self.admission.active(item['owner_id']) or any(failed_transport_activity[key]
-                                for key in ('runningAgents', 'runningJobs', 'activeSettingsWrites'))):
-                            return
-                    elif (self.admission.busy(item['owner_id'])
+                if host_running and sandbox_running and failed_transport_activity is None:
+                    if (self.admission.busy(item['owner_id'])
                             or (item.get('state') != 'provisioning' and (native_activity is None
                                 or any(native_activity[key] for key in
                                        ('runningAgents', 'pendingMessages', 'runningJobs', 'activeSettingsWrites'))))):

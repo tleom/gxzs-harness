@@ -44,7 +44,7 @@ export class HistoryPresentation {
         if (chunk.type === 'tool-call-delta') {
           let calls = this.preparations.get(attemptId)
           if (!calls) this.preparations.set(attemptId, calls = new Map())
-          const data = fileToolPreparation(run, calls, chunk)
+          const data = fileToolPreparation(run, calls, chunk, event.time)
           if (data) display.events.push({ run_id: run.id, event: {
             event: 'workbench_activity', _id: `stream:${this.sessionId}:${attemptId}:${event.seq}`,
             data: { ...data, native_attempt: attemptId, segment_id: `t${turn}s${step}a${attemptId}:b${chunk.index}` },

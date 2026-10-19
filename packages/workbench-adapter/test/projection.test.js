@@ -152,7 +152,7 @@ describe('DSH session event projection', () => {
     project({ agent, frame: { type: 'chunk', attemptId: 'a', chunk: { type: 'tool-call-delta', index: 0, id: 'write', name: 'write', argumentsDelta: '{' } } })
     database.flushStreamEvents()
     expect(database.eventsAfter(chat.ownerId, run.id, 0).find(entry => entry.data?.kind === 'tool').data)
-      .toMatchObject({ stage: 'preparing', call_id: 'write', argument_chars: 1, segment_id: 't1s1aa:b0' })
+      .toMatchObject({ stage: 'preparing', call_id: 'write', file_progress: { path: '', added: 0, removed: 0 }, segment_id: 't1s1aa:b0' })
     expect(database.db.prepare('SELECT COUNT(*) AS n FROM tool_calls WHERE run_id=?').get(run.id).n).toBe(0)
     projectSessionEvent(database, chat.sessionId, { type: 'tool/call', data: { turn: 1, callId: 'write', name: 'write', arguments: '{"path":"data.js","content":"done"}' } })
     expect(database.eventsAfter(chat.ownerId, run.id, 0).filter(entry => entry.data?.kind === 'tool').map(entry => entry.data.stage)).toEqual(['preparing', 'started'])

@@ -23,15 +23,15 @@ it('resolves each turn once during a large reconnect snapshot and refreshes on t
     message: { content: [{ type: 'text', text: 'latest' }] } })).events[0].run_id).toBe('replacement')
   expect(resolve).toHaveBeenCalledTimes(4)
 })
-it('shows file preparation immediately and updates its native KB counter before tool execution', () => {
+it('shows a filename and streamed line counts before file execution', () => {
   const view = new HistoryPresentation('session', () => run)
   view.accept(snapshot())
   view.accept(frame({ type: 'start', attemptId: 'a', revision: 1, turn: 1, step: 1, startedAfterSeq: 0 }))
-  const delta = (index, chunk) => view.accept(frame({ type: 'chunk', attemptId: 'a', revision: index + 2, index, time: index + 1, chunk }))
+  const delta = (index, chunk) => view.accept(frame({ type: 'chunk', attemptId: 'a', revision: index + 2, index, time: index * 1000 + 1, chunk }))
   const first = delta(0, { type: 'tool-call-delta', index: 0, id: 'write-call', name: 'write', argumentsDelta: '' })
-  expect(first.events[0].event.data).toMatchObject({ call_id: 'write-call', tool_name: 'write', stage: 'preparing', argument_chars: 0, native_attempt: 'a' })
+  expect(first.events[0].event.data).toMatchObject({ call_id: 'write-call', tool_name: 'write', stage: 'preparing', file_progress: { path: '', added: 0, removed: 0 }, native_attempt: 'a' })
   const content = '{"path":"data.js","content":"' + 'x'.repeat(5000)
-  expect(delta(1, { type: 'tool-call-delta', index: 0, id: 'write-call', argumentsDelta: content }).events[0].event.data.argument_chars).toBe(content.length)
+  expect(delta(1, { type: 'tool-call-delta', index: 0, id: 'write-call', argumentsDelta: content }).events[0].event.data.file_progress).toEqual({ path: 'data.js', added: 1, removed: 0 })
   expect(delta(2, { type: 'tool-call-delta', index: 0, id: 'write-call', argumentsDelta: 'x' }).events).toEqual([])
   const call = view.accept(durable(1, 'tool/call', { turn: 1, callId: 'write-call', name: 'write', arguments: content + 'x"}' }))
   expect(call.events[0].event.data).toMatchObject({ call_id: 'write-call', stage: 'started' })
@@ -40,24 +40,24 @@ it('shows file preparation immediately and updates its native KB counter before 
 it('restores a preparing file counter from the native reconnect prefix and retires failed attempts', () => {
   const view = new HistoryPresentation('session', () => run)
   const opened = view.accept(snapshot([], { revision: 2, activeAttempt: { attemptId: 'a', turn: 1, step: 1, startedAfterSeq: 0, nextIndex: 1,
-    stream: [{ type: 'tool-call-chunks', time0: 1, index: 0, id: 'edit-call', name: 'edit', dt: [], args: ['x'.repeat(2300)] }] } }))
-  expect(opened.events[0].event.data).toMatchObject({ call_id: 'edit-call', stage: 'preparing', argument_chars: 2300 })
+    stream: [{ type: 'tool-call-chunks', time0: 1, index: 0, id: 'edit-call', name: 'edit', dt: [], args: ['{"file_path":"edit.js","old_string":"first\\nsecond","new_string":"new'] }] } }))
+  expect(opened.events[0].event.data).toMatchObject({ call_id: 'edit-call', stage: 'preparing', file_progress: { path: 'edit.js', added: 1, removed: 2 } })
   expect(view.accept(frame({ type: 'end', attemptId: 'a', revision: 3, index: 1, outcome: { kind: 'abandoned' } })).retire_attempts).toEqual(['a'])
   expect(view.preparations.size).toBe(0)
   view.accept(frame({ type: 'start', attemptId: 'retry', revision: 4, turn: 1, step: 1, startedAfterSeq: 0 }))
   expect(view.accept(frame({ type: 'chunk', attemptId: 'retry', revision: 5, index: 0, time: 2,
-    chunk: { type: 'tool-call-delta', index: 0, id: 'edit-call', name: 'edit', argumentsDelta: '' } })).events[0].event.data.argument_chars).toBe(0)
+    chunk: { type: 'tool-call-delta', index: 0, id: 'edit-call', name: 'edit', argumentsDelta: '' } })).events[0].event.data.file_progress).toEqual({ path: '', added: 0, removed: 0 })
 })
 it('keeps simultaneous file preparation counters separate and leaves other tools unchanged', () => {
   const view = new HistoryPresentation('session', () => run)
   view.accept(snapshot())
   view.accept(frame({ type: 'start', attemptId: 'a', revision: 1, turn: 1, step: 1, startedAfterSeq: 0 }))
-  const chunks = [{ index: 0, id: 'a', name: 'write', argumentsDelta: 'x'.repeat(1025) },
-    { index: 1, id: 'b', name: 'edit', argumentsDelta: 'x'.repeat(10) },
+  const chunks = [{ index: 0, id: 'a', name: 'write', argumentsDelta: '{"path":"a.js","content":"a\\nb' },
+    { index: 1, id: 'b', name: 'edit', argumentsDelta: '{"file_path":"b.js","old_string":"before","new_string":"after' },
     { index: 2, id: 'c', name: 'bash', argumentsDelta: 'x'.repeat(2000) }]
   const events = chunks.flatMap((chunk, index) => view.accept(frame({ type: 'chunk', attemptId: 'a', revision: index + 2, index, time: index + 1,
     chunk: { type: 'tool-call-delta', ...chunk } })).events)
-  expect(events.map(item => [item.event.data.call_id, item.event.data.argument_chars])).toEqual([['a', 1025], ['b', 10]])
+  expect(events.map(item => [item.event.data.call_id, item.event.data.file_progress])).toEqual([['a', { path: 'a.js', added: 2, removed: 0 }], ['b', { path: 'b.js', added: 1, removed: 1 }]])
 })
 it('renders automatic compaction once at its checkpoint in both live and restored history', () => {
   const records = [durable(1, 'turn/start', { turn: 1 }),
