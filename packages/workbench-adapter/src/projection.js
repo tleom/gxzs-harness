@@ -56,12 +56,17 @@ export function createAssistantStreamProjector(database, expectedOwnerId) {
 
 export function projectSessionEvent(database, sessionId, event, expectedOwnerId, context) {
   database.flushStreamEvents()
+  const projected = database.hasProjectedEvent(sessionId, event.seq)
+  // Settled history can contain thousands of events backed by megabyte-sized
+  // frozen tool catalogs. Only turn/end needs its receipt before deduplication:
+  // older adapters may have acknowledged the event before binding its end.
+  if (projected && event.type !== 'turn/end') return undefined
   const turn = event.data?.turn
   const run = Number.isInteger(turn) ? database.runForTurn(sessionId, turn) : undefined
   // Earlier adapter versions could acknowledge a native completion before its
   // autonomous receipt existed. Recover that durable end once after binding.
   const unprojectedEnd = event.type === 'turn/end' && run && run.sourceEndSeq == null
-  if (database.hasProjectedEvent(sessionId, event.seq) && !unprojectedEnd) return undefined
+  if (projected && !unprojectedEnd) return undefined
   return database.transaction(() => {
     const result = projectEvent(database, sessionId, event, expectedOwnerId, context)
     // Native events may precede verified autonomous admission at startup.
