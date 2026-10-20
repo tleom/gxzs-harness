@@ -110,6 +110,14 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
+      - name: Make room for runtime image layers
+        run: |
+          test "$RUNNER_ENVIRONMENT" = 'github-hosted'
+          df -h /
+          # BuildKit and the loaded smoke-test images coexist. These bundled
+          # SDKs are unused by the Node/Python/container verification below.
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          df -h /
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - name: Build Host image
@@ -148,3 +156,8 @@ jobs:
           cache-to: ${{ github.ref == 'refs/heads/main' && 'type=gha,scope=harness-sandbox,mode=max' || '' }}
       - name: Runtime, Office and container isolation smoke
         run: bash scripts/smoke-images.sh gxzs/verify-host gxzs/verify-manager gxzs/verify-sandbox
+      - name: Record image storage usage
+        if: always()
+        run: |
+          df -h /
+          docker system df

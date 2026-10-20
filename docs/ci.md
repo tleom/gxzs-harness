@@ -18,6 +18,8 @@ CI 使用 GitHub 托管的 `ubuntu-latest`，由面向 `main` 的 PR、`main` �
 
 三个镜像分别使用 GitHub Actions 的 BuildKit 层缓存，scope 为 `harness-host`、`harness-manager` 和 `harness-sandbox`，避免相互覆盖。缓存按 Dockerfile、构建上下文和参数的实际输入失效；本次提交的 `VCS_REF` 标签仍参与构建。镜像通过 `load: true` 装入本次 Runner 的 Docker，`push: false`，随后完整执行原有 [smoke-images.sh](../scripts/smoke-images.sh)。缓存命中不会跳过任何冒烟。
 
+BuildKit 构建区和加载后的冒烟镜像会同时占用磁盘。镜像任务在临时 GitHub Runner 中先清理未使用的 Android、.NET 和 GHC SDK，并记录前后磁盘及 Docker 用量；清理步骤限定为 GitHub 托管 Runner，保留 Node、Python 和 Docker。首次实跑曾因空间不足退出，因此缓存流程的验收同时包含空间检查。
+
 仅 `main` 的推送或手动运行更新缓存，后续 PR 只读取缓存，避免每个 PR 上传三套大型缓存。缓存缺失时正常冷构建；缓存写入错误会使任务失败，不伪装为验证通过。实现依据 [Docker GitHub Actions 缓存文档](https://docs.docker.com/build/ci/github-actions/cache/)。
 
 2026-10-20 核查时，Harness `main` 没有分支保护，所以保留主分支推送检查，覆盖直接推送。以后若启用强制 PR 和最新提交门禁，可以再评估取消合并后的重复验证；不能仅参照已启用主分支保护的其他仓库就直接移除。
