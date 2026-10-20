@@ -24,4 +24,4 @@ pnpm check:config
 
 `pnpm check:config` performs a real DSH `--dump-config` check and therefore requires the profile dependencies installed from the lockfile.
 
-The native lifecycle integration tests also load the locked DSH profile and use a local fake model. Linux manager/MCP tests and all three image builds run separately in CI. See `docs/repair-contract-20260922.md` for the current cross-repository protocol and `services/sandbox/README.md` for the sandbox build source.
+The native lifecycle integration tests also load the locked DSH profile and use a local fake model. Linux manager/MCP tests and all three image builds run separately in CI. The [CI guide](docs/ci.md) describes the verification gates, documentation-only path and image caches. See `docs/repair-contract-20260922.md` for the current cross-repository protocol and `services/sandbox/README.md` for the sandbox build source.
