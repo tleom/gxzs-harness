@@ -1647,6 +1647,45 @@ it('dismisses plan review without another model request and settles the Workbenc
   expect(t.agent.session.snapshotEvents().filter(event => event.type === 'turn/end').at(-1).data.reason).toEqual({ kind: 'completed' })
 })
 
+it('directly steers an old answer ahead of queued messages without waiting for another scheduler tick', async () => {
+  let release
+  const test = await fixture([new Promise(resolve => { release = resolve }), 'updated from reanswer', 'queued reply'])
+  const first = test.create('working')
+  await test.scheduler.enqueue(first, [{ type: 'text', text: first.query }])
+  await test.scheduler.tick()
+  await vi.waitFor(() => expect(test.model.requests).toHaveLength(1))
+  const bridge = new HumanInputBridge({ database: test.db, executionRun: id => test.runtime.executionRun(id),
+    resumeInput: (run, signal) => test.scheduler.resumeInput(run, signal) })
+  const question = bridge.handleRequest({ agent: test.agent, questions: [{ id: 'old', question: 'old question' }],
+    signal: new AbortController().signal }, () => { throw new Error('unexpected fallback') })
+  const oldId = test.db.getPendingInput(test.owner.ownerId, first.id).requestId
+  bridge.skip(test.owner.ownerId, first.id, oldId)
+  await question
+  const queued = test.create('ordinary queued message')
+  // A pending dispatcher snapshot must not delay an explicit reanswer.
+  test.db.saveSubmission(test.owner.ownerId, queued.id, [{ type: 'text', text: queued.query }])
+  const tick = vi.spyOn(test.scheduler, 'tick').mockResolvedValue()
+  const service = new WorkbenchService({ database: test.db, sessionController: test.sessions,
+    agents: test.ctx.agents, scheduler: test.scheduler })
+  service.humanInput = bridge
+  const body = { request_id: oldId, answers: [{ id: 'old', selected: [], custom: 'new evidence' }] }
+  const accepted = await service.supplement(test.owner, first.id, body)
+  expect(accepted).toMatchObject({ status: 'steered', steer_target_run_id: first.id,
+    input_supplement: [{ question: 'old question', answer: 'new evidence' }] })
+  expect(test.agent.inbox.nextStep.some(message => message.source?.rpcId === accepted.id)).toBe(true)
+  expect(test.agent.inbox.nextTurn).toHaveLength(0)
+  expect(test.db.submission(test.owner.ownerId, accepted.id)).toBeUndefined()
+  expect(test.scheduler.hasAdmission(test.agent.id)).toBe(true)
+  expect(test.db.getRun(test.owner.ownerId, queued.id).status).toBe('queued')
+  expect((await service.supplement(test.owner, first.id, body)).id).toBe(accepted.id)
+  release('original answer')
+  await test.agent.whenIdle()
+  expect(test.model.requests).toHaveLength(2)
+  expect(JSON.stringify(test.model.requests[1].messages)).toContain('new evidence')
+  expect(test.agent.session.snapshotEvents().filter(event => event.type === 'user/message' && event.data.source?.rpcId === accepted.id)).toHaveLength(1)
+  tick.mockRestore()
+})
+
 it('accepts an old answer while a newer native question has released admission, skipping only the newer question', async () => {
   let release
   const test = await fixture([new Promise(resolve => { release = resolve }), 'updated with old answer'])
