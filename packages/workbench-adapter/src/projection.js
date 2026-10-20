@@ -5,6 +5,7 @@ import { runPromptId } from './native-prompt.js'
 import { presentRunEvent } from './run-failure.js'
 import { contextUsage } from './context-usage.js'
 import { goalMentionResources } from './resource-mentions.js'
+import { scheduleOccurrences } from './schedule-notifications.js'
 
 const END_STATUS = {
   completed: 'completed', aborted: 'cancelled', error: 'failed',
@@ -329,7 +330,8 @@ function adoptMessage(database, sessionId, message, context) {
     // A display/admission receipt for a message DSH already delivered. Never enqueue it again.
     const { run } = database.createRun({ ownerId: chat.ownerId, chatId: chat.id, sessionId,
       id: message.id, requestKey: `schedule:${message.id}`, query: contentText(message.content),
-      selection: { ...chat.selection, native_source: 'schedule' }, mcpTools: context?.mcpTools ?? [] })
+      selection: { ...chat.selection, native_source: 'schedule', schedule_notification_pending: true,
+        schedule_occurrences: scheduleOccurrences(contentText(message.content)) }, mcpTools: context?.mcpTools ?? [] })
     database.adoptInboxMessage(sessionId, run.id, message.id)
     return run
   }

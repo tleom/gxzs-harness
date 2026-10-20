@@ -20,6 +20,7 @@ from owner_auth import owner_token, assertion_key
 from runtime_names import account_names, host_name, volume_prefix
 from global_skills import mount_arguments as global_skill_mounts, matches_mount, native_root
 
+IDLE_TIMEOUT_SECONDS = 2 * 60 * 60
 
 class Hosts:
     def __init__(self, state, docker, ensure_sandbox, identity, lock, admission, ensure_network):
@@ -32,6 +33,8 @@ class Hosts:
         self.recoveries = {}
         self.cleanup_at = {}
         self.native_snapshots = {}
+        self.sleep_protocols = {}
+        self.sleep_deadlines = {}
         self._maintenance_pool = ThreadPoolExecutor(max_workers=16, thread_name_prefix='host-maintenance')
         self._maintenance_guard = threading.Lock()
         self._maintenance_pending = {}
@@ -135,6 +138,22 @@ class Hosts:
                     raise ResourceUnavailable('个人工作环境正在恢复，请稍后重试', 'HOST_NOT_READY', 2)
                 if current.get('state') == 'ready' and current.get('ready') is False:
                     return current
+                if payload.get('scheduled_wakeup') is True:
+                    # Serialized with _maintain_one's final idle check/stop.
+                    # A wake either renews activity before that check or observes
+                    # the stopped pair and starts it again below.
+                    (self.root.parent / workspace).touch()
+                    if current.get('state') == 'ready' and current.get('ready') is True:
+                        sandbox, _ = self.identity(workspace)
+                        host_info = self._upgrade_inspect(host_name(current))
+                        sandbox_info = self._upgrade_inspect(sandbox)
+                        self._verify_named_container(current, host_info)
+                        self._verify_named_container(current, sandbox_info, sandbox=True)
+                        if (host_info and sandbox_info
+                                and host_info.get('State', {}).get('Running') is True
+                                and sandbox_info.get('State', {}).get('Running') is True
+                                and self.healthy(current['endpoint'])):
+                            return current
             else:
                 current.update(names)
                 if names:
@@ -454,7 +473,7 @@ class Hosts:
             return None
         raise ValueError('Container state could not be verified')
 
-    def _stop_pair(self, item):
+    def _stop_pair(self, item, *, deadline=None):
         """Do not release admission or tool fences until physical stop is proved."""
         sandbox, _ = self.identity(item['workspace_id'])
         containers = (host_name(item), sandbox)
@@ -465,7 +484,12 @@ class Hosts:
             if info is not None:
                 inspected.append(container)
         for container in inspected:
-            self.docker('stop', '--time', '10', container, check=True)
+            if deadline is not None:
+                if deadline - time.time() < 16:
+                    raise ValueError('Sleep handoff expired before container stop')
+                self.docker('stop', '--time', '10', container, timeout=15, check=True)
+            else:
+                self.docker('stop', '--time', '10', container, check=True)
         # A successful CLI exit is insufficient (daemon races, asynchronous
         # wrappers). Unknown inspection is not evidence that a container vanished.
         for container in containers:
@@ -667,26 +691,57 @@ class Hosts:
     def _activity_counts(payload):
         activity = payload.get('activity') or {}
         keys = ('runningAgents', 'pendingMessages', 'runningJobs', 'activeSchedules', 'activeSidebarResources', 'activeSettingsWrites')
-        if (activity.get('protocol') == 1 and activity.get('status') == 'ready'
+        if (type(activity.get('protocol')) is int and activity.get('protocol') in (1, 2) and activity.get('status') == 'ready'
                 and all(type(activity.get(key)) is int and activity[key] >= 0 for key in keys)):
-            return {key: activity[key] for key in keys}
+            counts = {key: activity[key] for key in keys}
+            if activity['protocol'] == 2:
+                registered = activity.get('registeredSchedules')
+                pending = activity.get('pendingScheduleReports')
+                if (type(registered) is not int or not 0 <= registered <= counts['activeSchedules']
+                        or type(pending) is not int or pending < 0):
+                    return None
+                counts['activeSchedules'] -= registered
+                counts['activeSettingsWrites'] += pending
+            return counts
         return None
 
     def native_activity(self, endpoint):
         """Only a complete native activity read can authorize idle shutdown.
 
-        Active schedules keep their DSH timer resident, including while the
-        user is offline. The manager never computes or delivers reminders.
+        Legacy active schedules remain resident. Protocol 2 permits sleep only
+        after platform wakeup acknowledgment and a final native handoff.
+        The manager never computes or delivers reminders.
         Older Hosts and unavailable catalogs fail closed until upgraded/ready.
         """
         try:
             with self.opener.open(endpoint + '/ai/workbench/health', timeout=2) as response:
                 payload = json.loads(response.read(4096))
                 if response.status == 200 and payload.get('ready') is True:
+                    self.sleep_protocols[endpoint] = (payload.get('activity') or {}).get('protocol')
                     return self._activity_counts(payload)
         except Exception:
             pass
         return None
+
+    def _prepare_sleep(self, item):
+        """The current Host fences writes/steps and rechecks its acknowledged next wakeup."""
+        if self.sleep_protocols.get(item['endpoint']) != 2:
+            return True  # Legacy protocol still refuses every active schedule.
+        try:
+            token = owner_token(os.environ['WORKBENCH_SANDBOX_MANAGER_TOKEN'], item['owner_id'],
+                                item['workspace_id'], item['generation'], item['instance_id'])
+            request = Request(item['endpoint'] + '/ai/workbench/lifecycle/sleep', data=b'', method='POST',
+                              headers={'Authorization': 'Bearer ' + token})
+            with self.opener.open(request, timeout=3) as response:
+                payload = json.loads(response.read(4096))
+            prepared = (payload.get('prepared') is True and payload.get('generation') == item['generation']
+                    and payload.get('instance_id') == item['instance_id']
+                    and type(payload.get('until')) is int and payload['until'] > time.time() * 1000 + 25_000)
+            if prepared:
+                self.sleep_deadlines[item['instance_id']] = payload['until'] / 1000
+            return prepared
+        except Exception:
+            return False
 
     def failed_transport_activity(self, endpoint):
         """A definitive, non-reconnecting SSH failure is not a probe timeout."""
@@ -910,10 +965,18 @@ class Hosts:
                     self.native_snapshots[item['instance_id']] = dict(native_activity)
                 native_idle = native_activity is not None and not any(native_activity.values())
                 idle = (item.get('state') != 'draining' and activity.exists()
-                        and time.time() - activity.stat().st_mtime > 1800
+                        and time.time() - activity.stat().st_mtime > IDLE_TIMEOUT_SECONDS
                         and not self.admission.busy(item['owner_id']) and native_idle)
                 if host_running and idle:
-                    self._stop_pair(item)
+                    if not self._prepare_sleep(item):
+                        if healthy and item.get('ready') is True:
+                            heartbeats.append((dict(item), 'ready'))
+                        return
+                    deadline = self.sleep_deadlines.pop(item['instance_id'], None)
+                    if deadline is None:
+                        self._stop_pair(item)
+                    else:
+                        self._stop_pair(item, deadline=deadline)
                     self._fence(item['workspace_id'], item['owner_id'], item['instance_id'])
                     item.update(state='stopped', ready=False)
                     self._save(record, item)

@@ -31,6 +31,11 @@ export class WorkbenchDatabase {
         version INTEGER PRIMARY KEY,
         applied_at INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS platform_schedule_sync (
+        owner_id TEXT PRIMARY KEY,
+        sequence INTEGER NOT NULL,
+        fingerprint TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS chats (
         id TEXT PRIMARY KEY,
         owner_id TEXT NOT NULL,
@@ -212,6 +217,17 @@ export class WorkbenchDatabase {
     this.flushStreamEvents()
     clearTimeout(this.streamTimer)
     this.db.close()
+  }
+
+  scheduleSyncSequence(ownerId, fingerprint) {
+    return this.transaction(() => {
+      const current = this.db.prepare('SELECT sequence,fingerprint FROM platform_schedule_sync WHERE owner_id=?').get(ownerId)
+      if (current?.fingerprint === fingerprint) return current.sequence
+      const sequence = (current?.sequence ?? 0) + 1
+      this.db.prepare(`INSERT INTO platform_schedule_sync(owner_id,sequence,fingerprint) VALUES(?,?,?)
+        ON CONFLICT(owner_id) DO UPDATE SET sequence=excluded.sequence,fingerprint=excluded.fingerprint`).run(ownerId, sequence, fingerprint)
+      return sequence
+    })()
   }
 
   publishEvent(runId, entry) {
@@ -513,6 +529,43 @@ export class WorkbenchDatabase {
     return this.db.prepare(`SELECT r.*, f.result_json AS stop_confirmation_json FROM runs r LEFT JOIN run_fences f ON f.run_id=r.id
       WHERE r.owner_id = ? AND r.chat_id = ? AND r.id IN (${placeholders})`)
       .all(ownerId, chatId, ...tracked).map(decodeRun)
+  }
+
+  pendingScheduleNotifications(ownerId) {
+    return this.db.prepare(`SELECT r.* FROM runs r JOIN chats c ON c.id=r.chat_id
+      WHERE r.owner_id=? AND c.deleted_at IS NULL
+      AND json_extract(r.selection_json, '$.schedule_notification_pending')=1
+      ORDER BY r.created_at,r.id`).all(ownerId).map(decodeRun)
+  }
+
+  rememberScheduleInitialization(ownerId, chatId, task, createdAt) {
+    return this.saveCommandReceipt(ownerId, chatId, `schedule-notify-init:${task.id}`, { task, createdAt })
+  }
+
+  pendingScheduleInitializations(ownerId) {
+    return this.db.prepare(`SELECT r.chat_id,r.result_json FROM command_receipts r JOIN chats c ON c.id=r.chat_id
+      WHERE r.owner_id=? AND c.deleted_at IS NULL AND r.request_key LIKE 'schedule-notify-init:%'
+      AND json_extract(r.result_json, '$.createdAt') IS NOT NULL
+      ORDER BY r.created_at,r.request_key`).all(ownerId)
+      .map(row => ({ chatId: row.chat_id, ...JSON.parse(row.result_json) }))
+  }
+
+  acknowledgeScheduleInitialization(ownerId, chatId, jobId) {
+    // The platform's config version is the replay fence; completed local
+    // initialization records need not accumulate beside creation receipts.
+    this.db.prepare('DELETE FROM command_receipts WHERE owner_id=? AND chat_id=? AND request_key=?')
+      .run(ownerId, chatId, `schedule-notify-init:${jobId}`)
+  }
+
+  acknowledgeScheduleNotification(ownerId, runId) {
+    const run = this.getRun(ownerId, runId)
+    if (run) this.updateRunResources(run, { ...run.selection, schedule_notification_pending: false }, run.mcpTools)
+  }
+
+  scheduleNotificationEnd(ownerId, runId) {
+    return this.db.prepare(`SELECT e.payload_json,e.created_at FROM run_events e JOIN runs r ON r.id=e.run_id
+      WHERE r.owner_id=? AND r.id=? AND json_extract(e.payload_json, '$.event')='workbench_end'
+      ORDER BY e.seq DESC LIMIT 1`).get(ownerId, runId)
   }
 
   listRuns(ownerId, chatId) {

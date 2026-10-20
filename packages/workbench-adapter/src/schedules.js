@@ -1,4 +1,4 @@
-import { httpError } from './http.js'
+import { errorResponse, httpError } from './http.js'
 
 /** Native Host Schedule owns storage, timing, delivery and receipts. */
 export class WorkbenchSchedules {
@@ -7,6 +7,8 @@ export class WorkbenchSchedules {
     this.database = database
     this.service = service
     this.pendingNames = new Map()
+    this.pendingCreates = new Map()
+    this.nativeCreations = 0
   }
   get native() {
     const value = this.getNative()
@@ -14,6 +16,12 @@ export class WorkbenchSchedules {
     return value
   }
   async catalog(owner) {
+    const tasks = await this.ownedCatalog(owner)
+    if (!this.notifications) return tasks
+    try { return await this.notifications.sync(tasks) }
+    catch { return tasks.map(task => ({ ...task, notification_available: false })) }
+  }
+  async ownedCatalog(owner) {
     const chats = new Map(this.database.chatBindings(owner.ownerId).map(chat => [chat.sessionId, chat]))
     return (await this.native.catalog()).flatMap(task => {
       const chat = chats.get(task.sessionId)
@@ -79,10 +87,65 @@ export class WorkbenchSchedules {
   }
   async create(owner, chatId, request, signal) {
     const chat = this.service.requireChat(owner, chatId)
+    if (request.request_key === undefined) return this.createNative(chat, request, signal)
+    if (typeof request.request_key !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(request.request_key))
+      throw httpError(400, '创建请求标识无效')
+    const key = `schedule-create:${request.request_key}`
+    const fingerprint = JSON.stringify(Object.fromEntries(['title', 'prompt', 'after_seconds', 'at',
+      'every_seconds', 'daily', 'weekly', 'cron', 'notify_enabled'].map(name => [name, request[name]])))
+    const receipt = this.database.getCommandReceipt(owner.ownerId, chat.id, key)
+    if (receipt && receipt.fingerprint !== fingerprint)
+      throw httpError(409, '本次创建已提交，请先确认结果后再修改任务')
+    const pendingKey = JSON.stringify([owner.ownerId, chat.id, key])
+    if (this.pendingCreates.has(pendingKey)) return this.pendingCreates.get(pendingKey)
+    const resultKey = `${key}:result`
+    const saved = this.database.getCommandReceipt(owner.ownerId, chat.id, resultKey)
+    if (saved) return saved
+    if (receipt)
+      throw httpError(409, '创建结果尚未确认，请刷新任务列表核对，避免重复创建')
+    signal?.throwIfAborted()
+    // Check readiness before committing intent. After intent, connection loss
+    // must not cancel the write or its receipt. Native storage and SQLite cannot
+    // commit atomically; an interrupted intent must never blindly create again.
+    const native = this.native
+    this.database.saveCommandReceipt(owner.ownerId, chat.id, key, { fingerprint })
+    const operation = (async () => {
+      let result
+      try { result = await this.createNative(chat, request, undefined, native) }
+      catch (error) {
+        if (error?.name !== 'ScheduleInputError') throw error
+        // Native input refusals occur before persistence and can be corrected.
+        result = { ...errorResponse(error).body, creation_failed: true }
+      }
+      return this.database.saveCommandReceipt(owner.ownerId, chat.id, resultKey, result)
+    })()
+    this.pendingCreates.set(pendingKey, operation)
+    try { return await operation }
+    finally { this.pendingCreates.delete(pendingKey) }
+  }
+  async createNative(chat, request, signal, native = this.native) {
     // The signed owner/chat binding supplies the Session; the client cannot choose it.
     const { title, prompt, after_seconds, at, every_seconds, daily, weekly, cron } = request
-    return this.native.create(chat.sessionId, { title, prompt,
-      ...Object.fromEntries(Object.entries({ after_seconds, at, every_seconds, daily, weekly, cron }).filter(([, value]) => value !== undefined)) }, signal)
+    if (request.notify_enabled !== undefined && typeof request.notify_enabled !== 'boolean')
+      throw httpError(400, '通知设置参数无效')
+    const createdAt = Date.now()
+    this.nativeCreations++
+    try {
+      const record = await native.create(chat.sessionId, { title, prompt,
+        ...Object.fromEntries(Object.entries({ after_seconds, at, every_seconds, daily, weekly, cron }).filter(([, value]) => value !== undefined)) }, signal)
+      if (!this.notifications) return record
+      const task = { ...record, sessionId: chat.sessionId, chat_id: chat.id }
+      try {
+        if (request.notify_enabled === true) await this.notifications.initialize(task, createdAt)
+        else await this.notifications.sync([task])
+        return record
+      } catch {
+        return { ...record, notification_error: '任务已创建，通知设置暂未确认，请稍后刷新或重新设置' }
+      }
+    } finally {
+      this.nativeCreations--
+      this.notifications?.kick()
+    }
   }
   async task(owner, id) {
     if (typeof id !== 'string' || !id) throw httpError(400, '定时任务标识无效')
@@ -98,11 +161,33 @@ export class WorkbenchSchedules {
   async update(owner, id, request, signal) {
     const task = await this.task(owner, id)
     const { expected, title, prompt, change } = request
-    return this.native.update({ sessionId: task.sessionId, id, expected,
+    if (request.notify_enabled !== undefined && (!task.notification_available || typeof request.notify_enabled !== 'boolean'))
+      throw httpError(503, '通知设置暂不可用，请刷新后重试')
+    if (request.notify_enabled !== undefined && request.notification_version !== task.notification_version)
+      throw httpError(409, '通知设置已更新，请刷新后重试')
+    const result = await this.native.update({ sessionId: task.sessionId, id, expected,
       ...Object.fromEntries(Object.entries({ title, prompt, change }).filter(([, value]) => value !== undefined)) }, signal)
+    if (!result?.code && request.notify_enabled !== undefined) {
+      try {
+        await this.notifications.configure({ ...task, title: title ?? task.title }, request.notify_enabled, request.notification_version, signal)
+      } catch {
+        // Native rules have already committed. Return their new expected record
+        // so the editor can retry settings without replaying an obsolete rule.
+        let latest
+        try { latest = await this.task(owner, id) } catch { /* Retry can refresh settings later. */ }
+        return { ...result, notification_version: latest?.notification_version,
+          notification_error: '任务规则已保存，通知设置未确认，请重试保存通知设置' }
+      }
+    }
+    return result
   }
   async delete(owner, id, signal) {
     const task = await this.task(owner, id)
-    return this.native.delete({ sessionId: task.sessionId, id }, signal)
+    const result = await this.native.delete({ sessionId: task.sessionId, id }, signal)
+    if (result.deleted && this.notifications) {
+      try { await this.notifications.remove(task, signal) }
+      catch { /* Native deletion is committed; retained records cannot rearm it. */ }
+    }
+    return result
   }
 }

@@ -13,6 +13,7 @@ import { createRequire } from 'node:module'
 import { DatabaseSync } from 'node:sqlite'
 import { pathToFileURL } from 'node:url'
 import { createContext, runInContext } from 'node:vm'
+import { createSchedulePlatformFixture } from './smoke-schedule-platform.mjs'
 
 if (process.platform !== 'linux') throw new Error('Host bootstrap smoke requires the Linux host image')
 
@@ -106,8 +107,14 @@ const fixture = (handler) => http.createServer(async (req, res) => {
     respond(res, 500, { message: 'Bootstrap fixture rejected the request' })
   }
 })
+const schedulePlatform = createSchedulePlatformFixture()
 const platform = fixture((req, res) => {
   checkIdentity(req, platformToken)
+  const scheduleResult = schedulePlatform(req.method, req.url, req.fixtureBody)
+  if (scheduleResult !== undefined) {
+    respond(res, 200, { data: scheduleResult })
+    return
+  }
   if (req.method === 'POST' && req.url === '/internal/workbench/mcp/call') {
     assert.equal(req.fixtureBody.resource_id, fixtureTool.id)
     assert.equal(req.fixtureBody.tool_name, fixtureTool.tool_name)
@@ -459,7 +466,10 @@ async function nativeSettingsRoundtrip() {
   void changing.catch(() => {})
   try {
     await Promise.race([gate.observed.promise, delay(5000).then(() => { throw new Error('Manager settings check did not arrive') })])
-    await waitForHealth((status, body) => status === 200 && body.activity?.activeSettingsWrites === 1,
+    // Protocol 2 counts both the native settings hold and the enclosing HTTP
+    // sleep barrier. Neither may disappear before the Manager admits this write.
+    await waitForHealth((status, body) => status === 200 && body.activity?.protocol === 2
+      && body.activity.activeSettingsWrites === 2,
       'in-flight settings write is visible before Manager approval', 5000)
   } finally {
     gate.release.resolve()
@@ -478,7 +488,8 @@ async function nativeSettingsRoundtrip() {
     assert.equal(denied.status, 503, 'Draining must reject new settings writes before native mutation')
     assert.equal((await denied.json()).code, 'SANDBOX_UPDATING')
   } finally { settingsWritable = true }
-  await waitForHealth((status, body) => status === 200 && body.activity?.activeSettingsWrites === 0,
+  await waitForHealth((status, body) => status === 200 && body.activity?.protocol === 2
+    && body.activity.activeSettingsWrites === 0,
     'completed and refused settings writes release their activity count', 5000)
   assert.equal((await nativeSettingsView()).namespaces.find(row => row.ns === 'subagent').value.maxDepth, value,
     'The maintenance refusal must preserve the committed setting')
@@ -713,6 +724,9 @@ try {
   registered = true
   await waitForHealth((status, body) => acceptedCatalogs > 0 && status === 200 && body.live === true && body.ready === true,
     'registered catalog: HTTP 200, live=true, ready=true', 30_000)
+  await waitForHealth((status, body) => status === 200 && body.activity?.protocol === 2
+    && body.activity.pendingScheduleReports === 0 && body.activity.activeSchedules === 0
+    && body.activity.registeredSchedules === 0, 'empty schedule snapshot acknowledged', 10_000)
   await nativeClientRoundtrip()
   if (legacyProof) await assertLegacyProfileMigration(legacyProof)
   const nativeSettingsProof = await nativeSettingsRoundtrip()
@@ -801,17 +815,31 @@ try {
     }
     const scheduleResponse = await signedRequest('POST', `/chats/${chat.id}/schedules`, {
       title: 'Fixture scheduled reminder', prompt: 'Synthetic future reminder', after_seconds: 3600,
+      notify_enabled: true, request_key: randomUUID(),
     })
     assert.equal(scheduleResponse.status, 201, 'Full host must resolve the late native schedule service')
     const task = (await scheduleResponse.json()).data
+    assert.equal(task.notification_error, undefined, 'Creation notification preference must be confirmed')
     const tasks = (await (await signedRequest('GET', '/schedules')).json()).data
-    assert.ok(tasks.some(item => item.id === task.id && item.chat_id === chat.id))
-    const updatedTask = await signedRequest('PATCH', `/schedules/${task.id}`, { expected: task, title: 'Updated fixture reminder' })
+    const listed = tasks.find(item => item.id === task.id && item.chat_id === chat.id)
+    assert.ok(listed?.notification_available && listed.notify_enabled, 'Catalog must expose initialized notification settings')
+    await waitForHealth((status, body) => status === 200 && body.activity?.protocol === 2
+      && body.activity.activeSchedules === 1 && body.activity.registeredSchedules === 1
+      && body.activity.pendingScheduleReports === 0, 'future task wakeup acknowledged', 10_000)
+    const updatedTask = await signedRequest('PATCH', `/schedules/${task.id}`, { expected: task, title: 'Updated fixture reminder',
+      notify_enabled: false, notification_version: listed.notification_version })
     assert.equal(updatedTask.status, 200)
-    assert.equal((await updatedTask.json()).data.record.title, 'Updated fixture reminder')
+    const updatedRecord = (await updatedTask.json()).data
+    assert.equal(updatedRecord.record.title, 'Updated fixture reminder')
+    assert.equal(updatedRecord.notification_error, undefined)
+    const changedTasks = (await (await signedRequest('GET', '/schedules')).json()).data
+    assert.equal(changedTasks.find(item => item.id === task.id)?.notify_enabled, false)
     assert.equal((await signedRequest('DELETE', `/schedules/${task.id}`)).status, 200)
+    await waitForHealth((status, body) => status === 200 && body.activity?.protocol === 2
+      && body.activity.activeSchedules === 0 && body.activity.registeredSchedules === 0
+      && body.activity.pendingScheduleReports === 0, 'deleted task wakeup acknowledged', 10_000)
     assert.equal(modelCalls, 0, 'Schedule management must not call the model')
-    console.log('PASS native schedule HTTP: create, catalog, update and delete through the full host')
+    console.log('PASS native schedule HTTP: notification initialization/update, wakeup acknowledgment and deletion through the full host')
     // Empty native sessions are lazy until their first event or explicit flush.
     const renamed = await signedRequest('PATCH', `/chats/${chat.id}`, { title: 'Native create smoke' })
     assert.equal(renamed.status, 200)

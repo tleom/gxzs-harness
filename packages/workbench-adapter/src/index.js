@@ -35,7 +35,10 @@ import { WorkbenchJobs } from './jobs.js'
 import { registerScheduledClaims } from './scheduled-claims.js'
 import { isNativeNotice } from './display-events.js'
 import { registerToolDisplayReceipts } from './tool-display-receipts.js'
+import { ScheduleNotifications, registerScheduleNotificationTool } from './schedule-notifications.js'
 import { nativeHostActivity } from './host-activity.js'
+import { ScheduleWakeups } from './schedule-wakeups.js'
+import { SleepBarrier } from './sleep-barrier.js'
 import { WorkbenchNativeClient } from './native-client.js'
 import { WorkbenchNativeSessions } from './native-sessions.js'
 import { WorkbenchSubagentSettings } from './settings.js'
@@ -107,6 +110,19 @@ export function apply(ctx, config) {
   }
   service.waitSessionActivity = sessionId => waitSessionActivity(ctx, sessionId)
   const schedules = new WorkbenchSchedules({ native: () => ctx.get('schedule'), database, service })
+  const scheduleNotifications = new ScheduleNotifications({ database, platformClient: ctx.workbenchPlatformClient,
+    ownerId: config.ownerId, schedules, logger: ctx.logger })
+  schedules.notifications = scheduleNotifications
+  const scheduleWakeups = new ScheduleWakeups({ database, platformClient: ctx.workbenchPlatformClient,
+    ownerId: config.ownerId, schedules, logger: ctx.logger })
+  const sleepBarrier = new SleepBarrier()
+  const readActivity = () => nativeHostActivity(ctx, runtime.sidebarActivity,
+    () => subagentSettings.activeWrites + sleepBarrier.requests, tasks => {
+      const safety = scheduleWakeups.safety(tasks)
+      return { ...safety, pendingScheduleReports: safety.pendingScheduleReports
+        + database.pendingScheduleNotifications(config.ownerId).filter(run => scheduleNotifications.execution(run)).length }
+    })
+  registerScheduleNotificationTool(ctx, { schedules, database, runtime, ownerId: config.ownerId })
   workspaces.schedules = schedules
   const subagents = new WorkbenchSubagents({ sessions: ctx.sessionController, service, native: ctx.subagents, attachments: ctx.attachments, runtime })
   const nativeSessions = new WorkbenchNativeSessions({ ctx, sessions: ctx.sessionController, service, subagents, database })
@@ -164,6 +180,8 @@ export function apply(ctx, config) {
       if (scheduler.closed) return
       recovered = true
       recoveryError = undefined
+      scheduleNotifications.start(ctx)
+      scheduleWakeups.start(ctx)
       scheduler.start()
       resumeInboxes()
     })().catch(error => {
@@ -198,6 +216,7 @@ export function apply(ctx, config) {
   registerScheduledClaims(ctx, { runtime, database, ownerId: config.ownerId })
   registerToolDisplayReceipts(ctx, { runtime, database, ownerId: config.ownerId })
   ctx.on('agent/pre-step', async (payload, next) => {
+    sleepBarrier.assertAwake()
     const autonomous = payload.messages?.filter(message => ['schedule', 'tool-jobs'].includes(message.source?.kind) || isNativeNotice(message)) ?? []
     const displays = new Map()
     const rememberSchedule = run => {
@@ -225,6 +244,7 @@ export function apply(ctx, config) {
     if (recoveryError) return { kind: 'reject' }
     rememberSchedule(runtime.executionRun(payload.agent.session?.id ?? payload.agent.id))
     await Promise.all(displays.values())
+    sleepBarrier.assertAwake()
     return scheduler.admitNativeStep(payload, () => service.guardSkillInvocations(payload, next))
   }, { global: true, prepend: true })
   ctx.on('agent/status', ({ agent, status }) => {
@@ -266,7 +286,7 @@ export function apply(ctx, config) {
     })))
     return {
       resources_pending: modelsOnly,
-      dsh_version: '0.2.1-rc.2', schedule_protocol: 1, subagent_protocol: 1, terminal_protocol: 1, browser_protocol: 1, browser_input_protocol: 2, job_protocol: 1,
+      dsh_version: '0.2.1-rc.2', schedule_protocol: 1, schedule_notification_protocol: 1, schedule_creation_protocol: 1, subagent_protocol: 1, terminal_protocol: 1, browser_protocol: 1, browser_input_protocol: 2, job_protocol: 1,
       activity_protocol: 1, sidebar_lease_protocol: 1, human_input_protocol: 1, followup_protocol: 1, history_protocol: 1, native_history_protocol: 1,
       ...(ctx.get('clientModules') ? { native_client_protocol: 1, native_session_client_protocol: 2, native_schedule_client_protocol: 1,
         ...(ctx.sessionReferenceResolver.listSessionCandidates && ctx.get('fileReferences')?.listObserved ? { native_subagent_reference_protocol: 1 } : {}),
@@ -573,8 +593,11 @@ export function apply(ctx, config) {
       sendJson(res, 200, { data: await service.stopRun(owner, match[1]) })],
     ['PATCH', /^\/runs\/([\w-]+)\/queue$/, async ({ owner, json }, res, match) =>
       sendJson(res, 200, { data: await service.editQueued(owner, match[1], json) })],
-    ['DELETE', /^\/runs\/([\w-]+)\/queue$/, async ({ owner }, res, match) =>
-      sendJson(res, 200, { data: await service.removeQueued(owner, match[1]) })],
+    ['DELETE', /^\/runs\/([\w-]+)\/queue$/, async ({ owner }, res, match) => {
+      const data = await service.removeQueued(owner, match[1])
+      scheduleNotifications.kick()
+      sendJson(res, 200, { data })
+    }],
     ['POST', /^\/runs\/([\w-]+)\/steer$/, async ({ owner, json }, res, match) =>
       sendJson(res, 200, { data: await service.steer(owner, match[1], String(json.target_run_id ?? '')) })],
     ['POST', /^\/runs\/([\w-]+)\/input-supplement$/, async ({ owner, json }, res, match) =>
@@ -678,11 +701,19 @@ export function apply(ctx, config) {
   let diagnosticWindow = 0, diagnosticCount = 0, diagnosticSuppressed = 0
   const handler = async (req, res) => {
     let diagnosticRoute = 'bootstrap'
+    let leaveRequest
     try {
+      if (req.method === 'POST' && req.url === config.basePath + '/lifecycle/sleep') {
+        const result = await sleepBarrier.prepare(req.headers.authorization, readActivity, {
+          generation: Number(process.env.GXZS_HOST_GENERATION), instance_id: process.env.GXZS_HOST_INSTANCE_ID,
+        })
+        sendJson(res, 200, result)
+        return
+      }
       if (req.method === 'GET' && req.url === config.basePath + '/health') {
         diagnosticRoute = 'health'
         const available = recovered && !database.streamFlushError
-        const activity = available ? await nativeHostActivity(ctx, runtime.sidebarActivity, () => subagentSettings.activeWrites) : { protocol: 1, status: 'unknown' }
+        const activity = available ? await readActivity() : { protocol: 1, status: 'unknown' }
         // Sample the non-reconnecting native transport after the activity await.
         // A completed bootstrap does not make a subsequently closed SSH usable.
         const ssh = ctx.get('ssh')
@@ -711,6 +742,8 @@ export function apply(ctx, config) {
         contentType: req.headers['content-type'] ?? '', lastEventId: req.headers['last-event-id'] ?? '',
       })
       if (owner.ownerId !== config.ownerId) throw httpError(403, '当前用户不属于此工作台宿主')
+      sleepBarrier.assertAwake()
+      if (!['GET', 'HEAD', 'OPTIONS'].includes(req.method)) leaveRequest = sleepBarrier.enter()
       const contentType = req.headers['content-type'] ?? ''
       const context = { owner, req, url, body, json: body.length && contentType.includes('application/json') ? parseJson(body) : {} }
       let methodNotAllowed = false
@@ -753,7 +786,7 @@ export function apply(ctx, config) {
       if (res.destroyed || res.writableEnded) return
       if (!res.headersSent) sendJson(res, failure.status, failure.body)
       else res.end()
-    }
+    } finally { leaveRequest?.() }
   }
 
   ctx.effect(() => {
@@ -765,6 +798,8 @@ export function apply(ctx, config) {
       terminals.dispose()
       browsers.dispose()
       disposeRoute?.()
+      scheduleNotifications.close()
+      scheduleWakeups.close()
       database.close()
     }
   }, 'gxzs workbench adapter')

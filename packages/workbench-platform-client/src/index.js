@@ -19,6 +19,8 @@ const ROUTES = new Set([
   'GET mcp/catalog', 'GET mcp/plugins', 'POST mcp/call', 'POST mcp/cancel',
   'GET workbench/config',
   'POST scheduling',
+  'POST jobs',
+  'POST schedule-wakeups',
 ])
 
 function transientConfigRead(error) {

@@ -50,7 +50,9 @@ it('uses the published native JSON domain, delivers once and preserves rule/hist
     expect(modelCreated).toMatchObject({ title: '对话创建', prompt: '由模型工具创建的提醒', kind: 'after' })
     expect((await first.gateway.catalog(owner)).some(task => task.id === modelCreated.id)).toBe(true)
     await first.gateway.delete(owner, modelCreated.id)
-    const daily = await first.gateway.create(owner, chat.id, { title: '每天提醒', prompt: '中文内容', daily: { time: '08:00:00', time_zone: 'Asia/Shanghai' } })
+    const createDaily = { request_key: 'daily-creation', title: '每天提醒', prompt: '中文内容', daily: { time: '08:00:00', time_zone: 'Asia/Shanghai' } }
+    const daily = await first.gateway.create(owner, chat.id, createDaily)
+    expect(await first.gateway.create(owner, chat.id, createDaily)).toEqual(daily)
     const once = await first.gateway.create(owner, chat.id, { title: '立即验证', prompt: '只投递一次', after_seconds: 1 })
     const forkSession = first.ctx.sessions.fork(first.agent.session)
     const fork = db.createChat({ ownerId: owner.ownerId, sessionId: forkSession.id, selection: {} })
@@ -73,6 +75,7 @@ it('uses the published native JSON domain, delivers once and preserves rule/hist
     expect(receipt.records[0].prompt).toBe('只投递一次')
     await first.ctx.fiber.dispose()
     const restarted = await start()
+    expect(await restarted.gateway.create(owner, chat.id, createDaily)).toEqual(daily)
     expect((await restarted.gateway.catalog(owner)).map(task => [task.id, task.status])).toEqual(expect.arrayContaining([[daily.id, 'active'], [once.id, 'inactive']]))
     expect(await restarted.gateway.history(owner, once.id)).toEqual(receipt)
     expect(delivered).toHaveBeenCalledOnce()
