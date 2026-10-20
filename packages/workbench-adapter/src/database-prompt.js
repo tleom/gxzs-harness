@@ -6,6 +6,8 @@ const responseStyles = {
   concise: '简洁务实的回答，请直接给出结论与重点，明确可执行的步骤，减少重复说明',
   humorous: '轻松幽默的回答，请在适合的场合使用自然、得体的幽默，保持内容清晰并贴合话题',
   patient: '耐心细致的回答，请循序渐进地解释复杂内容，必要时提供步骤、例子和术语说明',
+  imaginative: '天马行空的回答，请大胆联想、跳出常规，从不同角度提出新颖、有趣的思路',
+  sharp: '毒舌犀利的回答，请直截了当地指出问题和漏洞，观点鲜明，吐槽精准、有锋芒',
 }
 
 /** Render user-owned preferences literally; an old backend contributes no preferences. */

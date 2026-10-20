@@ -100,3 +100,11 @@ it.each(['professional', 'enthusiastic', 'concise', 'humorous', 'patient'])(
     expect(text).not.toContain('称呼偏好：')
     expect(text).not.toContain('自定义指令：')
   })
+
+it.each([['imaginative', '天马行空'], ['sharp', '毒舌犀利']])(
+  'renders the %s preference in the user context', (responseStyle, label) => {
+    const text = renderUserPreferences({ ...emptyPreferences, responseStyle })
+    expect(text).toContain(`回答偏好：用户偏好${label}的回答`)
+    expect(text).not.toContain('称呼偏好：')
+    expect(text).not.toContain('自定义指令：')
+  })
