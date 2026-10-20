@@ -466,7 +466,10 @@ async function nativeSettingsRoundtrip() {
   void changing.catch(() => {})
   try {
     await Promise.race([gate.observed.promise, delay(5000).then(() => { throw new Error('Manager settings check did not arrive') })])
-    await waitForHealth((status, body) => status === 200 && body.activity?.activeSettingsWrites === 1,
+    // Protocol 2 counts both the native settings hold and the enclosing HTTP
+    // sleep barrier. Neither may disappear before the Manager admits this write.
+    await waitForHealth((status, body) => status === 200 && body.activity?.protocol === 2
+      && body.activity.activeSettingsWrites === 2,
       'in-flight settings write is visible before Manager approval', 5000)
   } finally {
     gate.release.resolve()
@@ -485,7 +488,8 @@ async function nativeSettingsRoundtrip() {
     assert.equal(denied.status, 503, 'Draining must reject new settings writes before native mutation')
     assert.equal((await denied.json()).code, 'SANDBOX_UPDATING')
   } finally { settingsWritable = true }
-  await waitForHealth((status, body) => status === 200 && body.activity?.activeSettingsWrites === 0,
+  await waitForHealth((status, body) => status === 200 && body.activity?.protocol === 2
+    && body.activity.activeSettingsWrites === 0,
     'completed and refused settings writes release their activity count', 5000)
   assert.equal((await nativeSettingsView()).namespaces.find(row => row.ns === 'subagent').value.maxDepth, value,
     'The maintenance refusal must preserve the committed setting')
