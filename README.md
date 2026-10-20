@@ -13,6 +13,8 @@ See `docs/architecture.md` and `docs/workbench-migration-matrix.md` before addin
 
 Persistence uses Node's built-in `node:sqlite` with WAL and full synchronous transactions. The API is experimental on Node 22; verified locally on Node 22.23.2. No native addon compilation is required.
 
+Personal prompts are stored by the backend in `gxzs_agent_prompt` and included in the authenticated owner's `workbench/config` response. The adapter reads them at each model step and turns a preferred form of address, background, answer preference and custom instructions into literal, required DSH user context, including for complete-prompt presets, scheduled turns and local child agents. Only filled fields contribute text; the default answer preference contributes nothing. Deploy the backend migration and API before this adapter; older backends without `user_preferences` continue to work. Platform instructions remain system-prompt sections.
+
 ## Commands
 
 ```bash

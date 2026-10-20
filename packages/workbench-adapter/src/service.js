@@ -1179,7 +1179,13 @@ export class WorkbenchService {
       for (const question of pending)
         if (question.status === 'pending' && question.requestId !== input.requestId)
           this.humanInput.skip(owner.ownerId, active.id, question.requestId)
-      if (this.scheduler) await this.scheduler.enqueue(run, content)
+      if (this.scheduler) {
+        // Reuse explicit direct-send handling so a live, admitted turn receives
+        // the answer now, instead of waiting behind a dispatcher snapshot.
+        this.database.saveSubmission(owner.ownerId, run.id, content)
+        if (active) await this.steerQueued(owner, run.id, active.id)
+        else void this.scheduler.tick()
+      }
       else await this.sessions.prompt({ requestId: run.id, sessionId: run.sessionId, mode: 'steer', content }, new AbortController().signal)
     }
     this.database.recordInputSupplement(owner.ownerId, sourceRunId, input.requestId, {

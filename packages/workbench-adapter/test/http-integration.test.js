@@ -62,7 +62,7 @@ function setup({ databasePath = ':memory:', configure = () => {} } = {}) {
     logger: { warn: vi.fn() },
     skills: { list: vi.fn(async () => []), get: async () => undefined },
     tokenMeter: { measure: vi.fn(() => ({ totalTokens: 0, baseline: { kind: 'none' } })) },
-    systemPrompt: { section: vi.fn(() => () => {}), getSectionOrder: () => 3000 },
+    systemPrompt: { section: vi.fn(() => () => {}), context: vi.fn(() => () => {}), getSectionOrder: () => 3000 },
     tools: { register: vi.fn(() => () => {}) },
     on: vi.fn(), emit: vi.fn(), reflect: { provide: vi.fn() },
     effect: (factory) => cleanups.push(factory()),

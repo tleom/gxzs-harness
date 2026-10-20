@@ -966,13 +966,13 @@ describe('followup and control service', () => {
     activateNative(test, run.id)
     const bridge = new HumanInputBridge({ database })
     service.humanInput = bridge
-    service.scheduler = { enqueue: vi.fn(async () => {}) }
+    service.scheduler = { hasAdmission: () => true, tick: vi.fn(async () => {}) }
     const pending = ['a', 'b'].map(id => bridge.handleRequest({ agent: { session: { id: chat.sessionId } }, questions: [{ id, question: id }] }, vi.fn()))
     try {
       await service.supplement(owner, source.id, { request_id: 'old', answers: [{ id: 'old', selected: [], custom: '补答' }] })
       expect(database.listPendingInputs(owner.ownerId, run.id).map(input => input.status)).toEqual(['skipped', 'skipped'])
       expect(await Promise.all(pending)).toEqual(['a', 'b'].map(id => ({ answers: [{ id, selected: [] }] })))
-      expect(service.scheduler.enqueue).toHaveBeenCalledOnce()
+      expect(test.sessionController.prompt).toHaveBeenCalledWith(expect.objectContaining({ mode: 'steer' }), expect.any(AbortSignal))
     } finally {
       for (const input of database.listPendingInputs(owner.ownerId, run.id))
         if (input.status === 'pending') bridge.skip(owner.ownerId, run.id, input.requestId)
@@ -988,20 +988,26 @@ describe('followup and control service', () => {
     database.settlePendingInput(owner.ownerId, run.id, 'late-answer', 'skipped')
     if (status === 'running') activateNative(test, run.id)
     else database.transitionRun(owner.ownerId, run.id, status)
-    const enqueue = vi.fn()
-    service.scheduler = { enqueue }
+    const tick = vi.fn(async () => {})
+    service.scheduler = { hasAdmission: () => true, tick }
     const body = { request_id: 'late-answer', answers: [{ id: 'format', selected: [], custom: 'Word' }] }
     const result = await service.supplement(owner, run.id, body)
-    const [accepted, content] = enqueue.mock.calls[0]
+    const accepted = database.getRun(owner.ownerId, result.id)
+    const content = status === 'running' ? sessionController.prompt.mock.calls[0][0].content : database.submission(owner.ownerId, result.id).content
     expect(content[0].text).toContain('交付格式？')
     expect(content[0].text).toContain('Word')
     expect(accepted.selection.prompt_mode).toBe('steer')
-    expect(result.status).toBe('queued')
+    expect(result.status).toBe(status === 'running' ? 'steered' : 'queued')
     expect(result.input_supplement).toEqual([{ question: '交付格式？', answer: 'Word' }])
     await service.supplement(owner, run.id, body)
-    expect(enqueue).toHaveBeenCalledTimes(1)
-    if (status === 'running') expect(agent.steer).not.toHaveBeenCalled()
-    expect(sessionController.prompt).not.toHaveBeenCalled()
+    if (status === 'running') {
+      expect(agent.steer).not.toHaveBeenCalled()
+      expect(sessionController.prompt).toHaveBeenCalledOnce()
+      expect(tick).not.toHaveBeenCalled()
+    } else {
+      expect(tick).toHaveBeenCalledOnce()
+      expect(sessionController.prompt).not.toHaveBeenCalled()
+    }
   })
 
   it('selects the next model during execution while retaining the active run snapshot', async () => {

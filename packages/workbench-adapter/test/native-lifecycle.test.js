@@ -489,6 +489,52 @@ it('reacquires real native admission before a later sidebar child step uses its 
   await handle.dispose()
 })
 
+it.each([false, true])('reloads personal user context for scheduled turns and child agents with complete prompt=%s', async complete => {
+  const test = await fixture(['first', 'changed', 'cleared', 'child'], { scheduledClaims: true })
+  test.runtime.mcpCatalogState = { ready: true }
+  test.runtime.mcpResources = () => []
+  let preferences = { version: 1, preferredName: '李律师', identity: '执行案件代理人',
+    responseStyle: 'professional', customInstructions: '先给结论 {{literal}}' }
+  test.ctx.provide('workbenchPlatformClient', { json: async () => ({ data: {
+    enabled: true, system_prompt: 'platform instructions', user_preferences: preferences,
+  } }) })
+  registerDatabasePrompt(test.ctx, test.owner.ownerId)
+  if (complete) {
+    test.ctx.systemPrompt.section({ name: 'fixture:complete', order: 0, complete: true, text: 'complete fixture prompt' })
+    test.ctx.systemPrompt.suppressRuntimeContext()
+  }
+  const send = async agent => {
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'Check records' }], source: { kind: 'schedule' } }))
+    await agent.whenIdle()
+  }
+  const latestContext = agent => agent.session.snapshotEvents().filter(event => event.type === 'user/message'
+    && event.data.source.kind === 'runtime-context').at(-1)?.data.content[0].text
+  await send(test.agent)
+  expect(latestContext(test.agent)).toContain('李律师')
+  expect(JSON.stringify(test.model.requests[0].messages)).toContain('{{literal}}')
+  const system = test.model.requests[0].messages.filter(message => message.role === 'system')
+  expect(JSON.stringify(system)).not.toContain('李律师')
+  preferences = { ...preferences, version: 2, preferredName: '李老师' }
+  await send(test.agent)
+  expect(latestContext(test.agent)).toContain('李老师')
+  preferences = { version: 3, preferredName: '', identity: '', responseStyle: 'default', customInstructions: '' }
+  await send(test.agent)
+  expect(latestContext(test.agent)).not.toContain('李老师')
+  preferences = { ...preferences, version: 4, preferredName: '子任务称呼' }
+  const parent = test.db.listRuns(test.owner.ownerId, test.chat.id)[0]
+  test.db.updateRunResources(parent, { ...parent.selection, subagent_ids: ['personal-prompt-child'] }, parent.mcpTools)
+  const handle = await test.ctx.agents.create({ sessionId: 'personal-prompt-child', parentAgent: test.agent,
+    agentOptions: { provider: 'mock', model: 'mock' }, meta: { cwd: '/workspace/other', origin: 'subagent' } })
+  const child = handle.agent
+  test.runtime.bindChild(child)
+  test.runtime.prepareChildPrompt(test.chat, { id: child.id, title: '偏好验收助手' }, 'prompt-child')
+  child.followup(createUserMessage({ content: [{ type: 'text', text: 'Check delegated records' }], source: { kind: 'user' } }))
+  await child.whenIdle()
+  expect(latestContext(child)).toContain('子任务称呼')
+  expect(test.model.requests).toHaveLength(4)
+  await handle.dispose()
+})
+
 it.each([false, true])('assembles the actual first scheduled native request with verified MCP tools and complete prompt=%s', async complete => {
   const test = await fixture(['scheduled answer'], { scheduledClaims: true })
   const catalog = await delayedScheduledCatalog(test)
@@ -1599,6 +1645,45 @@ it('dismisses plan review without another model request and settles the Workbenc
   expect(t.ctx.planMode.get(t.agent)).toMatchObject({ active: true })
   expect(t.db.getRun(t.owner.ownerId, run.id)).toMatchObject({ status: 'completed' })
   expect(t.agent.session.snapshotEvents().filter(event => event.type === 'turn/end').at(-1).data.reason).toEqual({ kind: 'completed' })
+})
+
+it('directly steers an old answer ahead of queued messages without waiting for another scheduler tick', async () => {
+  let release
+  const test = await fixture([new Promise(resolve => { release = resolve }), 'updated from reanswer', 'queued reply'])
+  const first = test.create('working')
+  await test.scheduler.enqueue(first, [{ type: 'text', text: first.query }])
+  await test.scheduler.tick()
+  await vi.waitFor(() => expect(test.model.requests).toHaveLength(1))
+  const bridge = new HumanInputBridge({ database: test.db, executionRun: id => test.runtime.executionRun(id),
+    resumeInput: (run, signal) => test.scheduler.resumeInput(run, signal) })
+  const question = bridge.handleRequest({ agent: test.agent, questions: [{ id: 'old', question: 'old question' }],
+    signal: new AbortController().signal }, () => { throw new Error('unexpected fallback') })
+  const oldId = test.db.getPendingInput(test.owner.ownerId, first.id).requestId
+  bridge.skip(test.owner.ownerId, first.id, oldId)
+  await question
+  const queued = test.create('ordinary queued message')
+  // A pending dispatcher snapshot must not delay an explicit reanswer.
+  test.db.saveSubmission(test.owner.ownerId, queued.id, [{ type: 'text', text: queued.query }])
+  const tick = vi.spyOn(test.scheduler, 'tick').mockResolvedValue()
+  const service = new WorkbenchService({ database: test.db, sessionController: test.sessions,
+    agents: test.ctx.agents, scheduler: test.scheduler })
+  service.humanInput = bridge
+  const body = { request_id: oldId, answers: [{ id: 'old', selected: [], custom: 'new evidence' }] }
+  const accepted = await service.supplement(test.owner, first.id, body)
+  expect(accepted).toMatchObject({ status: 'steered', steer_target_run_id: first.id,
+    input_supplement: [{ question: 'old question', answer: 'new evidence' }] })
+  expect(test.agent.inbox.nextStep.some(message => message.source?.rpcId === accepted.id)).toBe(true)
+  expect(test.agent.inbox.nextTurn).toHaveLength(0)
+  expect(test.db.submission(test.owner.ownerId, accepted.id)).toBeUndefined()
+  expect(test.scheduler.hasAdmission(test.agent.id)).toBe(true)
+  expect(test.db.getRun(test.owner.ownerId, queued.id).status).toBe('queued')
+  expect((await service.supplement(test.owner, first.id, body)).id).toBe(accepted.id)
+  release('original answer')
+  await test.agent.whenIdle()
+  expect(test.model.requests).toHaveLength(2)
+  expect(JSON.stringify(test.model.requests[1].messages)).toContain('new evidence')
+  expect(test.agent.session.snapshotEvents().filter(event => event.type === 'user/message' && event.data.source?.rpcId === accepted.id)).toHaveLength(1)
+  tick.mockRestore()
 })
 
 it('accepts an old answer while a newer native question has released admission, skipping only the newer question', async () => {
