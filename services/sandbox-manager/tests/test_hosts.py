@@ -84,7 +84,7 @@ def test_idle_shutdown_preserves_fences_until_both_containers_are_confirmed_stop
     docker.side_effect = operate
     activity = host.root.parent / 'workspace'
     activity.touch()
-    os.utime(activity, (time.time() - 3600, time.time() - 3600))
+    os.utime(activity, (time.time() - 10800, time.time() - 10800))
     maintain(host)
     assert stopped
     host.admission.fence.assert_not_called()
@@ -181,6 +181,69 @@ def test_first_use_creates_once_and_reuses_workspace(tmp_path, monkeypatch):
     assert 'sandbox-workspace-files:/workspace:ro' in create
     assert not any(value.endswith(':/workspace') for value in create)
 
+def test_scheduled_wakeup_renews_activity_under_stop_lock(tmp_path, monkeypatch):
+    host, docker, _, payload, _ = setup(tmp_path, monkeypatch)
+    host.ensure('workspace', payload)
+    maintain(host)
+    activity = host.root.parent / 'workspace'
+    activity.touch()
+    os.utime(activity, (1, 1))
+    docker.reset_mock()
+    result = host.ensure('workspace', dict(payload, scheduled_wakeup=True))
+    assert result['ready'] is True
+    assert time.time() - activity.stat().st_mtime < 10
+    maintain(host)
+    assert not any(call.args[0] == 'stop' for call in docker.call_args_list)
+
+
+def test_scheduled_wakeup_after_shutdown_restarts_before_success(tmp_path, monkeypatch):
+    host, docker, _, payload, created = setup(tmp_path, monkeypatch)
+    host.ensure('workspace', payload)
+    maintain(host)
+    activity = host.root.parent / 'workspace'
+    activity.touch()
+    os.utime(activity, (1, 1))
+    maintain(host)
+    assert created['State']['Running'] is False
+    result = host.ensure('workspace', dict(payload, scheduled_wakeup=True))
+    assert result['ready'] is False
+    assert created['State']['Running'] is True
+    maintain(host)
+    assert host.ensure('workspace', dict(payload, scheduled_wakeup=True))['ready'] is True
+
+
+def test_scheduled_wakeup_waits_for_inflight_physical_stop(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    host, _, _, payload, created = setup(tmp_path, monkeypatch)
+    host.ensure('workspace', payload)
+    maintain(host)
+    activity = host.root.parent / 'workspace'
+    activity.touch()
+    os.utime(activity, (1, 1))
+    stopping, release_stop, wake_entered = threading.Event(), threading.Event(), threading.Event()
+    original = host._stop_pair
+    def stop(item, **kwargs):
+        stopping.set()
+        assert release_stop.wait(3)
+        return original(item, **kwargs)
+    host._stop_pair = stop
+    def wake():
+        wake_entered.set()
+        return host.ensure('workspace', dict(payload, scheduled_wakeup=True))
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        maintenance = workers.submit(maintain, host)
+        assert stopping.wait(2)
+        wakeup = workers.submit(wake)
+        try:
+            assert wake_entered.wait(2)
+            assert not wakeup.done()
+        finally:
+            release_stop.set()
+        maintenance.result(timeout=3)
+        assert wakeup.result(timeout=3)['ready'] is False
+    assert created['State']['Running'] is True
+    maintain(host)
+    assert host.ensure('workspace', dict(payload, scheduled_wakeup=True))['ready'] is True
 
 def test_account_named_host_keeps_the_logical_instance_and_owner_volumes(tmp_path, monkeypatch):
     host, docker, _, payload, _ = setup(tmp_path, monkeypatch)
@@ -545,6 +608,61 @@ def test_idle_shutdown_fences_before_reporting_stopped(tmp_path, monkeypatch):
     assert stops == ['host-1', 'sandbox-workspace']
     host.admission.fence.assert_called_once_with('t:1', 'host-1')
     assert host.heartbeat.call_args.args[1] == 'stopped'
+
+
+@pytest.mark.parametrize('seconds,stops', [(3600, False), (7199, False), (7201, True)])
+def test_idle_shutdown_uses_two_hour_boundary(tmp_path, monkeypatch, seconds, stops):
+    host, docker, _, payload, _ = setup(tmp_path, monkeypatch)
+    host.ensure('workspace', payload)
+    maintain(host)
+    activity = host.root.parent / 'workspace'
+    now = time.time()
+    activity.touch()
+    os.utime(activity, (now - seconds, now - seconds))
+    docker.reset_mock()
+    maintain(host)
+    assert bool([call for call in docker.call_args_list if call.args[0] == 'stop']) is stops
+
+
+@pytest.mark.parametrize('registered,pending,expected', [(1, 0, 0), (0, 0, 1), (1, 1, 0)])
+def test_registered_wakeups_are_excluded_but_unconfirmed_reports_keep_host_resident(registered, pending, expected):
+    activity = dict(protocol=2, status='ready', runningAgents=0, pendingMessages=0, runningJobs=0,
+                    activeSchedules=1, activeSidebarResources=0, activeSettingsWrites=0,
+                    registeredSchedules=registered, pendingScheduleReports=pending)
+    counts = Hosts._activity_counts({'activity': activity})
+    assert counts['activeSchedules'] == expected
+    assert counts['activeSettingsWrites'] == pending
+
+
+@pytest.mark.parametrize('value', [None, -1, 2, True, '1'])
+def test_invalid_wakeup_acknowledgments_never_authorize_sleep(value):
+    activity = dict(protocol=2, status='ready', runningAgents=0, pendingMessages=0, runningJobs=0,
+                    activeSchedules=1, activeSidebarResources=0, activeSettingsWrites=0,
+                    registeredSchedules=value, pendingScheduleReports=0)
+    assert Hosts._activity_counts({'activity': activity}) is None
+
+
+def test_failed_sleep_handoff_keeps_running_pair_and_renews_healthy_heartbeat(tmp_path, monkeypatch):
+    host, docker, _, payload, _ = setup(tmp_path, monkeypatch)
+    host.ensure('workspace', payload)
+    maintain(host)
+    (host.root.parent / 'workspace').touch()
+    os.utime(host.root.parent / 'workspace', (1, 1))
+    host._prepare_sleep = Mock(return_value=False)
+    docker.reset_mock()
+    maintain(host)
+    assert not [call for call in docker.call_args_list if call.args[0] == 'stop']
+    assert host.heartbeat.call_args.args[1] == 'ready'
+
+
+def test_expired_handoff_never_stops_a_host_that_can_accept_new_requests(tmp_path, monkeypatch):
+    host, docker, _, payload, _ = setup(tmp_path, monkeypatch)
+    host.ensure('workspace', payload)
+    item = json.loads((host.root / 'workspace' / 'host.json').read_text())
+    docker.reset_mock()
+    with pytest.raises(ValueError, match='handoff expired'):
+        host._stop_pair(item, deadline=time.time() - 1)
+    assert not [call for call in docker.call_args_list if call.args[0] == 'stop']
 
 
 def test_idle_stopped_pair_is_not_recovered_by_maintenance(tmp_path, monkeypatch):

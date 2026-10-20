@@ -447,7 +447,8 @@ describe('authenticated workbench HTTP handler', () => {
     } }
     const response = await call(handler, key, 'GET', '/health', undefined, false)
     expect(response).toMatchObject({ status: 503, body: { live: true, ready: false, recovery: 'ready',
-      runtime_error: 'SSH_UNAVAILABLE', activity: { protocol: 1, status: 'ready', runningAgents: 0, pendingMessages: 1, activeSchedules: 1 } } })
+      runtime_error: 'SSH_UNAVAILABLE', activity: { protocol: 2, status: 'ready', runningAgents: 0, pendingMessages: 1, activeSchedules: 1,
+        registeredSchedules: 0, pendingScheduleReports: 1 } } })
     expect(JSON.stringify(response.body)).not.toContain('secret transport details')
     runtime.mcpCatalogState = { ready: false, status: 'unavailable' }
     expect((await call(handler, key, 'GET', '/health', undefined, false)).body.runtime_error).toBe('SSH_UNAVAILABLE')

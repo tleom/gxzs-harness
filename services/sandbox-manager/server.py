@@ -671,7 +671,7 @@ def operation(key, action, payload):
     raise ValueError("Unsupported operation")
 
 
-from hosts import Hosts
+from hosts import Hosts, IDLE_TIMEOUT_SECONDS
 HOSTS = Hosts(STATE, docker, ensure, identity, lock, ADMISSION, ensure_network)
 
 
@@ -879,7 +879,7 @@ def reap():
                         # Managed hosts and their sandboxes share one lifecycle.
                         if (HOSTS.root / key / 'host.json').exists():
                             continue
-                        if time.time() - item.stat().st_mtime > 1800:
+                        if time.time() - item.stat().st_mtime > IDLE_TIMEOUT_SECONDS:
                             from mcp_runtime import invalidate
 
                             invalidate(key)
