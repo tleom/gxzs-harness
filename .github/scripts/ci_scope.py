@@ -11,7 +11,7 @@ def is_documentation(path):
 
 
 def changed_files(event, base):
-    if event not in ("pull_request", "push") or not re.fullmatch(r"[0-9a-f]{40}", base or "") or base == "0" * 40:
+    if event != "pull_request" or not re.fullmatch(r"[0-9a-f]{40}", base or "") or base == "0" * 40:
         return None
     result = subprocess.run(
         ["git", "diff", "--no-renames", "--name-only", "-z", base, "HEAD", "--"],
@@ -36,9 +36,7 @@ def main():
             for path in docs:
                 if Path(path).is_file():
                     Path(path).read_text(encoding="utf-8")
-    # A docs push can cancel a preceding, still-running code push. Main must
-    # always verify the whole current tree; a PR diff includes its full changes.
-    runtime = os.environ.get("GITHUB_EVENT_NAME") != "pull_request" or runtime_required(files)
+    runtime = runtime_required(files)
     value = "true" if runtime else "false"
     print(f"runtime={value}")
     if output := os.environ.get("GITHUB_OUTPUT"):
