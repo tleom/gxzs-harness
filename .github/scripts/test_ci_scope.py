@@ -18,11 +18,11 @@ class ScopeTests(unittest.TestCase):
     def test_unproven_or_empty_diff_requires_full_checks(self):
         self.assertTrue(runtime_required(None))
         self.assertTrue(runtime_required([]))
-        for event, base in [("workflow_dispatch", "a" * 40), ("push", "0" * 40), ("push", ""), ("push", "--help")]:
+        for event, base in [("workflow_dispatch", "a" * 40), ("push", "a" * 40), ("pull_request", "0" * 40), ("pull_request", ""), ("pull_request", "--help")]:
             with self.subTest(event=event, base=base):
                 self.assertIsNone(changed_files(event, base))
         with patch("ci_scope.subprocess.run", return_value=subprocess.CompletedProcess([], 128, b"", b"bad revision")):
-            self.assertIsNone(changed_files("push", "a" * 40))
+            self.assertIsNone(changed_files("pull_request", "a" * 40))
 
     def test_git_rename_keeps_the_deleted_runtime_path_and_handles_newlines(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -48,18 +48,18 @@ class ScopeTests(unittest.TestCase):
                 Path("docs/guide.md").write_text("updated\n", encoding="utf-8")
                 git("add", ".")
                 git("commit", "-qm", "docs")
-                self.assertFalse(runtime_required(changed_files("push", docs_base)))
+                self.assertFalse(runtime_required(changed_files("pull_request", docs_base)))
                 with patch.dict(os.environ, {"GITHUB_EVENT_NAME": "pull_request", "BASE_SHA": docs_base, "GITHUB_OUTPUT": "outputs", "GITHUB_STEP_SUMMARY": "summary"}):
                     main()
                 self.assertEqual(Path("outputs").read_text(), "runtime=false\n")
-                with patch.dict(os.environ, {"GITHUB_EVENT_NAME": "push", "BASE_SHA": docs_base, "GITHUB_OUTPUT": "push-outputs", "GITHUB_STEP_SUMMARY": "summary"}):
+                with patch.dict(os.environ, {"GITHUB_EVENT_NAME": "workflow_dispatch", "BASE_SHA": docs_base, "GITHUB_OUTPUT": "manual-outputs", "GITHUB_STEP_SUMMARY": "summary"}):
                     main()
-                self.assertEqual(Path("push-outputs").read_text(), "runtime=true\n")
+                self.assertEqual(Path("manual-outputs").read_text(), "runtime=true\n")
                 whitespace_base = git("rev-parse", "HEAD")
                 Path("docs/guide.md").write_text("trailing whitespace   \n", encoding="utf-8")
                 git("add", ".")
                 git("commit", "-qm", "invalid docs")
-                with patch.dict(os.environ, {"GITHUB_EVENT_NAME": "push", "BASE_SHA": whitespace_base, "GITHUB_OUTPUT": "blocked-outputs"}):
+                with patch.dict(os.environ, {"GITHUB_EVENT_NAME": "pull_request", "BASE_SHA": whitespace_base, "GITHUB_OUTPUT": "blocked-outputs"}):
                     with self.assertRaises(subprocess.CalledProcessError):
                         main()
                 self.assertFalse(Path("blocked-outputs").exists())
