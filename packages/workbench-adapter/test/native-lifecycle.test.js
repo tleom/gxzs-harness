@@ -489,6 +489,52 @@ it('reacquires real native admission before a later sidebar child step uses its 
   await handle.dispose()
 })
 
+it.each([false, true])('reloads personal user context for scheduled turns and child agents with complete prompt=%s', async complete => {
+  const test = await fixture(['first', 'changed', 'cleared', 'child'], { scheduledClaims: true })
+  test.runtime.mcpCatalogState = { ready: true }
+  test.runtime.mcpResources = () => []
+  let preferences = { version: 1, preferredName: '李律师', identity: '执行案件代理人',
+    responseStyle: 'professional', customInstructions: '先给结论 {{literal}}' }
+  test.ctx.provide('workbenchPlatformClient', { json: async () => ({ data: {
+    enabled: true, system_prompt: 'platform instructions', user_preferences: preferences,
+  } }) })
+  registerDatabasePrompt(test.ctx, test.owner.ownerId)
+  if (complete) {
+    test.ctx.systemPrompt.section({ name: 'fixture:complete', order: 0, complete: true, text: 'complete fixture prompt' })
+    test.ctx.systemPrompt.suppressRuntimeContext()
+  }
+  const send = async agent => {
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'Check records' }], source: { kind: 'schedule' } }))
+    await agent.whenIdle()
+  }
+  const latestContext = agent => agent.session.snapshotEvents().filter(event => event.type === 'user/message'
+    && event.data.source.kind === 'runtime-context').at(-1)?.data.content[0].text
+  await send(test.agent)
+  expect(latestContext(test.agent)).toContain('李律师')
+  expect(JSON.stringify(test.model.requests[0].messages)).toContain('{{literal}}')
+  const system = test.model.requests[0].messages.filter(message => message.role === 'system')
+  expect(JSON.stringify(system)).not.toContain('李律师')
+  preferences = { ...preferences, version: 2, preferredName: '李老师' }
+  await send(test.agent)
+  expect(latestContext(test.agent)).toContain('李老师')
+  preferences = { version: 3, preferredName: '', identity: '', responseStyle: 'default', customInstructions: '' }
+  await send(test.agent)
+  expect(latestContext(test.agent)).not.toContain('李老师')
+  preferences = { ...preferences, version: 4, preferredName: '子任务称呼' }
+  const parent = test.db.listRuns(test.owner.ownerId, test.chat.id)[0]
+  test.db.updateRunResources(parent, { ...parent.selection, subagent_ids: ['personal-prompt-child'] }, parent.mcpTools)
+  const handle = await test.ctx.agents.create({ sessionId: 'personal-prompt-child', parentAgent: test.agent,
+    agentOptions: { provider: 'mock', model: 'mock' }, meta: { cwd: '/workspace/other', origin: 'subagent' } })
+  const child = handle.agent
+  test.runtime.bindChild(child)
+  test.runtime.prepareChildPrompt(test.chat, { id: child.id, title: '偏好验收助手' }, 'prompt-child')
+  child.followup(createUserMessage({ content: [{ type: 'text', text: 'Check delegated records' }], source: { kind: 'user' } }))
+  await child.whenIdle()
+  expect(latestContext(child)).toContain('子任务称呼')
+  expect(test.model.requests).toHaveLength(4)
+  await handle.dispose()
+})
+
 it.each([false, true])('assembles the actual first scheduled native request with verified MCP tools and complete prompt=%s', async complete => {
   const test = await fixture(['scheduled answer'], { scheduledClaims: true })
   const catalog = await delayedScheduledCatalog(test)
