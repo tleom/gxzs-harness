@@ -3,6 +3,7 @@ import { Readable } from 'node:stream'
 import { Service } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { setTimeout as delay } from 'node:timers/promises'
+import { managerFetch } from './transport.js'
 
 export const name = 'workbench-file-manager'
 export const Config = z.object({
@@ -25,7 +26,7 @@ const ACTIONS = {
 }
 
 export class FileManagerClient {
-  constructor(config, { fetchImpl = globalThis.fetch } = {}) {
+  constructor(config, { fetchImpl = managerFetch } = {}) {
     this.baseUrl = config.baseUrl.replace(/\/+$/, '')
     this.workspaceId = validateWorkspaceId(config.workspaceId)
     this.token = process.env[config.tokenEnv]

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
-import { mkdtemp, open, rm } from 'node:fs/promises'
+import { mkdtemp, open, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { FileManagerClient } from '/opt/workbench/packages/workbench-file-manager/src/index.js'
@@ -11,6 +11,20 @@ const directory = await mkdtemp(join(tmpdir(), 'gxzs-stream-smoke-'))
 const mib = 1024 * 1024
 try {
   if (phase === 'file') {
+    for (const count of [3, 4, 5, 10]) {
+      await Promise.all(Array.from({ length: count }, async (_, index) => {
+        const path = join(directory, `small-${index}`), bytes = Buffer.from(`batch-file-${index}`)
+        await writeFile(path, bytes)
+        const metadata = { operation: 'upload', path: `probe/small-${index}.txt`, version: null }
+        const result = await manager.upload('files', { path, metadata, size: bytes.length, offset: 0 })
+        assert.equal(result.version, createHash('sha256').update(bytes).digest('hex'))
+        const download = await manager.download(metadata.path), parts = []
+        for await (const part of download.body) parts.push(Buffer.from(part))
+        assert.deepEqual(Buffer.concat(parts), bytes)
+        await manager.operate({ operation: 'delete', path: metadata.path, version: result.version })
+      }))
+      console.log(`PASS ${count} concurrent small-file uploads/downloads: exact bytes, independent versions, no Host exit`)
+    }
     const path = join(directory, 'upload')
     const size = 100 * mib
     const metadata = { operation: 'upload', path: 'probe/large.bin', size, version: null }
