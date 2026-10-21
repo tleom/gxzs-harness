@@ -2,11 +2,13 @@
 import base64
 import bisect
 import hashlib
+import io
 import json
 import os
 import stat
 import sys
 import uuid
+import zipfile
 
 MAX_BYTES = 100 * 1024 * 1024
 MAX_TREE_BYTES = 1024 * 1024 * 1024
@@ -186,6 +188,27 @@ def entry_metadata(fd, name, path, info, *, shallow=False):
             "modified": info.st_mtime, "version": fingerprint, "downloadable": downloadable}
 
 
+def legacy_archive(fd):
+    """Keep pre-streaming Hosts working during Manager-first rolling upgrades."""
+    entries = tree_entries(fd)
+    if len(entries) > MAX_TREE_ITEMS or sum(size for _, mode, size, _, _ in entries if stat.S_ISREG(mode)) > 50 * 1024 * 1024:
+        raise ValueError('Legacy directory download exceeds 50 MiB or 10000 entries; use streaming download')
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
+        for path, mode, _, _, _ in entries:
+            if stat.S_ISDIR(mode):
+                archive.writestr(path + '/', b'')
+            elif stat.S_ISREG(mode):
+                parent, name = parent_fd(fd, path)
+                try:
+                    archive.writestr(path, read_file(parent, name, 50 * 1024 * 1024))
+                finally:
+                    os.close(parent)
+            else:
+                raise ValueError('Folder contains an unsupported link or special file')
+    return output.getvalue()
+
+
 def remove_contents(fd):
     for name in os.listdir(fd):
         info = os.stat(name, dir_fd=fd, follow_symlinks=False)
@@ -271,7 +294,11 @@ def operate(payload, root="/workspace"):
             try:
                 fingerprint = tree_version(child)
                 if operation == "get":
-                    raise ValueError('目录下载请使用流式下载接口')
+                    data = legacy_archive(child)
+                    if fingerprint != tree_version(child):
+                        return conflict()
+                    return {"data": base64.b64encode(data).decode(), "version": fingerprint,
+                            "kind": "directory", "name": name + ".zip"}
                 if operation != "delete":
                     raise ValueError("A folder cannot be overwritten by an uploaded file")
                 if payload.get("version") != fingerprint:

@@ -38,8 +38,9 @@ def test_resource_roots_allow_browsing_and_zip_download_but_reject_deletion(root
     directory.mkdir()
     (directory / 'demo.txt').write_text('content')
     assert module.operate({'operation': 'list', 'path': name}, root)['entries'][0]['name'] == 'demo.txt'
-    with pytest.raises(ValueError, match='流式下载'):
-        module.operate({'operation': 'get', 'path': name}, root)
+    result = module.operate({'operation': 'get', 'path': name}, root)
+    with zipfile.ZipFile(io.BytesIO(base64.b64decode(result['data']))) as archive:
+        assert archive.read('demo.txt') == b'content'
     current = module.operate({'operation': 'stat', 'path': name}, root)
     with pytest.raises(ValueError, match='cannot be deleted'):
         module.operate({'operation': 'delete', 'path': name, 'version': current['version']}, root)
@@ -156,3 +157,13 @@ def test_symlink_directory_leaf_and_fifo_are_blocked(root,tmp_path):
     entries=module.operate({'operation':'list','path':'conversations/test-chat'},root)['entries']
     assert all(item['kind']=='blocked' for item in entries)
     assert (outside/'secret').read_bytes()==b'private'
+
+
+def test_legacy_directory_download_keeps_its_original_memory_budget(root):
+    directory = Path(root) / 'legacy'
+    directory.mkdir()
+    with (directory / 'large.bin').open('wb') as stream:
+        stream.truncate(50 * 1024 * 1024 + 1)
+    assert module.operate({'operation': 'stat', 'path': 'legacy'}, root)['downloadable']
+    with pytest.raises(ValueError, match='Legacy directory download'):
+        module.operate({'operation': 'get', 'path': 'legacy'}, root)
