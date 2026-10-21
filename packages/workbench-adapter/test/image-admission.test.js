@@ -52,6 +52,26 @@ it('preserves a small lossless PNG byte-for-byte through native validation', asy
   expect(store.saveImage.mock.calls[0][0].data).toEqual(png)
 })
 
+it('reports a decodable-header but corrupt raster as invalid input and releases the image lane', async () => {
+  const corrupt = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=', 'base64')
+  expect(await sharp(corrupt).metadata()).toMatchObject({ format: 'png', width: 1, height: 1 })
+  const store = storeFor(corrupt)
+  const firstDirectory = temporary.length
+  await expect(resolveUploadedImages(store, [image(corrupt)]))
+    .rejects.toMatchObject({ status: 400, code: 'INVALID_REQUEST', message: '图片内容无效，请重新选择' })
+  expect(store.saveImage).toHaveBeenCalledOnce()
+  expect(store.readImage).not.toHaveBeenCalled()
+  for (const directory of temporary.slice(firstDirectory)) await expect(access(directory)).rejects.toMatchObject({ code: 'ENOENT' })
+  await expect(resolveUploadedImages(storeFor(), [image()])).resolves.toHaveLength(1)
+})
+
+it('preserves native storage failures instead of reporting them as corrupt user images', async () => {
+  const store = storeFor()
+  const error = Object.assign(new Error('storage unavailable'), { code: 'EIO' })
+  store.saveImage.mockRejectedValue(error)
+  await expect(resolveUploadedImages(store, [image()])).rejects.toBe(error)
+})
+
 it('keeps native orientation and transparency handling for bounded images', async () => {
   const jpeg = await sharp({ create: { width: 80, height: 40, channels: 3, background: '#336699' } })
     .jpeg().withMetadata({ orientation: 6 }).toBuffer()
