@@ -10,6 +10,7 @@ export function managerFetch(input, options = {}) {
   const url = new URL(input)
   const transport = url.protocol === 'https:' ? https : http
   return new Promise((resolve, reject) => {
+    options.signal?.throwIfAborted()
     const request = transport.request(url, {
       method: options.method, headers: options.headers, signal: options.signal,
     }, incoming => {

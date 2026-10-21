@@ -15,7 +15,7 @@ try {
       await Promise.all(Array.from({ length: count }, async (_, index) => {
         const path = join(directory, `small-${index}`), bytes = Buffer.from(`batch-file-${index}`)
         await writeFile(path, bytes)
-        const metadata = { operation: 'upload', path: `probe/small-${index}.txt`, version: null }
+        const metadata = { operation: 'upload', path: `probe/small-${index}.txt`, size: bytes.length, version: null }
         const result = await manager.upload('files', { path, metadata, size: bytes.length, offset: 0 })
         assert.equal(result.version, createHash('sha256').update(bytes).digest('hex'))
         const download = await manager.download(metadata.path), parts = []

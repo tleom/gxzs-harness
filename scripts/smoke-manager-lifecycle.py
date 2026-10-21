@@ -160,7 +160,10 @@ try:
                         '--entrypoint', 'node', '-v', script + ':/smoke-streaming-files.mjs:ro',
                         '-e', 'TEST_MANAGER_TOKEN=' + token, '-e', 'GXZS_HOST_OWNER_ID=fixture:1',
                         '-e', 'GXZS_HOST_GENERATION=1', '-e', 'GXZS_HOST_INSTANCE_ID=streaming-fixture',
-                        host_image, '/smoke-streaming-files.mjs', workspaces[0], phase)
+                        host_image, '/smoke-streaming-files.mjs', workspaces[0], phase, check=False)
+        if output.returncode:
+            print((output.stdout + output.stderr).replace(token, '[fixture-redacted]')[-6000:], file=sys.stderr)
+            raise RuntimeError('Streaming file smoke failed: ' + phase)
         print(output.stdout.strip(), flush=True)
     streaming_probe('file')
     prepare_directory = """
