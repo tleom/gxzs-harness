@@ -38,9 +38,8 @@ def test_resource_roots_allow_browsing_and_zip_download_but_reject_deletion(root
     directory.mkdir()
     (directory / 'demo.txt').write_text('content')
     assert module.operate({'operation': 'list', 'path': name}, root)['entries'][0]['name'] == 'demo.txt'
-    result = module.operate({'operation': 'get', 'path': name}, root)
-    with zipfile.ZipFile(io.BytesIO(base64.b64decode(result['data']))) as archive:
-        assert any(archive.read(path) == b'content' for path in archive.namelist())
+    with pytest.raises(ValueError, match='流式下载'):
+        module.operate({'operation': 'get', 'path': name}, root)
     current = module.operate({'operation': 'stat', 'path': name}, root)
     with pytest.raises(ValueError, match='cannot be deleted'):
         module.operate({'operation': 'delete', 'path': name, 'version': current['version']}, root)
@@ -119,7 +118,7 @@ def test_large_file_rejects_stale_delete_and_remains_bounded_for_download(root):
         stream.write(b'changed')
     result = module.operate({'operation': 'delete', 'path': target.name, 'version': metadata['version']}, root)
     assert result['code'] == 'FILE_VERSION_CONFLICT' and target.exists()
-    with pytest.raises(ValueError, match='20 MiB'):
+    with pytest.raises(ValueError, match='100 MiB'):
         module.operate({'operation': 'get', 'path': target.name}, root)
 
 

@@ -9,7 +9,7 @@ COPY --from=docker-cli /usr/local/bin/docker /usr/local/bin/docker
 WORKDIR /app
 COPY mcp_outcomes.py global_memory.py ./
 RUN python global_memory.py --install
-COPY server.py file_ops.py resource_ops.py environment.py stop_jobs.py office_preview.py office_conversions.py planning.py planning_exec.py ./
+COPY server.py file_ops.py resource_ops.py binary_upload.py file_download.py environment.py stop_jobs.py office_preview.py office_conversions.py planning.py planning_exec.py ./
 COPY mcp_ops.py mcp_worker.py mcp_runtime.py mcp_exec.py ./
 COPY hosts.py admission.py owner_auth.py mcp_authorization.py resource_limits.py runtime_names.py ./
 COPY owner_networks.py docker_inspect.py global_skills.py ./

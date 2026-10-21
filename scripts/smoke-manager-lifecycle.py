@@ -153,6 +153,34 @@ try:
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
         results = list(pool.map(populate, range(2)))
     print('PASS real manager: parallel owner provisioning, binary roundtrip, stale-version conflict', flush=True)
+    # Exercise Node's actual streaming manager client, not a JSON/base64 test double.
+    def streaming_probe(phase):
+        script = str(Path(__file__).with_name('smoke-streaming-files.mjs').resolve())
+        output = docker('run', '--rm', '--network', 'container:' + manager, '--memory', '512m', '--cpus', '1',
+                        '--entrypoint', 'node', '-v', script + ':/smoke-streaming-files.mjs:ro',
+                        '-e', 'TEST_MANAGER_TOKEN=' + token, '-e', 'GXZS_HOST_OWNER_ID=fixture:1',
+                        '-e', 'GXZS_HOST_GENERATION=1', '-e', 'GXZS_HOST_INSTANCE_ID=streaming-fixture',
+                        host_image, '/smoke-streaming-files.mjs', workspaces[0], phase)
+        print(output.stdout.strip(), flush=True)
+    streaming_probe('file')
+    prepare_directory = """
+from pathlib import Path
+import os
+root=Path('/workspace/probe/stream-dir'); root.mkdir()
+for index in range(10): os.link('/workspace/probe/large.bin',root/str(index))
+with (root/'tail').open('wb') as stream: stream.truncate(24*1024*1024)
+for index in range(10005): (root/('empty-'+str(index))).touch()
+"""
+    sandbox = prefix + '-' + workspaces[0]
+    docker('exec', '--user', '1000', sandbox, '/usr/local/bin/python', '-I', '-S', '-c', prepare_directory)
+    streaming_probe('directory')
+    docker('exec', '--user', '1000', sandbox, '/usr/local/bin/python', '-I', '-S', '-c',
+           "from pathlib import Path;Path('/workspace/probe/stream-dir/extra').write_bytes(b'x')")
+    streaming_probe('oversize-directory')
+    folder = files(workspaces[0], 'stat', path='probe/stream-dir')
+    files(workspaces[0], 'delete', path='probe/stream-dir', version=folder['version'])
+    large = files(workspaces[0], 'stat', path='probe/large.bin')
+    files(workspaces[0], 'delete', path='probe/large.bin', version=large['version'])
     sandbox = prefix + '-' + workspaces[0]
     before = json.loads(docker('inspect', sandbox).stdout)[0]
     assert before['HostConfig']['PidsLimit'] == 1024

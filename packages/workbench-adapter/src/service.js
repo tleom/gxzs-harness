@@ -500,7 +500,7 @@ export class WorkbenchService {
     // Skill references become explicit native user invocation gestures.
     const mcpTools = await this.freezeMcpTools(owner, mentions.tools, mentions.plugins)
     checkCancelled()
-    const admitted = await admitSandboxAttachments({ fileManager: this.fileManager, workspace: this.workspace, query, files, nativeFiles: this.nativeFileAttachments })
+    const admitted = await admitSandboxAttachments({ fileManager: this.fileManager, workspace: this.workspace, query, files, nativeFiles: this.nativeFileAttachments, attachmentStore: this.attachments })
     chat = await this.ensureChatSession(owner, chat)
     const agent = this.agents.get(chat.sessionId)
     const selectedSkills = await this.selectedSkills(mentions, agent)
@@ -694,21 +694,21 @@ export class WorkbenchService {
     }
   }
 
-  async mutateResource(body, owner) {
+  async mutateResource(body, owner, sendPackage = payload => this.fileManager.personalResources(payload)) {
     const operation = body?.operation
     if (typeof operation !== 'string') throw httpError(400, '缺少资源操作')
     if (operation === 'skill_inspect') {
-      const inspected = await this.fileManager.personalResources(body)
+      const inspected = await sendPackage(body)
       const metadata = await readImportedSkill(inspected.content)
       const snapshot = await this.fileManager.personalResources({ operation: 'list' })
       const previous = (snapshot.skills ?? []).find((skill) => skill.id === metadata.name)
       return { name: metadata.name, displayName: metadata.displayName, version: previous?.version ?? null }
     }
     if (operation === 'skill_import') {
-      const inspected = await this.fileManager.personalResources({ ...body, operation: 'skill_inspect' })
+      const inspected = await sendPackage({ ...body, operation: 'skill_inspect' })
       const metadata = await readImportedSkill(inspected.content)
       await this.assertNoGlobalSkillCollision(metadata.name)
-      return this.fileManager.personalResources({ ...body, name: metadata.name })
+      return sendPackage({ ...body, name: metadata.name })
     }
     if (operation === 'skill_update') {
       const metadata = await readImportedSkill(body.content)
@@ -818,7 +818,7 @@ export class WorkbenchService {
         const mcpTools = await this.freezeMcpTools(owner, mentions.tools, mentions.plugins)
         const selectedSkills = await this.selectedSkills(mentions, agent)
         const admitted = body.files?.length
-          ? await admitSandboxAttachments({ fileManager: this.fileManager, workspace: this.workspace, query: '', files: body.files, nativeFiles: this.nativeFileAttachments })
+          ? await admitSandboxAttachments({ fileManager: this.fileManager, workspace: this.workspace, query: '', files: body.files, nativeFiles: this.nativeFileAttachments, attachmentStore: this.attachments })
           : { content: [], attachments: [] }
         const resourceContext = appendResourceInstructions(admitted.content.filter(item => item.type === 'text'), mentions, mcpTools)
           .map(item => item.text).join('\n')
@@ -869,7 +869,7 @@ export class WorkbenchService {
       if ((resumesGoal || editsGoal && body.resource_mentions === undefined) && previousGoalRun?.selection.skill_invocations)
         assertSkillInvocationClaims(selectedGoalSkills, previousGoalRun.selection.skill_invocations)
       const admitted = body.files?.length
-        ? await admitSandboxAttachments({ fileManager: this.fileManager, workspace: this.workspace, query: '', files: body.files, nativeFiles: this.nativeFileAttachments })
+        ? await admitSandboxAttachments({ fileManager: this.fileManager, workspace: this.workspace, query: '', files: body.files, nativeFiles: this.nativeFileAttachments, attachmentStore: this.attachments })
         : { content: [], attachments: [] }
       const commandAttachments = await this.commandAttachments(agent, admitted.content)
       let editedResources
@@ -958,8 +958,7 @@ export class WorkbenchService {
       if (item.type === 'image') result.push(item)
       if (item.type === 'file') {
         if (!this.fileUploads) throw httpError(503, '原生文件上传服务尚未就绪')
-        const uploaded = await this.fileUploads.upload(agent, { name: item.name, data: item.data }, new AbortController().signal)
-        result.push({ type: 'file', receiptId: uploaded.receiptId })
+        result.push(...await prepareNativeFiles(this.fileUploads, agent.id, [item], this.attachments))
       }
     }
     return result
@@ -1268,7 +1267,7 @@ export class WorkbenchService {
     // Upload durable files before checking the target; DSH owns prompt admission.
     let pending = this.scheduler && this.database.submission(owner.ownerId, run.id)
     const content = pending && !pending.dispatched
-      ? await prepareNativeFiles(this.fileUploads, run.sessionId, pending.content)
+      ? await prepareNativeFiles(this.fileUploads, run.sessionId, pending.content, this.attachments)
       : undefined
     const active = this.database.getRun(owner.ownerId, targetRunId)
     const current = this.database.getRun(owner.ownerId, runId)

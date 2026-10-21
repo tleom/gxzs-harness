@@ -1,3 +1,4 @@
+import { resolveUploadedImages } from './attachments.js'
 import { hasEarlierContent, historyWindow } from './history-page.js'
 import { HistoryPresentation } from './history-presentation.js'
 import { httpError, nativeError } from './http.js'
@@ -58,20 +59,14 @@ export class WorkbenchSubagents {
     const delivery = request.delivery ?? 'queue'
     if (typeof request.text !== 'string' || (!request.text.trim() && !images.length) || typeof request.requestId !== 'string'
       || !['queue', 'steer'].includes(delivery) || !Array.isArray(images) || images.length > 20) throw httpError(400, '子智能体消息无效')
-    let bytes = 0
-    for (const image of images) {
-      if (!image || !['image/png', 'image/jpeg', 'image/gif', 'image/webp'].includes(image.mediaType)
-        || typeof image.data !== 'string' || (image.name !== undefined && typeof image.name !== 'string')) throw httpError(400, '图片参数无效')
-      bytes += image.data.length * 0.75
-    }
-    if (bytes > 20 * 1024 * 1024) throw httpError(413, '图片总大小超过 20 MiB')
+    const resolvedImages = await resolveUploadedImages(this.attachments, images)
     const deliver = async () => {
     signal.throwIfAborted()
     const receipt = this.runtime?.prepareChildPrompt(this.service.requireChat(owner, chatId), child, request.requestId)
     try { return await this.native.prompt({ parentSessionId: child.parentSessionId, childSessionId: child.id,
       mode: 'continuable', requestId: request.requestId, delivery, content: [
         ...(request.text.trim() ? [{ type: 'text', text: request.text }] : []),
-        ...images.map(({ data, mediaType, name }) => ({ type: 'image', data, mediaType, ...(name ? { name } : {}) }))],
+        ...resolvedImages.map(({ data, mediaType, name }) => ({ type: 'image', data, mediaType, ...(name ? { name } : {}) }))],
       ...(request.clientTimeZone ? { clientTimeZone: request.clientTimeZone } : {}) }, signal)
     } catch (error) {
       const status = nativeError(error)?.status ?? error.status

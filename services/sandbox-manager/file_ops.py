@@ -2,16 +2,14 @@
 import base64
 import bisect
 import hashlib
-import io
 import json
 import os
 import stat
 import sys
 import uuid
-import zipfile
 
-MAX_BYTES = 20 * 1024 * 1024
-MAX_TREE_BYTES = 50 * 1024 * 1024
+MAX_BYTES = 100 * 1024 * 1024
+MAX_TREE_BYTES = 1024 * 1024 * 1024
 MAX_TREE_ITEMS = 10000
 MAX_MANIFEST_FILE_BYTES = 2 * 1024 * 1024 * 1024
 MAX_MANIFEST_TREE_BYTES = 10 * 1024 * 1024 * 1024
@@ -38,18 +36,18 @@ def parent_fd(root, path, *, missing_ok=False):
         raise
 
 
-def read_file(fd, name):
+def read_file(fd, name, max_bytes=MAX_BYTES):
     try:
         item = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
     except FileNotFoundError:
         return None
     with os.fdopen(item, "rb") as stream:
         info = os.fstat(stream.fileno())
-        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_BYTES:
-            raise ValueError("Only regular files up to 20 MiB are supported")
-        data = stream.read(MAX_BYTES + 1)
-        if len(data) > MAX_BYTES:
-            raise ValueError("File exceeds 20 MiB")
+        if not stat.S_ISREG(info.st_mode) or info.st_size > max_bytes:
+            raise ValueError("Only regular files up to %d MiB are supported" % (max_bytes // (1024 * 1024)))
+        data = stream.read(max_bytes + 1)
+        if len(data) > max_bytes:
+            raise ValueError("File exceeds %d MiB" % (max_bytes // (1024 * 1024)))
         return data
 
 
@@ -104,8 +102,6 @@ def tree_entries(fd, prefix="", result=None):
     """Fingerprint metadata without following links or reading every file on listing."""
     result = [] if result is None else result
     for name in sorted(os.listdir(fd)):
-        if len(result) >= MAX_TREE_ITEMS:
-            raise ValueError("Folder contains too many entries")
         info = os.stat(name, dir_fd=fd, follow_symlinks=False)
         path = prefix + name
         result.append((path, info.st_mode, info.st_size, info.st_mtime_ns, info.st_ino))
@@ -127,8 +123,14 @@ def hash_file(fd, name, expected_size):
         info = os.fstat(stream.fileno())
         if not stat.S_ISREG(info.st_mode) or info.st_size != expected_size:
             raise ValueError("Workspace changed during migration manifest")
-        while chunk := stream.read(1024 * 1024):
+        count = 0
+        while chunk := stream.read(64 * 1024):
+            count += len(chunk)
+            if count > expected_size:
+                raise ValueError('File changed while hashing')
             digest.update(chunk)
+        if count != expected_size or file_identity(os.fstat(stream.fileno())) != file_identity(info):
+            raise ValueError('File changed while hashing')
     return digest.hexdigest()
 
 
@@ -164,8 +166,7 @@ def entry_metadata(fd, name, path, info, *, shallow=False):
         return {"name": name, "path": path, "kind": kind, "size": info.st_size,
                 "modified": info.st_mtime, "version": None,
                 "downloadable": path != "conversations" and (kind == "directory" or (kind == "file" and info.st_size <= MAX_BYTES))}
-    data = read_file(fd, name) if kind == "file" and info.st_size <= MAX_BYTES else None
-    fingerprint = version(data)
+    fingerprint = hash_file(fd, name, info.st_size) if kind == "file" and info.st_size <= MAX_BYTES else None
     downloadable = kind == "file" and fingerprint is not None
     if kind == "file" and info.st_size > MAX_BYTES:
         fingerprint = large_file_version(info)
@@ -183,27 +184,6 @@ def entry_metadata(fd, name, path, info, *, shallow=False):
             os.close(child)
     return {"name": name, "path": path, "kind": kind, "size": info.st_size,
             "modified": info.st_mtime, "version": fingerprint, "downloadable": downloadable}
-
-
-def archive(fd):
-    entries = tree_entries(fd)
-    total = sum(size for _, mode, size, _, _ in entries if stat.S_ISREG(mode))
-    if total > MAX_TREE_BYTES:
-        raise ValueError("Folder download exceeds 50 MiB; download its files separately")
-    output = io.BytesIO()
-    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as zipped:
-        for path, mode, _, _, _ in entries:
-            if stat.S_ISDIR(mode):
-                zipped.writestr(path + "/", b"")
-            elif stat.S_ISREG(mode):
-                parent, name = parent_fd(fd, path)
-                try:
-                    zipped.writestr(path, read_file(parent, name))
-                finally:
-                    os.close(parent)
-            else:
-                raise ValueError("Folder contains an unsupported link or special file")
-    return output.getvalue()
 
 
 def remove_contents(fd):
@@ -291,11 +271,7 @@ def operate(payload, root="/workspace"):
             try:
                 fingerprint = tree_version(child)
                 if operation == "get":
-                    data = archive(child)
-                    if fingerprint != tree_version(child):
-                        return conflict()
-                    return {"data": base64.b64encode(data).decode(), "version": fingerprint,
-                            "kind": "directory", "name": name + ".zip"}
+                    raise ValueError('目录下载请使用流式下载接口')
                 if operation != "delete":
                     raise ValueError("A folder cannot be overwritten by an uploaded file")
                 if payload.get("version") != fingerprint:
@@ -307,7 +283,10 @@ def operate(payload, root="/workspace"):
             return {"deleted": True}
         if operation == "delete":
             return delete_file(fd, name, payload)
-        old = read_file(fd, name)
+        max_bytes = payload.get("max_bytes", MAX_BYTES) if operation == "get" else MAX_BYTES
+        if type(max_bytes) is not int or not 0 < max_bytes <= MAX_BYTES:
+            raise ValueError("Invalid file read limit")
+        old = read_file(fd, name, max_bytes)
         if operation == "get":
             if old is None:
                 raise FileNotFoundError(path)
@@ -318,7 +297,7 @@ def operate(payload, root="/workspace"):
             return conflict()
         data = base64.b64decode(payload["data"], validate=True)
         if len(data) > MAX_BYTES:
-            raise ValueError("Upload exceeds 20 MiB")
+            raise ValueError("Upload exceeds 100 MiB")
         temporary = ".upload-" + uuid.uuid4().hex
         try:
             target = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=fd)
@@ -335,6 +314,59 @@ def operate(payload, root="/workspace"):
                 pass
         return {"path": path, "version": version(data)}
     finally:
+        os.close(fd)
+
+
+def upload_stream(payload, source, root="/workspace"):
+    """Write bounded chunks atomically after checking the current file version."""
+    path = payload.get('path')
+    size = payload.get('size')
+    if not isinstance(path, str) or path in {'.', 'conversations'}:
+        raise ValueError('文件路径无效')
+    if type(size) is not int or not 0 <= size <= MAX_BYTES:
+        raise ValueError('单个文件最大 100 MiB')
+    fd, name = parent_fd(root, path)
+    temporary = '.upload-' + uuid.uuid4().hex
+    try:
+        try:
+            old = os.stat(name, dir_fd=fd, follow_symlinks=False)
+        except FileNotFoundError:
+            old = None
+        if old is not None and (not stat.S_ISREG(old.st_mode) or old.st_size > MAX_BYTES):
+            raise ValueError('只能覆盖 100 MiB 以内的普通文件')
+        previous = hash_file(fd, name, old.st_size) if old else None
+        if 'version' not in payload or payload['version'] != previous:
+            return conflict()
+        digest = hashlib.sha256()
+        target = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=fd)
+        with os.fdopen(target, 'wb') as output:
+            remaining = size
+            while remaining:
+                chunk = source.read(min(64 * 1024, remaining))
+                if not chunk:
+                    raise ValueError('文件上传不完整')
+                digest.update(chunk)
+                output.write(chunk)
+                remaining -= len(chunk)
+            if source.read(1):
+                raise ValueError('文件大小与声明不一致')
+            output.flush()
+            os.fsync(output.fileno())
+        # Recheck after receiving bytes; a user process may have edited the file.
+        try:
+            current = os.stat(name, dir_fd=fd, follow_symlinks=False)
+        except FileNotFoundError:
+            current = None
+        if (file_identity(current) if current else None) != (file_identity(old) if old else None):
+            return conflict()
+        os.rename(temporary, name, src_dir_fd=fd, dst_dir_fd=fd)
+        os.fsync(fd)
+        return {'path': path, 'version': digest.hexdigest()}
+    finally:
+        try:
+            os.unlink(temporary, dir_fd=fd)
+        except FileNotFoundError:
+            pass
         os.close(fd)
 
 

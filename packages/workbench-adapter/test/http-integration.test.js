@@ -102,14 +102,15 @@ it('serializes absent native changes as null without hiding ownership or diff fa
 })
 
 async function call(handler, key, method, route, value, authenticated = true, userId = '42', extraHeaders = {}, onResponse) {
-  const body = value === undefined ? Buffer.alloc(0) : Buffer.from(JSON.stringify(value))
+  const body = value === undefined ? Buffer.alloc(0) : Buffer.isBuffer(value) ? value : Buffer.from(JSON.stringify(value))
+  const contentType = extraHeaders['content-type'] ?? 'application/json'
   const now = Math.floor(Date.now() / 1000)
   const header = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url')
   const payload = Buffer.from(JSON.stringify({
     iss: 'gxzs', aud: 'agent-workbench', sub: `t:${userId}`, tenant_id: 't', user_id: userId, name: '用户',
     iat: now, exp: now + 60, jti: randomUUID(), method,
     target: `/console/api/workbench${route}`, body_sha256: createHash('sha256').update(body).digest('hex'),
-    content_type: 'application/json', last_event_id: '',
+    content_type: contentType, last_event_id: '',
   })).toString('base64url')
   const signature = createHmac('sha256', Buffer.from(key, 'base64')).update(`${header}.${payload}`).digest('base64url')
   const req = Readable.from(body.length ? [body] : [])
@@ -652,4 +653,25 @@ it('opens a fork through the authenticated HTTP API and rejects anonymous reques
   expect(fork.body.data.id).not.toBe(sourceChat)
   expect(fork.body.data.runs).toMatchObject([{ query: 'fork source', status: 'completed' }])
   expect(context.sessionController.fork).toHaveBeenCalledWith({ sessionId: 'http-source-session', atSeq: 8 })
+})
+
+
+it('authenticates a streamed upload and forwards binary bytes without JSON encoding', async () => {
+  const { readFile } = await import('node:fs/promises')
+  let stagedPath
+  const { handler, key, context } = setup({ configure(context) {
+    context.workbenchFileManager.upload = vi.fn(async (action, upload) => {
+      expect(action).toBe('files')
+      expect(upload.metadata).toMatchObject({ operation: 'upload', path: 'a.bin', size: 3 })
+      stagedPath = upload.path
+      expect((await readFile(upload.path)).subarray(upload.offset)).toEqual(Buffer.from([0, 255, 42]))
+      return { path: 'a.bin', version: 'v2' }
+    })
+  } })
+  const body = Buffer.concat([Buffer.from(JSON.stringify({ operation: 'upload', path: 'a.bin', size: 3 }) + '\n'), Buffer.from([0, 255, 42])])
+  const headers = { 'content-type': 'application/octet-stream', 'content-length': String(body.length) }
+  expect(await call(handler, key, 'POST', '/files/upload', body, true, '42', headers)).toMatchObject({ status: 200, body: { data: { version: 'v2' } } })
+  await expect(readFile(stagedPath)).rejects.toMatchObject({ code: 'ENOENT' })
+  expect((await call(handler, key, 'POST', '/files/upload', body, true, 'other', headers)).status).toBe(403)
+  expect(context.workbenchFileManager.upload).toHaveBeenCalledOnce()
 })

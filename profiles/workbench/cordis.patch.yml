@@ -151,3 +151,10 @@
       name: '@gxzs/dsh-tool-discovery'
     - id: gxzs-native-schedule
       name: '@deepseek-ai/dsh-schedule'
+
+# Workbench file admission: 100 MiB per image, 20 images, 1 GiB per message.
+- id: attachment-local
+  config:
+    maxImageBytes: 104857600
+    maxImagesPerMessage: 20
+    maxMessageImageBytes: 1073741824

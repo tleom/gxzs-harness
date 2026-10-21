@@ -132,3 +132,39 @@ describe('restricted sandbox-manager file client', () => {
     await expect(invalid.operate({ operation: 'mkdir', path: '../x' })).rejects.toMatchObject({ status: 400 })
   })
 })
+
+
+it('streams a package from disk and preserves scoped credentials and exact length', async () => {
+  const { mkdtemp, writeFile, rm } = await import('node:fs/promises')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const directory = await mkdtemp(join(tmpdir(), 'manager-upload-test-'))
+  try {
+    const path = join(directory, 'body')
+    await writeFile(path, Buffer.from([10, 0, 255, 42]))
+    const metadata = { operation: 'upload', path: 'a.bin', size: 3 }
+    const fetchImpl = vi.fn(async (_url, options) => {
+      const chunks = []
+      for await (const chunk of options.body) chunks.push(chunk)
+      const body = Buffer.concat(chunks)
+      expect(body).toEqual(Buffer.concat([Buffer.from(JSON.stringify(metadata) + '\n'), Buffer.from([0, 255, 42])]))
+      expect(Number(options.headers['content-length'])).toBe(body.length)
+      expect(options.headers['x-gxzs-host-generation']).toBe('7')
+      expect(options.duplex).toBe('half')
+      return new Response('{"path":"a.bin","version":"v2"}')
+    })
+    expect(await create(fetchImpl).upload('files', { path, size: 4, offset: 1, metadata })).toMatchObject({ version: 'v2' })
+  } finally { await rm(directory, { recursive: true, force: true }) }
+})
+
+it('returns a streamed download and validates its metadata', async () => {
+  const metadata = { name: 'a.bin', kind: 'file', size: 3, version: 'a'.repeat(64) }
+  const fetchImpl = vi.fn(async () => new Response(new Uint8Array([0, 255, 42]), { headers: {
+    'content-length': '3', 'x-workbench-file': Buffer.from(JSON.stringify(metadata)).toString('base64url'),
+  } }))
+  const result = await create(fetchImpl).download('a.bin')
+  expect(Buffer.from(await new Response(result.body).arrayBuffer())).toEqual(Buffer.from([0, 255, 42]))
+  expect(result.version).toBe(metadata.version)
+  fetchImpl.mockResolvedValue(new Response('bad', { headers: { 'x-workbench-file': 'invalid' } }))
+  await expect(create(fetchImpl).download('a.bin')).rejects.toThrow()
+})

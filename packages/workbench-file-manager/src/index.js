@@ -1,3 +1,5 @@
+import { createReadStream } from 'node:fs'
+import { Readable } from 'node:stream'
 import { Service } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { setTimeout as delay } from 'node:timers/promises'
@@ -11,8 +13,8 @@ export const Config = z.object({
   generationEnv: z.string().default('GXZS_HOST_GENERATION'),
   instanceEnv: z.string().default('GXZS_HOST_INSTANCE_ID'),
   timeoutMs: z.number().default(90_000),
-  // A manager directory download allows 50 MiB before base64 encoding.
-  maxResponseBytes: z.number().default(72 * 1024 * 1024),
+  // Legacy JSON file reads can encode a 100 MiB file; downloads use a separate stream.
+  maxResponseBytes: z.number().default(140 * 1024 * 1024),
 })
 
 const ACTIONS = {
@@ -37,7 +39,7 @@ export class FileManagerClient {
     if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash)
       throw new Error('sandbox manager baseUrl must be an HTTP(S) service base without credentials, query or fragment')
     this.timeoutMs = config.timeoutMs ?? 90_000
-    this.maxResponseBytes = config.maxResponseBytes ?? 72 * 1024 * 1024
+    this.maxResponseBytes = config.maxResponseBytes ?? 140 * 1024 * 1024
     if (!Number.isSafeInteger(this.maxResponseBytes) || this.maxResponseBytes < 1) throw new Error('maxResponseBytes must be a positive integer')
     this.fetch = fetchImpl
   }
@@ -48,6 +50,61 @@ export class FileManagerClient {
   async assertSettingsWritable() {
     const result = await this.request('host-settings', { operation: 'check' })
     if (result.writable !== true) throw Object.assign(new Error('工作台正在维护，请稍后保存设置'), { status: 503, code: 'HOST_UPDATING' })
+  }
+
+  async download(path, signal) {
+    const requestSignal = signal ? AbortSignal.any([signal, AbortSignal.timeout(600_000)]) : AbortSignal.timeout(600_000)
+    const response = await this.fetch(`${this.baseUrl}/sandboxes/${this.workspaceId}/files`, {
+      method: 'POST', headers: { authorization: `Bearer ${this.token}`, 'content-type': 'application/json',
+        'x-gxzs-owner': this.owner, 'x-gxzs-host-generation': this.generation, 'x-gxzs-host-instance': this.instance },
+      body: JSON.stringify({ operation: 'download', path }), signal: requestSignal, redirect: 'error',
+    })
+    if (!response.ok) {
+      const result = await managerJson(response, 256 * 1024)
+      throw Object.assign(new Error(result.error || '文件下载失败'), { status: response.status, code: result.code })
+    }
+    try {
+      const encoded = response.headers.get('x-workbench-file')
+      if (!encoded || encoded.length > 16 * 1024) throw new Error('missing download metadata')
+      const metadata = JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8'))
+      if (!Number.isSafeInteger(metadata.size) || metadata.size < 0 || !['file', 'directory'].includes(metadata.kind)
+        || typeof metadata.name !== 'string' || !/^[a-f0-9]{64}$/.test(metadata.version)
+        || Number(response.headers.get('content-length')) !== metadata.size || !response.body) throw new Error('invalid download metadata')
+      return { ...metadata, body: response.body }
+    } catch {
+      await response.body?.cancel().catch(() => {})
+      throw Object.assign(new Error('文件下载元数据无效'), { status: 502 })
+    }
+  }
+
+  async upload(action, upload, signal) {
+    if (!['files', 'personal-resources'].includes(action)) throw new TypeError('unsupported upload target')
+    const requestSignal = signal ? AbortSignal.any([signal, AbortSignal.timeout(600_000)]) : AbortSignal.timeout(600_000)
+    const header = Buffer.from(JSON.stringify(upload.metadata) + '\n')
+    const size = header.length + upload.size - upload.offset
+    for (let attempt = 0; ; attempt++) {
+      requestSignal.throwIfAborted()
+      const stream = Readable.from((async function* () {
+        yield header
+        yield* createReadStream(upload.path, { start: upload.offset, signal: requestSignal })
+      })())
+      try {
+        const response = await this.fetch(`${this.baseUrl}/sandboxes/${this.workspaceId}/${action}`, {
+          method: 'POST', headers: { authorization: `Bearer ${this.token}`, 'content-type': 'application/octet-stream',
+            'content-length': String(size), 'x-gxzs-owner': this.owner,
+            'x-gxzs-host-generation': this.generation, 'x-gxzs-host-instance': this.instance },
+          body: stream, duplex: 'half', signal: requestSignal, redirect: 'error',
+        })
+        const result = await managerJson(response, 256 * 1024)
+        if (response.status === 503 && result.code === 'MANAGER_BUSY' && attempt < 3) {
+          await delay(100 * 2 ** attempt, undefined, { signal: requestSignal }); continue
+        }
+        if (!response.ok || result.conflict) throw Object.assign(new Error(result.message || result.error || '文件上传失败'), {
+          status: result.conflict ? 409 : response.status, code: result.code || (result.conflict ? 'RESOURCE_CONFLICT' : 'UPLOAD_FAILED'),
+        })
+        return result
+      } finally { stream.destroy() }
+    }
   }
 
   async request(action, payload, signal) {
@@ -133,6 +190,8 @@ export class WorkbenchFileManager extends Service {
     this.client = new FileManagerClient(config)
   }
   get workspaceId() { return this.client.workspaceId }
+  upload(action, upload, signal) { return this.client.upload(action, upload, signal) }
+  download(path, signal) { return this.client.download(path, signal) }
   operate(payload, signal) { return this.client.operate(payload, signal) }
   personalResources(payload) { return this.client.personalResources(payload) }
   personalMcp(payload) { return this.client.personalMcp(payload) }
