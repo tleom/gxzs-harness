@@ -33,11 +33,12 @@ export class AssertionVerifier {
       throw unauthorized('工作台身份断言已过期')
     if (claims.exp - claims.iat > 60 + this.clockSkewSeconds) throw unauthorized('工作台身份断言有效期无效')
 
+    if (!/^[a-f0-9]{64}$/.test(claims.body_sha256)) throw unauthorized('工作台请求摘要无效')
     const body = request.body ?? Buffer.alloc(0)
     const expectedClaims = {
       method: String(request.method ?? '').toUpperCase(),
       target: request.target,
-      body_sha256: createHash('sha256').update(body).digest('hex'),
+      ...(request.streaming ? {} : { body_sha256: createHash('sha256').update(body).digest('hex') }),
       content_type: request.contentType ?? '',
       last_event_id: request.lastEventId ?? '',
     }
@@ -49,6 +50,9 @@ export class AssertionVerifier {
       throw unauthorized('工作台请求期限无效')
     if (this.replayCache.consume(claims.jti, claims.exp + this.clockSkewSeconds, now) === false) throw unauthorized('工作台身份断言已被使用')
     return {
+      ...(request.streaming ? { verifyBody: digest => {
+        if (digest !== claims.body_sha256) throw unauthorized('工作台身份断言未绑定当前请求：body_sha256')
+      } } : {}),
       ownerId: claims.sub,
       tenantId: String(claims.tenant_id),
       userId: String(claims.user_id),

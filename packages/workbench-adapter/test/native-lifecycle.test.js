@@ -884,7 +884,7 @@ it('passes goal-edit files through the native attachment store and user inbox', 
   const { FileUploads } = await native('dsh-client-file-upload')
   await test.ctx.plugin(FileUploads)
   const service = new WorkbenchService({ database: test.db, sessionController: test.sessions, agents: test.ctx.agents,
-    scheduler: test.scheduler, commands: test.ctx.commands, goals: test.ctx.goals, fileUploads: test.ctx.fileUploads, workspace: '/workspace', nativeFileAttachments: true,
+    scheduler: test.scheduler, commands: test.ctx.commands, goals: test.ctx.goals, fileUploads: test.ctx.fileUploads, attachments: test.ctx.attachments, workspace: '/workspace', nativeFileAttachments: true,
     skills: { list: async () => [] }, platformClient: { json: async () => ({ tools: [] }) },
     fileManager: { operate: async () => ({ kind: 'file', version: 'v1', data: Buffer.from('updated evidence').toString('base64') }) } })
   await service.issueCommand(test.owner, test.chat.id, { command: '/goal Review evidence', request_key: 'file-goal' })

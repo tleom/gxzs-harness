@@ -153,6 +153,53 @@ try:
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
         results = list(pool.map(populate, range(2)))
     print('PASS real manager: parallel owner provisioning, binary roundtrip, stale-version conflict', flush=True)
+    # Exercise Node's actual streaming manager client, not a JSON/base64 test double.
+    def streaming_probe(phase):
+        script = str(Path(__file__).with_name('smoke-streaming-files.mjs').resolve())
+        output = docker('run', '--rm', '--network', 'container:' + manager, '--memory', '512m', '--cpus', '1',
+                        '--entrypoint', 'node', '-v', script + ':/smoke-streaming-files.mjs:ro',
+                        '-e', 'TEST_MANAGER_TOKEN=' + token, '-e', 'GXZS_HOST_OWNER_ID=fixture:1',
+                        '-e', 'GXZS_HOST_GENERATION=1', '-e', 'GXZS_HOST_INSTANCE_ID=streaming-fixture',
+                        host_image, '/smoke-streaming-files.mjs', workspaces[0], phase)
+        print(output.stdout.strip(), flush=True)
+    streaming_probe('file')
+    prepare_directory = """
+from pathlib import Path
+import os
+root=Path('/workspace/probe/stream-dir'); root.mkdir()
+for index in range(10): os.link('/workspace/probe/large.bin',root/str(index))
+with (root/'tail').open('wb') as stream: stream.truncate(24*1024*1024)
+for index in range(10005): (root/('empty-'+str(index))).touch()
+"""
+    sandbox = prefix + '-' + workspaces[0]
+    docker('exec', '--user', '1000', sandbox, '/usr/local/bin/python', '-I', '-S', '-c', prepare_directory)
+    streaming_probe('directory')
+    docker('exec', '--user', '1000', sandbox, '/usr/local/bin/python', '-I', '-S', '-c',
+           "from pathlib import Path;Path('/workspace/probe/stream-dir/extra').write_bytes(b'x')")
+    streaming_probe('oversize-directory')
+    metadata_limit = request('/sandboxes/' + workspaces[0] + '/files',
+                             {'operation': 'stat', 'path': 'probe/stream-dir'})
+    assert metadata_limit['status'] == 400 and metadata_limit['body']['error'] == 'Folder contains too many entries', metadata_limit
+    # Streaming download has no entry-count cap; ordinary metadata deliberately
+    # retains its existing budget. Restore this synthetic fixture to that budget
+    # before exercising the unrelated versioned-delete lifecycle below.
+    docker('exec', '--user', '1000', sandbox, '/usr/local/bin/python', '-I', '-S', '-c', """
+from pathlib import Path
+import stat
+root=Path('/workspace/probe/stream-dir')
+assert root.resolve() == root and root.is_dir()
+for index in range(10005):
+    child=root/('empty-'+str(index))
+    info=child.lstat()
+    assert stat.S_ISREG(info.st_mode) and info.st_size == 0
+    child.unlink()
+assert len(list(root.iterdir())) == 12
+""")
+    print('PASS directory metadata: oversized entry count rejected; bounded fixture restored for versioned deletion', flush=True)
+    folder = files(workspaces[0], 'stat', path='probe/stream-dir')
+    files(workspaces[0], 'delete', path='probe/stream-dir', version=folder['version'])
+    large = files(workspaces[0], 'stat', path='probe/large.bin')
+    files(workspaces[0], 'delete', path='probe/large.bin', version=large['version'])
     sandbox = prefix + '-' + workspaces[0]
     before = json.loads(docker('inspect', sandbox).stdout)[0]
     assert before['HostConfig']['PidsLimit'] == 1024

@@ -1,6 +1,7 @@
 #!/bin/sh
 set -eu
 umask 077
+/usr/local/bin/python -I -S /opt/workbench/tmp_lifecycle.py
 ssh_dir="${HOME:-/home/gxzs}/.ssh"
 mkdir -p "$ssh_dir"
 chmod 700 "$ssh_dir"

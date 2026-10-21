@@ -11,6 +11,7 @@ import sqlite3
 from pathlib import Path
 import subprocess
 import threading
+import tempfile
 import time
 import uuid
 from contextlib import contextmanager
@@ -396,6 +397,25 @@ def authorize_mcp(payload):
         return False
 
 
+def upload_operation(key, action, source):
+    if action not in {'files', 'personal-resources'}:
+        raise ValueError('Unsupported binary upload target')
+    from mcp_runtime import module_source
+    script = module_source('file_ops', 'resource_ops', 'binary_upload')
+    script += "\ntry:\n print(json.dumps(binary_upload.run(sys.stdin.buffer, " + repr(action) + ")))\nexcept (ValueError, OSError, zipfile.BadZipFile) as error:\n print(json.dumps({'error': str(error)})); sys.exit(2)"
+    script = script.replace('\ntry:', "import json,zipfile,binary_upload;\ntry:")
+    with lock(key):
+        ensure(key)
+        name, _ = identity(key)
+        source.seek(0)
+        result = subprocess.run(['docker', 'exec', '--user', '1000', '-i', name, *MANAGER_PYTHON, '-c', script],
+                                stdin=source, capture_output=True, timeout=600)
+        output = json.loads(result.stdout or b'{}')
+        if result.returncode and not output.get('conflict'):
+            raise ValueError(output.get('error', '文件上传失败'))
+        return output
+
+
 def operation(key, action, payload):
     name, _ = identity(key)
     if action == "global-memory":
@@ -719,6 +739,49 @@ class Handler(BaseHTTPRequestHandler):
             # failures above retain their actual error status and diagnostics.
             LOGGER.debug('Sandbox client response closed request_id=%s action=%s', request_id, action)
 
+    def download(self, key, payload):
+        from mcp_runtime import module_source
+        source = module_source('file_ops', 'file_download')
+        source += "import json,file_download;\ntry:\n file_download.write_download(json.loads(sys.argv[1]),sys.stdout.buffer)\nexcept (ValueError,OSError) as error:\n print(json.dumps({'error':str(error)}));sys.exit(2)"
+        with lock(key):
+            ensure(key)
+            name, _ = identity(key)
+            process = subprocess.Popen(['docker', 'exec', '--user', '1000', name, *MANAGER_PYTHON, '-c', source, json.dumps(payload)],
+                                       stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        with process:
+            timer = threading.Timer(600, process.kill)
+            timer.daemon = True
+            timer.start()
+            try:
+                line = process.stdout.readline(128 * 1024)
+                if not line.endswith(b'\n'):
+                    raise ValueError('下载准备失败或超时')
+                metadata = json.loads(line)
+                if metadata.get('error'):
+                    raise ValueError(metadata['error'])
+                size = metadata.get('size')
+                if type(size) is not int or size < 0:
+                    raise ValueError('文件大小无效')
+                self.close_connection = True
+                self._streaming_response = True
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/octet-stream')
+                self.send_header('Content-Length', str(size))
+                self.send_header('X-Workbench-File', __import__('base64').urlsafe_b64encode(json.dumps(metadata).encode()).decode())
+                self.send_header('Connection', 'close')
+                self.end_headers()
+                remaining = size
+                while remaining:
+                    chunk = process.stdout.read(min(64 * 1024, remaining))
+                    if not chunk:
+                        raise ConnectionError('下载流提前结束')
+                    self.wfile.write(chunk)
+                    remaining -= len(chunk)
+            finally:
+                timer.cancel()
+                if process.poll() is None:
+                    process.kill()
+
     def do_POST(self):
         code = 200
         admitted = False
@@ -744,19 +807,43 @@ class Handler(BaseHTTPRequestHandler):
             if self.headers.get('Transfer-Encoding'):
                 raise ValueError('Transfer-Encoding is not supported; send a fixed Content-Length')
             size = int(self.headers.get("Content-Length", "0"))
-            if not 0 <= size <= MAX_BODY:
+            binary = self.headers.get('Content-Type', '').split(';', 1)[0].strip().lower() == 'application/octet-stream'
+            limit = 100 * 1024 * 1024 + 128 * 1024 if binary else MAX_BODY
+            if not 0 <= size <= limit:
                 raise ValueError("Request too large")
-            body = self.rfile.read(size)
-            if len(body) != size:
-                raise ValueError('Incomplete request body; operation was not started')
-            payload = json.loads(body or "{}")
-            if not isinstance(payload, dict):
-                raise ValueError('Request must be an object')
-            if parts[2] not in CONTROL_ACTIONS and not (parts[2] == 'office-preview' and payload.get('operation') == 'cancel'):
+            if binary:
+                if action not in {'files', 'personal-resources'}:
+                    raise ValueError('Unsupported binary upload target')
                 admitted = OPERATION_CAPACITY.acquire(blocking=False)
                 if not admitted:
                     raise CapacityError('Sandbox manager is busy; operation was not started')
-            output = operation(key, parts[2], payload)
+                with tempfile.TemporaryFile(dir=STATE) as staged:
+                    remaining = size
+                    deadline = time.monotonic() + 600
+                    while remaining:
+                        if time.monotonic() > deadline:
+                            raise ValueError('文件上传超时')
+                        chunk = self.rfile.read(min(64 * 1024, remaining))
+                        if not chunk:
+                            raise ValueError('Incomplete request body; operation was not started')
+                        staged.write(chunk)
+                        remaining -= len(chunk)
+                    output = upload_operation(key, action, staged)
+            else:
+                body = self.rfile.read(size)
+                if len(body) != size:
+                    raise ValueError('Incomplete request body; operation was not started')
+                payload = json.loads(body or "{}")
+                if not isinstance(payload, dict):
+                    raise ValueError('Request must be an object')
+                if parts[2] not in CONTROL_ACTIONS and not (parts[2] == 'office-preview' and payload.get('operation') == 'cancel'):
+                    admitted = OPERATION_CAPACITY.acquire(blocking=False)
+                    if not admitted:
+                        raise CapacityError('Sandbox manager is busy; operation was not started')
+                if action == 'files' and payload.get('operation') == 'download':
+                    self.download(key, payload)
+                    return
+                output = operation(key, parts[2], payload)
             if output.get("conflict"):
                 code = 409
         except CapacityError as error:
@@ -780,6 +867,9 @@ class Handler(BaseHTTPRequestHandler):
             REQUEST_CONTEXT.owner = None
             if admitted:
                 OPERATION_CAPACITY.release()
+        if getattr(self, '_streaming_response', False):
+            self.close_connection = True
+            return
         if code >= 400:
             output.setdefault('request_id', request_id)
         data = json.dumps(output).encode()

@@ -191,7 +191,12 @@ def verify(container, host_image=None):
                         # Compact those URLs before truncation so the actual cause survives.
                         diagnostics = re.sub(r'data:[^\s,]*;base64,[A-Za-z0-9+/=]+',
                                              '<inline-module>', result.stderr)
-                        print(diagnostics[-4000:], file=sys.stderr, end='')
+                        # The bootstrap prints its cause before the bounded
+                        # Host log tail. Preserve that cause as well as the
+                        # final diagnostics; relay retries must not hide it.
+                        if len(diagnostics) > 6000:
+                            diagnostics = diagnostics[:2000] + '\n[Host log middle omitted]\n' + diagnostics[-4000:]
+                        print(diagnostics, file=sys.stderr, end='')
                         raise ValueError('Native SSH smoke failed: ' + script)
                     # Local bridge bookkeeping can be empty while an SSH remote
                     # command is still stuck. Assert against the sandbox PID

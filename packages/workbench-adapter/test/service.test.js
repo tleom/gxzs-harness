@@ -2475,3 +2475,22 @@ it('rejects unsupported knowledge independently of configured skills', async () 
   await expect(service.updateConfig(owner, chat.id, { version: 1, selection: { model: 'p/m', skills: [123] } }))
     .rejects.toMatchObject({ status: 400 })
 })
+
+
+it('streams durable file references into command receipts for plan and goal admission', async () => {
+  const { service, agent } = setup()
+  const storedFile = { attachmentId: 'sha256:fixture', name: 'evidence.txt', bytes: 8 }
+  service.attachments = { readFileStream: async function* (ref) {
+    expect(ref).toEqual(storedFile)
+    yield Buffer.from('evidence')
+  } }
+  service.fileUploads = { uploadStream: vi.fn(async ({ sessionId, data }) => {
+    expect(sessionId).toBe(agent.id)
+    const chunks = []; for await (const chunk of data) chunks.push(chunk)
+    expect(Buffer.concat(chunks).toString()).toBe('evidence')
+    return { receiptId: 'command-file' }
+  }) }
+  expect(await service.commandAttachments(agent, [{ type: 'text', text: 'query' },
+    { type: 'file', storedFile, name: 'evidence.txt' }])).toEqual([{ type: 'file', receiptId: 'command-file' }])
+  expect(service.fileUploads.uploadStream).toHaveBeenCalledOnce()
+})

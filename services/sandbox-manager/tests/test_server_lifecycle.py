@@ -597,6 +597,25 @@ def test_chunked_body_is_rejected_before_manager_admission(server, monkeypatch):
     assert handler.send_response.call_args.args[0] == 400
 
 
+@pytest.mark.parametrize('content_type', [
+    'Application/Octet-Stream', 'application/octet-stream; charset=binary',
+    'APPLICATION/OCTET-STREAM ; name=upload.bin',
+])
+def test_binary_upload_accepts_media_type_case_and_parameters(server, monkeypatch, content_type):
+    body = b'{}\nx'
+    received = []
+    def upload(key, action, staged):
+        staged.seek(0)
+        received.append((action, staged.read()))
+        return {'ok': True}
+    monkeypatch.setattr(server, 'upload_operation', upload)
+    handler = post_handler(server, body, len(body), **{'Content-Type': content_type})
+    handler.path = handler.path.rsplit('/', 1)[0] + '/files'
+    handler.do_POST()
+    assert handler.send_response.call_args.args[0] == 200
+    assert received == [('files', body)]
+
+
 def test_complete_body_is_dispatched_once_and_unknown_operation_errors_still_log(server, monkeypatch, caplog):
     body = b'{"action":"acquire"}'
     operation = Mock(return_value={'ok': True})

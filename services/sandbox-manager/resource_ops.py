@@ -19,7 +19,7 @@ import zipfile
 
 from file_ops import parent_fd, read_file, remove_contents, tree_version, version
 
-MAX_PACKAGE = 20 * 1024 * 1024
+MAX_PACKAGE = 100 * 1024 * 1024
 MAX_SKILL_TEXT = 64 * 1024
 MAX_FILES = 200
 SETTINGS = ".settings.json"
@@ -40,24 +40,32 @@ def safe_name(name):
     return name
 
 
-def members(payload, *, require_skill=True):
+def archive_members(archive):
+    entries = {}
+    infos = [info for info in archive.infolist() if not info.is_dir()]
+    if len(infos) > MAX_FILES or sum(info.file_size for info in infos) > MAX_PACKAGE:
+        raise ValueError("技能包最多包含 200 个文件，总大小不超过 100 MiB")
+    for info in infos:
+        mode = info.external_attr >> 16
+        if (stat.S_IFMT(mode) and not stat.S_ISREG(mode)) or info.flag_bits & 1:
+            raise ValueError("技能包不能包含链接、特殊文件或加密文件")
+        if info.filename in entries:
+            raise ValueError("技能包包含重复路径")
+        entries[info.filename] = archive.read(info)
+    return entries
+
+
+def members(payload, *, require_skill=True, supplied=None):
     """Normalize a SKILL.md package, accepting one optional enclosing folder."""
     entries = {}
-    if payload.get("archive"):
+    if supplied is not None:
+        entries = supplied
+    elif payload.get("archive"):
         raw = base64.b64decode(payload["archive"], validate=True)
         if len(raw) > MAX_PACKAGE:
-            raise ValueError("技能包超过 20 MiB")
+            raise ValueError("技能包超过 100 MiB")
         with zipfile.ZipFile(io.BytesIO(raw)) as archive:
-            infos = [info for info in archive.infolist() if not info.is_dir()]
-            if len(infos) > MAX_FILES or sum(info.file_size for info in infos) > MAX_PACKAGE:
-                raise ValueError("技能包最多包含 200 个文件，总大小不超过 20 MiB")
-            for info in infos:
-                mode = info.external_attr >> 16
-                if (stat.S_IFMT(mode) and not stat.S_ISREG(mode)) or info.flag_bits & 1:
-                    raise ValueError("技能包不能包含链接、特殊文件或加密文件")
-                if info.filename in entries:
-                    raise ValueError("技能包包含重复路径")
-                entries[info.filename] = archive.read(info)
+            entries = archive_members(archive)
     else:
         for item in payload.get("files", []):
             if item["path"] in entries:
@@ -272,7 +280,7 @@ def write_package(fd, files, *, readonly=False):
         protect(fd)
 
 
-def personal(payload, root="/workspace"):
+def personal(payload, root="/workspace", *, supplied=None):
     operation = payload["operation"]
     if operation not in {"list", "skill_inspect", "skill_import", "skill_update", "skill_uninstall", "skill_toggle", "skill_reorder"}:
         raise ValueError("未知个人资源操作")
@@ -281,7 +289,7 @@ def personal(payload, root="/workspace"):
     try:
         warnings = []
         if operation == "skill_inspect":
-            files = members(payload)
+            files = members(payload, supplied=supplied)
             return {"content": files["SKILL.md"].decode("utf-8-sig")}
         try:
             skillsfd = resource_directory(rootfd, "skills")
@@ -436,7 +444,7 @@ def personal(payload, root="/workspace"):
                 return {"id": name, "enabled": settings[name]}
             if operation != "skill_import":
                 raise ValueError("未知个人资源操作")
-            files = members(payload)
+            files = members(payload, supplied=supplied)
             try:
                 oldfd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=skillsfd)
             except FileNotFoundError:

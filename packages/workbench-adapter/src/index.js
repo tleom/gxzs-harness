@@ -4,6 +4,10 @@ import { dirname } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { storageStatus, assertStorageWritable } from './storage-pressure.js'
 import { AssertionVerifier } from './assertion.js'
+import { spoolUpload } from './upload.js'
+import { createReadStream } from 'node:fs'
+import { Readable } from 'node:stream'
+import { pipeline } from 'node:stream/promises'
 import { RunEventBus } from './events.js'
 import { HumanInputBridge } from './human-input.js'
 import { errorResponse, httpError, parseJson, readBody, sendJson, withResponseSignal } from './http.js'
@@ -87,7 +91,7 @@ export function apply(ctx, config) {
   const workspaces = new WorkbenchWorkspaces({ controller: ctx.workspaceController, database, root: resolveWorkspacePath(config.workspace, 'conversations'), fileManager: ctx.workbenchFileManager, sessions: ctx.sessionController })
   const scheduler = new TaskScheduler({ database, sessions: ctx.sessionController, platformClient: ctx.workbenchPlatformClient, ownerId: config.ownerId, agents: ctx.agents, modelSettings: ctx.settings, goals: ctx.goals,
     assertStorageWritable: () => assertStorageWritable(storage()),
-    prepareContent: (sessionId, content) => prepareNativeFiles(ctx.fileUploads, sessionId, content) })
+    prepareContent: (sessionId, content) => prepareNativeFiles(ctx.fileUploads, sessionId, content, ctx.attachments) })
   runtime.scheduler = scheduler
   scheduler.hasOwnedWork = sessionId => runtime.hasOwnedWork(sessionId)
   scheduler.cancelOwned = (sessionId, runId) => runtime.cancelOwned(sessionId, runId)
@@ -307,9 +311,14 @@ export function apply(ctx, config) {
     }
   }
 
-  const managerPath = (value, { allowRoot = false } = {}) => {
+  const managerPath = (value, { allowRoot = false, allowTemporary = false } = {}) => {
     const requested = String(value ?? '')
     if (!requested) throw httpError(400, '缺少 path')
+    if (allowTemporary && requested.startsWith('/tmp/')) {
+      if (requested.slice(5).split('/').some(part => !part || part === '.' || part === '..' || /[\\\0]/u.test(part)))
+        throw httpError(400, '文件路径无效')
+      return requested
+    }
     const absolute = resolveWorkspacePath(config.workspace, requested)
     const root = config.workspace.replace(/\/+$/, '')
     if (absolute === root) {
@@ -638,7 +647,7 @@ export function apply(ctx, config) {
       sendJson(res, 200, { data: result })
     })],
     ['GET', /^\/files\/stat$/, async ({ url }, res) => withResponseSignal(res, async signal => {
-      const requested = managerPath(url.searchParams.get('path'), { allowRoot: true })
+      const requested = managerPath(url.searchParams.get('path'), { allowRoot: true, allowTemporary: true })
       const result = await ctx.workbenchFileManager.operate({ operation: 'stat', path: requested }, signal)
       signal.throwIfAborted()
       if (result.kind === 'missing') throw httpError(404, '路径不存在')
@@ -648,7 +657,7 @@ export function apply(ctx, config) {
       const requested = managerPath(json.path)
       if (typeof json.data !== 'string') throw httpError(400, '缺少 data')
       const bytes = Buffer.from(json.data, 'base64')
-      if (bytes.length > 20 * 1024 * 1024) throw httpError(413, '文件超过 20 MiB')
+      if (bytes.length > 100 * 1024 * 1024) throw httpError(413, '文件超过 100 MiB')
       const result = await ctx.workbenchFileManager.operate({ operation: 'upload', path: requested, version: json.version ?? null, data: json.data })
       sendJson(res, 200, { data: result })
     }],
@@ -665,20 +674,19 @@ export function apply(ctx, config) {
       sendJson(res, 200, { data: result })
     }],
     ['GET', /^\/files\/download$/, async ({ url }, res) => withResponseSignal(res, async signal => {
-      const requested = managerPath(url.searchParams.get('path'))
-      const result = await ctx.workbenchFileManager.operate({ operation: 'get', path: requested }, signal)
+      const requested = managerPath(url.searchParams.get('path'), { allowTemporary: true })
+      const result = await ctx.workbenchFileManager.download(requested, signal)
       signal.throwIfAborted()
-      const bytes = Buffer.from(result.data, 'base64')
       res.writeHead(200, {
-        'content-type': 'application/octet-stream', 'content-length': bytes.byteLength,
-        'content-disposition': `attachment; filename*=UTF-8''${encodeURIComponent(result.name || requested.split('/').at(-1) || 'download')}`,
-        etag: `"${String(result.version)}"`, 'cache-control': 'no-store',
+        'content-type': 'application/octet-stream', 'content-length': result.size,
+        'content-disposition': `attachment; filename*=UTF-8''${encodeURIComponent(result.name || 'download')}`,
+        etag: `"${result.version}"`, 'cache-control': 'no-store',
       })
-      res.end(bytes)
+      await pipeline(Readable.fromWeb(result.body), res, { signal })
     })],
     ['GET', /^\/files\/text$/, async ({ url }, res) => withResponseSignal(res, async signal => {
-      const requested = managerPath(url.searchParams.get('path'))
-      const result = await ctx.workbenchFileManager.operate({ operation: 'get', path: requested }, signal)
+      const requested = managerPath(url.searchParams.get('path'), { allowTemporary: true })
+      const result = await ctx.workbenchFileManager.operate({ operation: 'get', path: requested, max_bytes: 2 * 1024 * 1024 }, signal)
       signal.throwIfAborted()
       if (result.kind === 'directory') throw httpError(400, '文件不是 UTF-8 文本，请下载后编辑')
       const bytes = Buffer.from(result.data, 'base64')
@@ -701,6 +709,7 @@ export function apply(ctx, config) {
   let diagnosticWindow = 0, diagnosticCount = 0, diagnosticSuppressed = 0
   const handler = async (req, res) => {
     let diagnosticRoute = 'bootstrap'
+    let upload
     let leaveRequest
     try {
       if (req.method === 'POST' && req.url === config.basePath + '/lifecycle/sleep') {
@@ -733,17 +742,41 @@ export function apply(ctx, config) {
       await recovery
       if (recoveryError) throw Object.assign(httpError(503, '原生会话恢复尚未完成'), { code: 'RECOVERY_UNAVAILABLE' })
       diagnosticRoute = 'authentication'
-      const body = await readBody(req)
       const url = new URL(req.url ?? '/', 'http://workbench.local')
       const path = url.pathname.slice(config.basePath.length) || '/'
       const target = `${config.assertionAudiencePath}${path}${url.search}`
+      const streaming = req.method === 'POST' && ['/files/upload', '/resources/upload', '/images/upload'].includes(path)
+      const body = streaming ? Buffer.alloc(0) : await readBody(req)
       const owner = verifier.verify(req.headers['x-gxzs-assertion'], {
-        method: req.method, target, body,
+        method: req.method, target, body, streaming,
         contentType: req.headers['content-type'] ?? '', lastEventId: req.headers['last-event-id'] ?? '',
       })
       if (owner.ownerId !== config.ownerId) throw httpError(403, '当前用户不属于此工作台宿主')
       sleepBarrier.assertAwake()
       if (!['GET', 'HEAD', 'OPTIONS'].includes(req.method)) leaveRequest = sleepBarrier.enter()
+      if (streaming) {
+        await withResponseSignal(res, async signal => {
+          upload = await spoolUpload(req, owner.verifyBody, signal, (path === '/images/upload' ? 20 : 100) * 1024 * 1024)
+          if (path === '/images/upload') {
+            const { name, mediaType } = upload.metadata
+            if (typeof name !== 'string' || name.length > 512 || !['image/png', 'image/jpeg', 'image/gif', 'image/webp'].includes(mediaType)) throw httpError(400, '图片参数无效')
+            const image = await ctx.attachments.saveFileStream({ name,
+              data: createReadStream(upload.path, { start: upload.offset, signal }), signal })
+            sendJson(res, 200, { data: { upload: image, name, mediaType } })
+            return
+          }
+          const action = path === '/files/upload'  ? 'files' : 'personal-resources'
+          if (action === 'files') {
+            if (upload.metadata.operation !== 'upload') throw httpError(400, '文件上传操作无效')
+            upload.metadata.path = managerPath(upload.metadata.path)
+          } else if (!['skill_inspect', 'skill_import'].includes(upload.metadata.operation)) throw httpError(400, '技能包上传操作无效')
+          const result = action === 'files' ? await ctx.workbenchFileManager.upload(action, upload, signal)
+            : await service.mutateResource(upload.metadata, owner, metadata => ctx.workbenchFileManager.upload(action, { ...upload, metadata }, signal))
+          if (action === 'personal-resources' && upload.metadata.operation === 'skill_import') ctx.emit('workbench/resources-changed')
+          sendJson(res, 200, { data: result })
+        })
+        return
+      }
       const contentType = req.headers['content-type'] ?? ''
       const context = { owner, req, url, body, json: body.length && contentType.includes('application/json') ? parseJson(body) : {} }
       let methodNotAllowed = false
@@ -786,7 +819,7 @@ export function apply(ctx, config) {
       if (res.destroyed || res.writableEnded) return
       if (!res.headersSent) sendJson(res, failure.status, failure.body)
       else res.end()
-    } finally { leaveRequest?.() }
+    } finally { try { await upload?.dispose() } finally { leaveRequest?.() } }
   }
 
   ctx.effect(() => {
