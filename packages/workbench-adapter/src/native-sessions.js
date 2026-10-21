@@ -2,7 +2,7 @@ import { httpError } from './http.js'
 import { ownedSessionRoots } from './owned-session-roots.js'
 
 const SESSION_EVENTS = ['api-session/added', 'api-session/removed', 'api-session/status', 'api-session/activity', 'api-session/error']
-const GLOBAL_EVENTS = ['settings/document-updated', 'llm/adapters-updated', 'schedule/changed']
+const GLOBAL_EVENTS = ['settings/document-updated', 'llm/adapters-updated', 'schedule/changed', 'workbench/schedule-notifications-changed']
 
 /** Owner-scoped transport for public Session APIs. Admission stays in the existing gateways. */
 export class WorkbenchNativeSessions {
@@ -74,7 +74,9 @@ export class WorkbenchNativeSessions {
           const value = queue.shift()
           if (GLOBAL_EVENTS.includes(value.event)) {
             if (value.event === 'settings/document-updated' && !['subagent', 'subagent-model-selection-settings', 'ui-conversation'].includes(value.args[0])) continue
-            yield { event: 'native_session_events', value: { type: 'emit', ...value } }
+            // Keep existing clients' catalog invalidation contract at the transport boundary.
+            yield { event: 'native_session_events', value: { type: 'emit', ...value,
+              event: value.event === 'workbench/schedule-notifications-changed' ? 'schedule/changed' : value.event } }
             continue
           }
           ids ??= new Set((await this.list(owner, signal)).items.map(item => item.sessionId))

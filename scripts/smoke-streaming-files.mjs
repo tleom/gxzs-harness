@@ -1,9 +1,13 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
+import { createRequire } from 'node:module'
+import { inflateRawSync } from 'node:zlib'
 import { mkdtemp, open, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { FileManagerClient } from '/opt/workbench/packages/workbench-file-manager/src/index.js'
+import WorkbenchAttachmentStore from '/opt/workbench/packages/workbench-adapter/src/attachment-store.js'
+import { admitSandboxAttachments, prepareNativeFiles } from '/opt/workbench/packages/workbench-adapter/src/attachments.js'
 
 const [workspaceId, phase] = process.argv.slice(2)
 const manager = new FileManagerClient({ baseUrl: 'http://127.0.0.1:5010', workspaceId, tokenEnv: 'TEST_MANAGER_TOKEN' })
@@ -66,6 +70,117 @@ try {
       metadata: { ...skillMetadata, operation: 'skill_import', name: 'upload-audit', version: 'stale' } }), error => error.status === 409)
     await manager.personalResources({ operation: 'skill_uninstall', name: 'upload-audit', version: imported.version })
     console.log('PASS streaming files: 100 MiB binary upload/download SHA-256, conflicts, oversize rejection, skill import/version checks')
+  } else if (phase === 'mixed') {
+    const nativeRequire = createRequire('/opt/workbench/profiles/workbench/package.json')
+    const { Context } = nativeRequire('@deepseek-ai/cordis')
+    const sharp = createRequire(nativeRequire.resolve('@deepseek-ai/dsh-attachment-local'))('sharp')
+    const ctx = new Context()
+    await ctx.plugin(WorkbenchAttachmentStore, { dshHome: directory, imageCompressionConcurrency: 1 })
+    const png = await sharp({ create: { width: 48, height: 32, channels: 4, background: '#33669980' } }).png().toBuffer()
+    const jpeg = await sharp({ create: { width: 48, height: 32, channels: 3, background: '#336699' } }).jpeg().toBuffer()
+    let peakRss = process.memoryUsage().rss
+    const monitor = setInterval(() => { peakRss = Math.max(peakRss, process.memoryUsage().rss) }, 20)
+    try {
+      await manager.operate({ operation: 'mkdir', path: 'probe/mixed' })
+      for (let round = 0; round < 3; round++) {
+        const names = ['证据.txt', '照片.png', '说明.pdf', '图像.jpg', 'empty.txt', '图二.png', '数据.bin', '图三.jpg', '记录.csv', '末张.png']
+        const originals = names.map((name, i) => name.endsWith('.png') ? png : name.endsWith('.jpg') ? jpeg
+          : name === 'empty.txt' ? Buffer.alloc(0) : Buffer.from(`mixed-${round}-${i}-中文证据`))
+        const files = await Promise.all(names.map(async (name, i) => {
+          const local = join(directory, `mixed-${i}`), bytes = originals[i]
+          await writeFile(local, bytes)
+          const metadata = { operation: 'upload', path: `probe/mixed/${name}`, version: null, size: bytes.length }
+          const uploaded = await manager.upload('files', { path: local, metadata, size: bytes.length, offset: 0 })
+          assert.equal(uploaded.version, createHash('sha256').update(bytes).digest('hex'))
+          const downloaded = await manager.download(metadata.path), chunks = []
+          for await (const chunk of downloaded.body) chunks.push(Buffer.from(chunk))
+          assert.deepEqual(Buffer.concat(chunks), bytes)
+          return { path: metadata.path, version: uploaded.version }
+        }))
+        const admitted = await admitSandboxAttachments({ fileManager: manager, workspace: '/workspace', query: '复核附件', files,
+          nativeFiles: true, attachmentStore: ctx.attachments })
+        assert.equal(admitted.attachments.length, 10)
+        assert.equal(admitted.content.filter(item => item.type === 'image').length, 5)
+        assert.equal(admitted.content.filter(item => item.type === 'file').length, 5)
+        const receipts = await prepareNativeFiles({ uploadStream: async ({ name, data }) => {
+          const chunks = []; for await (const chunk of data) chunks.push(Buffer.from(chunk))
+          assert.deepEqual(Buffer.concat(chunks), originals[names.indexOf(name)])
+          return { receiptId: `receipt-${name}` }
+        } }, 'fixture', admitted.content, ctx.attachments)
+        assert.equal(receipts.filter(item => item.type === 'file' && item.receiptId).length, 5)
+        const archived = await manager.download('probe/mixed'), chunks = []
+        for await (const chunk of archived.body) chunks.push(Buffer.from(chunk))
+        const zip = Buffer.concat(chunks)
+        assert.equal(zip.length, archived.size)
+        const end = zip.length - 22
+        assert.equal(zip.readUInt32LE(end), 0x06054b50)
+        assert.equal(zip.readUInt16LE(end + 10), names.length)
+        let offset = zip.readUInt32LE(end + 16)
+        for (let i = 0; i < names.length; i++) {
+          assert.equal(zip.readUInt32LE(offset), 0x02014b50)
+          const nameLength = zip.readUInt16LE(offset + 28), extraLength = zip.readUInt16LE(offset + 30), commentLength = zip.readUInt16LE(offset + 32)
+          const name = zip.subarray(offset + 46, offset + 46 + nameLength).toString('utf8')
+          const local = zip.readUInt32LE(offset + 42)
+          const start = local + 30 + zip.readUInt16LE(local + 26) + zip.readUInt16LE(local + 28)
+          const bytes = inflateRawSync(zip.subarray(start, start + zip.readUInt32LE(offset + 20)))
+          assert.deepEqual(bytes, originals[names.indexOf(name)])
+          offset += 46 + nameLength + extraLength + commentLength
+        }
+        for (const file of files) await manager.operate({ operation: 'delete', ...file })
+        console.log(`PASS mixed round ${round + 1}: 10 concurrent uploads, exact downloads, 5 native images + 5 file receipts, ZIP names/content`)
+      }
+      const folder = await manager.operate({ operation: 'stat', path: 'probe/mixed' })
+      await manager.operate({ operation: 'delete', path: 'probe/mixed', version: folder.version })
+      console.log(`PASS mixed memory: peak Node RSS ${Math.ceil(peakRss / mib)} MiB in a 512 MiB container`)
+    } finally { clearInterval(monitor); await ctx.fiber.dispose() }
+  } else if (phase === 'mixed-boundary') {
+    const nativeRequire = createRequire('/opt/workbench/profiles/workbench/package.json')
+    const { Context } = nativeRequire('@deepseek-ai/cordis')
+    const ctx = new Context()
+    await ctx.plugin(WorkbenchAttachmentStore, { dshHome: directory, imageCompressionConcurrency: 1 })
+    let peakRss = process.memoryUsage().rss
+    const monitor = setInterval(() => { peakRss = Math.max(peakRss, process.memoryUsage().rss) }, 20)
+    try {
+      await manager.operate({ operation: 'mkdir', path: 'probe/boundary' })
+      const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64')
+      const sources = []
+      for (const [name, size, prefix] of [['file.bin', 100 * mib, Buffer.from('binary')], ['image.png', 20 * mib, png], ['empty.txt', 0, Buffer.alloc(0)]]) {
+        const local = join(directory, name), digest = createHash('sha256'), file = await open(local, 'wx')
+        try {
+          await file.writeFile(prefix); digest.update(prefix)
+          const chunk = Buffer.alloc(64 * 1024)
+          for (let remaining = size - prefix.length; remaining > 0;) {
+            const part = chunk.subarray(0, Math.min(remaining, chunk.length))
+            await file.writeFile(part); digest.update(part); remaining -= part.length
+          }
+        } finally { await file.close() }
+        sources.push({ local, name, size, version: digest.digest('hex') })
+      }
+      const selected = [...Array(4).fill(sources[0]), ...Array(5).fill(sources[1]), sources[2]]
+      const files = await Promise.all(selected.map(async (source, index) => {
+        const path = `probe/boundary/${index}-${source.name}`
+        const metadata = { operation: 'upload', path, size: source.size, version: null }
+        const result = await manager.upload('files', { path: source.local, metadata, offset: 0, size: source.size })
+        assert.equal(result.version, source.version)
+        return { path, version: result.version }
+      }))
+      const admitted = await admitSandboxAttachments({ fileManager: manager, workspace: '/workspace', query: '边界混合附件', files,
+        nativeFiles: true, attachmentStore: ctx.attachments })
+      assert.equal(admitted.attachments.length, 10)
+      assert.equal(admitted.content.filter(item => item.type === 'image').length, 5)
+      const receipts = await prepareNativeFiles({ uploadStream: async ({ name, data }) => {
+        const expected = selected[Number(name.split('-')[0])], digest = createHash('sha256')
+        let count = 0
+        for await (const chunk of data) { count += chunk.length; digest.update(chunk) }
+        assert.equal(count, expected.size); assert.equal(digest.digest('hex'), expected.version)
+        return { receiptId: `receipt-${name}` }
+      } }, 'fixture', admitted.content, ctx.attachments)
+      assert.equal(receipts.filter(item => item.type === 'file').length, 5)
+      for (const file of files) await manager.operate({ operation: 'delete', ...file })
+      const folder = await manager.operate({ operation: 'stat', path: 'probe/boundary' })
+      await manager.operate({ operation: 'delete', path: 'probe/boundary', version: folder.version })
+      console.log(`PASS mixed boundary: 10 files / 500 MiB, four 100 MiB files + five 20 MiB images + one empty file; streaming receipts exact; peak Node RSS ${Math.ceil(peakRss / mib)} MiB`)
+    } finally { clearInterval(monitor); await ctx.fiber.dispose() }
   } else if (phase === 'directory') {
     const result = await manager.download('probe/stream-dir')
     assert.equal(result.kind, 'directory')

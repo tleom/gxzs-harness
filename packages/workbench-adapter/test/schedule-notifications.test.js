@@ -1,9 +1,10 @@
 import { afterEach, expect, it, vi } from 'vitest'
 import { WorkbenchDatabase } from '../src/persistence.js'
 import { projectInboxClaim, projectSessionEvent } from '../src/projection.js'
-import { ScheduleNotifications, scheduleOccurrences } from '../src/schedule-notifications.js'
+import { ScheduleNotifications, scheduleOccurrences, registerScheduleNotificationTool } from '../src/schedule-notifications.js'
 import { WorkbenchSchedules } from '../src/schedules.js'
 import { WorkbenchService } from '../src/service.js'
+import { ScheduleWakeups } from '../src/schedule-wakeups.js'
 
 const databases = []
 const bridges = []
@@ -19,7 +20,7 @@ function fixture() {
   const platformClient = { json: vi.fn(async request => {
     const body = JSON.parse(request.body)
     sent.push(body)
-    return { data: ['sync', 'recover'].includes(body.action) ? body.tasks.map(task => ({ jobId: task.id, notifyEnabled: true, version: 2 })) : ['schedule-one'] }
+    return { data: ['lookup', 'sync', 'recover'].includes(body.action) ? body.tasks.map(task => ({ jobId: task.id, notifyEnabled: true, version: 2 })) : ['schedule-one'] }
   }) }
   const schedules = { ownedCatalog: vi.fn(async () => [{ id: 'schedule-one', sessionId: chat.sessionId,
     chat_id: chat.id, title: '提醒' }]) }
@@ -36,6 +37,89 @@ function fixture() {
   }
   return { database, ownerId, chat, platformClient, bridge, deliver, end, sent }
 }
+
+it('reads notification settings without writing task registrations or pending creation intents', async () => {
+  const h = fixture()
+  const tasks = await h.bridge.schedules.ownedCatalog()
+  h.database.rememberScheduleInitialization(h.ownerId, h.chat.id, h.bridge.task(tasks[0]), Date.now())
+  const [task] = await h.bridge.read(tasks)
+  expect(task).toMatchObject({ notification_available: false, notification_stale: true })
+  expect(task.notify_enabled).toBeUndefined()
+  expect(h.sent.map(body => body.action)).toEqual(['lookup'])
+  expect(h.database.pendingScheduleInitializations(h.ownerId)).toHaveLength(1)
+})
+
+it('retains confirmed enabled settings on a transient read failure and retries with a finite budget', async () => {
+  vi.useFakeTimers()
+  const h = fixture()
+  h.bridge.changed = vi.fn()
+  try {
+    const tasks = await h.bridge.schedules.ownedCatalog()
+    await h.bridge.read(tasks)
+    h.platformClient.json.mockRejectedValue(new Error('synthetic network failure'))
+    for (const delay of [500, 1000, 2000, 4000]) {
+      expect(await h.bridge.read(tasks)).toMatchObject([{ notify_enabled: true, notification_available: false, notification_stale: true }])
+      await vi.advanceTimersByTimeAsync(delay)
+    }
+    await h.bridge.read(tasks)
+    await vi.advanceTimersByTimeAsync(60_000)
+    expect(h.bridge.changed).toHaveBeenCalledTimes(4)
+    h.bridge.close()
+    await vi.advanceTimersByTimeAsync(60_000)
+    expect(h.bridge.changed).toHaveBeenCalledTimes(4)
+  } finally { vi.useRealTimers() }
+})
+
+it('never treats an unknown notification state as a confirmed disabled setting', async () => {
+  const h = fixture()
+  h.platformClient.json.mockRejectedValue(new Error('synthetic unavailable'))
+  const tasks = await h.bridge.schedules.ownedCatalog()
+  const [task] = await h.bridge.read(tasks)
+  expect(task.notification_available).toBe(false)
+  expect(task.notification_stale).toBe(true)
+  expect(task.notify_enabled).toBeUndefined()
+})
+
+it('refreshes notification displays without writing wakeup snapshots or draining completion receipts', async () => {
+  vi.useFakeTimers()
+  const h = fixture()
+  const hooks = new Map(), events = []
+  const ctx = {
+    on(name, listener) { hooks.set(name, [...(hooks.get(name) ?? []), listener]) },
+    emit(name) { events.push(name); for (const listener of hooks.get(name) ?? []) listener() },
+  }
+  const wakeups = new ScheduleWakeups({ database: h.database, ownerId: h.ownerId,
+    platformClient: h.platformClient, schedules: h.bridge.schedules })
+  bridges.push(wakeups)
+  wakeups.sync = vi.fn(async () => {})
+  h.bridge.drain = vi.fn(async () => {})
+  try {
+    h.bridge.start(ctx); wakeups.start(ctx)
+    await vi.advanceTimersByTimeAsync(25)
+    wakeups.sync.mockClear(); h.bridge.drain.mockClear()
+    h.platformClient.json.mockResolvedValueOnce({ data: { jobId: 'schedule-one', notifyEnabled: false, version: 3 } })
+    const tasks = await h.bridge.schedules.ownedCatalog()
+    await h.bridge.configure(tasks[0], false, 2)
+    h.platformClient.json.mockRejectedValue(new Error('synthetic read failure'))
+    await h.bridge.read(tasks)
+    await vi.advanceTimersByTimeAsync(600)
+    expect(events).toEqual(['workbench/schedule-notifications-changed', 'workbench/schedule-notifications-changed'])
+    expect(wakeups.sync).not.toHaveBeenCalled()
+    expect(h.bridge.drain).not.toHaveBeenCalled()
+  } finally { vi.useRealTimers() }
+})
+
+it('does not let a delayed lookup replace the acknowledged version from a newer switch', async () => {
+  const h = fixture()
+  const tasks = await h.bridge.schedules.ownedCatalog()
+  let finish
+  h.platformClient.json.mockImplementationOnce(() => new Promise(resolve => { finish = resolve }))
+    .mockResolvedValueOnce({ data: { jobId: 'schedule-one', notifyEnabled: false, version: 3 } })
+  const reading = h.bridge.read(tasks)
+  await h.bridge.configure(tasks[0], false, 2)
+  finish({ data: [{ jobId: 'schedule-one', notifyEnabled: true, version: 2 }] })
+  expect(await reading).toMatchObject([{ notify_enabled: false, notification_version: 3, notification_available: true }])
+})
 
 it('extracts individual occurrences from a native batch without sharing notification settings', () => {
   expect(scheduleOccurrences('reminders_json: [{"schedule_id":"a","occurrence_at":"2026-10-20T01:00:00Z"},{"schedule_id":"b","occurrence_at":"2026-10-20T02:00:00Z"}]'))
@@ -147,6 +231,29 @@ it('registers creation settings and saves notification-only edits without changi
   expect(h.sent.filter(body => body.action === 'configure').at(-1)?.notifyEnabled).toBe(false)
 })
 
+it('allows the native creation tool to enable notifications before the wakeup snapshot registers its row', async () => {
+  const h = fixture()
+  const tasks = await h.bridge.schedules.ownedCatalog()
+  const schedules = new WorkbenchSchedules({ native: { catalog: async () => tasks }, database: h.database, service: {} })
+  schedules.notifications = h.bridge
+  h.platformClient.json.mockImplementation(async ({ body }) => {
+    const request = JSON.parse(body); h.sent.push(request)
+    if (request.action === 'lookup') return { data: [] }
+    if (request.action === 'recover') return { data: [{ jobId: 'schedule-one', notifyEnabled: false, version: 1 }] }
+    return { data: { jobId: 'schedule-one', notifyEnabled: true, version: 2 } }
+  })
+  let tool
+  registerScheduleNotificationTool({ tools: { register(value) { tool = value } } }, {
+    schedules, database: h.database, ownerId: h.ownerId,
+    runtime: { executionRun: () => ({ ownerId: h.ownerId, status: 'running' }), scheduler: { hasAdmission: () => true } },
+  })
+  expect(await tool.execute({ id: 'schedule-one', enabled: true }, {
+    agent: { session: { id: h.chat.sessionId } }, signal: new AbortController().signal,
+  })).toEqual({ id: 'schedule-one', enabled: true })
+  expect(h.sent.map(item => item.action)).toEqual(['lookup', 'recover', 'configure'])
+  expect(h.sent.at(-1)).toMatchObject({ expectedVersion: 1, notifyEnabled: true })
+})
+
 it('retains the created native task when platform settings cannot be saved', async () => {
   const h = fixture()
   h.platformClient.json.mockRejectedValue(new Error('platform unavailable'))
@@ -228,7 +335,7 @@ it('rejects a stale settings version before changing native rules and exposes a 
   }
   const gateway = new WorkbenchSchedules({ native, database: h.database, service: {} })
   gateway.notifications = {
-    sync: async tasks => tasks.map(task => ({ ...task, notification_available: true, notification_version: 3 })),
+    read: async tasks => tasks.map(task => ({ ...task, notification_available: true, notification_version: 3 })),
     configure: vi.fn().mockRejectedValueOnce(new Error('lost settings response')).mockResolvedValue({}),
   }
   await expect(gateway.update({ ownerId: h.ownerId }, record.id, {

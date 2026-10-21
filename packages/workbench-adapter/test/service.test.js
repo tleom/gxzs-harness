@@ -305,7 +305,7 @@ describe('followup and control service', () => {
     database.transitionRun(owner.ownerId, run.id, 'completed')
     let background = true
     service.hasOwnedWork = (session, id) => session === chat.sessionId && id === run.id && background
-    service.workspaces = { controller: { archiveSession: vi.fn(async () => { background = false }) } }
+    service.workspaces = { baseline: async () => ({ items: [] }), controller: { archiveSession: vi.fn(async () => { background = false }) } }
     service.platformClient = { json: vi.fn(async () => ({ fenced: true })) }
     await service.deleteChat(owner, chat.id)
     expect(service.platformClient.json).toHaveBeenCalledWith(expect.objectContaining({ route: 'mcp/cancel', body: expect.any(Buffer) }))
@@ -619,7 +619,7 @@ describe('followup and control service', () => {
   })
   it('creates a native workspace session and persists its directory without deleting workspace files', async () => {
     const { service, owner, database, sessionController, fileManager } = setup()
-    service.workspaces = { requireWorkspace: vi.fn(async () => ({ workspaceId: 'ws-cases', path: 'cases' })) }
+    service.workspaces = { baseline: async () => ({ items: [{ workspaceId: 'ws-cases', path: 'cases' }] }), requireWorkspace: vi.fn(async () => ({ workspaceId: 'ws-cases', path: 'cases' })) }
     const chat = await service.createChat(owner, '/workspace', {}, 'ws-cases')
     expect(service.workspaces.requireWorkspace).toHaveBeenCalledWith(owner, 'ws-cases', true)
     expect(sessionController.create).toHaveBeenCalledWith({ workspaceId: 'ws-cases' })
@@ -1405,7 +1405,7 @@ describe('followup and control service', () => {
   it('stops native background activity and terminals before removing the chat directory', async () => {
     const { owner, chat, service, fileManager } = setup()
     const actions = []
-    service.workspaces = { controller: { archiveSession: vi.fn(async request => actions.push(['archive', request])) } }
+    service.workspaces = { baseline: async () => ({ items: [] }), controller: { archiveSession: vi.fn(async request => actions.push(['archive', request])) } }
     service.closeTerminals = vi.fn(async sessionId => actions.push(['terminals', sessionId]))
     let settled
     const unwinding=new Promise(resolve=>{settled=resolve})

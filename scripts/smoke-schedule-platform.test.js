@@ -27,14 +27,14 @@ it('accepts actual wakeup and notification bridge requests through bootstrap reg
       status: 'active', kind: 'once', scheduledAt: new Date(Date.now() + 3_600_000).toISOString() }]
     await wakeups.flush()
     expect(wakeups.safety(tasks)).toEqual({ registeredSchedules: 1, pendingScheduleReports: 0 })
-    const [before] = await notifications.sync(tasks)
+    const [before] = await notifications.read(tasks)
     expect(before).toMatchObject({ notify_enabled: false, notification_available: true, notification_version: 1 })
     await notifications.initialize(tasks[0], Date.now())
     expect(database.pendingScheduleInitializations(ownerId)).toEqual([])
-    const [enabled] = await notifications.sync(tasks)
+    const [enabled] = await notifications.read(tasks)
     expect(enabled).toMatchObject({ notify_enabled: true, notification_version: 2 })
     await notifications.configure(tasks[0], false, enabled.notification_version)
-    expect((await notifications.sync(tasks))[0]).toMatchObject({ notify_enabled: false, notification_version: 3 })
+    expect((await notifications.read(tasks))[0]).toMatchObject({ notify_enabled: false, notification_version: 3 })
     await expect(notifications.configure(tasks[0], true, enabled.notification_version)).rejects.toThrow()
     await notifications.remove(tasks[0])
     tasks = []
@@ -45,6 +45,16 @@ it('accepts actual wakeup and notification bridge requests through bootstrap reg
     wakeups.close()
     database.close()
   }
+})
+
+it('keeps catalog reads from registering jobs or overwriting titles', () => {
+  const fixture = createSchedulePlatformFixture()
+  const route = '/internal/workbench/jobs'
+  const task = { id: 'job', sessionId: 'session', chatId: 'chat', title: 'Original' }
+  expect(fixture('POST', route, { action: 'lookup', tasks: [task] })).toEqual([])
+  fixture('POST', route, { action: 'sync', tasks: [task] })
+  expect(fixture('POST', route, { action: 'lookup', tasks: [{ ...task, title: 'Stale' }] }))
+    .toMatchObject([{ title: 'Original', version: 1, notifyEnabled: false }])
 })
 
 it('rejects malformed snapshots, changed bindings and unsupported fixture requests', () => {

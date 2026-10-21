@@ -45,6 +45,10 @@ export function createSchedulePlatformFixture() {
       })) }
     }
     if (route !== '/internal/workbench/jobs') return undefined
+    if (body.action === 'lookup') {
+      assert.ok(Array.isArray(body.tasks) && body.tasks.length <= 200)
+      return body.tasks.flatMap(task => jobs.has(task.id) ? [{ ...jobs.get(task.id) }] : [])
+    }
     if (['sync', 'recover'].includes(body.action)) {
       assert.ok(Array.isArray(body.tasks) && body.tasks.length <= 200)
       return body.tasks.map(task => ({ ...register(task, body.action === 'recover') }))

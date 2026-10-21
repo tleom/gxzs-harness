@@ -3,6 +3,20 @@ import { expect, it, vi } from 'vitest'
 import { browserAction, SandboxBrowser, WorkbenchBrowsers } from '../src/browsers.js'
 const id = '12345678-1234-1234-1234-123456789abc'
 const signal = () => new AbortController().signal
+it('receives a full-resolution PNG above the old line limit without closing the browser', async () => {
+  const stdin = new PassThrough(), stdout = new PassThrough()
+  const browser = new SandboxBrowser({spawn:spec => ({stdin,stdout,
+    done:new Promise(resolve => spec.signal.addEventListener('abort',resolve))})})
+  try {
+    const image=Buffer.alloc(8*1024*1024).toString('base64')
+    const frame=JSON.stringify({type:'frame',image,mediaType:'image/png',width:1920,height:1080})+'\n'
+    stdout.write(frame.slice(0,9*1024*1024))
+    expect(browser.closed).toBe(false)
+    stdout.write(frame.slice(9*1024*1024))
+    expect(browser.closed).toBe(false)
+    expect(browser.frame.image).toBe(image)
+  } finally {browser.dispose();await browser.done}
+})
 it('binds RFB input to its owner, active attachment and current ordered display handshake', async () => {
   const worker = { closed:false, done:new Promise(()=>{}), command:vi.fn(async()=>({display:'kasm'})), dispose:vi.fn() }
   const gateway = new WorkbenchBrowsers({create:()=>worker})

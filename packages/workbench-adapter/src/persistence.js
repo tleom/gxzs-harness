@@ -58,6 +58,12 @@ export class WorkbenchDatabase {
         created_at INTEGER NOT NULL,
         completed_at INTEGER
       );
+      CREATE TABLE IF NOT EXISTS workspace_deletions (
+        workspace_id TEXT PRIMARY KEY,
+        owner_id TEXT NOT NULL,
+        plan_json TEXT NOT NULL,
+        completed_at INTEGER
+      );
       CREATE TABLE IF NOT EXISTS runs (
         id TEXT PRIMARY KEY,
         owner_id TEXT NOT NULL,
@@ -302,6 +308,32 @@ export class WorkbenchDatabase {
   deletionChat(ownerId, chatId) {
     const row = this.db.prepare('SELECT * FROM chats WHERE id = ? AND owner_id = ?').get(chatId, ownerId)
     return row ? decodeChat(row) : undefined
+  }
+
+  directoryChats(ownerId) {
+    // Include interrupted deletions until native writers have been erased.
+    return this.db.prepare('SELECT * FROM chats WHERE owner_id = ?').all(ownerId).map(decodeChat)
+  }
+
+  workspaceDeletion(ownerId, workspaceId) {
+    const row = this.db.prepare('SELECT * FROM workspace_deletions WHERE owner_id = ? AND workspace_id = ?').get(ownerId, workspaceId)
+    return row ? { ...JSON.parse(row.plan_json), workspaceId, completedAt: row.completed_at } : undefined
+  }
+
+  pendingWorkspaceDeletions(ownerId) {
+    return this.db.prepare('SELECT workspace_id FROM workspace_deletions WHERE owner_id = ? AND completed_at IS NULL')
+      .all(ownerId).map(row => this.workspaceDeletion(ownerId, row.workspace_id))
+  }
+
+  beginWorkspaceDeletion(ownerId, workspaceId, plan) {
+    this.db.prepare('INSERT OR IGNORE INTO workspace_deletions(workspace_id, owner_id, plan_json) VALUES (?, ?, ?)')
+      .run(workspaceId, ownerId, JSON.stringify(plan))
+    return this.workspaceDeletion(ownerId, workspaceId)
+  }
+
+  finishWorkspaceDeletion(ownerId, workspaceId) {
+    this.db.prepare('UPDATE workspace_deletions SET completed_at = ? WHERE owner_id = ? AND workspace_id = ?')
+      .run(Date.now(), ownerId, workspaceId)
   }
 
   chatDeletion(ownerId, chatId) {

@@ -40,18 +40,20 @@ it('coalesces frames when the transport is slow and releases discarded frame rec
   await stream.dispose()
 })
 
-it('uses high-quality motion encoding during rapid repaint and restores lossless text when settled', async()=>{
+it('keeps rapidly repainted and large frames lossless', async()=>{
   vi.useFakeTimers()
   const session=Object.assign(new EventEmitter(),{send:vi.fn(async()=>({}))})
   let sequence=0
-  const stream=createScreencast({session,page:{viewportSize:()=>({width:1000,height:700})},emit:async()=>true,nextId:()=>++sequence})
+  const emit=vi.fn(async()=>true)
+  const stream=createScreencast({session,page:{viewportSize:()=>({width:1920,height:1080})},emit,nextId:()=>++sequence})
   try {
     await stream.start()
     for(let id=1;id<=4;id++) {session.emit('Page.screencastFrame',{sessionId:id,data:'aA=='});await vi.advanceTimersByTimeAsync(1)}
-    expect(session.send).toHaveBeenCalledWith('Page.startScreencast',expect.objectContaining({format:'jpeg',quality:95}))
-    session.emit('Page.screencastFrame',{sessionId:5,data:'aA=='})
+    const data=Buffer.alloc(4500000).toString('base64')
+    session.emit('Page.screencastFrame',{sessionId:5,data})
     await vi.advanceTimersByTimeAsync(1600)
-    expect(session.send.mock.calls.filter(([name])=>name==='Page.startScreencast').at(-1)[1].format).toBe('png')
+    expect(emit).toHaveBeenCalledWith(expect.objectContaining({image:data,mediaType:'image/png'}))
+    expect(session.send.mock.calls.filter(([name])=>name==='Page.startScreencast').map(([,args])=>args.format)).toEqual(['png'])
   } finally {await stream.dispose();vi.useRealTimers()}
 })
 
@@ -65,4 +67,19 @@ it('does not restart encoding when a hidden view stops during CDP configuration'
   expect(await starting).toBe(false)
   expect(session.send.mock.calls.some(([name])=>name==='Page.startScreencast')).toBe(false)
   await stream.dispose()
+})
+
+it('stops an oversized lossless stream and reports failure without lowering quality', async()=>{
+  const session=Object.assign(new EventEmitter(),{send:vi.fn(async()=>({}))})
+  const emit=vi.fn(async()=>true),onUnavailable=vi.fn()
+  const stream=createScreencast({session,page:{viewportSize:()=>({width:1920,height:1080})},emit,nextId:()=>1,onUnavailable})
+  try {
+    await stream.start()
+    session.emit('Page.screencastFrame',{sessionId:1,data:'A'.repeat(Math.ceil(8*1024*1024/3)*4+4)})
+    await vi.waitFor(()=>expect(onUnavailable).toHaveBeenCalledOnce())
+    expect(emit).not.toHaveBeenCalled()
+    expect(stream.active).toBe(false)
+    expect(session.send).toHaveBeenCalledWith('Page.stopScreencast')
+    expect(session.send.mock.calls.filter(([name])=>name==='Page.startScreencast').map(([,args])=>args.format)).toEqual(['png'])
+  } finally {await stream.dispose()}
 })

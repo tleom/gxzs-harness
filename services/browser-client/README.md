@@ -18,6 +18,11 @@ disconnect. The bundled upstream MPL-2.0 license is kept
 next to the artifact; upstream source is available at
 https://github.com/kasmtech/noVNC/tree/475ecfa5356579ef222983c7ce4619a7576a3bce.
 
+The client does not advertise JPEG quality support, and the product wrapper
+disables WebP and video scaling. Tight therefore carries lossless zlib pixels.
+The CDP fallback uses PNG at the viewport's original resolution, including
+during motion, with an 8 MiB encoded-frame limit and matching transport bounds.
+
 The single-display adaptation releases decoded ImageBitmap/VideoFrame images
 after painting, on dropped frames, and on disconnect, including late decodes.
 It also closes the display BroadcastChannel. Desktop pixels use CSS resolution

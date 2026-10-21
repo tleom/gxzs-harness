@@ -11,7 +11,7 @@ import { normalizeResourceMentions, appendResourceInstructions, pluginId, plugin
 import { appendSkillInvocations, assertSkillInvocationClaims, resolveSkillInvocations, skillGestureNames, skillInvocationClaims } from './skill-invocations.js'
 import { httpError } from './http.js'
 import { decodeCursor } from './cursor.js'
-import { containsWorkspacePath, resolveWorkspacePath } from './paths.js'
+import { resolveWorkspacePath } from './paths.js'
 import { forkChat } from './fork-chat.js'
 import { inputSupplement, toAnswer } from './human-input.js'
 import { requireDatabaseModel } from './database-models.js'
@@ -26,6 +26,7 @@ import { withNativeCommandRun, nativeCommandRecords } from './native-command.js'
 import { dispatchRunPrompt } from './native-prompt.js'
 import { goalFailureReason, presentRunEvent, resumeGoalSelection, runFailure } from './run-failure.js'
 import { ownedSessionRoots } from './owned-session-roots.js'
+import { DirectoryLifecycle } from './directory-lifecycle.js'
 
 export class WorkbenchService {
   constructor({ database, sessionController, agents, commands, skills, globalSkillOrder, workingDirectory, onGoalChanged, fileManager, platformClient, workspace, sessionQuery, agentPresets, agentDefaultModel, modelSettings, scheduler, attachments, goals, fileUploads, nativeFileAttachments = false }) {
@@ -52,13 +53,19 @@ export class WorkbenchService {
     this.goals = goals
     this.fileUploads = fileUploads
     this.nativeFileAttachments = nativeFileAttachments
+    this.directories = new DirectoryLifecycle(this)
   }
 
   async createChat(owner, workspace, selection, workspaceId) {
+    return this.directories.run(owner, () => this.createChatLocked(owner, workspace, selection, workspaceId))
+  }
+
+  async createChatLocked(owner, workspace, selection, workspaceId) {
     const id = randomUUID()
     if (workspaceId !== undefined) {
       if (!this.workspaces) throw httpError(503, '工作区服务尚未就绪')
       const target = await this.workspaces.requireWorkspace(owner, workspaceId, true)
+      this.directories.assertAvailable(owner, this.directories.workspacePath(target))
       const created = await this.sessions.create({ workspaceId: target.workspaceId })
       return this.database.createChat({ id, ownerId: owner.ownerId, sessionId: created.sessionId, selection,
         directory: target.path === '.' ? 'conversations' : `conversations/${target.path}` })
@@ -213,7 +220,7 @@ export class WorkbenchService {
     })
   }
 
-  fork(owner, sourceRunId, body) { return forkChat(this, owner, sourceRunId, body) }
+  fork(owner, sourceRunId, body) { return this.directories.run(owner, () => forkChat(this, owner, sourceRunId, body)) }
 
   feedback(owner, runId, rating) {
     if (rating !== null && rating !== 'like' && rating !== 'dislike') throw httpError(400, '反馈类型无效')
@@ -231,6 +238,10 @@ export class WorkbenchService {
   }
 
   async deleteChat(owner, chatId) {
+    return this.directories.run(owner, () => this.deleteChatLocked(owner, chatId))
+  }
+
+  async deleteChatLocked(owner, chatId) {
     return this.withChatMutation(chatId, async () => {
       const pending = this.database.chatDeletion(owner.ownerId, chatId)
       if (pending) {
@@ -275,13 +286,12 @@ export class WorkbenchService {
             this.database.finishSubmission(owner.ownerId, run.id, access)
           }
         }
-        const path = chat.directory ?? `conversations/${chat.id}`
-        // Allocated task directories are private; selected workspaces and forks retain shared files.
-        const shared = this.database.listChats(owner.ownerId).some((other) => other.id !== chat.id && containsWorkspacePath(path, other.directory ?? `conversations/${other.id}`))
-        const allocated = path === `conversations/${chat.id}` || /^conversations\/\d{4}-\d{2}-\d{2}\//.test(path) && path.split('/').at(-1) === chat.id
+        const path = this.directories.chatPath(chat)
         const sessionIds = await this.permanentDeletion.prepare(chat)
-        let fileDeletion
-        if (!shared && allocated && path !== '.') {
+        // Retain the shared path even when another fork currently owns it. A
+        // failed erasure can be retried after that other fork has been deleted.
+        let fileDeletion = path.startsWith('conversations/') ? { path } : undefined
+        if (await this.directories.canCleanChat(owner, chat, path)) {
           const entry = await this.fileManager.operate({ operation: 'stat', path })
           if (entry.kind !== 'missing') fileDeletion = { path, version: entry.version }
         }
@@ -297,10 +307,9 @@ export class WorkbenchService {
     if (!this.permanentDeletion) throw httpError(503, '会话删除服务尚未就绪')
     if (deletion.fileDeletion) {
       const { path, version } = deletion.fileDeletion
-      const shared = this.database.listChats(owner.ownerId).some(chat => containsWorkspacePath(path, chat.directory ?? `conversations/${chat.id}`))
-      if (!shared) {
+      if (await this.directories.canCleanChat(owner, { id: deletion.chatId }, path)) {
         const entry = await this.fileManager.operate({ operation: 'stat', path })
-        if (entry.kind !== 'missing') await this.fileManager.operate({ operation: 'delete', path, version: refreshFiles ? entry.version : version })
+        if (entry.kind !== 'missing') await this.fileManager.operate({ operation: 'delete', path, version: refreshFiles || !version ? entry.version : version })
       }
     }
     await this.permanentDeletion.erase(deletion)
@@ -1376,6 +1385,7 @@ export class WorkbenchService {
   requireChat(owner, chatId) {
     const chat = this.database.getChat(owner.ownerId, chatId)
     if (!chat) throw httpError(404, '会话不存在或已被删除')
+    this.directories.assertAvailable(owner, chat.directory ?? `conversations/${chat.id}`)
     return chat
   }
 }
