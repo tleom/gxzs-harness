@@ -10,6 +10,12 @@ function request(chunks, headers = {}) {
   return Object.assign(Readable.from(chunks), { headers: { 'content-type': 'application/octet-stream', ...headers } })
 }
 describe('signed streamed uploads', () => {
+  it('applies the image route budget before consuming an oversized upload', async () => {
+    let read = false
+    const input = (async function* () { read = true; yield Buffer.alloc(1) })()
+    await expect(spoolUpload(request(input, { 'content-length': String(20 * 1024 * 1024 + 128 * 1024 + 1) }), () => {}, undefined, 20 * 1024 * 1024)).rejects.toMatchObject({ status: 413 })
+    expect(read).toBe(false)
+  })
   it.each(['Application/Octet-Stream', 'application/octet-stream; charset=binary', 'APPLICATION/OCTET-STREAM ; name=upload.bin'])('accepts the binary media type %s', async contentType => {
     const upload = await spoolUpload(request([Buffer.from('{}\nx')], { 'content-type': contentType }), () => {})
     pending.push(upload)

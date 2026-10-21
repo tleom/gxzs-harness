@@ -25,7 +25,7 @@ GXZS_AI_PUBLIC_BASE_URL=https://ai.example.com
 GXZS_SPEECH_URL=https://speech.example.com/v1/audio/transcriptions
 GXZS_SPEECH_TOKEN=<provider bearer>
 GXZS_SPEECH_MODEL=sensevoice
-GXZS_SPEECH_MAX_BYTES=15728640
+GXZS_SPEECH_MAX_BYTES=20971520
 
 # 32个ASCII字符，用于数据库中MCP client secret/token/header凭据的AES加密。
 GXZS_MCP_CREDENTIAL_KEY=<恰好32字符>

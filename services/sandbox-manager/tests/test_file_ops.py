@@ -1,4 +1,5 @@
 import base64
+from contextlib import contextmanager
 import importlib.util
 from pathlib import Path
 import os
@@ -167,3 +168,65 @@ def test_legacy_directory_download_keeps_its_original_memory_budget(root):
     assert module.operate({'operation': 'stat', 'path': 'legacy'}, root)['downloadable']
     with pytest.raises(ValueError, match='Legacy directory download'):
         module.operate({'operation': 'get', 'path': 'legacy'}, root)
+
+
+@pytest.mark.parametrize('operation', ['stat', 'get', 'delete'])
+def test_metadata_and_legacy_paths_stop_before_collecting_an_oversized_directory(root, monkeypatch, operation):
+    directory = Path(root) / 'large'
+    directory.mkdir()
+    for index in range(20):
+        (directory / str(index)).write_text('preserved')
+    monkeypatch.setattr(module, 'MAX_TREE_ITEMS', 3)
+    original = os.scandir
+    seen = []
+    @contextmanager
+    def counted(fd):
+        with original(fd) as entries:
+            def generate():
+                for entry in entries:
+                    seen.append(entry.name)
+                    yield entry
+            yield generate()
+    monkeypatch.setattr(module.os, 'scandir', counted)
+    monkeypatch.setattr(module.os, 'listdir', lambda *args: pytest.fail('must not allocate all directory names'))
+    monkeypatch.setattr(module, 'read_file', lambda *args: pytest.fail('must reject before reading file data'))
+    monkeypatch.setattr(module, 'remove_contents', lambda *args: pytest.fail('must reject before deleting anything'))
+    with pytest.raises(ValueError, match='too many entries'):
+        module.operate({'operation': operation, 'path': 'large', 'version': 'stale'}, root)
+    assert len(seen) == 4
+    assert all((directory / str(index)).read_text() == 'preserved' for index in range(20))
+
+
+def test_tree_budget_counts_nested_directories_and_keeps_existing_fingerprint_order(root, monkeypatch):
+    directory = Path(root) / 'tree'
+    directory.mkdir()
+    (directory / 'z').touch()
+    (directory / 'a-').touch()
+    (directory / 'a').mkdir()
+    (directory / 'a' / 'z').touch()
+    (directory / 'a' / 'b').touch()
+    monkeypatch.setattr(module, 'MAX_TREE_ITEMS', 5)
+    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        entries = module.tree_entries(fd)
+        assert [entry[0] for entry in entries] == ['a', 'a/b', 'a/z', 'a-', 'z']
+        first = module.tree_version(fd)
+        assert first == module.tree_version(fd)
+        monkeypatch.setattr(module, 'MAX_TREE_ITEMS', 4)
+        with pytest.raises(ValueError, match='too many entries'):
+            module.tree_version(fd)
+    finally:
+        os.close(fd)
+
+
+def test_directory_delete_rejects_stale_version_then_deletes_with_current_version(root):
+    directory = Path(root) / 'tree'
+    directory.mkdir()
+    (directory / 'a.txt').write_text('before')
+    first = module.operate({'operation': 'stat', 'path': 'tree'}, root)
+    (directory / 'a.txt').write_text('after change')
+    assert module.operate({'operation': 'delete', 'path': 'tree', 'version': first['version']}, root)['conflict']
+    assert (directory / 'a.txt').read_text() == 'after change'
+    latest = module.operate({'operation': 'stat', 'path': 'tree'}, root)
+    assert module.operate({'operation': 'delete', 'path': 'tree', 'version': latest['version']}, root) == {'deleted': True}
+    assert not directory.exists()

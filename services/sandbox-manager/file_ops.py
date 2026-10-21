@@ -154,17 +154,27 @@ def delete_file(fd, name, payload):
 
 def tree_entries(fd, prefix="", result=None):
     """Fingerprint metadata without following links or reading every file on listing."""
-    result = [] if result is None else result
-    for name in sorted(os.listdir(fd)):
-        info = os.stat(name, dir_fd=fd, follow_symlinks=False)
-        path = prefix + name
-        result.append((path, info.st_mode, info.st_size, info.st_mtime_ns, info.st_ino))
-        if stat.S_ISDIR(info.st_mode):
-            child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
-            try:
-                tree_entries(child, path + "/", result)
-            finally:
-                os.close(child)
+    top = result is None
+    result = [] if top else result
+    # Do not allocate listdir/sorted before enforcing the shared tree budget:
+    # a single flat directory can itself exceed the metadata limit.
+    with os.scandir(fd) as entries:
+        for entry in entries:
+            if len(result) >= MAX_TREE_ITEMS:
+                raise ValueError("Folder contains too many entries")
+            name = entry.name
+            info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            path = prefix + name
+            result.append((path, info.st_mode, info.st_size, info.st_mtime_ns, info.st_ino))
+            if stat.S_ISDIR(info.st_mode):
+                child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                try:
+                    tree_entries(child, path + "/", result)
+                finally:
+                    os.close(child)
+    if top:
+        # Preserve the original sorted, depth-first fingerprint order.
+        result.sort(key=lambda item: item[0].split('/'))
     return result
 
 
@@ -243,8 +253,8 @@ def entry_metadata(fd, name, path, info, *, shallow=False):
 def legacy_archive(fd):
     """Keep pre-streaming Hosts working during Manager-first rolling upgrades."""
     entries = tree_entries(fd)
-    if len(entries) > MAX_TREE_ITEMS or sum(size for _, mode, size, _, _ in entries if stat.S_ISREG(mode)) > 50 * 1024 * 1024:
-        raise ValueError('Legacy directory download exceeds 50 MiB or 10000 entries; use streaming download')
+    if sum(size for _, mode, size, _, _ in entries if stat.S_ISREG(mode)) > 50 * 1024 * 1024:
+        raise ValueError('Legacy directory download exceeds 50 MiB; use streaming download')
     output = io.BytesIO()
     with zipfile.ZipFile(output, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
         for path, mode, _, _, _ in entries:

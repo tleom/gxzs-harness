@@ -60,7 +60,17 @@ def test_directory_budget_uses_uncompressed_bytes_and_has_no_entry_cap(tmp_path,
     monkeypatch.setattr(file_ops, 'MAX_TREE_ITEMS', 1)
     for name in ['a', 'b', 'c']:
         (directory / name).write_bytes(b'123')
-    file_download.write_download({'path': 'files'}, io.BytesIO(), str(tmp_path))
+    # Frontend downloads use shallow list metadata and call the independent
+    # streaming route directly, even when full metadata cannot be collected.
+    listing = file_ops.operate({'operation': 'list', 'path': '.'}, str(tmp_path))
+    assert listing['entries'][0]['downloadable'] is True
+    with pytest.raises(ValueError, match='too many entries'):
+        file_ops.operate({'operation': 'stat', 'path': 'files'}, str(tmp_path))
+    output = io.BytesIO()
+    file_download.write_download({'path': 'files'}, output, str(tmp_path))
+    with zipfile.ZipFile(io.BytesIO(output.getvalue().split(b'\n', 1)[1])) as archive:
+        assert archive.namelist() == ['a', 'b', 'c']
+        assert all(archive.read(name) == b'123' for name in archive.namelist())
     (directory / 'd').write_bytes(b'12')
     with pytest.raises(ValueError, match='1 GiB'):
         file_download.write_download({'path': 'files'}, io.BytesIO(), str(tmp_path))

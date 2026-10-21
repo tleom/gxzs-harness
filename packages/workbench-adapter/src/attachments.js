@@ -2,11 +2,17 @@ import path from 'node:path'
 import { createHash } from 'node:crypto'
 import { resolveWorkspacePath } from './paths.js'
 import { httpError } from './http.js'
+import { normalizeStreamedImage, serializeAttachmentAdmission } from './image-normalizer.js'
 
 export const MAX_FILE_BYTES = 100 * 1024 * 1024
+export const MAX_IMAGE_BYTES = 20 * 1024 * 1024
 export const MAX_MESSAGE_BYTES = 1024 * 1024 * 1024
 
-export async function admitSandboxAttachments({ fileManager, workspace, query, files = [], nativeFiles = false, attachmentStore }) {
+export function admitSandboxAttachments(input) {
+  return serializeAttachmentAdmission(() => admitAttachments(input))
+}
+
+async function admitAttachments({ fileManager, workspace, query, files = [], nativeFiles = false, attachmentStore }) {
   if (!Array.isArray(files) || files.length > 20) throw httpError(400, '最多允许 20 个附件')
   const content = [], attachments = [], paths = []
   let totalBytes = 0
@@ -58,9 +64,14 @@ export async function admitSandboxAttachments({ fileManager, workspace, query, f
         } finally { await iterator.return?.() }
       })()
       if (mediaType) {
-        const chunks = []
-        for await (const chunk of data) chunks.push(chunk)
-        content.push({ type: 'image', ...await normalizedImage(attachmentStore, Buffer.concat(chunks), mediaType, name) })
+        if (size > MAX_IMAGE_BYTES) throw httpError(413, '单张图片最大 20 MiB')
+        if (attachmentStore) content.push({ type: 'image', ...await normalizeStreamedImage(attachmentStore, data, size, mediaType, name) })
+        else {
+          if (size > 4 * 1024 * 1024) throw httpError(503, '图片服务尚未就绪')
+          const chunks = []
+          for await (const chunk of data) chunks.push(chunk)
+          content.push({ type: 'image', mediaType, data: Buffer.concat(chunks).toString('base64'), name })
+        }
       } else if (nativeFiles && attachmentStore) {
         const storedFile = await attachmentStore.saveFileStream({ name, data })
         content.push({ type: 'file', storedFile, name })
@@ -87,14 +98,11 @@ export async function admitSandboxAttachments({ fileManager, workspace, query, f
   return { content, attachments }
 }
 
-async function normalizedImage(store, bytes, mediaType, name) {
-  if (!store) return { mediaType, data: bytes.toString('base64'), name }
-  const ref = await store.saveImage({ data: bytes, mediaType, name })
-  const image = await store.readImage(ref)
-  return { mediaType: image.ref?.mediaType ?? ref.mediaType, data: Buffer.from(image.data).toString('base64'), name }
+export function resolveUploadedImages(store, images) {
+  return serializeAttachmentAdmission(() => resolveImages(store, images))
 }
 
-export async function resolveUploadedImages(store, images) {
+async function resolveImages(store, images) {
   if (!Array.isArray(images) || images.length > 20) throw httpError(400, '最多允许 20 张图片')
   const resolved = []
   let total = 0
@@ -102,28 +110,27 @@ export async function resolveUploadedImages(store, images) {
     if (!image || !['image/png', 'image/jpeg', 'image/gif', 'image/webp'].includes(image.mediaType)
       || image.name !== undefined && typeof image.name !== 'string') throw httpError(400, '图片参数无效')
     if (image.upload) {
-      if (!store || !Number.isSafeInteger(image.upload.bytes) || image.upload.bytes < 0 || image.upload.bytes > MAX_FILE_BYTES)
-        throw httpError(413, '单张图片最大 100 MiB')
+      if (!store || !Number.isSafeInteger(image.upload.bytes) || image.upload.bytes < 0 || image.upload.bytes > MAX_IMAGE_BYTES)
+        throw httpError(413, '单张图片最大 20 MiB')
       total += image.upload.bytes
       if (total > MAX_MESSAGE_BYTES) throw httpError(413, '图片合计最大 1 GiB')
-      const chunks = []
-      let count = 0
-      for await (const chunk of store.readFileStream(image.upload)) {
-        count += chunk.length
-        if (count > image.upload.bytes || count > MAX_FILE_BYTES) throw httpError(413, '单张图片最大 100 MiB')
-        chunks.push(chunk)
-      }
-      if (count !== image.upload.bytes) throw httpError(400, '图片大小无效')
-      const bytes = Buffer.concat(chunks)
-      if (imageMediaType(bytes) !== image.mediaType) throw httpError(400, '图片内容与格式不匹配')
-      resolved.push(await normalizedImage(store, bytes, image.mediaType, image.name))
+      resolved.push(await normalizeStreamedImage(store, store.readFileStream(image.upload), image.upload.bytes, image.mediaType, image.name))
     } else {
       if (typeof image.data !== 'string') throw httpError(400, '图片参数无效')
       const bytes = Buffer.byteLength(image.data, 'base64')
-      if (bytes > MAX_FILE_BYTES) throw httpError(413, '单张图片最大 100 MiB')
+      if (bytes > MAX_IMAGE_BYTES) throw httpError(413, '单张图片最大 20 MiB')
       total += bytes
       if (total > MAX_MESSAGE_BYTES) throw httpError(413, '图片合计最大 1 GiB')
-      resolved.push(image)
+      if (store) {
+        const data = (async function* () {
+          for (let offset = 0; offset < image.data.length; offset += 64 * 1024)
+            yield Buffer.from(image.data.slice(offset, offset + 64 * 1024), 'base64')
+        })()
+        resolved.push(await normalizeStreamedImage(store, data, bytes, image.mediaType, image.name))
+      } else {
+        if (bytes > 4 * 1024 * 1024) throw httpError(503, '图片服务尚未就绪')
+        resolved.push(image)
+      }
     }
   }
   return resolved

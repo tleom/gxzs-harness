@@ -211,13 +211,15 @@ it.each(['subagent/invalid-time-zone','subagent/parent-unavailable'])('settles a
 })
 it('admits image-only continuation through the native image store and scopes binary reads to the owner', async () => {
   const native = {listDescendants:descendants([child]),prompt:vi.fn(async () => ({messageId:'accepted'}))}
-  const attachments = {readImage:vi.fn(async ref => ({ref,data:Buffer.from('image')}))}
+  const attachments = {saveImage:vi.fn(async () => ({attachmentId:'normalized',mediaType:'image/png'})),readImage:vi.fn(async ref => ({ref,data:Buffer.from('image')}))}
   const sessions = {list:async () => ({items:[{sessionId:'root',agentAvailable:true,projections:{values:{subagentCatalog:[child]}}}]})}
   const gateway = new WorkbenchSubagents({native,sessions,service,attachments})
   const signal = new AbortController().signal
-  const image = {mediaType:'image/png',data:'aW1hZ2U=',name:'调研.png'}
+  const image = {mediaType:'image/png',data:'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',name:'调研.png'}
   await gateway.prompt(owner,chat.id,child.id,{requestId:attachment,text:'',images:[image]},signal)
-  expect(native.prompt).toHaveBeenCalledWith(expect.objectContaining({content:[{type:'image',...image}]}),signal)
+  expect(native.prompt).toHaveBeenCalledWith(expect.objectContaining({content:[{type:'image',...image,data:'aW1hZ2U='}]}),signal)
+  expect(attachments.saveImage).toHaveBeenCalledOnce()
+  attachments.readImage.mockClear()
   await expect(gateway.prompt(owner,chat.id,child.id,{requestId:attachment,text:'',images:[{...image,mediaType:'text/html'}]},signal)).rejects.toMatchObject({status:400})
   const ref = {attachmentId:'image-id',mediaType:'image/png'}
   await expect(gateway.image({ownerId:'foreign'},chat.id,child.id,ref,signal)).rejects.toMatchObject({status:404})

@@ -8,11 +8,12 @@ export const MAX_UPLOAD_BYTES = 100 * 1024 * 1024 + 128 * 1024
 
 // The assertion is authenticated before reading, and its digest is checked
 // before any sandbox mutation. Only bounded chunks are retained in memory.
-export async function spoolUpload(request, verifyBody, signal) {
+export async function spoolUpload(request, verifyBody, signal, maxFileBytes = 100 * 1024 * 1024) {
   if (request.headers['content-type']?.split(';', 1)[0].trim().toLowerCase() !== 'application/octet-stream') throw httpError(415, '文件上传需要二进制请求')
   const declared = request.headers['content-length']
-  if (declared !== undefined && (!/^\d+$/.test(declared) || Number(declared) > MAX_UPLOAD_BYTES))
-    throw httpError(413, '单个文件或技能包最大 100 MiB')
+  const message = maxFileBytes === 20 * 1024 * 1024 ? '单张图片最大 20 MiB' : '单个文件或技能包最大 100 MiB'
+  if (declared !== undefined && (!/^\d+$/.test(declared) || Number(declared) > maxFileBytes + 128 * 1024))
+    throw httpError(413, message)
   const directory = await mkdtemp(join(tmpdir(), 'gxzs-upload-'))
   const path = join(directory, 'body')
   const dispose = () => rm(directory, { recursive: true, force: true })
@@ -24,7 +25,7 @@ export async function spoolUpload(request, verifyBody, signal) {
     for await (const chunk of request) {
       signal?.throwIfAborted()
       size += chunk.length
-      if (size > MAX_UPLOAD_BYTES) throw httpError(413, '单个文件或技能包最大 100 MiB')
+      if (size > maxFileBytes + 128 * 1024) throw httpError(413, message)
       digest.update(chunk)
       await file.writeFile(chunk)
     }
@@ -39,7 +40,7 @@ export async function spoolUpload(request, verifyBody, signal) {
     try { metadata = JSON.parse(headerBuffer.subarray(0, newline).toString('utf8')) }
     catch { throw httpError(400, '文件上传元数据无效') }
     if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) throw httpError(400, '文件上传元数据无效')
-    if (size - newline - 1 > 100 * 1024 * 1024) throw httpError(413, '单个文件或技能包最大 100 MiB')
+    if (size - newline - 1 > maxFileBytes) throw httpError(413, message)
     completed = true
     return { path, size, metadata, offset: newline + 1, dispose }
   } finally {

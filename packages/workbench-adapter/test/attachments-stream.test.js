@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto'
 import { expect, it, vi } from 'vitest'
-import { admitSandboxAttachments, prepareNativeFiles } from '../src/attachments.js'
+import { admitSandboxAttachments, prepareNativeFiles, resolveUploadedImages } from '../src/attachments.js'
 
 function snapshot(bytes, name = 'a.bin', digest) {
   const version = digest ?? createHash('sha256').update(bytes).digest('hex')
@@ -14,9 +14,9 @@ function snapshot(bytes, name = 'a.bin', digest) {
 }
 
 it('normalizes a fragmented image stream before admitting prompt content', async () => {
-  const bytes = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 0, 1, 2, 3])
+  const bytes = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64')
   const attachmentStore = { saveImage: vi.fn(async input => {
-    expect(input.data).toEqual(bytes)
+    expect(input.data.byteLength).toBeLessThanOrEqual(4 * 1024 * 1024)
     return { mediaType: 'image/png' }
   }), readImage: async () => ({ ref: { mediaType: 'image/png' }, data: Buffer.from('normalized') }) }
   const result = await admitSandboxAttachments({ ...snapshot(bytes, 'a.png'), attachmentStore })
@@ -54,4 +54,58 @@ it('rejects an oversized file before consuming its stream and cancels the body',
     fileManager: { download: async () => ({ body, kind: 'file', version: 'v', size: 100 * 1024 * 1024 + 1 }) },
   })).rejects.toMatchObject({ status: 413 })
   expect(cancel).toHaveBeenCalledOnce()
+})
+
+it('rejects images above 20 MiB before opening a stored upload', async () => {
+  const store = { readFileStream: vi.fn() }
+  await expect(resolveUploadedImages(store, [{ mediaType: 'image/png', upload: { bytes: 20 * 1024 * 1024 + 1 } }])).rejects.toMatchObject({ status: 413 })
+  expect(store.readFileStream).not.toHaveBeenCalled()
+})
+
+it('normalizes a full 20 MiB disk-backed image without passing its source buffer to the store', async () => {
+  const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64')
+  const size = 20 * 1024 * 1024
+  const store = {
+    readFileStream: async function* () {
+      yield png
+      const chunk = Buffer.alloc(64 * 1024)
+      for (let remaining = size - png.length; remaining; remaining -= Math.min(remaining, chunk.length)) yield chunk.subarray(0, Math.min(remaining, chunk.length))
+    },
+    saveImage: vi.fn(async input => {
+      expect(input.data.byteLength).toBeLessThanOrEqual(4 * 1024 * 1024)
+      return { mediaType: input.mediaType, data: input.data }
+    }),
+    readImage: async ref => ({ ref, data: ref.data }),
+  }
+  const result = await resolveUploadedImages(store, [{ mediaType: 'image/png', name: 'large.png', upload: { bytes: size } }])
+  expect(result).toHaveLength(1)
+  expect(Buffer.byteLength(result[0].data, 'base64')).toBeLessThanOrEqual(4 * 1024 * 1024)
+  expect(store.saveImage).toHaveBeenCalledOnce()
+})
+
+it('serializes concurrent image batches and keeps the lane usable after a decode error', async () => {
+  const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64')
+  const reads = []
+  let release, started
+  const gate = new Promise(resolve => { release = resolve })
+  const entered = new Promise(resolve => { started = resolve })
+  const store = {
+    readFileStream: async function* (ref) { reads.push(ref.id); yield ref.id === 'bad' ? Buffer.alloc(png.length) : png },
+    saveImage: async input => {
+      if (reads.length === 1) { started(); await gate }
+      return { mediaType: input.mediaType, data: input.data }
+    },
+    readImage: async ref => ({ ref, data: ref.data }),
+  }
+  const image = id => [{ mediaType: 'image/png', upload: { id, bytes: png.length } }]
+  const first = resolveUploadedImages(store, image('first'))
+  await entered
+  const second = resolveUploadedImages(store, image('second'))
+  await new Promise(resolve => setTimeout(resolve, 10))
+  expect(reads).toEqual(['first'])
+  release()
+  await Promise.all([first, second])
+  await expect(resolveUploadedImages(store, image('bad'))).rejects.toMatchObject({ status: 400 })
+  await expect(resolveUploadedImages(store, image('after'))).resolves.toHaveLength(1)
+  expect(reads).toEqual(['first', 'second', 'bad', 'after'])
 })
