@@ -26,6 +26,10 @@ docker run --rm --network none --cap-drop ALL --security-opt no-new-privileges:t
 docker run --rm --network none --cap-drop ALL --security-opt no-new-privileges:true \
   --memory 1g --cpus 1 --pids-limit 128 --entrypoint node "$host_image" \
   /opt/workbench/check-runtime-imports.mjs
+
+docker run --rm --network none --cap-drop ALL --security-opt no-new-privileges:true \
+  --memory 256m --cpus 1 --pids-limit 128 --entrypoint node \
+  -v "$script_dir/smoke-http-backpressure.mjs:/smoke-http-backpressure.mjs:ro" "$host_image" /smoke-http-backpressure.mjs
 docker run --rm --network none --cap-drop ALL --security-opt no-new-privileges:true \
   --memory 256m --cpus 1 --pids-limit 64 --entrypoint node \
   -v "$script_dir/smoke-host-relay.mjs:/smoke-host-relay.mjs:ro" "$host_image" /smoke-host-relay.mjs
