@@ -59,7 +59,7 @@ export class WorkbenchSubagents {
     const delivery = request.delivery ?? 'queue'
     if (typeof request.text !== 'string' || (!request.text.trim() && !images.length) || typeof request.requestId !== 'string'
       || !['queue', 'steer'].includes(delivery) || !Array.isArray(images) || images.length > 20) throw httpError(400, '子智能体消息无效')
-    const resolvedImages = await resolveUploadedImages(this.attachments, images)
+    const resolvedImages = await resolveUploadedImages(this.attachments, images, signal)
     const deliver = async () => {
     signal.throwIfAborted()
     const receipt = this.runtime?.prepareChildPrompt(this.service.requireChat(owner, chatId), child, request.requestId)

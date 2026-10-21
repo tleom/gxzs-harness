@@ -4,6 +4,8 @@ This document includes historical validation records; test counts and rollout st
 
 ## Verified locally
 
+- Image sources accept 20 MiB and normally up to 64 million pixels. Progressive JPEG and interlaced PNG are limited to 16 million pixels before decoding, including native tool image storage; native compression is serialized to fit the 1 GiB Host budget. Stored normalization remains at most 4 MiB / 4 megapixels.
+
 - Locked workspace dependencies and a separately locked deployment profile.
 - Syntax, plugin import and DSH dump-config checks.
 - Node built-in SQLite WAL/FULL persistence, owner-scoped queries, BEGIN IMMEDIATE event transactions and interrupted startup recovery. node:sqlite is experimental on the current Node 22 runtime.

@@ -83,6 +83,7 @@ try {
   await plugin('search-tools', SearchTools, { sampleOverCapGlobResults: false })
   await execute('bash', { command: `mkdir -m 700 -- '${directory}'`, description: 'Create isolated tool fixture', workdir: '/tmp', timeoutMs: 10_000 })
   created = true
+  const canonicalDirectory = ctx.fs.processPath(await ctx.fs.resolve(directory))
   // Exercise the optional native PTY tools through the same remote subprocess
   // provider as production, including retained shell state and exact-Agent access.
   await plugin('agents', (await native('dsh-agent')).default)
@@ -99,9 +100,10 @@ try {
   const sessionId = opened.value.sessionId
   assert.equal(ctx.terminals.hasOwnerActivity(agent), true)
   await execute('terminal_send', { sessionId, text: 'export GXZS_PTY_FIXTURE=retained-state' }, agent)
-  const retained = await execute('terminal_send', { sessionId, text: 'printf "value=%s uid=%s\\n" "$GXZS_PTY_FIXTURE" "$(id -u)"; pwd' }, agent)
+  const retained = await execute('terminal_send', { sessionId, text: `printf "value=%s uid=%s\\n" "$GXZS_PTY_FIXTURE" "$(id -u)"; test . -ef '${directory}' && printf 'cwd-same-inode\\n'; pwd -P` }, agent)
   assert.match(text(retained), /value=retained-state uid=1000/)
-  assert.ok(text(retained).includes(directory))
+  assert.ok(text(retained).split(/\r?\n/).includes('cwd-same-inode'))
+  assert.ok(text(retained).split(/\r?\n/).includes(canonicalDirectory))
   assert.equal((await execute('terminal_list', {}, agent)).value.length, 1)
   assert.deepEqual((await execute('terminal_list', {}, other)).value, [])
   const denied = await ctx.tools.execute({ callId: randomUUID(), name: 'terminal_read', arguments: { sessionId }, agent: other, signal: AbortSignal.timeout(5000) })
@@ -125,9 +127,9 @@ try {
   const { default: NodeRuntime } = await native('dsh-ptc-runtime-node')
   await plugin('ptc-runtime', NodeRuntime, { launch: { kind: 'node-script', executable: '/usr/local/bin/node',
     bootstrapPath: '/opt/dsh/node_modules/@deepseek-ai/dsh-ptc-runtime-node/lib/process.js' } })
-  const ptc = await ctx.ptcRuntime.run(ctx.ptcRuntime.resolve({ program: 'return { value: 42, cwd: process.cwd() }', bindings: [], cwd: directory, signal: AbortSignal.timeout(20_000) }))
+  const ptc = await ctx.ptcRuntime.run(ctx.ptcRuntime.resolve({ program: `const fs=await import('node:fs/promises'); const here=await fs.stat('.'), requested=await fs.stat(${JSON.stringify(directory)}); return { value: 42, cwd: process.cwd(), sameDirectory: here.dev===requested.dev && here.ino===requested.ino }`, bindings: [], cwd: directory, signal: AbortSignal.timeout(20_000) }))
   assert.equal(ptc.error, undefined)
-  assert.deepEqual(ptc.value, { value: 42, cwd: directory })
+  assert.deepEqual(ptc.value, { value: 42, cwd: canonicalDirectory, sameDirectory: true })
   checked.push('ptc-runtime')
   if (process.argv.includes('--changes-check')) {
     stage = 'native-changes'

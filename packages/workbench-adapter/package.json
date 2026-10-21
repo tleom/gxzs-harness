@@ -10,7 +10,8 @@
     "./package.json": "./package.json",
     "./persistence": "./src/persistence.js",
     "./cursor": "./src/cursor.js",
-    "./paths": "./src/paths.js"
+    "./paths": "./src/paths.js",
+    "./attachment-store": "./src/attachment-store.js"
   },
   "engines": {
     "node": "^22.19.0 || >=24.0.0"

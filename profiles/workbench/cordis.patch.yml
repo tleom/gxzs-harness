@@ -154,10 +154,16 @@
 
 # Workbench image admission: 20 MiB per image, 20 images, 1 GiB per message.
 - id: attachment-local
-  config:
-    maxImageBytes: 20971520
-    maxImagesPerMessage: 20
-    maxMessageImageBytes: 1073741824
+  disabled: true
+
+- insert:
+    - id: gxzs-attachment-local
+      name: '@gxzs/dsh-workbench-adapter/attachment-store'
+      config:
+        maxImageBytes: 20971520
+        maxImagesPerMessage: 20
+        maxMessageImageBytes: 1073741824
+        imageCompressionConcurrency: 1
 
 # Native connection validates capacity for its legacy inline-image contract at
 # startup. GXZS uploads use binary streams; its gateway JSON limit is unchanged.

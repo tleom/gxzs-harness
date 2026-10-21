@@ -10,7 +10,9 @@ const root = process.env.GXZS_SMOKE_SOURCE_ROOT ?? '/opt/workbench'
 const requireNative = createRequire(join(root, 'profiles/workbench/package.json'))
 const native = name => import(pathToFileURL(requireNative.resolve(name)).href)
 const [{ Context }, { LocalAttachmentStore }, { resolveUploadedImages }] = await Promise.all([
-  native('@deepseek-ai/cordis'), native('@deepseek-ai/dsh-attachment-local'),
+  native('@deepseek-ai/cordis'),
+  import(pathToFileURL(join(root, 'packages/workbench-adapter/src/attachment-store.js')).href)
+    .then(module => ({ LocalAttachmentStore: module.default })),
   import(pathToFileURL(join(root, 'packages/workbench-adapter/src/attachments.js')).href),
 ])
 const sharp = createRequire(requireNative.resolve('@deepseek-ai/dsh-attachment-local'))('sharp')
@@ -24,7 +26,7 @@ try {
   const bytes = 20 * 1024 * 1024
   assert.ok((await stat(source)).size < bytes)
   await ctx.plugin(LocalAttachmentStore, { dshHome: directory, maxImageBytes: bytes,
-    maxImagesPerMessage: 20, maxMessageImageBytes: 1024 * 1024 * 1024 })
+    maxImagesPerMessage: 20, maxMessageImageBytes: 1024 * 1024 * 1024, imageCompressionConcurrency: 1 })
   const store = ctx.attachments
   const data = (async function* () {
     let count = 0
