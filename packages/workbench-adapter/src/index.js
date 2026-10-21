@@ -311,9 +311,14 @@ export function apply(ctx, config) {
     }
   }
 
-  const managerPath = (value, { allowRoot = false } = {}) => {
+  const managerPath = (value, { allowRoot = false, allowTemporary = false } = {}) => {
     const requested = String(value ?? '')
     if (!requested) throw httpError(400, '缺少 path')
+    if (allowTemporary && requested.startsWith('/tmp/')) {
+      if (requested.slice(5).split('/').some(part => !part || part === '.' || part === '..' || /[\\\0]/u.test(part)))
+        throw httpError(400, '文件路径无效')
+      return requested
+    }
     const absolute = resolveWorkspacePath(config.workspace, requested)
     const root = config.workspace.replace(/\/+$/, '')
     if (absolute === root) {
@@ -642,7 +647,7 @@ export function apply(ctx, config) {
       sendJson(res, 200, { data: result })
     })],
     ['GET', /^\/files\/stat$/, async ({ url }, res) => withResponseSignal(res, async signal => {
-      const requested = managerPath(url.searchParams.get('path'), { allowRoot: true })
+      const requested = managerPath(url.searchParams.get('path'), { allowRoot: true, allowTemporary: true })
       const result = await ctx.workbenchFileManager.operate({ operation: 'stat', path: requested }, signal)
       signal.throwIfAborted()
       if (result.kind === 'missing') throw httpError(404, '路径不存在')
@@ -669,7 +674,7 @@ export function apply(ctx, config) {
       sendJson(res, 200, { data: result })
     }],
     ['GET', /^\/files\/download$/, async ({ url }, res) => withResponseSignal(res, async signal => {
-      const requested = managerPath(url.searchParams.get('path'))
+      const requested = managerPath(url.searchParams.get('path'), { allowTemporary: true })
       const result = await ctx.workbenchFileManager.download(requested, signal)
       signal.throwIfAborted()
       res.writeHead(200, {
@@ -680,7 +685,7 @@ export function apply(ctx, config) {
       await pipeline(Readable.fromWeb(result.body), res, { signal })
     })],
     ['GET', /^\/files\/text$/, async ({ url }, res) => withResponseSignal(res, async signal => {
-      const requested = managerPath(url.searchParams.get('path'))
+      const requested = managerPath(url.searchParams.get('path'), { allowTemporary: true })
       const result = await ctx.workbenchFileManager.operate({ operation: 'get', path: requested, max_bytes: 2 * 1024 * 1024 }, signal)
       signal.throwIfAborted()
       if (result.kind === 'directory') throw httpError(400, '文件不是 UTF-8 文本，请下载后编辑')

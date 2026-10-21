@@ -807,7 +807,7 @@ class Handler(BaseHTTPRequestHandler):
             if self.headers.get('Transfer-Encoding'):
                 raise ValueError('Transfer-Encoding is not supported; send a fixed Content-Length')
             size = int(self.headers.get("Content-Length", "0"))
-            binary = self.headers.get('Content-Type') == 'application/octet-stream'
+            binary = self.headers.get('Content-Type', '').split(';', 1)[0].strip().lower() == 'application/octet-stream'
             limit = 100 * 1024 * 1024 + 128 * 1024 if binary else MAX_BODY
             if not 0 <= size <= limit:
                 raise ValueError("Request too large")

@@ -10,6 +10,14 @@ function request(chunks, headers = {}) {
   return Object.assign(Readable.from(chunks), { headers: { 'content-type': 'application/octet-stream', ...headers } })
 }
 describe('signed streamed uploads', () => {
+  it.each(['Application/Octet-Stream', 'application/octet-stream; charset=binary', 'APPLICATION/OCTET-STREAM ; name=upload.bin'])('accepts the binary media type %s', async contentType => {
+    const upload = await spoolUpload(request([Buffer.from('{}\nx')], { 'content-type': contentType }), () => {})
+    pending.push(upload)
+    expect(upload.size - upload.offset).toBe(1)
+  })
+  it.each([undefined, '', 'application/*', 'application/octet-streamx', 'text/plain; application/octet-stream'])('rejects a different media type %s', async contentType => {
+    await expect(spoolUpload(request([], { 'content-type': contentType }), () => {})).rejects.toMatchObject({ status: 415 })
+  })
   it('spools split headers and binary bytes without changing the signed digest', async () => {
     const bytes = Buffer.from('文件\u0000body')
     const header = Buffer.from(JSON.stringify({ operation: 'upload', path: 'a.txt', version: null, size: bytes.length }) + '\n')

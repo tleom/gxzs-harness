@@ -15,6 +15,58 @@ MAX_TREE_BYTES = 1024 * 1024 * 1024
 MAX_TREE_ITEMS = 10000
 MAX_MANIFEST_FILE_BYTES = 2 * 1024 * 1024 * 1024
 MAX_MANIFEST_TREE_BYTES = 10 * 1024 * 1024 * 1024
+TEMP_PATH = '/tmp'
+TEMP_STORAGE_ROOT = '/var/lib/gxzs-tmp'
+
+
+def temporary_parent(path, *, missing_ok=False):
+    """Read only the current scratch generation, never arbitrary absolute paths."""
+    if not isinstance(path, str) or not path.startswith('/tmp/'):
+        raise ValueError('Invalid file path')
+    if os.path.islink(TEMP_PATH):
+        if os.readlink(TEMP_PATH) != TEMP_STORAGE_ROOT + '/current':
+            raise ValueError('Invalid temporary root')
+        base = os.open(TEMP_STORAGE_ROOT, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            root = os.open('current', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=base)
+        finally:
+            os.close(base)
+    else:
+        # Existing images retain a normal /tmp until their sandbox is upgraded.
+        root = os.open(TEMP_PATH, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        return parent_fd(root, path[len('/tmp/'):], missing_ok=missing_ok)
+    finally:
+        os.close(root)
+
+
+def temporary_file(payload):
+    operation, path = payload.get('operation'), payload.get('path')
+    if operation not in {'get', 'stat'}:
+        raise ValueError('Temporary files are read-only')
+    fd, name = temporary_parent(path, missing_ok=operation == 'stat')
+    if fd is None:
+        return {'path': path, 'kind': 'missing'}
+    try:
+        try:
+            info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+        except FileNotFoundError:
+            if operation == 'stat':
+                return {'path': path, 'kind': 'missing'}
+            raise
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError('Only regular files can be previewed')
+        if operation == 'stat':
+            return entry_metadata(fd, name, path, info)
+        maximum = payload.get('max_bytes', MAX_BYTES)
+        if type(maximum) is not int or not 0 < maximum <= MAX_BYTES:
+            raise ValueError('Invalid file read limit')
+        data = read_file(fd, name, maximum)
+        if data is None:
+            raise FileNotFoundError(path)
+        return {'data': base64.b64encode(data).decode(), 'version': version(data), 'name': name}
+    finally:
+        os.close(fd)
 
 
 def parent_fd(root, path, *, missing_ok=False):
@@ -226,6 +278,8 @@ def remove_contents(fd):
 def operate(payload, root="/workspace"):
     operation = payload["operation"]
     path = payload.get("path", ".")
+    if isinstance(path, str) and path.startswith('/tmp/'):
+        return temporary_file(payload)
     if operation == "delete" and path in {"mcp", "skills"}:
         raise ValueError("Resource directories cannot be deleted from file management")
     if path in {".", "conversations"} and operation not in {"list", "manifest"}:

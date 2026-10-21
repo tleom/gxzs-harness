@@ -583,6 +583,28 @@ describe('authenticated workbench HTTP handler', () => {
     })
   })
 
+  it('reads temporary files through owner-authorized routes without allowing listing or mutation', async () => {
+    const { handler, key, context } = setup()
+    const operate = context.workbenchFileManager.operate.getMockImplementation()
+    context.workbenchFileManager.operate.mockImplementation(async payload => payload.operation === 'get'
+      ? { data: Buffer.from('text').toString('base64'), version: 'v1' } : operate(payload))
+    context.workbenchFileManager.download = vi.fn(async () => { throw Object.assign(new Error('文件不存在'), { status: 404 }) })
+    const query = '?path=%2Ftmp%2Frender%2Fa.png'
+    for (const route of ['/files/stat', '/files/text', '/files/download']) {
+      expect((await call(handler, key, 'GET', route + query, undefined, false)).status).toBe(401)
+      expect((await call(handler, key, 'GET', route + query, undefined, true, 'other')).status).toBe(403)
+      expect((await call(handler, key, 'GET', route + query)).status).toBe(route.endsWith('/download') ? 404 : 200)
+    }
+    expect(context.workbenchFileManager.operate).toHaveBeenCalledWith(expect.objectContaining({ path: '/tmp/render/a.png' }), expect.any(AbortSignal))
+    expect(context.workbenchFileManager.download).toHaveBeenCalledWith('/tmp/render/a.png', expect.any(AbortSignal))
+    context.workbenchFileManager.operate.mockClear()
+    expect((await call(handler, key, 'GET', '/files' + query)).status).toBe(403)
+    expect((await call(handler, key, 'DELETE', '/files', { path: '/tmp/render/a.png', version: 'v1' })).status).toBe(403)
+    expect((await call(handler, key, 'POST', '/files/directories', { path: '/tmp/new' })).status).toBe(403)
+    expect((await call(handler, key, 'GET', '/files/stat?path=%2Ftmp%2F..%2Fsecret')).status).toBe(400)
+    expect(context.workbenchFileManager.operate).not.toHaveBeenCalled()
+  })
+
   it('blocks file deletion while any owner run is active', async () => {
     const { handler, key, context } = setup()
     const chat = await call(handler, key, 'POST', '/chats', {})

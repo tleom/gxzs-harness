@@ -6,7 +6,7 @@ import stat
 import tempfile
 import zipfile
 
-from file_ops import MAX_BYTES, parent_fd, file_identity
+from file_ops import MAX_BYTES, parent_fd, file_identity, temporary_parent
 
 MAX_DIRECTORY_BYTES = 1024 * 1024 * 1024
 
@@ -53,9 +53,12 @@ def write_download(payload, output, root='/workspace'):
     path = payload.get('path')
     if not isinstance(path, str) or path in {'.', 'conversations'}:
         raise ValueError('请选择具体文件或对话目录')
-    parent, name = parent_fd(root, path)
+    temporary = path.startswith('/tmp/')
+    parent, name = temporary_parent(path) if temporary else parent_fd(root, path)
     try:
         info = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        if temporary and not stat.S_ISREG(info.st_mode):
+            raise ValueError('Only regular files can be previewed')
         digest = hashlib.sha256()
         with tempfile.TemporaryFile(dir=root) as staged:
             if stat.S_ISREG(info.st_mode):

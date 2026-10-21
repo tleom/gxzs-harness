@@ -85,9 +85,14 @@ COPY --from=dsh-dependencies /opt/workbench /opt/workbench
 RUN ln -s /opt/workbench/profiles/workbench /opt/dsh \
     && chown -R 0:0 /opt/workbench && chmod -R go-w /opt/workbench
 COPY services/sandbox/entrypoint.sh /usr/local/bin/start-owner-sandbox
+COPY services/sandbox/tmp_lifecycle.py /opt/workbench/tmp_lifecycle.py
 COPY services/sandbox/verify-runtime.mjs /opt/workbench/verify-runtime.mjs
 RUN chmod 755 /usr/local/bin/start-owner-sandbox \
-    && node /opt/workbench/verify-runtime.mjs
+    && node /opt/workbench/verify-runtime.mjs \
+    && mkdir -p /var/lib/gxzs-tmp/current \
+    && chown -R 1000:1000 /var/lib/gxzs-tmp \
+    && chmod 700 /var/lib/gxzs-tmp && chmod 1777 /var/lib/gxzs-tmp/current \
+    && rm -rf /tmp && ln -s /var/lib/gxzs-tmp/current /tmp
 ARG VCS_REF=unknown
 LABEL org.opencontainers.image.source="https://github.com/tleom/gxzs-harness" \
       org.opencontainers.image.revision=$VCS_REF

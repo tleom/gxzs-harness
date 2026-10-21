@@ -9,7 +9,7 @@ export const MAX_UPLOAD_BYTES = 100 * 1024 * 1024 + 128 * 1024
 // The assertion is authenticated before reading, and its digest is checked
 // before any sandbox mutation. Only bounded chunks are retained in memory.
 export async function spoolUpload(request, verifyBody, signal) {
-  if (request.headers['content-type'] !== 'application/octet-stream') throw httpError(415, '文件上传需要二进制请求')
+  if (request.headers['content-type']?.split(';', 1)[0].trim().toLowerCase() !== 'application/octet-stream') throw httpError(415, '文件上传需要二进制请求')
   const declared = request.headers['content-length']
   if (declared !== undefined && (!/^\d+$/.test(declared) || Number(declared) > MAX_UPLOAD_BYTES))
     throw httpError(413, '单个文件或技能包最大 100 MiB')
