@@ -177,7 +177,7 @@ const manager = fixture(async (req, res) => {
       assert.match(value.path, /^(?:conversations\/\d{4}-\d{2}-\d{2}\/[a-f0-9-]{36}|\.agent-output\/[a-f0-9]{32})$/)
       respond(res, 200, sandboxFileOperation(value)); return
     }
-    if (nativeAttachments && ['upload', 'get'].includes(value?.operation)) {
+    if (nativeAttachments && ['upload', 'get', 'download'].includes(value?.operation)) {
       assert.match(value.path, /^conversations\/\d{4}-\d{2}-\d{2}\/[a-f0-9-]{36}\/native-evidence\.(txt|png)$/)
       if (value.operation === 'upload') {
         assert.equal(value.version, null)
@@ -189,8 +189,13 @@ const manager = fixture(async (req, res) => {
       const data = remote(`base64 -w0 -- /workspace/${value.path}`)
       const version = createHash('sha256').update(Buffer.from(data, 'base64')).digest('hex')
       assert.equal(version, fixtureFiles.get(value.path))
-      respond(res, 200, { path: value.path, name: path.basename(value.path), kind: 'file', version,
-        size: Buffer.from(data, 'base64').length, ...(value.operation === 'get' ? { data } : {}) })
+      const bytes = Buffer.from(data, 'base64')
+      const metadata = { path: value.path, name: path.basename(value.path), kind: 'file', version, size: bytes.length }
+      if (value.operation === 'download') {
+        res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': bytes.length,
+          'x-workbench-file': Buffer.from(JSON.stringify(metadata)).toString('base64url') })
+        res.end(bytes)
+      } else respond(res, 200, { ...metadata, ...(value.operation === 'get' ? { data } : {}) })
       return
     }
     if (sessionCreate) {
