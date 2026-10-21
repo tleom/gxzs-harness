@@ -95,7 +95,7 @@ export class SandboxBrowser {
     while ((boundary = this.buffer.indexOf('\n')) >= 0) {
       const line = this.buffer.slice(0, boundary)
       this.buffer = this.buffer.slice(boundary + 1)
-      if (line.length > 8 * 1024 * 1024) { this.dispose(); return }
+      if (line.length > 12 * 1024 * 1024) { this.dispose(); return }
       try {
         const frame = JSON.parse(line)
         if (frame.type === 'fatal' && typeof frame.error === 'string' && frame.error.length <= 256) {
@@ -119,7 +119,7 @@ export class SandboxBrowser {
           this.publish()
         } else if (frame.type === 'display') {
           // Messages from a replaced attachment belong to its old RFB handshake.
-        } else if (frame.type === 'frame' && (frame.display === 'kasm' || typeof frame.image === 'string' && frame.image.length <= 6 * 1024 * 1024)
+        } else if (frame.type === 'frame' && (frame.display === 'kasm' || typeof frame.image === 'string' && frame.image.length <= Math.ceil(8 * 1024 * 1024 / 3) * 4)
           && integer(frame.width, 320, 1920) && integer(frame.height, 240, 1080)) {
           if (frame.legacy) this.legacyFrame = frame
           else {
@@ -130,7 +130,7 @@ export class SandboxBrowser {
         } else throw new Error('Invalid frame')
       } catch { this.dispose(httpError(502, '沙盒浏览器数据无效')); return }
     }
-    if (this.buffer.length > 8 * 1024 * 1024) this.dispose()
+    if (this.buffer.length > 12 * 1024 * 1024) this.dispose()
   }
   retainWindow() {
     if (this.closed) throw this.failure

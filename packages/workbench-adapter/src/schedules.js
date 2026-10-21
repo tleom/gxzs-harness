@@ -18,8 +18,7 @@ export class WorkbenchSchedules {
   async catalog(owner) {
     const tasks = await this.ownedCatalog(owner)
     if (!this.notifications) return tasks
-    try { return await this.notifications.sync(tasks) }
-    catch { return tasks.map(task => ({ ...task, notification_available: false })) }
+    return this.notifications.read(tasks)
   }
   async ownedCatalog(owner) {
     const chats = new Map(this.database.chatBindings(owner.ownerId).map(chat => [chat.sessionId, chat]))

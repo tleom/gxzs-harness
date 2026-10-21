@@ -166,6 +166,14 @@ try:
             raise RuntimeError('Streaming file smoke failed: ' + phase)
         print(output.stdout.strip(), flush=True)
     streaming_probe('file')
+    sandbox = prefix + '-' + workspaces[0]
+    mixed_before = json.loads(docker('inspect', sandbox).stdout)[0]
+    streaming_probe('mixed')
+    streaming_probe('mixed-boundary')
+    mixed_after = json.loads(docker('inspect', sandbox).stdout)[0]
+    assert mixed_after['State']['Running'] and not mixed_after['State']['OOMKilled']
+    assert mixed_after['Id'] == mixed_before['Id'] and mixed_after['State']['StartedAt'] == mixed_before['State']['StartedAt']
+    print('PASS mixed attachment operations: sandbox stayed running without recreation or OOM', flush=True)
     prepare_directory = """
 from pathlib import Path
 import os

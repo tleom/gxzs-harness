@@ -29,6 +29,7 @@ function setup({ databasePath = ':memory:', configure = () => {} } = {}) {
     get: name => context[name],
     webServer: { register: vi.fn((route) => { handler = route.handler; return () => {} }) },
     sessionController: {
+      list: async () => ({ items: [] }),
       modelCatalog: async () => ({ default: { provider: 'p', model: 'm' }, groups: [{ id: 'p', models: [{ id: 'm' }] }] }),
       create: async (request = {}) => {
         const sessionId = request.sessionId || randomUUID()
@@ -38,6 +39,9 @@ function setup({ databasePath = ':memory:', configure = () => {} } = {}) {
       prompt: async () => ({ accepted: true }),
       selectModel: async () => ({ selected: { provider: 'p', model: 'm' } }),
       rename: async ({ title }) => ({ title, seq: 1 }),
+    },
+    workspaceController: {
+      follow: async function* () { yield { type: 'baseline', value: { items: [], archivedSessionIds: [], pinnedSessionIds: [] } } },
     },
     fs: {}, workbenchFileManager: {
       workspaceId: '33333333-3333-4333-8333-333333333333',
@@ -271,6 +275,16 @@ describe('authenticated workbench HTTP handler', () => {
     expect(context.workbenchFileManager.operate.mock.calls.some(([request]) => request.operation === 'delete')).toBe(false)
     runtime.hasOwnedWork = () => false
     expect((await call(handler, key, 'DELETE', '/files', { path: 'case/a.txt' })).status).toBe(200)
+  })
+  it('returns the directory warning before any file operation for a live conversation or its parent', async () => {
+    const { handler, key, context } = setup()
+    const chat = (await call(handler, key, 'POST', '/chats', {})).body.data
+    context.workbenchFileManager.operate.mockClear()
+    for (const path of [chat.file_directory, chat.file_directory.split('/').slice(0, -1).join('/')]) {
+      const response = await call(handler, key, 'DELETE', '/files', { path, version: 'v1' })
+      expect(response).toMatchObject({ status: 409, body: { code: 'DIRECTORY_IN_USE', message: '请先删除对应对话或工作区' } })
+    }
+    expect(context.workbenchFileManager.operate).not.toHaveBeenCalled()
   })
   it('defers a live scheduled receipt until the first verified MCP catalog', async () => {
     const { handler, key, context } = setup()

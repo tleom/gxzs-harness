@@ -4,22 +4,15 @@ const { randomUUID } = require('node:crypto')
 const { createScreencast } = require('./browser-screencast.cjs')
 const { startDisplay, displayAvailable } = require('./browser-display.cjs')
 const partialNavigationNotice = '页面已打开，但尚未完成加载；请根据当前页面内容继续操作'
-/** Prefer lossless text at the bounded CSS viewport size; bound photographic frames without low-quality encoding. */
-function createImageCapture({ now = Date.now, budgetMs = 8000 } = {}) {
-  const formats = [{type:'png'}, ...[95,90,85].map(quality => ({type:'jpeg',quality}))]
-  let key, start = 0
+/** Preserve viewport pixels; never fall back to a lossy photograph encoding. */
+function createImageCapture({ budgetMs = 8000 } = {}) {
   return async (page, captureBudgetMs = budgetMs) => {
-    const viewport = page.viewportSize() || await page.evaluate(() => ({ width: innerWidth, height: innerHeight }))
-    const current = `${page.url()}|${viewport.width}:${viewport.height}`
-    if (current !== key) { key = current; start = 0 }
-    const deadline = now() + Math.min(budgetMs, captureBudgetMs)
-    for (let index = start; index < formats.length; index++) {
-      const remaining = deadline - now()
-      if (remaining <= 0) throw new Error('capture_timeout')
-      const image = await page.screenshot({ ...formats[index], caret: 'initial', timeout: remaining })
-      if (image.length <= 4 * 1024 * 1024) { start = index; image.mediaType = `image/${formats[index].type}`; return image }
-    }
-    throw new Error('frame_too_large')
+    const timeout = Math.min(budgetMs, captureBudgetMs)
+    if (timeout <= 0) throw new Error('capture_timeout')
+    const image = await page.screenshot({ type: 'png', caret: 'initial', timeout })
+    if (image.length > 8 * 1024 * 1024) throw new Error('frame_too_large')
+    image.mediaType = 'image/png'
+    return image
   }
 }
 // Self-contained page-context observation; never evaluates model-provided code.

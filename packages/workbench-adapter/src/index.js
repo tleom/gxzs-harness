@@ -102,6 +102,7 @@ export function apply(ctx, config) {
   service.workingDirectory = ctx.workingDirectory
   service.onGoalChanged = listener => ctx.on('goal/changed', listener, { prepend: true })
   service.workspaces = workspaces
+  workspaces.service = service
   service.sessionReferences = ctx.sessionReferenceResolver
   service.fileReferences = ctx.fileReferences
   service.cancelOwned = (sessionId, runId) => runtime.cancelOwned(sessionId, runId)
@@ -167,6 +168,10 @@ export function apply(ctx, config) {
     recovering = true
     recovered = false
     recovery = (async () => {
+      for (const deletion of database.pendingWorkspaceDeletions(config.ownerId)) {
+        try { await workspaces.mutate({ ownerId: config.ownerId }, { operation: 'delete', workspaceId: deletion.workspaceId }) }
+        catch { ctx.logger.warn('Permanent workspace deletion remains pending; retry the delete request') }
+      }
       for (const deletion of database.pendingChatDeletions(config.ownerId)) {
         try { await service.completeChatDeletion({ ownerId: config.ownerId }, deletion) }
         catch { ctx.logger.warn('Permanent chat deletion remains pending; retry the delete request') }
@@ -541,7 +546,7 @@ export function apply(ctx, config) {
     }],
     ['GET', /^\/workspaces\/events$/, async ({ owner }, res) => streamWorkspaceEvents({ workspaces, owner, res,
       subscribe: changed => {
-        const stops = ['api-session/added', 'api-session/removed', 'api-session/status', 'api-session/activity', 'schedule/changed', 'workbench/completion'].map(event => ctx.on(event, changed))
+        const stops = ['api-session/added', 'api-session/removed', 'api-session/status', 'api-session/activity', 'schedule/changed', 'workbench/schedule-notifications-changed', 'workbench/completion'].map(event => ctx.on(event, changed))
         return () => stops.forEach(stop => stop())
       },
     })],
@@ -663,10 +668,7 @@ export function apply(ctx, config) {
     }],
     ['DELETE', /^\/files$/, async ({ owner, json }, res) => {
       const requested = managerPath(json.path)
-      if (database.hasActiveRuns(owner.ownerId) || database.listChats(owner.ownerId)
-        .some(chat => runtime.hasOwnedWork(chat.sessionId)))
-        throw httpError(409, '工作台正在执行任务，请停止后再删除文件')
-      const result = await ctx.workbenchFileManager.operate({ operation: 'delete', path: requested, version: json.version ?? null })
+      const result = await service.directories.deleteFile(owner, requested, json.version ?? null)
       sendJson(res, 200, { data: result })
     }],
     ['POST', /^\/files\/directories$/, async ({ json }, res) => {

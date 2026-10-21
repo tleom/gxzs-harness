@@ -35,6 +35,46 @@ export class ScheduleNotifications {
   task(task) {
     return { id: task.id, sessionId: task.sessionId, chatId: task.chat_id, title: task.title }
   }
+  async read(tasks) {
+    const values = new Map()
+    const initializing = new Set(this.database.pendingScheduleInitializations(this.ownerId).map(intent => intent.task.id))
+    try {
+      for (let offset = 0; offset < tasks.length; offset += 200) {
+        const records = await this.request({ action: 'lookup', tasks: tasks.slice(offset, offset + 200).map(task => this.task(task)) })
+        if (!Array.isArray(records)) throw httpError(502, '平台任务记录无效')
+        for (const record of records) values.set(record.jobId, record)
+      }
+      this.knownJobs ??= new Map()
+      for (const [id, job] of values) {
+        if (initializing.has(id)) continue
+        if (!this.knownJobs.has(id) || job.version >= this.knownJobs.get(id).version) this.knownJobs.set(id, job)
+      }
+      if (tasks.every(task => values.has(task.id) && !initializing.has(task.id))) {
+        clearTimeout(this.catalogRetry)
+        this.catalogRetry = undefined
+        this.catalogFailures = 0
+      } else this.retryCatalog()
+      return tasks.map(task => this.notificationState(task, !values.has(task.id) || initializing.has(task.id), initializing.has(task.id)))
+    } catch {
+      this.retryCatalog()
+      return tasks.map(task => this.notificationState(task, true, initializing.has(task.id)))
+    }
+  }
+  notificationState(task, stale = false, initializing = false) {
+    const job = initializing ? undefined : this.knownJobs?.get(task.id)
+    return { ...task, ...(job ? { notify_enabled: job.notifyEnabled === true, notification_version: job.version } : {}),
+      notification_available: Boolean(job) && !stale, notification_stale: stale }
+  }
+  retryCatalog() {
+    if (this.lifetime.signal.aborted || this.catalogRetry || (this.catalogFailures ?? 0) >= 4) return
+    const delay = 500 * 2 ** (this.catalogFailures ?? 0)
+    this.catalogFailures = (this.catalogFailures ?? 0) + 1
+    this.catalogRetry = setTimeout(() => {
+      this.catalogRetry = undefined
+      if (!this.lifetime.signal.aborted) this.changed?.()
+    }, delay)
+    this.catalogRetry.unref?.()
+  }
   async sync(tasks, action = 'sync') {
     await this.initializePending(new Set(tasks.map(task => task.id)))
     const values = new Map()
@@ -44,9 +84,10 @@ export class ScheduleNotifications {
       for (const record of records) values.set(record.jobId, record)
     }
     this.knownJobs ??= new Map()
-    for (const [id, job] of values) this.knownJobs.set(id, job)
+    for (const [id, job] of values)
+      if (!this.knownJobs.has(id) || job.version >= this.knownJobs.get(id).version) this.knownJobs.set(id, job)
     return tasks.map(task => {
-      const job = values.get(task.id)
+      const job = this.knownJobs.get(task.id)
       return { ...task, notify_enabled: job?.notifyEnabled === true, notification_version: job?.version,
         notification_available: Boolean(job) }
     })
@@ -55,6 +96,11 @@ export class ScheduleNotifications {
     if (typeof enabled !== 'boolean' || !Number.isSafeInteger(expectedVersion) || expectedVersion < 1)
       throw httpError(400, '通知设置参数无效')
     const result = await this.request({ action: 'configure', task: this.task(task), notifyEnabled: enabled, expectedVersion }, signal)
+    if (result?.jobId) {
+      this.knownJobs ??= new Map()
+      if (!this.knownJobs.has(result.jobId) || result.version >= this.knownJobs.get(result.jobId).version)
+        this.knownJobs.set(result.jobId, result)
+    }
     this.changed?.()
     return result
   }
@@ -77,7 +123,8 @@ export class ScheduleNotifications {
   start(ctx) {
     if (this.started) return
     this.started = true
-    this.changed = () => ctx.emit('schedule/changed')
+    // Display refreshes must not publish another native schedule snapshot.
+    this.changed = () => ctx.emit('workbench/schedule-notifications-changed')
     ctx.on('schedule/changed', () => this.kick(), { global: true })
     ctx.on('workbench/completion', () => this.kick())
     this.kick()
@@ -175,6 +222,7 @@ export class ScheduleNotifications {
     }
   }
   close() {
+    clearTimeout(this.catalogRetry)
     clearTimeout(this.retry)
     clearTimeout(this.scheduled)
     this.lifetime.abort()
@@ -201,8 +249,12 @@ export function registerScheduleNotificationTool(ctx, { schedules, database, run
       if (!chat || chat.ownerId !== ownerId || run?.ownerId !== ownerId || run.status !== 'running'
         || run.stopConfirmation?.fenced || !runtime.scheduler.hasAdmission(sessionId))
         throw httpError(403, '当前智能体没有此任务的设置权限')
-      const task = await schedules.task({ ownerId }, args.id)
+      let task = await schedules.task({ ownerId }, args.id)
       if (task.sessionId !== sessionId) throw httpError(404, '定时任务不存在')
+      // A native schedule_create can finish before its background wakeup snapshot.
+      // This explicit mutation may register the missing row; catalog reads remain read-only.
+      if (!task.notification_available && task.notification_version === undefined)
+        [task] = await schedules.notifications.sync([task], 'recover')
       if (!task.notification_available) throw httpError(503, '通知设置暂不可用，请稍后重试')
       await schedules.notifications.configure(task, args.enabled, task.notification_version, exec.signal)
       return { id: args.id, enabled: args.enabled }

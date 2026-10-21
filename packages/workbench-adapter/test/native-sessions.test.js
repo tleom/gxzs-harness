@@ -78,6 +78,8 @@ it('forwards native settings and model invalidations without exposing other sett
   expect((await source.next()).value.value).toEqual({type:'emit',event:'llm/adapters-updated',args:[]})
   listeners.get('schedule/changed')()
   expect((await source.next()).value.value).toEqual({type:'emit',event:'schedule/changed',args:[]})
+  listeners.get('workbench/schedule-notifications-changed')()
+  expect((await source.next()).value.value).toEqual({type:'emit',event:'schedule/changed',args:[]})
   expect(sessions.list).not.toHaveBeenCalled()
   controller.abort();await source.return()
   expect(listeners.size).toBe(0)

@@ -89,6 +89,11 @@ export class WorkbenchWorkspaces {
   }
 
   async mutate(owner, request) {
+    if (this.service) return this.service.directories.run(owner, () => this.mutateLocked(owner, request))
+    return this.mutateLocked(owner, request)
+  }
+
+  async mutateLocked(owner, request) {
     const { operation } = request
     if (operation === 'browse' || operation === 'mkdir') {
       const canonical = await this.resolveDirectory(request.path ?? '.')
@@ -120,14 +125,19 @@ export class WorkbenchWorkspaces {
       // The owner's workspace volume is mounted read-only at the same absolute
       // path in Host. Validate the canonical target before native registration.
       const canonical = await this.resolveDirectory(request.path)
+      this.service?.directories.assertAvailable(owner, path.posix.join('conversations', path.posix.relative(this.root, canonical)))
       await this.controller.create({ path: canonical })
-    } else if (['rename', 'delete', 'insertBefore', 'insertSessionBefore'].includes(operation)) {
+    } else if (operation === 'delete') {
+      if (!this.service) {
+        await this.requireWorkspace(owner, request.workspaceId)
+        throw httpError(503, '工作区删除服务尚未就绪')
+      }
+      await this.service.directories.deleteWorkspace(owner, request.workspaceId)
+    } else if (['rename', 'insertBefore', 'insertSessionBefore'].includes(operation)) {
       await this.requireWorkspace(owner, request.workspaceId, operation === 'insertSessionBefore')
       if (operation === 'rename') {
         if (typeof request.title !== 'string') throw httpError(400, '工作区名称无效')
         await this.controller.rename({ workspaceId: request.workspaceId, title: request.title })
-      } else if (operation === 'delete') {
-        await this.controller.delete({ workspaceId: request.workspaceId })
       } else if (operation === 'insertBefore') {
         if (request.beforeWorkspaceId != null) await this.requireWorkspace(owner, request.beforeWorkspaceId)
         await this.controller.insertBefore({ workspaceId: request.workspaceId, beforeWorkspaceId: request.beforeWorkspaceId ?? undefined })
