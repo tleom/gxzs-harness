@@ -177,6 +177,25 @@ for index in range(10005): (root/('empty-'+str(index))).touch()
     docker('exec', '--user', '1000', sandbox, '/usr/local/bin/python', '-I', '-S', '-c',
            "from pathlib import Path;Path('/workspace/probe/stream-dir/extra').write_bytes(b'x')")
     streaming_probe('oversize-directory')
+    metadata_limit = request('/sandboxes/' + workspaces[0] + '/files',
+                             {'operation': 'stat', 'path': 'probe/stream-dir'})
+    assert metadata_limit['status'] == 400 and metadata_limit['body']['error'] == 'Folder contains too many entries', metadata_limit
+    # Streaming download has no entry-count cap; ordinary metadata deliberately
+    # retains its existing budget. Restore this synthetic fixture to that budget
+    # before exercising the unrelated versioned-delete lifecycle below.
+    docker('exec', '--user', '1000', sandbox, '/usr/local/bin/python', '-I', '-S', '-c', """
+from pathlib import Path
+import stat
+root=Path('/workspace/probe/stream-dir')
+assert root.resolve() == root and root.is_dir()
+for index in range(10005):
+    child=root/('empty-'+str(index))
+    info=child.lstat()
+    assert stat.S_ISREG(info.st_mode) and info.st_size == 0
+    child.unlink()
+assert len(list(root.iterdir())) == 12
+""")
+    print('PASS directory metadata: oversized entry count rejected; bounded fixture restored for versioned deletion', flush=True)
     folder = files(workspaces[0], 'stat', path='probe/stream-dir')
     files(workspaces[0], 'delete', path='probe/stream-dir', version=folder['version'])
     large = files(workspaces[0], 'stat', path='probe/large.bin')
