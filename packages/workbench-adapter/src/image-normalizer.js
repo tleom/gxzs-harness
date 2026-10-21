@@ -71,7 +71,12 @@ export async function normalizeStreamedImage(store, data, size, mediaType, name,
     const save = async (bytes, type) => {
       signal?.throwIfAborted()
       if (!store) return { mediaType: type, data: bytes.toString('base64'), name }
-      const ref = await store.saveImage({ data: bytes, mediaType: type, name })
+      const ref = await store.saveImage({ data: bytes, mediaType: type, name }).catch(error => {
+        // A readable header does not guarantee that the raster decodes. The
+        // native store performs that final validation even for small images.
+        if (error?.name === 'AttachmentError' && error.code === 'INVALID_IMAGE') return invalid()
+        throw error
+      })
       signal?.throwIfAborted()
       const saved = await store.readImage(ref, signal)
       signal?.throwIfAborted()
