@@ -27,8 +27,7 @@ export class WorkbenchRuntime extends Service {
     const parent = this.agents.list?.().find(parent => this.agents.isOwnedBy?.(agent.id, parent))
     const root = this.rootOf(agent)
     const chat = root && this.database.getChatBySession(root.session?.id ?? root.id)
-    const existing = chat && this.database.listRuns(this.ownerId, chat.id).reverse()
-      .find(run => run.selection?.subagent_ids?.includes(agent.id))
+    const existing = chat && this.database.runForSubagent(this.ownerId, chat.id, agent.id)
     const inherited = parent && this.executionRun(parent.session?.id ?? parent.id)
     const run = this.childPrompts.get(agent.id) && this.database.getRun(this.ownerId, this.childPrompts.get(agent.id))
       || (activation && inherited?.status === 'running' && (existing?.stopConfirmation?.fenced || ['completed','cancelled','failed','interrupted'].includes(existing?.status)) ? inherited : existing ?? inherited)
@@ -44,16 +43,15 @@ export class WorkbenchRuntime extends Service {
 
   /** A sidebar prompt is a new authorized activation, never a revival of a fenced MCP run. */
   prepareChildPrompt(chat, child, requestId) {
-    const candidates = this.database.listRuns(this.ownerId, chat.id).reverse()
     const requestKey = `subagent-prompt:${child.id}:${requestId}`
     const saved = this.database.getCommandReceipt(this.ownerId, chat.id, requestKey)
-    const replay = saved ? this.database.getRun(this.ownerId, saved.runId) : candidates.find(run => run.requestKey === requestKey)
+    const replay = saved ? this.database.getRun(this.ownerId, saved.runId) : this.database.findRunByRequestKey(this.ownerId, chat.id, requestKey)
     if (replay) {
       if (['failed','discarded','cancelled','interrupted'].includes(replay.status))
         throw Object.assign(new Error('该消息已结束，请重新发送'), { status: 409, code: 'SUBAGENT_MESSAGE_FINISHED' })
       return replay
     }
-    const previous = candidates.find(run => run.selection?.subagent_ids?.includes(child.id))
+    const previous = this.database.runForSubagent(this.ownerId, chat.id, child.id)
     if (!previous) throw Object.assign(new Error('子智能体运行归属尚未恢复，请稍后重试'), { status: 409 })
     const agent = this.agents.get(child.id)
     const pending = this.childPrompts.get(child.id) && this.database.getRun(this.ownerId, this.childPrompts.get(child.id))

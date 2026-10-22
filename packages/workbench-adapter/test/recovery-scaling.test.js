@@ -1,8 +1,9 @@
 import { expect, it } from 'vitest'
+import { spawnSync } from 'node:child_process'
 import { WorkbenchDatabase } from '../src/persistence.js'
 import { reconcileNativeSessions } from '../src/projection.js'
 
-it.each([100, 250])('decodes at most two run inventories when recovering %s messages', async count => {
+it.each([100, 250])('recovers %s messages without loading complete run inventories', async count => {
   const database = new WorkbenchDatabase(':memory:')
   try {
     const ownerId = 'owner', sessionId = 'session', chatId = 'chat', events = []
@@ -29,9 +30,71 @@ it.each([100, 250])('decodes at most two run inventories when recovering %s mess
     const receipt = database.runForTurn.bind(database)
     database.runForTurn = (...args) => { receiptReads++; return receipt(...args) }
     await reconcileNativeSessions(database, { observeSession: async () => ({ events, [Symbol.dispose]() {} }) }, ownerId)
-    expect(calls).toBeLessThanOrEqual(2)
-    expect(decoded).toBeLessThanOrEqual(count * 2)
+    expect(calls).toBe(0)
+    expect(decoded).toBe(0)
     expect(receiptReads).toBeLessThanOrEqual(count)
     expect(original(ownerId, chatId).every(run => run.status === 'completed')).toBe(true)
   } finally { database.close() }
 })
+
+it('keeps large historical resource snapshots out of the recovery heap and preserves them on disk', () => {
+  const source = `
+    import assert from 'node:assert/strict';
+    import { WorkbenchDatabase } from ${JSON.stringify(new URL('../src/persistence.js', import.meta.url).href)};
+    import { reconcileNativeSessions } from ${JSON.stringify(new URL('../src/projection.js', import.meta.url).href)};
+    import { WorkbenchService } from ${JSON.stringify(new URL('../src/service.js', import.meta.url).href)};
+    const database = new WorkbenchDatabase(':memory:');
+    try {
+      const owner = 'owner', chat = 'chat', session = 'session';
+      database.createChat({ id: chat, ownerId: owner, sessionId: session, selection: {} });
+      const snapshot = JSON.stringify([{ description: 'x'.repeat(512 * 1024) }]);
+      for (let i = 0; i < 200; i++) {
+        database.createRun({ id: 'run-' + i, ownerId: owner, chatId: chat, sessionId: session, query: 'preserved', selection: {} });
+        database.transitionRun(owner, 'run-' + i, 'completed');
+      }
+      database.db.prepare('UPDATE runs SET mcp_tools_json=?').run(snapshot);
+      database.db.prepare('UPDATE runs SET message_id=? WHERE id=?').run('pending-message', 'run-199');
+      database.db.prepare('UPDATE runs SET source_start_seq=2 WHERE id=?').run('run-0');
+      database.db.prepare('UPDATE runs SET selection_json=?,created_at=1 WHERE id IN (?,?)')
+        .run(JSON.stringify({ subagent_ids: ['child'] }), 'run-197', 'run-198');
+      database.requireRunFence(owner, 'run-198');
+      database.confirmRunFence(owner, 'run-198');
+      const refs = database.listRunReferences(owner, chat);
+      assert.equal(refs.length, 200);
+      assert.equal(refs.find(r => r.id === 'run-199').messageId, 'pending-message');
+      assert.equal(refs.find(r => r.id === 'run-0').messageId, null);
+      assert.deepEqual(database.listRunReferences('foreign', chat), []);
+      assert.deepEqual(database.listRunReferences(owner, 'foreign'), []);
+      assert.equal(database.runForSubagent(owner, chat, 'child').id, 'run-198');
+      assert.equal(database.runForSubagent(owner, chat, 'child').stopConfirmation.fenced, true);
+      assert.equal(database.runForSubagent('foreign', chat, 'child'), undefined);
+      assert.equal(database.runForSubagent(owner, 'foreign', 'child'), undefined);
+      const service = new WorkbenchService({ database, agents: new Map(), sessionQuery: { observeSession: async () => ({
+        events: [{ seq: 1, type: 'command/run', data: { commandId: 'command', name: 'plan', args: '' } }],
+      }) } });
+      assert.equal(service.getChat({ ownerId: owner }, chat).runs.length, 200);
+      const control = await service.getControl({ ownerId: owner }, chat);
+      assert.equal(control.commands[0].before_run_id, 'run-0');
+      const view = service.historyPageView({ ownerId: owner }, database.getChat(owner, chat), { records: [], through_seq: 1000 }, true, true);
+      assert.equal(view.runs.length, 199);
+      assert.equal(view.runs.some(run => run.id === 'run-0'), false);
+      const events = [{ seq: 1, type: 'agent/inbox/spliced', data: {
+        target: 'next-turn', start: 0, removedCount: 0,
+        inserted: [{ id: 'pending-message', source: { kind: 'user' }, role: 'user', content: [] }],
+      } }];
+      const queued = await reconcileNativeSessions(database, { observeSession: async () => ({ events }) }, owner);
+      assert.deepEqual(queued, ['run-199']);
+      assert.equal(database.getRun(owner, 'run-199').status, 'queued');
+      assert.equal(database.getRun(owner, 'run-0').mcpTools[0].description.length, 512 * 1024);
+      assert.equal(database.db.prepare('SELECT count(*) AS n FROM runs WHERE mcp_tools_json=?').get(snapshot).n, 200);
+      global.gc();
+      console.log(JSON.stringify({ completed: true, heapUsed: process.memoryUsage().heapUsed }));
+    } finally { database.close(); }
+  `
+  const child = spawnSync(process.execPath, ['--max-old-space-size=96', '--expose-gc', '--input-type=module', '-e', source], {
+    encoding: 'utf8', timeout: 30000, windowsHide: true,
+  })
+  expect(child.status, child.stderr).toBe(0)
+  expect(JSON.parse(child.stdout)).toMatchObject({ completed: true })
+  expect(JSON.parse(child.stdout).heapUsed).toBeLessThan(40 * 1024 * 1024)
+}, 35000)

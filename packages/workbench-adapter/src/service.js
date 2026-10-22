@@ -260,7 +260,7 @@ export class WorkbenchService {
         // could arrive after cancellation and restart the deleted conversation.
         await this.scheduler?.pendingTick
         // Capture background run authority before archive dispatches child stops.
-        const cancelling = this.database.listRuns(owner.ownerId, chatId)
+        const cancelling = this.database.listRunReferences(owner.ownerId, chatId)
           .filter(run => ['running', 'waiting_input', 'stopping'].includes(run.status) || this.database.submission(owner.ownerId, run.id)?.dispatched
             || this.hasOwnedWork?.(chat.sessionId, run.id)
             || this.database.pendingRunFences(owner.ownerId, access).some(value => value.id === run.id))
@@ -278,7 +278,7 @@ export class WorkbenchService {
         if (agent) await agent.whenIdle()
         await this.waitSessionActivity?.(chat.sessionId)
         for (const run of cancelling) this.database.confirmRunFence(owner.ownerId, run.id, confirmation, access)
-        for (const run of this.database.listRuns(owner.ownerId, chatId)) {
+        for (const run of this.database.listRunReferences(owner.ownerId, chatId)) {
           if (['queued', 'running', 'waiting_input', 'stopping'].includes(run.status))
             this.database.transitionRun(owner.ownerId, run.id, 'cancelled', undefined, Date.now(), access)
           if (this.scheduler && this.database.submission(owner.ownerId, run.id)) {
@@ -330,7 +330,7 @@ export class WorkbenchService {
 
   getChat(owner, chatId, includeEvents = false) {
     const chat = this.requireChat(owner, chatId)
-    return { ...this.chatSummary(owner, chat), selection: chat.selection, runs: this.database.listRuns(owner.ownerId, chat.id).filter(run => !run.selection?.native_child).map((run) => this.getRun(owner, run.id, includeEvents)) }
+    return { ...this.chatSummary(owner, chat), selection: chat.selection, runs: this.database.listRunReferences(owner.ownerId, chat.id).filter(run => !run.nativeChild).map((run) => this.getRun(owner, run.id, includeEvents)) }
   }
 
   async historyPage(owner, chatId, cursor, signal, nativeLive = false) {
@@ -371,12 +371,12 @@ export class WorkbenchService {
     }
     // The live run uses its existing SSE snapshot/cursor as one atomic pair.
     // Older windows are read-only; they must never replace a newer live view.
-    if (opening) for (const run of this.database.listRuns(owner.ownerId, chat.id)) {
-      if (run.selection?.native_child) continue
+    if (opening) for (const run of this.database.listRunReferences(owner.ownerId, chat.id)) {
+      if (run.nativeChild) continue
       if (['queued', 'running', 'waiting_input', 'stopping'].includes(run.status)
         || (run.sourceStartSeq == null && run.sourceEndSeq == null)
         || run.sourceEndSeq > page.through_seq || run.sourceStartSeq > page.through_seq) {
-        runs.set(run.id, nativeLive ? (runs.get(run.id) ?? this.inputRunDto(owner, run))
+        runs.set(run.id, nativeLive ? (runs.get(run.id) ?? this.inputRunDto(owner, this.database.getRun(owner.ownerId, run.id)))
           : { ...this.getRun(owner, run.id, true), history_complete: true })
       }
     }
@@ -514,7 +514,7 @@ export class WorkbenchService {
     const checkCancelled = () => { if (cancelled()) throw httpError(409, '消息已取消') }
     checkCancelled()
     await requireDatabaseModel(this.platformClient, this.sessions, owner, chat.selection.model, this.modelSettings)
-    let parentRunId = body.retry_of ?? body.continue_run_id ?? body.parent_run_id ?? this.database.listRuns(owner.ownerId, chatId)
+    let parentRunId = body.retry_of ?? body.continue_run_id ?? body.parent_run_id ?? this.database.listRunReferences(owner.ownerId, chatId)
       .filter((run) => !['discarded', 'steered'].includes(run.status)).at(-1)?.id
     if (parentRunId != null) {
       const parent = this.database.getRun(owner.ownerId, parentRunId)
@@ -525,7 +525,7 @@ export class WorkbenchService {
     // Admission is serialized per chat: a normal follow-up belongs after the
     // actual queue tail, even if the client's active-run snapshot is stale.
     if (!body.continue_run_id && !body.retry_of) {
-      const tail = this.database.listRuns(owner.ownerId, chatId)
+      const tail = this.database.listRunReferences(owner.ownerId, chatId)
         .filter((run) => ['queued', 'running', 'waiting_input', 'stopping'].includes(run.status)).at(-1)
       if (tail) parentRunId = tail.id
     }
@@ -1099,7 +1099,7 @@ export class WorkbenchService {
       }
       return withGoalResources({ ...state, plan, contextPressure: source.projections?.values?.contextPressure ?? null,
         contextBreakdown: source.projections?.values?.contextBreakdown ?? null,
-        commands: nativeCommandRecords(source.events ?? [], this.database.listRuns(owner.ownerId, chatId)) })
+        commands: nativeCommandRecords(source.events ?? [], this.database.listRunReferences(owner.ownerId, chatId)) })
     } finally { source[Symbol.dispose]?.() }
   }
 

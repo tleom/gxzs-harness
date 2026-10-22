@@ -262,7 +262,7 @@ export function projectInboxClaim(database, { agent, message, turn }, expectedOw
     }
   }
   else if (message.source?.kind === 'goal' || (message.source?.kind === 'user' && !message.source.rpcId)) {
-    const admitted = database.listRuns(chat.ownerId, chat.id).find(item => item.messageId === message.id) ?? nativeCommandRun(sessionId)
+    const admitted = database.runForMessage(sessionId, message.id) ?? nativeCommandRun(sessionId)
     if (admitted) {
       const current = database.runForTurn(sessionId, turn)
       run = database.bindRunMessage(sessionId, admitted.id, turn, message.id)
@@ -302,12 +302,12 @@ function adoptJobNotice(database, chat, message, context) {
   return run
 }
 function noticeParent(database, chat, message) {
-  return database.listRuns(chat.ownerId, chat.id).reverse().find(run =>
-    run.selection?.subagent_ids?.includes(message.source.senderSessionId))
+  return database.runForSubagent(chat.ownerId, chat.id, message.source.senderSessionId)
 }
 function adoptNativeNotice(database, chat, message, context) {
   if (chat.deletedAt || !isNativeNotice(message) || typeof message.id !== 'string') return
-  const existing = database.listRuns(chat.ownerId, chat.id).find(run => run.id === message.id)
+  const match = database.listRunReferences(chat.ownerId, chat.id).find(run => run.id === message.id)
+  const existing = match && database.getRun(chat.ownerId, match.id)
   if (existing) return existing
   const parent = noticeParent(database, chat, message)
   // The native inbox starts a new turn after the old task has settled. Retain
@@ -398,7 +398,7 @@ export async function reconcileNativeSessions(database, sessionQuery, ownerId, c
   const chats = database.listChats(ownerId)
   // Native timers may deliver while asynchronous cold history reads are pending.
   // Only receipts that existed on entry belong to this startup interruption pass.
-  const initialRunIds = startupRunIds ?? chats.flatMap(chat => database.listRuns(ownerId, chat.id).map(run => run.id))
+  const initialRunIds = startupRunIds ?? chats.flatMap(chat => database.listRunReferences(ownerId, chat.id).map(run => run.id))
   const queued = []
   for (const chat of chats) {
     const resources = message => {
@@ -424,7 +424,7 @@ export async function reconcileNativeSessions(database, sessionQuery, ownerId, c
       // Observe may yield while native timers bind new receipts. Capture the
       // message index after it returns, then reuse it during this synchronous
       // replay rather than decoding every run once for every user message.
-      const byMessage = new Map(database.listRuns(chat.ownerId, chat.id)
+      const byMessage = new Map(database.listRunReferences(chat.ownerId, chat.id)
         .filter(run => run.messageId).map(run => [run.messageId, run]))
       const inbox = { 'next-turn': [], 'next-step': [] }
       let turn
