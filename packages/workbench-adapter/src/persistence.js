@@ -585,10 +585,14 @@ export class WorkbenchDatabase {
   }
 
   pendingScheduleNotifications(ownerId) {
-    return this.db.prepare(`SELECT r.* FROM runs r JOIN chats c ON c.id=r.chat_id
+    // Notification delivery retains this list across network requests. It needs
+    // occurrence metadata, never the frozen tools or attachment bodies.
+    return this.db.prepare(`SELECT r.id,r.owner_id AS ownerId,r.chat_id AS chatId,r.session_id AS sessionId,
+      r.query,r.status,r.selection_json,r.updated_at AS updatedAt FROM runs r JOIN chats c ON c.id=r.chat_id
       WHERE r.owner_id=? AND c.deleted_at IS NULL
       AND json_extract(r.selection_json, '$.schedule_notification_pending')=1
-      ORDER BY r.created_at,r.id`).all(ownerId).map(decodeRun)
+      ORDER BY r.created_at,r.id`).all(ownerId)
+      .map(({ selection_json, ...run }) => ({ ...run, selection: JSON.parse(selection_json) }))
   }
 
   rememberScheduleInitialization(ownerId, chatId, task, createdAt) {
@@ -1068,8 +1072,11 @@ export class WorkbenchDatabase {
   }
 
   pendingRunFences(ownerId, { includeDeleted = false } = {}) {
-    return this.db.prepare(`SELECT r.* FROM runs r JOIN run_fences f ON r.id=f.run_id JOIN chats c ON c.id=r.chat_id
-      WHERE r.owner_id=? AND f.confirmed=0 AND (? OR c.deleted_at IS NULL)`).all(ownerId, Number(includeDeleted)).map(decodeRun)
+    // Fence workers only use identity. Holding full receipts here retains every
+    // historical catalog until remote confirmation and duplicates it on checks.
+    return this.db.prepare(`SELECT r.id,r.session_id AS sessionId FROM runs r
+      JOIN run_fences f ON r.id=f.run_id JOIN chats c ON c.id=r.chat_id
+      WHERE r.owner_id=? AND f.confirmed=0 AND (? OR c.deleted_at IS NULL)`).all(ownerId, Number(includeDeleted))
   }
 
   confirmRunFence(ownerId, runId, confirmation = { fenced: true, uncertain: false }, access) {
