@@ -35,7 +35,7 @@ it('applies live title and goal changes after the older snapshot across replay y
   } finally { db.close() }
 })
 
-it('leaves buffered facts replayable on failure and releases the observation and barrier', async () => {
+it('keeps live facts ordered across a failed recovery and the interval before retry', async () => {
   const db = new WorkbenchDatabase(':memory:')
   try {
     db.createChat({ id: 'chat', ownerId: 'owner', sessionId: 'session', selection: {} })
@@ -51,9 +51,49 @@ it('leaves buffered facts replayable on failure and releases the observation and
     await failed
     expect(disposed).toBe(true)
     expect(projected('session', live.seq)).toBe(false)
+    const later = title(97, 'later title')
+    projectSessionEvent(db, 'session', later, 'owner')
+    expect(projected('session', later.seq)).toBe(false)
     db.hasProjectedEvent = projected
-    await reconcileNativeSessions(db, { observeSession: async () => ({ events: [...events, live] }) }, 'owner')
-    expect(db.getChat('owner', 'chat').title).toBe('live title')
+    await reconcileNativeSessions(db, { observeSession: async () => ({ events: [...events, live, later] }) }, 'owner')
+    expect(db.getChat('owner', 'chat').title).toBe('later title')
     expect(projected('session', live.seq)).toBe(true)
+    projectSessionEvent(db, 'session', title(98, 'after retry'), 'owner')
+    expect(db.getChat('owner', 'chat').title).toBe('after retry')
+  } finally { db.close() }
+})
+
+it.each([false, true])('applies a live completion before interrupting startup runs (pending inbox=%s)', async pending => {
+  const db = new WorkbenchDatabase(':memory:')
+  try {
+    db.createChat({ id: 'chat', ownerId: 'owner', sessionId: 'session', selection: {} })
+    db.createRun({ id: 'run', ownerId: 'owner', chatId: 'chat', sessionId: 'session', query: 'work', selection: {} })
+    db.bindRunMessage('session', 'run', 1, 'message')
+    db.transitionRun('owner', 'run', 'running')
+    const events = Array.from({ length: 96 }, (_, i) => title(i, 'title'))
+    if (pending) events[0] = { seq: 0, type: 'agent/inbox/spliced', data: { target: 'next-turn', start: 0,
+      inserted: [{ id: 'message', source: { kind: 'user', rpcId: 'run' }, content: [] }] } }
+    const recovery = reconcileNativeSessions(db, { observeSession: async () => ({ events }) }, 'owner')
+    await yieldToEventLoop()
+    projectSessionEvent(db, 'session', { seq: 96, type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } }, 'owner')
+    expect(await recovery).toEqual([])
+    expect(db.getRun('owner', 'run').status).toBe('completed')
+    expect(db.allEvents('owner', 'run').filter(event => event.event === 'workbench_end').map(event => event.status)).toEqual(['completed'])
+    expect(db.pendingRunFences('owner')).toEqual([])
+  } finally { db.close() }
+})
+
+it('uses the live context for an event also included in the observed snapshot', async () => {
+  const db = new WorkbenchDatabase(':memory:')
+  try {
+    db.createChat({ id: 'chat', ownerId: 'owner', sessionId: 'session', selection: {} })
+    const event = { seq: 1, type: 'plan/mode', data: { active: true } }
+    const plan = { active: true, pending: false }
+    await reconcileNativeSessions(db, { observeSession: async () => {
+      projectSessionEvent(db, 'session', event, 'owner', { plan })
+      return { events: [event] }
+    } }, 'owner')
+    expect(db.getControl('owner', 'chat').plan).toMatchObject(plan)
+    expect(db.hasProjectedEvent('session', 1)).toBe(true)
   } finally { db.close() }
 })

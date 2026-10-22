@@ -14,9 +14,10 @@ const END_STATUS = {
 }
 
 // Live native facts are durable already, but must not overtake an older startup
-// snapshot while replay yields to I/O. Failed replay leaves them unacknowledged
-// so the next observation can recover them in native sequence order.
+// snapshot while replay yields to I/O. Keep the barrier across failed attempts
+// so newer live facts cannot overtake the retry's unacknowledged history.
 const nativeReplays = new WeakMap()
+const replayKey = (sessionId, event) => `${sessionId}:${event.seq}`
 
 export function createAssistantStreamProjector(database, expectedOwnerId) {
   const attempts = new Map()
@@ -64,7 +65,7 @@ export function createAssistantStreamProjector(database, expectedOwnerId) {
 export function projectSessionEvent(database, sessionId, event, expectedOwnerId, context) {
   const replay = nativeReplays.get(database)
   if (replay?.sessions.has(sessionId)) {
-    replay.events.push([sessionId, event, expectedOwnerId, context])
+    replay.events.set(replayKey(sessionId, event), [sessionId, event, expectedOwnerId, context])
     return undefined
   }
   return applySessionEvent(database, sessionId, event, expectedOwnerId, context)
@@ -410,22 +411,39 @@ export function settleNativeIdle(database, sessionId, goal) {
 
 /** Replay native facts before declaring readiness; never wake a recovered agent. */
 export async function reconcileNativeSessions(database, sessionQuery, ownerId, context, startupRunIds, archivedSessionIds = () => []) {
-  if (nativeReplays.has(database)) throw new Error('Native session recovery is already running')
-  const replay = { sessions: new Set(database.listChats(ownerId).map(chat => chat.sessionId)), events: [] }
+  const chats = database.listChats(ownerId)
+  const replay = nativeReplays.get(database) ?? {
+    ownerId, sessions: new Set(), events: new Map(),
+    initialRunIds: startupRunIds ?? chats.flatMap(chat => database.listRunReferences(ownerId, chat.id).map(run => run.id)),
+  }
+  if (replay.running || replay.ownerId !== ownerId) throw new Error('Native session recovery is already running')
+  for (const chat of chats) replay.sessions.add(chat.sessionId)
+  replay.running = true
   nativeReplays.set(database, replay)
   try {
-    const queued = await reconcileNativeSessionSnapshots(database, sessionQuery, ownerId, context, startupRunIds, archivedSessionIds)
-    for (const [sessionId, event, expectedOwnerId, eventContext] of replay.events)
+    const queued = await reconcileNativeSessionSnapshots(database, sessionQuery, ownerId, context, archivedSessionIds, replay)
+    const liveEnds = new Set()
+    let drained = 0
+    for (const [sessionId, event, expectedOwnerId, eventContext] of replay.events.values()) {
+      if (++drained % 32 === 0) await yieldToEventLoop()
       applySessionEvent(database, sessionId, event, expectedOwnerId, eventContext)
-    return queued
-  } finally { nativeReplays.delete(database) }
+      if (event.type === 'turn/end') {
+        const run = database.runForTurn(sessionId, event.data.turn)
+        if (run) liveEnds.add(run.id)
+      }
+    }
+    // An observed inbox may predate a buffered completion. Do not revive that
+    // completed receipt or classify it as interrupted from the stale snapshot.
+    const pending = queued.filter(id => !liveEnds.has(id)
+      || ['queued', 'running', 'waiting_input', 'stopping'].includes(database.getRun(ownerId, id)?.status))
+    database.recoverInterrupted(Date.now(), pending, replay.initialRunIds)
+    nativeReplays.delete(database)
+    return pending
+  } finally { replay.running = false }
 }
 
-async function reconcileNativeSessionSnapshots(database, sessionQuery, ownerId, context, startupRunIds, archivedSessionIds) {
+async function reconcileNativeSessionSnapshots(database, sessionQuery, ownerId, context, archivedSessionIds, replay) {
   const chats = database.listChats(ownerId)
-  // Native timers may deliver while asynchronous cold history reads are pending.
-  // Only receipts that existed on entry belong to this startup interruption pass.
-  const initialRunIds = startupRunIds ?? chats.flatMap(chat => database.listRunReferences(ownerId, chat.id).map(run => run.id))
   const queued = []
   let replayed = 0
   for (const chat of chats) {
@@ -487,6 +505,9 @@ async function reconcileNativeSessionSnapshots(database, sessionQuery, ownerId, 
       }
       for (const event of events) {
         if (++replayed % 32 === 0) await yieldToEventLoop()
+        // Observe can include a fact that also arrived through the live listener.
+        // Preserve its captured plan/goal/context before acknowledging the seq.
+        const eventContext = replay.events.get(replayKey(chat.sessionId, event))?.[3]
         if (event.type === 'assistant/message' && !database.hasProjectedEvent(chat.sessionId, event.seq)) {
           const run = database.runForTurn(chat.sessionId, event.data.turn)
           if (run && database.isStreamedStep(ownerId, run.id, event.data.turn, event.data.step)) {
@@ -497,7 +518,7 @@ async function reconcileNativeSessionSnapshots(database, sessionQuery, ownerId, 
             database.transaction(() => {
               database.clearStreamedStep(ownerId, run.id, event.data.turn, event.data.step)
               database.appendEvent(ownerId, run.id, { event: 'workbench_stream_reset', segment_prefix: `t${event.data.turn}s${event.data.step}a` })
-              applySessionEvent(database, chat.sessionId, event, ownerId)
+              applySessionEvent(database, chat.sessionId, event, ownerId, eventContext)
             })()
             continue
           }
@@ -505,7 +526,7 @@ async function reconcileNativeSessionSnapshots(database, sessionQuery, ownerId, 
         if (event.type === 'agent/inbox/spliced')
           for (const message of event.data?.inserted ?? [])
             if (message.source?.kind === 'schedule') adoptMessage(database, chat.sessionId, message, resources(message))
-        applySessionEvent(database, chat.sessionId, event, ownerId)
+        applySessionEvent(database, chat.sessionId, event, ownerId, eventContext)
       }
       for (const message of [...inbox['next-turn'], ...inbox['next-step']]) {
         if (++replayed % 32 === 0) await yieldToEventLoop()
@@ -522,7 +543,6 @@ async function reconcileNativeSessionSnapshots(database, sessionQuery, ownerId, 
       }
     } finally { observed[Symbol.dispose]?.() }
   }
-  database.recoverInterrupted(Date.now(), queued, initialRunIds)
   return queued
 }
 
