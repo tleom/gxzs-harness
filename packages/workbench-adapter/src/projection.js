@@ -13,6 +13,11 @@ const END_STATUS = {
   'max-tokens': 'failed', blocked: 'failed', interrupted: 'interrupted',
 }
 
+// Live native facts are durable already, but must not overtake an older startup
+// snapshot while replay yields to I/O. Failed replay leaves them unacknowledged
+// so the next observation can recover them in native sequence order.
+const nativeReplays = new WeakMap()
+
 export function createAssistantStreamProjector(database, expectedOwnerId) {
   const attempts = new Map()
   return ({ agent, frame }) => {
@@ -57,6 +62,15 @@ export function createAssistantStreamProjector(database, expectedOwnerId) {
 }
 
 export function projectSessionEvent(database, sessionId, event, expectedOwnerId, context) {
+  const replay = nativeReplays.get(database)
+  if (replay?.sessions.has(sessionId)) {
+    replay.events.push([sessionId, event, expectedOwnerId, context])
+    return undefined
+  }
+  return applySessionEvent(database, sessionId, event, expectedOwnerId, context)
+}
+
+function applySessionEvent(database, sessionId, event, expectedOwnerId, context) {
   database.flushStreamEvents()
   const projected = database.hasProjectedEvent(sessionId, event.seq)
   // Settled history can contain thousands of events backed by megabyte-sized
@@ -396,6 +410,18 @@ export function settleNativeIdle(database, sessionId, goal) {
 
 /** Replay native facts before declaring readiness; never wake a recovered agent. */
 export async function reconcileNativeSessions(database, sessionQuery, ownerId, context, startupRunIds, archivedSessionIds = () => []) {
+  if (nativeReplays.has(database)) throw new Error('Native session recovery is already running')
+  const replay = { sessions: new Set(database.listChats(ownerId).map(chat => chat.sessionId)), events: [] }
+  nativeReplays.set(database, replay)
+  try {
+    const queued = await reconcileNativeSessionSnapshots(database, sessionQuery, ownerId, context, startupRunIds, archivedSessionIds)
+    for (const [sessionId, event, expectedOwnerId, eventContext] of replay.events)
+      applySessionEvent(database, sessionId, event, expectedOwnerId, eventContext)
+    return queued
+  } finally { nativeReplays.delete(database) }
+}
+
+async function reconcileNativeSessionSnapshots(database, sessionQuery, ownerId, context, startupRunIds, archivedSessionIds) {
   const chats = database.listChats(ownerId)
   // Native timers may deliver while asynchronous cold history reads are pending.
   // Only receipts that existed on entry belong to this startup interruption pass.
@@ -471,7 +497,7 @@ export async function reconcileNativeSessions(database, sessionQuery, ownerId, c
             database.transaction(() => {
               database.clearStreamedStep(ownerId, run.id, event.data.turn, event.data.step)
               database.appendEvent(ownerId, run.id, { event: 'workbench_stream_reset', segment_prefix: `t${event.data.turn}s${event.data.step}a` })
-              projectSessionEvent(database, chat.sessionId, event, ownerId)
+              applySessionEvent(database, chat.sessionId, event, ownerId)
             })()
             continue
           }
@@ -479,7 +505,7 @@ export async function reconcileNativeSessions(database, sessionQuery, ownerId, c
         if (event.type === 'agent/inbox/spliced')
           for (const message of event.data?.inserted ?? [])
             if (message.source?.kind === 'schedule') adoptMessage(database, chat.sessionId, message, resources(message))
-        projectSessionEvent(database, chat.sessionId, event, ownerId)
+        applySessionEvent(database, chat.sessionId, event, ownerId)
       }
       for (const message of [...inbox['next-turn'], ...inbox['next-step']]) {
         if (++replayed % 32 === 0) await yieldToEventLoop()
