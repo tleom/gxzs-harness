@@ -3,6 +3,22 @@ import { httpError } from './http.js'
 // Same window as DSH Session.loadOlder. The native controller owns the cut,
 // source-message grouping, surface replacement records and cold-session reads.
 export const historyWindow = { maxMessages: 500, turnWindow: { minMessages: 50, minTurns: 2 } }
+// Prefer small UTF-8 pages. A single indivisible record retains the existing
+// frontend SSE ceiling (32 Mi characters including the data prefix).
+export const historyResponseBytes = 8 * 1024 * 1024
+export function historyWindowFor(maxMessages) {
+  return { maxMessages, turnWindow: { ...historyWindow.turnWindow, minMessages: Math.min(historyWindow.turnWindow.minMessages, maxMessages) } }
+}
+export const historyEventCharacters = 32 * 1024 * 1024 - 6
+export function fitsHistoryResponse(value, maxMessages = historyWindow.maxMessages) {
+  const encoded = JSON.stringify(value)
+  return encoded.length <= historyEventCharacters &&
+    (maxMessages === 1 || Buffer.byteLength(encoded) <= historyResponseBytes)
+}
+export function smallerHistoryWindow(maxMessages) {
+  if (maxMessages <= 1) throw httpError(413, '单条历史内容超过显示上限，请缩小工具输出后重试', 'HISTORY_ITEM_TOO_LARGE')
+  return Math.max(1, Math.floor(maxMessages / 2))
+}
 
 /** Native pagination counts log metadata too; the UI only offers earlier display content. */
 export async function hasEarlierContent(sessions, sessionId, throughSeq, beforeSeq, signal, address = { kind: 'session', sessionId }) {
@@ -25,7 +41,7 @@ export async function hasEarlierContent(sessions, sessionId, throughSeq, beforeS
 }
 
 /** Read one native history window after the caller has authorized the chat. */
-export async function loadNativeHistoryPage({ sessions, sessionQuery }, sessionId, cursor, signal) {
+export async function loadNativeHistoryPage({ sessions, sessionQuery }, sessionId, cursor, signal, options = {}) {
   signal.throwIfAborted()
   if (cursor !== undefined && (!cursor || typeof cursor !== 'object'
     || cursor.sessionId !== sessionId
@@ -34,7 +50,7 @@ export async function loadNativeHistoryPage({ sessions, sessionQuery }, sessionI
     || cursor.beforeSeq > cursor.throughSeq + 1)) {
     throw httpError(400, '历史消息游标无效，请重新打开对话')
   }
-  let throughSeq = cursor?.throughSeq
+  let throughSeq = cursor?.throughSeq ?? options.throughSeq
   if (throughSeq === undefined) {
     // Only the log cursor is needed here; avoid reconstructing every projection
     // before the native controller reads the requested page.
@@ -47,7 +63,7 @@ export async function loadNativeHistoryPage({ sessions, sessionQuery }, sessionI
   const page = await sessions.page({
     address: { kind: 'session', sessionId }, throughSeq,
     ...(cursor ? { beforeSeq: cursor.beforeSeq } : {}),
-    ...historyWindow,
+    ...historyWindowFor(options.maxMessages ?? historyWindow.maxMessages),
   }, signal)
   signal.throwIfAborted()
   const beforeSeq = page.records[0]?.event.seq

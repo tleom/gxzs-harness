@@ -81,3 +81,14 @@ it('closes an interrupted native stream without a synthetic completion', async (
   expect(res.write).toHaveBeenCalledTimes(1)
   expect(res.end).toHaveBeenCalledOnce()
 })
+
+it('delivers a terminal capacity error after the stream has opened', async () => {
+  const res=response()
+  const service={async *followHistory(){
+    yield {event:'workbench_history',value:{type:'snapshot'}}
+    throw Object.assign(new Error('large'),{status:413,code:'HISTORY_ITEM_TOO_LARGE'})
+  }}
+  await streamHistoryEvents({service,res})
+  expect(JSON.parse(res.write.mock.calls[1][0].slice(6))).toEqual({event:'workbench_error',status:413,code:'HISTORY_ITEM_TOO_LARGE',message:'large'})
+  expect(res.end).toHaveBeenCalledOnce()
+})
