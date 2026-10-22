@@ -426,7 +426,7 @@ export class WorkbenchDatabase {
     this.flushStreamEvents()
     const row = this.db.prepare(`SELECT r.*, f.result_json AS stop_confirmation_json FROM runs r JOIN chats c ON c.id = r.chat_id LEFT JOIN run_fences f ON f.run_id=r.id
       WHERE r.id = ? AND r.owner_id = ? AND (? OR c.deleted_at IS NULL)`).get(id, ownerId, Number(includeDeleted))
-    return row ? { ...decodeRun(row), ...(row.error ? { errorCode: this.runErrorCode(ownerId, id) } : {}) } : undefined
+    return row ? Object.assign(decodeRun(row), row.error ? { errorCode: this.runErrorCode(ownerId, id) } : {}) : undefined
   }
 
   /** Transport/receipt authorization needs no frozen tool/attachment payloads. */
@@ -506,7 +506,7 @@ export class WorkbenchDatabase {
 
   goalRun(sessionId) {
     const row = this.db.prepare('SELECT r.* FROM runs r JOIN goal_runs g ON r.id=g.run_id WHERE g.session_id=?').get(sessionId)
-    return row ? { ...decodeRun(row), ...(row.error ? { errorCode: this.runErrorCode(row.owner_id, row.id) } : {}) } : undefined
+    return row ? Object.assign(decodeRun(row), row.error ? { errorCode: this.runErrorCode(row.owner_id, row.id) } : {}) : undefined
   }
 
   updateRunResources(run, selection, mcpTools) {
@@ -1144,9 +1144,9 @@ function decodeChat(row) {
 }
 
 function decodeRun(row) {
-  return {
+  const run = {
     id: row.id, ownerId: row.owner_id, chatId: row.chat_id, sessionId: row.session_id,
-    requestKey: row.request_key ?? undefined, query: row.query, attachments: JSON.parse(row.attachments_json), mcpTools: JSON.parse(row.mcp_tools_json), status: row.status,
+    requestKey: row.request_key ?? undefined, query: row.query, attachments: JSON.parse(row.attachments_json), status: row.status,
     error: row.error ?? undefined, feedback: row.feedback ?? null, selection: JSON.parse(row.selection_json),
     stopConfirmation: parseNullable(row.stop_confirmation_json),
     parentRunId: row.parent_run_id ?? undefined, queueOrder: row.queue_order,
@@ -1154,6 +1154,21 @@ function decodeRun(row) {
     sourceStartSeq: row.source_start_seq ?? undefined, sourceEndSeq: row.source_end_seq ?? undefined,
     seq: row.next_seq - 1, createdAt: row.created_at, updatedAt: row.updated_at,
   }
+  // Recovery reads receipt identity/status repeatedly. Keep its frozen catalog
+  // intact, decoding only when permissions, execution or presentation need it.
+  // Each returned receipt owns its value; there is no shared mutable cache.
+  let toolsJson = row.mcp_tools_json
+  const materialize = value => {
+    Object.defineProperty(run, 'mcpTools', { value, enumerable: true, configurable: true, writable: true })
+    toolsJson = undefined
+    return value
+  }
+  Object.defineProperty(run, 'mcpTools', {
+    enumerable: true, configurable: true,
+    get: () => materialize(JSON.parse(toolsJson)),
+    set: materialize,
+  })
+  return run
 }
 
 function decodePending(row) {
