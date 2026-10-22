@@ -18,42 +18,42 @@ def test_limits_and_fifo(tmp_path):
     queue = Admission(str(tmp_path / 'queue.db'))
     def call(owner, run, action='acquire'):
         return queue.request(owner, 1, 'host-' + owner, run, run, action)['state']
-    for user in range(10):
-        for run in ('one', 'two', 'three'):
+    assert queue.request('0', 1, 'host-0', 'one', 'one', 'acquire')['limits'] == {'per_user': 2, 'users': 15, 'tasks': 30}
+    for user in range(15):
+        for run in ('one', 'two'):
             assert call(str(user), run) == 'running'
-    assert call('0', 'four') == 'waiting'
-    assert call('10', 'one') == 'waiting'
+    assert call('0', 'three') == 'waiting'
+    assert call('15', 'one') == 'waiting'
     call('0', 'one', 'release')
-    assert call('10', 'one') == 'waiting'
-    assert call('0', 'four') == 'running'
-    for run in ('one', 'two'):
-        call('1', run, 'release')
-        assert call('10', 'one') == 'waiting'
-    call('1', 'three', 'release')
-    assert call('10', 'one') == 'running'
+    assert call('15', 'one') == 'waiting'
+    assert call('0', 'three') == 'running'
+    call('1', 'one', 'release')
+    assert call('15', 'one') == 'waiting'
+    call('1', 'two', 'release')
+    assert call('15', 'one') == 'running'
     queue.close()
 
 
 def test_same_generation_recovery_preserves_pending_tickets_and_fifo(tmp_path):
     queue = Admission(str(tmp_path / 'queue.db'))
     try:
-        for run in ('one', 'two', 'three'):
+        for run in ('one', 'two'):
             assert queue.request('a', 1, 'host-a', run, run, 'acquire')['state'] == 'running'
-        assert queue.request('a', 1, 'host-a', 'waiting', 'four', 'acquire')['state'] == 'waiting'
-        queue.request('a', 1, 'host-a', 'three', 'three', 'release', retry=True)
+        assert queue.request('a', 1, 'host-a', 'waiting', 'three', 'acquire')['state'] == 'waiting'
+        queue.request('a', 1, 'host-a', 'two', 'two', 'release', retry=True)
         before = [tuple(row) for row in queue.db.execute("SELECT seq,run,state FROM task_admission WHERE state IN ('waiting','retry') ORDER BY seq")]
         queue.fence('a', 'wrong-host', preserve_pending=True)
-        assert queue.active('a') == 2
+        assert queue.active('a') == 1
         queue.fence('a', 'host-a', preserve_pending=True)
         assert queue.active('a') == 0 and queue.busy('a') == 2
         assert [tuple(row) for row in queue.db.execute("SELECT seq,run,state FROM task_admission WHERE state IN ('waiting','retry') ORDER BY seq")] == before
-        assert queue.request('a', 1, 'host-a', 'waiting', 'four', 'acquire')['state'] == 'running'
-        assert queue.request('a', 1, 'host-a', 'three', 'three', 'acquire')['state'] == 'running'
+        assert queue.request('a', 1, 'host-a', 'waiting', 'three', 'acquire')['state'] == 'running'
+        assert queue.request('a', 1, 'host-a', 'two', 'two', 'acquire')['state'] == 'running'
         assert queue.request('a', 1, 'host-a', 'one', 'one', 'acquire')['state'] == 'done'
         # Actual replacement/revocation keeps its stricter fencing semantics.
         queue.fence('a', 'host-a')
         assert queue.busy('a') == 0
-        assert queue.request('a', 2, 'host-b', 'waiting', 'four', 'acquire')['state'] == 'fenced'
+        assert queue.request('a', 2, 'host-b', 'waiting', 'three', 'acquire')['state'] == 'fenced'
     finally:
         queue.close()
 
@@ -83,11 +83,11 @@ def test_long_recovery_restores_waiting_fifo_before_any_dispatcher_polls(tmp_pat
     monkeypatch.setattr(admission.time, 'time', lambda: clock[0])
     path = str(tmp_path / 'queue.db')
     queue = Admission(path)
-    for run in ('one', 'two', 'three'):
+    for run in ('one', 'two'):
         assert queue.request('a', 1, 'host-a', run, run, 'acquire')['state'] == 'running'
     for run in ('first', 'second'):
         assert queue.request('a', 1, 'host-a', run, run, 'acquire')['state'] == 'waiting'
-    queue.request('a', 1, 'host-a', 'three', 'three', 'release', retry=True)
+    queue.request('a', 1, 'host-a', 'two', 'two', 'release', retry=True)
     clock[0] = 200
     queue.fence('a', 'host-a', preserve_pending=True)
     queue.close()
@@ -101,7 +101,7 @@ def test_long_recovery_restores_waiting_fifo_before_any_dispatcher_polls(tmp_pat
         assert queue.request('a', 1, 'host-a', 'second', 'second', 'acquire')['state'] == 'waiting'
         assert queue.request('a', 1, 'host-a', 'first', 'first', 'acquire')['state'] == 'running'
         assert queue.request('a', 1, 'host-a', 'second', 'second', 'acquire')['state'] == 'running'
-        assert queue.db.execute("SELECT state FROM task_admission WHERE run='three'").fetchone()[0] == 'retry'
+        assert queue.db.execute("SELECT state FROM task_admission WHERE run='two'").fetchone()[0] == 'retry'
     finally:
         queue.close()
 
@@ -138,9 +138,9 @@ def test_concurrent_owners_never_exceed_capacity(tmp_path):
     with ThreadPoolExecutor(max_workers=20) as pool:
         list(pool.map(acquire, range(90)))
     rows = queue.db.execute("SELECT owner,COUNT(*) n FROM task_admission WHERE state='running' GROUP BY owner").fetchall()
-    assert len(rows) <= 10
+    assert len(rows) <= 15
     assert sum(row['n'] for row in rows) <= 30
-    assert all(row['n'] <= 3 for row in rows)
+    assert all(row['n'] <= 2 for row in rows)
     queue.close()
 
 
@@ -152,8 +152,28 @@ def test_independent_connections_serialize_admission(tmp_path):
     with ThreadPoolExecutor(max_workers=20) as pool:
         list(pool.map(acquire, range(90)))
     rows = queues[0].db.execute("SELECT owner,COUNT(*) n FROM task_admission WHERE state='running' GROUP BY owner").fetchall()
-    assert len(rows) <= 10
+    assert len(rows) <= 15
     assert sum(row['n'] for row in rows) <= 30
-    assert all(row['n'] <= 3 for row in rows)
+    assert all(row['n'] <= 2 for row in rows)
     for queue in queues:
+        queue.close()
+
+
+def test_reduced_per_owner_limit_preserves_running_tasks_until_slots_drain(tmp_path, monkeypatch):
+    import admission
+    queue = Admission(str(tmp_path / 'queue.db'))
+    try:
+        monkeypatch.setattr(admission, 'MAX_CONVERSATIONS_PER_OWNER', 3)
+        for run in ('one', 'two', 'three'):
+            assert queue.request('a', 1, 'host-a', run, run, 'acquire')['state'] == 'running'
+        monkeypatch.setattr(admission, 'MAX_CONVERSATIONS_PER_OWNER', 2)
+        assert queue.request('a', 1, 'host-a', 'four', 'four', 'acquire')['state'] == 'waiting'
+        assert queue.active('a') == 3
+        assert queue.request('a', 1, 'host-a', 'three', 'three', 'renew')['state'] == 'running'
+        queue.request('a', 1, 'host-a', 'one', 'one', 'release')
+        assert queue.request('a', 1, 'host-a', 'four', 'four', 'acquire')['state'] == 'waiting'
+        queue.request('a', 1, 'host-a', 'two', 'two', 'release')
+        assert queue.request('a', 1, 'host-a', 'four', 'four', 'acquire')['state'] == 'running'
+        assert queue.active('a') == 2
+    finally:
         queue.close()

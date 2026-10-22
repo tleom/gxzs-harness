@@ -8,7 +8,7 @@
 
 任务先保存在用户宿主 SQLite 的 `run_submissions` 中，然后经 owner/generation 身份验证向 manager 申请全局名额。拿到名额才发送到 DSH；同一对话共用一个执行名额，后续消息由 DSH inbox 排队，插队消息与原生子智能体继承该对话的名额，不按消息数或子智能体数计数。
 
-固定限制：每个 owner 最多 3 个运行中的对话，全局最多 10 个运行中的 owner、30 个对话。等待提问回答、计划反馈或批准时释放名额，反馈后先重新申请名额再恢复；完成、失败、已暂停、已停止均不占名额。队列按首次申请顺序选择符合限制的任务，某个用户达到上限不会挡住其他符合条件的用户。停止但尚未确认结束的任务保留名额。manager 的队列持久化在 `/state/admission.sqlite3`，不能部署多个互不共享队列的 manager。
+固定限制：每个 owner 最多 2 个运行中的对话，全局最多 15 个运行中的 owner、30 个对话。等待提问回答、计划反馈或批准时释放名额，反馈后先重新申请名额再恢复；完成、失败、已暂停、已停止均不占名额。队列按首次申请顺序选择符合限制的任务，某个用户达到上限不会挡住其他符合条件的用户。停止但尚未确认结束的任务保留名额。下调限制后，已运行任务继续执行，新增任务等待名额降至上限以下后再准入。manager 的队列持久化在 `/state/admission.sqlite3`，不能部署多个互不共享队列的 manager。
 
 宿主心跳由 manager 检查健康后发送，不能再依赖迁移用户的静态清单。无运行任务且连续 2 小时没有沙盒/调度活动时，Host 和沙盒一起停止，数据卷保留，下次访问唤醒。已经向 SnailJob 确认登记的未来计划可以随环境休眠；距离原生执行时间不足 5 分钟、登记未确认、通知回传未确认、队列/Agent/工具/终端/浏览器仍活跃时继续运行。纯健康探测不延长空闲时间。宿主连续健康失败超过 60 秒时先停止宿主和沙盒，再回收名额。不能单凭心跳过期直接释放运行名额。
 
@@ -74,9 +74,9 @@ Host 活动协议 2 区分总计划和已经确认登记、且距离执行超过
 
 在 Docker 宿主机使用 systemd cgroup v2，把 `services/sandbox-manager/systemd/gxzs-workbench.slice` 和 `gxzs-workbench-.slice.d/limits.conf` 安装到 `/etc/systemd/system/`，执行 `systemctl daemon-reload`。全局池限制 15 CPU / 30 GiB，每个工作区 slice 限制 2 CPU / 4 GiB，Host 和 sandbox 的 `CgroupParent` 必须相同。前缀 drop-in 使后续新用户自动继承配额。
 
-manager 配置 `GXZS_OWNER_CGROUP_PREFIX=gxzs-workbench`，并将 `GXZS_HOST_CPUS=2`、`GXZS_HOST_MEMORY=4g`、`WORKBENCH_SANDBOX_CPUS=2`、`WORKBENCH_SANDBOX_MEMORY=4g` 设置为单容器上限；两容器合计仍受 owner slice 限制。MemoryHigh 在 owner 3 GiB / 全局 28 GiB 提前施加回收压力，禁用该池 swap。10 人同时运行时共享全局容量，每人 4 GiB 是弹性上限，不能视为每人保留 4 GiB。变更现有容器的 cgroup parent 需要排空后重建，个人数据卷继续复用。
+manager 配置 `GXZS_OWNER_CGROUP_PREFIX=gxzs-workbench`，并将 `GXZS_HOST_CPUS=2`、`GXZS_HOST_MEMORY=4g`、`WORKBENCH_SANDBOX_CPUS=2`、`WORKBENCH_SANDBOX_MEMORY=4g` 设置为单容器上限；两容器合计仍受 owner slice 限制。MemoryHigh 在 owner 3 GiB / 全局 28 GiB 提前施加回收压力，禁用该池 swap。15 人同时运行时共享全局容量，每人 4 GiB 是弹性上限，不能视为每人保留 4 GiB。变更现有容器的 cgroup parent 需要排空后重建，个人数据卷继续复用。
 
-沙盒的 `WORKBENCH_SANDBOX_PIDS_LIMIT` 默认 1024，可配置为正整数；Linux 的该额度同时计算进程和线程。Chromium 与 Node/SSH 工具共用额度，原来的 256 可导致 `pthread_create` / 辅助进程启动失败。manager 在容器镜像、归属网络、附件卷和 cgroup 校验通过后，可在线提高已有容器额度，降低运行中容器额度需先排空。该额度不改变 2 CPU / 4 GiB owner 上限或 3 个运行中主对话限制，也不是子智能体数量限制。
+沙盒的 `WORKBENCH_SANDBOX_PIDS_LIMIT` 默认 1024，可配置为正整数；Linux 的该额度同时计算进程和线程。Chromium 与 Node/SSH 工具共用额度，原来的 256 可导致 `pthread_create` / 辅助进程启动失败。manager 在容器镜像、归属网络、附件卷和 cgroup 校验通过后，可在线提高已有容器额度，降低运行中容器额度需先排空。该额度不改变 2 CPU / 4 GiB owner 上限或 2 个运行中主对话限制，也不是子智能体数量限制。
 
 引用搜索辅助进程默认空闲 60 秒退出，`GXZS_REFERENCE_IDLE_MS` 可配置正整数毫秒；查询进行中不回收，工具结果使索引失效不会延长空闲时间。下次引用沿用 DSH 原生索引重新建立，等待旧进程退出后再启动。MCP 连接在空闲 300 秒后回收，管理器最多保留 32 个缓存连接、每个 owner 最多保留 4 个；这些仅是空闲缓存目标，正在调用的连接不受该回收规则限制。MCP 和记忆调用退出尚未确认时仍计入占用，现有回收程序继续确认已结束调用的退出，外部调用的未知结果记录也继续保留。取消和清理不额外创建清理线程；Docker 客户端退出本身不能证明远端进程已退出，必须收到匹配的沙盒退出确认。
 
