@@ -168,7 +168,7 @@ function projectEvent(database, sessionId, event, expectedOwnerId, context) {
   }
   if (['todo/write', 'goal/change', 'compaction/start', 'compaction/summary', 'compaction/end'].includes(event.type)) {
     const result = projectControlEvent(database, chat, sessionId, event)
-    if (event.type === 'goal/change' && context?.nativeIdle) settleNativeIdle(database, sessionId, event.data?.goal)
+    if (event.type === 'goal/change' && context?.nativeIdle) applyNativeIdle(database, sessionId, event.data?.goal)
     return result
   }
 
@@ -426,6 +426,19 @@ function projectControlEvent(database, chat, sessionId, event) {
 }
 
 export function settleNativeIdle(database, sessionId, goal) {
+  const replay = nativeReplays.get(database)
+  if (replay?.sessions.has(sessionId)) {
+    replay.queue.push({ apply: () => {
+      const run = database.goalRun(sessionId)
+      applyNativeIdle(database, sessionId, goal)
+      if (run) replay.endedRuns.add(run.id)
+    } })
+    return
+  }
+  return applyNativeIdle(database, sessionId, goal)
+}
+
+function applyNativeIdle(database, sessionId, goal) {
   const run = database.goalRun(sessionId)
   if (!run || !['running', 'waiting_input', 'stopping'].includes(run.status)) return
   if (goal?.phase === 'active' && goal.activation !== 'disarmed') return
@@ -470,6 +483,10 @@ function acknowledgeReplayEntry(database, replay, entry) {
   if (Number.isInteger(entry.event?.seq) && !database.hasProjectedEvent(entry.sessionId, entry.event.seq)) return
   if (entry.event?.type === 'turn/end') {
     const run = database.runForTurn(entry.sessionId, entry.event.data.turn)
+    if (run) replay.endedRuns.add(run.id)
+  }
+  if (entry.event?.type === 'goal/change' && entry.context?.nativeIdle) {
+    const run = database.goalRun(entry.sessionId)
     if (run) replay.endedRuns.add(run.id)
   }
   entry.applied = true

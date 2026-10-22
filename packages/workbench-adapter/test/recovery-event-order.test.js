@@ -1,7 +1,7 @@
 import { expect, it } from 'vitest'
 import { setImmediate as yieldToEventLoop } from 'node:timers/promises'
 import { WorkbenchDatabase } from '../src/persistence.js'
-import { createAssistantStreamProjector, projectInboxClaim, projectSessionEvent, reconcileNativeSessions } from '../src/projection.js'
+import { createAssistantStreamProjector, projectInboxClaim, projectSessionEvent, reconcileNativeSessions, settleNativeIdle } from '../src/projection.js'
 
 const title = (seq, value) => ({ seq, type: 'session/title', data: { title: value } })
 const goal = (seq, objective) => ({ seq, type: 'goal/change', data: {
@@ -51,6 +51,23 @@ function streamAnswer(project, text, step, seq) {
   project({ agent, frame: { type: 'chunk', attemptId: 'attempt', chunk: { type: 'text-delta', index: 0, text } } })
   project({ agent, frame: { type: 'end', attemptId: 'attempt', outcome: { kind: 'committed', eventType: 'assistant/message', seq } } })
 }
+
+it('settles native idle after the older recovered answer', async () => {
+  const db = new WorkbenchDatabase(':memory:')
+  try {
+    runningChat(db)
+    db.setGoalRun('session', 'run')
+    const events = Array.from({ length: 96 }, (_, i) => title(i, 'title'))
+    events[95] = answer(95, 'older answer')
+    const recovery = reconcileNativeSessions(db, { observeSession: async () => ({ events }) }, 'owner')
+    await yieldToEventLoop()
+    settleNativeIdle(db, 'session', { phase: 'paused' })
+    await recovery
+    expect(db.allEvents('owner', 'run').filter(event => event.data?.kind === 'text' || event.event === 'workbench_end')
+      .map(event => event.data?.text ?? event.status)).toEqual(['older answer', 'completed'])
+    expect(db.pendingRunFences('owner')).toEqual([])
+  } finally { db.close() }
+})
 
 it('projects an identical unsequenced snapshot/live occurrence once', async () => {
   const db = new WorkbenchDatabase(':memory:')
