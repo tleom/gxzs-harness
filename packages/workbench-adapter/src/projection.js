@@ -17,12 +17,12 @@ const END_STATUS = {
 // snapshot while replay yields to I/O. Keep the barrier across failed attempts
 // so newer live facts cannot overtake the retry's unacknowledged history.
 const nativeReplays = new WeakMap()
-const replayKey = (sessionId, event) => Number.isInteger(event.seq) ? `${sessionId}:${event.seq}` : Symbol()
+const eventIdentity = event => Number.isInteger(event.seq) ? event.seq : event
+const streamStep = (sessionId, turn, step) => `${sessionId}:${turn}:${step}`
 
 export function createAssistantStreamProjector(database, expectedOwnerId) {
   const attempts = new Map()
-  return ({ agent, frame }) => {
-    const sessionId = agent?.session?.id ?? agent?.id
+  const applyFrame = (sessionId, frame, snapshotSteps) => {
     if (frame.type === 'start') {
       attempts.set(String(frame.attemptId), { sessionId, turn: frame.turn, step: frame.step, tools: new Map() })
       return undefined
@@ -30,6 +30,8 @@ export function createAssistantStreamProjector(database, expectedOwnerId) {
     const attempt = attempts.get(String(frame.attemptId))
     if (!attempt || attempt.sessionId !== sessionId) return undefined
     if (frame.type === 'end') attempts.delete(String(frame.attemptId))
+    // A durable final message in the snapshot already represents these deltas.
+    if (snapshotSteps?.has(streamStep(sessionId, attempt.turn, attempt.step))) return undefined
     const run = database.streamRunForTurn(sessionId, attempt.turn)
     if (!run || (expectedOwnerId && run.ownerId !== expectedOwnerId)) return undefined
     if (frame.type === 'end') {
@@ -60,12 +62,28 @@ export function createAssistantStreamProjector(database, expectedOwnerId) {
       },
     }, attempt.turn, attempt.step)
   }
+  return ({ agent, frame }) => {
+    const sessionId = agent?.session?.id ?? agent?.id
+    const replay = nativeReplays.get(database)
+    if (replay?.sessions.has(sessionId)) {
+      replay.queue.push({ apply: () => applyFrame(sessionId, frame, replay.snapshotSteps) })
+      return undefined
+    }
+    return applyFrame(sessionId, frame)
+  }
 }
 
 export function projectSessionEvent(database, sessionId, event, expectedOwnerId, context) {
   const replay = nativeReplays.get(database)
   if (replay?.sessions.has(sessionId)) {
-    replay.events.set(replayKey(sessionId, event), [sessionId, event, expectedOwnerId, context])
+    let events = replay.events.get(sessionId)
+    if (!events) replay.events.set(sessionId, events = new Map())
+    const key = eventIdentity(event)
+    if (!events.has(key)) {
+      const entry = { sessionId, event, expectedOwnerId, context }
+      events.set(key, entry)
+      replay.queue.push(entry)
+    }
     return undefined
   }
   return applySessionEvent(database, sessionId, event, expectedOwnerId, context)
@@ -232,6 +250,13 @@ export function claimNeedsResources(database, { agent, message, turn }, ownerId)
 
 /** Shared, side-effect-free display projection for live events and native history pages. */
 export function projectInboxClaim(database, { agent, message, turn }, expectedOwnerId, context) {
+  const run = applyInboxClaim(database, { agent, message, turn }, expectedOwnerId, context)
+  const replay = nativeReplays.get(database)
+  if (run && replay?.sessions.has(agent?.session?.id ?? agent?.id)) replay.claimedRuns.add(run.id)
+  return run
+}
+
+function applyInboxClaim(database, { agent, message, turn }, expectedOwnerId, context) {
   const sessionId = agent?.session?.id ?? agent?.id
   if (!Number.isInteger(turn) || typeof message?.id !== 'string') return undefined
   const chat = database.getChatBySession(sessionId)
@@ -413,7 +438,8 @@ export function settleNativeIdle(database, sessionId, goal) {
 export async function reconcileNativeSessions(database, sessionQuery, ownerId, context, startupRunIds, archivedSessionIds = () => []) {
   const chats = database.listChats(ownerId)
   const replay = nativeReplays.get(database) ?? {
-    ownerId, sessions: new Set(), events: new Map(),
+    ownerId, sessions: new Set(), events: new Map(), queue: [],
+    snapshotSteps: new Set(), claimedRuns: new Set(), endedRuns: new Set(),
     initialRunIds: startupRunIds ?? chats.flatMap(chat => database.listRunReferences(ownerId, chat.id).map(run => run.id)),
   }
   if (replay.running || replay.ownerId !== ownerId) throw new Error('Native session recovery is already running')
@@ -422,24 +448,31 @@ export async function reconcileNativeSessions(database, sessionQuery, ownerId, c
   nativeReplays.set(database, replay)
   try {
     const queued = await reconcileNativeSessionSnapshots(database, sessionQuery, ownerId, context, archivedSessionIds, replay)
-    const liveEnds = new Set()
     let drained = 0
-    for (const [sessionId, event, expectedOwnerId, eventContext] of replay.events.values()) {
+    for (const entry of replay.queue) {
+      if (entry.applied) continue
       if (++drained % 32 === 0) await yieldToEventLoop()
-      applySessionEvent(database, sessionId, event, expectedOwnerId, eventContext)
-      if (event.type === 'turn/end') {
-        const run = database.runForTurn(sessionId, event.data.turn)
-        if (run) liveEnds.add(run.id)
-      }
+      if (entry.apply) entry.apply()
+      else applySessionEvent(database, entry.sessionId, entry.event, entry.expectedOwnerId, entry.context)
+      acknowledgeReplayEntry(database, replay, entry)
     }
     // An observed inbox may predate a buffered completion. Do not revive that
     // completed receipt or classify it as interrupted from the stale snapshot.
-    const pending = queued.filter(id => !liveEnds.has(id)
-      || ['queued', 'running', 'waiting_input', 'stopping'].includes(database.getRun(ownerId, id)?.status))
-    database.recoverInterrupted(Date.now(), pending, replay.initialRunIds)
+    const pending = queued.filter(id => !replay.claimedRuns.has(id) && (!replay.endedRuns.has(id)
+      || ['queued', 'running', 'waiting_input', 'stopping'].includes(database.getRun(ownerId, id)?.status)))
+    database.recoverInterrupted(Date.now(), pending, replay.initialRunIds.filter(id => !replay.claimedRuns.has(id)))
     nativeReplays.delete(database)
     return pending
   } finally { replay.running = false }
+}
+
+function acknowledgeReplayEntry(database, replay, entry) {
+  if (Number.isInteger(entry.event?.seq) && !database.hasProjectedEvent(entry.sessionId, entry.event.seq)) return
+  if (entry.event?.type === 'turn/end') {
+    const run = database.runForTurn(entry.sessionId, entry.event.data.turn)
+    if (run) replay.endedRuns.add(run.id)
+  }
+  entry.applied = true
 }
 
 async function reconcileNativeSessionSnapshots(database, sessionQuery, ownerId, context, archivedSessionIds, replay) {
@@ -494,7 +527,7 @@ async function reconcileNativeSessionSnapshots(database, sessionQuery, ownerId, 
           if (isNativeNotice(message) && admitted) database.bindNativeTurn(admitted, turn)
           if (message.source?.kind === 'tool-jobs' && admitted) database.bindNativeTurn(admitted, turn)
           if (message.source?.kind === 'schedule' && admitted)
-            projectInboxClaim(database, { agent: { id: chat.sessionId }, message, turn }, ownerId)
+            applyInboxClaim(database, { agent: { id: chat.sessionId }, message, turn }, ownerId)
           if (runPromptId(message) || (message.source?.kind === 'user' && admitted))
             database.bindRunMessage(chat.sessionId, message.source.rpcId ?? admitted.id, turn, message.id)
           else if (message.source?.kind === 'goal' || (message.source?.kind === 'user' && !message.source.rpcId)) {
@@ -507,7 +540,9 @@ async function reconcileNativeSessionSnapshots(database, sessionQuery, ownerId, 
         if (++replayed % 32 === 0) await yieldToEventLoop()
         // Observe can include a fact that also arrived through the live listener.
         // Preserve its captured plan/goal/context before acknowledging the seq.
-        const eventContext = replay.events.get(replayKey(chat.sessionId, event))?.[3]
+        const buffered = replay.events.get(chat.sessionId)?.get(eventIdentity(event))
+        if (buffered?.applied) continue
+        const eventContext = buffered?.context
         if (event.type === 'assistant/message' && !database.hasProjectedEvent(chat.sessionId, event.seq)) {
           const run = database.runForTurn(chat.sessionId, event.data.turn)
           if (run && database.isStreamedStep(ownerId, run.id, event.data.turn, event.data.step)) {
@@ -520,6 +555,8 @@ async function reconcileNativeSessionSnapshots(database, sessionQuery, ownerId, 
               database.appendEvent(ownerId, run.id, { event: 'workbench_stream_reset', segment_prefix: `t${event.data.turn}s${event.data.step}a` })
               applySessionEvent(database, chat.sessionId, event, ownerId, eventContext)
             })()
+            replay.snapshotSteps.add(streamStep(chat.sessionId, event.data.turn, event.data.step))
+            if (buffered) acknowledgeReplayEntry(database, replay, buffered)
             continue
           }
         }
@@ -527,6 +564,8 @@ async function reconcileNativeSessionSnapshots(database, sessionQuery, ownerId, 
           for (const message of event.data?.inserted ?? [])
             if (message.source?.kind === 'schedule') adoptMessage(database, chat.sessionId, message, resources(message))
         applySessionEvent(database, chat.sessionId, event, ownerId, eventContext)
+        if (event.type === 'assistant/message') replay.snapshotSteps.add(streamStep(chat.sessionId, event.data.turn, event.data.step))
+        if (buffered) acknowledgeReplayEntry(database, replay, buffered)
       }
       for (const message of [...inbox['next-turn'], ...inbox['next-step']]) {
         if (++replayed % 32 === 0) await yieldToEventLoop()
