@@ -532,6 +532,13 @@ export class WorkbenchDatabase {
   }
 
   runForTurn(sessionId, turn) {
+    // The durable native turn binding is authoritative. Resolve its primary key
+    // before considering legacy receipts without a binding; scanning all runs
+    // also traverses every large frozen resource snapshot during recovery.
+    const bound = this.db.prepare(`SELECT r.* FROM run_turns t JOIN runs r ON r.id=t.run_id
+      WHERE t.session_id=? AND t.turn_number=? AND r.session_id=t.session_id
+      AND r.status NOT IN ('steered', 'discarded')`).get(sessionId, turn)
+    if (bound) return decodeRun(bound)
     const row = this.db.prepare(`SELECT r.* FROM runs r LEFT JOIN run_turns t ON t.run_id=r.id
       WHERE r.session_id = ? AND (t.turn_number = ? OR r.turn_number = ?)
       AND r.status NOT IN ('steered', 'discarded') ORDER BY r.queue_order LIMIT 1`).get(sessionId, turn, turn)
@@ -540,6 +547,13 @@ export class WorkbenchDatabase {
 
   /** Streaming needs only the current binding, never the frozen MCP schemas. */
   streamRunForTurn(sessionId, turn) {
+    this.boundStreamRunStatement ??= this.db.prepare(`SELECT r.id, r.owner_id AS ownerId FROM run_turns t
+      JOIN runs r ON r.id=t.run_id AND r.session_id=t.session_id
+      JOIN chats c ON c.id=r.chat_id AND c.session_id=r.session_id AND c.owner_id=r.owner_id
+      WHERE t.session_id=? AND t.turn_number=? AND c.deleted_at IS NULL
+      AND r.status NOT IN ('steered', 'discarded')`)
+    const bound = this.boundStreamRunStatement.get(sessionId, turn)
+    if (bound) return bound
     this.streamRunStatement ??= this.db.prepare(`SELECT r.id, r.owner_id AS ownerId FROM runs r
       JOIN chats c ON c.id=r.chat_id AND c.session_id=r.session_id AND c.owner_id=r.owner_id
       LEFT JOIN run_turns t ON t.run_id=r.id
