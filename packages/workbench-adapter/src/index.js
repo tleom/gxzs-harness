@@ -156,7 +156,7 @@ export function apply(ctx, config) {
   // MCP readiness can retry recovery after native timers already claimed new work.
   // Freeze the startup boundary once, independently of those retry entry points.
   const startupRunIds = database.listChats(config.ownerId)
-    .flatMap(chat => database.listRuns(config.ownerId, chat.id).map(run => run.id))
+    .flatMap(chat => database.listRunReferences(config.ownerId, chat.id).map(run => run.id))
   let recovered = false
   let recoveryError
   let recoveryTimer

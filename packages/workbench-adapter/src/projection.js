@@ -398,7 +398,7 @@ export async function reconcileNativeSessions(database, sessionQuery, ownerId, c
   const chats = database.listChats(ownerId)
   // Native timers may deliver while asynchronous cold history reads are pending.
   // Only receipts that existed on entry belong to this startup interruption pass.
-  const initialRunIds = startupRunIds ?? chats.flatMap(chat => database.listRuns(ownerId, chat.id).map(run => run.id))
+  const initialRunIds = startupRunIds ?? chats.flatMap(chat => database.listRunReferences(ownerId, chat.id).map(run => run.id))
   const queued = []
   for (const chat of chats) {
     const resources = message => {
@@ -424,7 +424,7 @@ export async function reconcileNativeSessions(database, sessionQuery, ownerId, c
       // Observe may yield while native timers bind new receipts. Capture the
       // message index after it returns, then reuse it during this synchronous
       // replay rather than decoding every run once for every user message.
-      const byMessage = new Map(database.listRuns(chat.ownerId, chat.id)
+      const byMessage = new Map(database.listRunReferences(chat.ownerId, chat.id)
         .filter(run => run.messageId).map(run => [run.messageId, run]))
       const inbox = { 'next-turn': [], 'next-step': [] }
       let turn

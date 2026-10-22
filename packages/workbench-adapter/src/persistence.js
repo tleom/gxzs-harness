@@ -606,6 +606,12 @@ export class WorkbenchDatabase {
       .all(ownerId, chatId).map(decodeRun)
   }
 
+  // Recovery needs receipt identities, not every frozen tool catalog and payload.
+  listRunReferences(ownerId, chatId) {
+    return this.db.prepare(`SELECT id, session_id AS sessionId, message_id AS messageId FROM runs
+      WHERE owner_id = ? AND chat_id = ? ORDER BY created_at, rowid`).all(ownerId, chatId)
+  }
+
   // Read existing native completion receipts; this is a display projection,
   // not a second task lifecycle. Feedback/config edits cannot advance its time.
   chatCompletions(ownerId) {
