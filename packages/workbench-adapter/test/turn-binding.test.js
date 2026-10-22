@@ -36,3 +36,26 @@ it('rejects a turn binding whose run belongs to another native session', () => {
     expect(db.streamRunForTurn('session', 1)).toBeUndefined()
   } finally { db.close() }
 })
+
+it.each([
+  ['message', 'steered'], ['message', 'discarded'],
+  ['native', 'steered'], ['native', 'discarded'],
+])('%s binding replaces an excluded %s receipt and preserves a valid turn owner', (kind, status) => {
+  const db = new WorkbenchDatabase(':memory:')
+  try {
+    db.createChat({ id: 'chat', sessionId: 'session', ownerId: 'owner', selection: {} })
+    for (const id of ['previous', 'replacement', 'later'])
+      db.createRun({ id, sessionId: 'session', chatId: 'chat', ownerId: 'owner', query: '', selection: {} })
+    const bind = (id) => kind === 'message' ? db.bindRunMessage('session', id, 1, id + '-message') : db.bindNativeTurn(db.getRun('owner', id), 1)
+    bind('previous')
+    db.db.prepare('UPDATE runs SET status=? WHERE id=?').run(status, 'previous')
+    bind('replacement')
+    expect(db.db.prepare('SELECT run_id FROM run_turns WHERE session_id=? AND turn_number=?').get('session', 1).run_id).toBe('replacement')
+    expect(db.runForTurn('session', 1).id).toBe('replacement')
+    expect(db.streamRunForTurn('session', 1).id).toBe('replacement')
+    bind('later')
+    expect(db.db.prepare('SELECT run_id FROM run_turns WHERE session_id=? AND turn_number=?').get('session', 1).run_id).toBe('replacement')
+    expect(db.runForTurn('session', 1).id).toBe('replacement')
+    expect(db.getRun('owner', 'previous').status).toBe(status)
+  } finally { db.close() }
+})

@@ -468,8 +468,11 @@ export class WorkbenchDatabase {
       WHERE session_id = ? AND id = ? AND (turn_number IS NULL OR turn_number = ?)`)
       .run(turn, messageId, sessionId, requestId, turn)
     const assigned = this.runForTurn(sessionId, turn)
-    if (!assigned || assigned.id === requestId) this.db.prepare(`INSERT OR IGNORE INTO run_turns(session_id, turn_number, run_id)
-      SELECT session_id, ?, id FROM runs WHERE session_id = ? AND id = ? AND status NOT IN ('steered', 'discarded')`)
+    if (!assigned || assigned.id === requestId) this.db.prepare(`INSERT INTO run_turns(session_id, turn_number, run_id)
+      SELECT session_id, ?, id FROM runs WHERE session_id = ? AND id = ? AND status NOT IN ('steered', 'discarded')
+      ON CONFLICT(session_id, turn_number) DO UPDATE SET run_id=excluded.run_id
+      WHERE EXISTS (SELECT 1 FROM runs previous WHERE previous.id=run_turns.run_id
+        AND previous.session_id=run_turns.session_id AND previous.status IN ('steered', 'discarded'))`)
       .run(turn, sessionId, requestId)
     const start = this.db.prepare('SELECT start_seq FROM pending_turns WHERE session_id = ? AND turn_number = ?').get(sessionId, turn)
     if (start) this.db.prepare('UPDATE runs SET source_start_seq = ? WHERE session_id = ? AND id = ?').run(start.start_seq, sessionId, requestId)
@@ -479,8 +482,12 @@ export class WorkbenchDatabase {
   }
 
   bindNativeTurn(run, turn) {
-    this.db.prepare('INSERT OR IGNORE INTO run_turns(session_id, turn_number, run_id) VALUES (?, ?, ?)')
-      .run(run.sessionId, turn, run.id)
+    this.db.prepare(`INSERT INTO run_turns(session_id, turn_number, run_id)
+      SELECT session_id, ?, id FROM runs WHERE session_id = ? AND id = ? AND status NOT IN ('steered', 'discarded')
+      ON CONFLICT(session_id, turn_number) DO UPDATE SET run_id=excluded.run_id
+      WHERE EXISTS (SELECT 1 FROM runs previous WHERE previous.id=run_turns.run_id
+        AND previous.session_id=run_turns.session_id AND previous.status IN ('steered', 'discarded'))`)
+      .run(turn, run.sessionId, run.id)
     const start = this.db.prepare('SELECT start_seq FROM pending_turns WHERE session_id=? AND turn_number=?').get(run.sessionId, turn)
     this.db.prepare('UPDATE runs SET turn_number=COALESCE(turn_number, ?), source_start_seq=COALESCE(source_start_seq, ?) WHERE id=?')
       .run(turn, start?.start_seq ?? null, run.id)
