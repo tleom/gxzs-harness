@@ -44,6 +44,9 @@ export async function streamNativeEvents({ follow, res, heartbeatMs = 15000, dra
     }
   } catch (error) {
     if (!abort.signal.aborted && !res.headersSent) throw error
+    if (!abort.signal.aborted && error?.code === 'HISTORY_ITEM_TOO_LARGE') {
+      await write(encodeSse({ event: 'workbench_error', code: error.code, status: 413, message: error.message }))
+    }
     // Reopening receives a fresh native baseline; never invent a success frame.
   } finally {
     close()

@@ -17,7 +17,7 @@ import { inputSupplement, toAnswer } from './human-input.js'
 import { requireDatabaseModel } from './database-models.js'
 import { currentExecutionRun, fenceMcpExecutions } from './scheduler.js'
 import { nativeTurn } from './native-turn.js'
-import { hasEarlierContent, historyWindow, loadNativeHistoryPage } from './history-page.js'
+import { fitsHistoryResponse, hasEarlierContent, historyWindow, historyWindowFor, loadNativeHistoryPage, smallerHistoryWindow } from './history-page.js'
 import { nativePresentation } from './projection.js'
 import { HistoryPresentation } from './history-presentation.js'
 import { historyDisplayEvent, historyEventMetadata, historyFrameMetadata } from './history-transport.js'
@@ -335,7 +335,17 @@ export class WorkbenchService {
 
   async historyPage(owner, chatId, cursor, signal, nativeLive = false) {
     const chat = this.requireChat(owner, chatId)
-    const page = await loadNativeHistoryPage(this, chat.sessionId, cursor, signal)
+    let maxMessages = historyWindow.maxMessages, throughSeq
+    while (true) {
+      const page = await loadNativeHistoryPage(this, chat.sessionId, cursor, signal, { maxMessages, throughSeq })
+      throughSeq = page.through_seq
+      const value = this.historyPageView(owner, chat, page, cursor === undefined, nativeLive)
+      if (!nativeLive || fitsHistoryResponse(value, maxMessages)) return value
+      maxMessages = smallerHistoryWindow(maxMessages)
+    }
+  }
+
+  historyPageView(owner, chat, page, opening, nativeLive) {
     const runs = new Map(), tools = new Map(), turns = new Map()
     let currentTurn
     for (const { event } of page.records) {
@@ -361,7 +371,7 @@ export class WorkbenchService {
     }
     // The live run uses its existing SSE snapshot/cursor as one atomic pair.
     // Older windows are read-only; they must never replace a newer live view.
-    if (cursor === undefined) for (const run of this.database.listRuns(owner.ownerId, chat.id)) {
+    if (opening) for (const run of this.database.listRuns(owner.ownerId, chat.id)) {
       if (run.selection?.native_child) continue
       if (['queued', 'running', 'waiting_input', 'stopping'].includes(run.status)
         || (run.sourceStartSeq == null && run.sourceEndSeq == null)
@@ -384,38 +394,52 @@ export class WorkbenchService {
       turn => Number.isInteger(turn) ? this.database.streamRunForTurn(chat.sessionId, turn) : undefined)
     const source = this.sessions.follow({ address: { kind: 'session', sessionId: chat.sessionId },
       ...historyWindow, assistantStream: true }, signal)
-    for await (const frame of withGoalUpdates(source, this.subscribeGoal
+    for await (const original of withGoalUpdates(source, this.subscribeGoal
       ? listener => this.subscribeGoal(chat.sessionId, listener) : undefined, signal)) {
       signal.throwIfAborted()
       // Directory changes replace the native session. End the old subscription
       // instead of combining two different source logs in one conversation.
       if (this.requireChat(owner, chatId).sessionId !== chat.sessionId) return
-      const turns = new Set()
-      if (frame.type === 'snapshot') {
-        for (const { event } of frame.records) if (Number.isInteger(event.data?.turn)) turns.add(event.data.turn)
-        if (frame.assistantStream?.activeAttempt) turns.add(frame.assistantStream.activeAttempt.turn)
-      } else if (frame.type === 'event' && Number.isInteger(frame.event.data?.turn)) turns.add(frame.event.data.turn)
-      else if (frame.type === 'assistant-stream' && frame.frame.type === 'start') turns.add(frame.frame.turn)
-      const runs = new Map(), bindings = []
-      for (const turn of turns) {
-        const run = this.database.runForTurn(chat.sessionId, turn)
-        if (!run) continue
-        runs.set(run.id, this.inputRunDto(owner, run))
-        bindings.push({ turn, run_id: run.id })
+      let frame = original, maxMessages = historyWindow.maxMessages
+      while (true) {
+        const turns = new Set()
+        if (frame.type === 'snapshot') {
+          for (const { event } of frame.records) if (Number.isInteger(event.data?.turn)) turns.add(event.data.turn)
+          if (frame.assistantStream?.activeAttempt) turns.add(frame.assistantStream.activeAttempt.turn)
+        } else if (frame.type === 'event' && Number.isInteger(frame.event.data?.turn)) turns.add(frame.event.data.turn)
+        else if (frame.type === 'assistant-stream' && frame.frame.type === 'start') turns.add(frame.frame.turn)
+        const runs = new Map(), bindings = []
+        for (const turn of turns) {
+          const run = this.database.runForTurn(chat.sessionId, turn)
+          if (!run) continue
+          runs.set(run.id, this.inputRunDto(owner, run))
+          bindings.push({ turn, run_id: run.id })
+        }
+        // Project the complete native frame locally. Only the display content and
+        // coordinates used by the UI cross the transport boundary, once each.
+        const value = frame.type === 'snapshot' ? {
+          type: frame.type, cursor: frame.cursor, records: frame.records,
+          hasMore: frame.hasMore && await hasEarlierContent(this.sessions, chat.sessionId,
+            frame.cursor, frame.records[0]?.event.seq, signal), assistantStream: frame.assistantStream,
+        } : frame
+        const updatesControl = frame.type === 'snapshot' || frame.type === 'goal-state'
+          || (frame.type === 'event' && (['goal/change', 'plan/mode', 'command/run', 'command/done', 'turn/end', 'request/context', 'assistant/message', 'assistant/attempt', 'compaction/end'].includes(frame.event.type)
+            || (frame.event.type === 'user/message' && ['goal', 'compact-checkpoint'].includes(frame.event.data?.source?.kind))))
+        const update = { event: 'workbench_history', session_id: chat.sessionId, value: historyFrameMetadata(value), runs: [...runs.values()], bindings,
+          ...(updatesControl ? { control: await this.getControl(owner, chatId) } : {}),
+          display: frame.type === 'goal-state' ? { events: [], replace: false, retire_attempts: [] } : presentation.accept(frame) }
+        if (fitsHistoryResponse(update, frame.type === 'snapshot' ? maxMessages : 1)) {
+          yield update
+          break
+        }
+        // Ask DSH to choose a smaller native message/surface boundary at the
+        // same cursor. Do not truncate records or advance past an unread page.
+        maxMessages = smallerHistoryWindow(frame.type === 'snapshot' ? maxMessages : 1)
+        const page = await this.sessions.page({ address: { kind: 'session', sessionId: chat.sessionId },
+          throughSeq: original.cursor, ...historyWindowFor(maxMessages) }, signal)
+        signal.throwIfAborted()
+        frame = { ...original, records: page.records, hasMore: page.hasMore }
       }
-      // Project the complete native frame locally. Only the display content and
-      // coordinates used by the UI cross the transport boundary, once each.
-      const value = frame.type === 'snapshot' ? {
-        type: frame.type, cursor: frame.cursor, records: frame.records,
-        hasMore: frame.hasMore && await hasEarlierContent(this.sessions, chat.sessionId,
-          frame.cursor, frame.records[0]?.event.seq, signal), assistantStream: frame.assistantStream,
-      } : frame
-      const updatesControl = frame.type === 'snapshot' || frame.type === 'goal-state'
-        || (frame.type === 'event' && (['goal/change', 'plan/mode', 'command/run', 'command/done', 'turn/end', 'request/context', 'assistant/message', 'assistant/attempt', 'compaction/end'].includes(frame.event.type)
-          || (frame.event.type === 'user/message' && ['goal', 'compact-checkpoint'].includes(frame.event.data?.source?.kind))))
-      yield { event: 'workbench_history', session_id: chat.sessionId, value: historyFrameMetadata(value), runs: [...runs.values()], bindings,
-        ...(updatesControl ? { control: await this.getControl(owner, chatId) } : {}),
-        display: frame.type === 'goal-state' ? { events: [], replace: false, retire_attempts: [] } : presentation.accept(frame) }
     }
   }
 

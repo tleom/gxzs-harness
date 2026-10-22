@@ -2,7 +2,7 @@ import { afterEach, expect, it } from 'vitest'
 import { createRequire } from 'node:module'
 import { dirname, join } from 'node:path'
 import { pathToFileURL } from 'node:url'
-import { loadNativeHistoryPage } from '../src/history-page.js'
+import { historyEventCharacters, historyResponseBytes, loadNativeHistoryPage } from '../src/history-page.js'
 import { WorkbenchDatabase } from '../src/persistence.js'
 import { WorkbenchService } from '../src/service.js'
 
@@ -186,3 +186,67 @@ it('carries a real native oversized snapshot and settlement through the Workbenc
     abort.abort(); await stream.return(); database.close()
   }
 })
+
+
+it('budgets large real DSH snapshots and pages without losing records or the live continuation', async () => {
+  const {ctx,session,services}=await fixture()
+  const database=new WorkbenchDatabase(':memory:'), owner={ownerId:'owner'}
+  const chat=database.createChat({ownerId:owner.ownerId,sessionId:session.id,selection:{}})
+  const {run}=database.createRun({ownerId:owner.ownerId,chatId:chat.id,sessionId:session.id,query:'goal',selection:{}})
+  database.bindRunMessage(session.id,run.id,1,'first'); database.bindNativeTurn(run,1)
+  database.transitionRun(owner.ownerId,run.id,'running')
+  session.append('turn/start',{turn:1})
+  const body='x'.repeat(70000)
+  for(let step=1;step<=500;step++) session.append('assistant/message',{turn:1,step,message:createMessage({role:'assistant',content:[{type:'text',text:body}],source:{kind:'model',provider:'fixture',model:'fixture'}}),stream:[]},{surfaceOp:'append'})
+  const service=new WorkbenchService({database,agents:ctx.agents,sessionController:services.sessions,sessionQuery:services.sessionQuery})
+  const abort=new AbortController(), stream=service.followHistory(owner,chat.id,abort.signal)
+  try {
+    const opening=(await stream.next()).value
+    expect(Buffer.byteLength(JSON.stringify(opening))).toBeLessThanOrEqual(historyResponseBytes)
+    expect(opening.value.hasMore).toBe(true)
+    expect(opening.display.events.length).toBeLessThan(500)
+    const cut=opening.value.cursor, seen=opening.value.records.map(({event})=>event.seq)
+    let cursor={sessionId:session.id,throughSeq:cut,beforeSeq:seen[0]}
+    while(cursor) {
+      const page=await service.historyPage(owner,chat.id,cursor,abort.signal,true)
+      expect(Buffer.byteLength(JSON.stringify(page))).toBeLessThanOrEqual(historyResponseBytes)
+      seen.unshift(...page.records.map(({event})=>event.seq)); cursor=page.cursor
+    }
+    expect(seen).toEqual(Array.from({length:session.seq},(_,i)=>i))
+    const next=session.append('assistant/message',{turn:1,step:501,message:createMessage({role:'assistant',content:[{type:'text',text:'continued'}],source:{kind:'model',provider:'fixture',model:'fixture'}}),stream:[]},{surfaceOp:'append'})
+    const update=(await stream.next()).value
+    expect(update.value.event.seq).toBe(next.seq)
+    expect(update.display.events.at(-1).event.data.text).toBe('continued')
+  } finally { abort.abort(); await stream.return(); database.close() }
+}, 30000)
+
+it('rejects one unpageable oversized record with a terminal capacity error', async () => {
+  const {ctx,session,services}=await fixture()
+  const database=new WorkbenchDatabase(':memory:'), owner={ownerId:'owner'}
+  const chat=database.createChat({ownerId:owner.ownerId,sessionId:session.id,selection:{}})
+  const {run}=database.createRun({ownerId:owner.ownerId,chatId:chat.id,sessionId:session.id,query:'goal',selection:{}})
+  database.bindNativeTurn(run,1)
+  session.append('assistant/message',{turn:1,step:1,message:createMessage({role:'assistant',content:[{type:'text',text:'x'.repeat(historyEventCharacters+1)}],source:{kind:'model',provider:'fixture',model:'fixture'}}),stream:[]},{surfaceOp:'append'})
+  const service=new WorkbenchService({database,agents:ctx.agents,sessionController:services.sessions,sessionQuery:services.sessionQuery})
+  const abort=new AbortController(), stream=service.followHistory(owner,chat.id,abort.signal)
+  try {
+    await expect(stream.next()).rejects.toMatchObject({status:413,code:'HISTORY_ITEM_TOO_LARGE'})
+    await expect(service.historyPage(owner,chat.id,undefined,abort.signal,true)).rejects.toMatchObject({status:413,code:'HISTORY_ITEM_TOO_LARGE'})
+  } finally { abort.abort(); await stream.return(); database.close() }
+}, 30000)
+
+it('keeps an indivisible valid record larger than the preferred page budget readable', async () => {
+  const {ctx,session,services}=await fixture()
+  const database=new WorkbenchDatabase(':memory:'),owner={ownerId:'owner'}
+  const chat=database.createChat({ownerId:owner.ownerId,sessionId:session.id,selection:{}})
+  const {run}=database.createRun({ownerId:owner.ownerId,chatId:chat.id,sessionId:session.id,query:'goal',selection:{}})
+  database.bindNativeTurn(run,1)
+  const body='x'.repeat(historyResponseBytes+100)
+  session.append('assistant/message',{turn:1,step:1,message:createMessage({role:'assistant',content:[{type:'text',text:body}],source:{kind:'model',provider:'fixture',model:'fixture'}}),stream:[]},{surfaceOp:'append'})
+  const service=new WorkbenchService({database,agents:ctx.agents,sessionController:services.sessions,sessionQuery:services.sessionQuery})
+  const abort=new AbortController(),stream=service.followHistory(owner,chat.id,abort.signal)
+  try {
+    expect((await stream.next()).value.display.events.at(-1).event.data.text).toBe(body)
+    expect((await service.historyPage(owner,chat.id,undefined,abort.signal,true)).runs[0].events.at(-1).data.text).toBe(body)
+  } finally { abort.abort(); await stream.return(); database.close() }
+},30000)
