@@ -468,8 +468,11 @@ export class WorkbenchDatabase {
       WHERE session_id = ? AND id = ? AND (turn_number IS NULL OR turn_number = ?)`)
       .run(turn, messageId, sessionId, requestId, turn)
     const assigned = this.runForTurn(sessionId, turn)
-    if (!assigned) this.db.prepare(`INSERT OR IGNORE INTO run_turns(session_id, turn_number, run_id)
-      SELECT session_id, ?, id FROM runs WHERE session_id = ? AND id = ? AND status NOT IN ('steered', 'discarded')`)
+    if (!assigned || assigned.id === requestId) this.db.prepare(`INSERT INTO run_turns(session_id, turn_number, run_id)
+      SELECT session_id, ?, id FROM runs WHERE session_id = ? AND id = ? AND status NOT IN ('steered', 'discarded')
+      ON CONFLICT(session_id, turn_number) DO UPDATE SET run_id=excluded.run_id
+      WHERE EXISTS (SELECT 1 FROM runs previous WHERE previous.id=run_turns.run_id
+        AND previous.session_id=run_turns.session_id AND previous.status IN ('steered', 'discarded'))`)
       .run(turn, sessionId, requestId)
     const start = this.db.prepare('SELECT start_seq FROM pending_turns WHERE session_id = ? AND turn_number = ?').get(sessionId, turn)
     if (start) this.db.prepare('UPDATE runs SET source_start_seq = ? WHERE session_id = ? AND id = ?').run(start.start_seq, sessionId, requestId)
@@ -479,8 +482,12 @@ export class WorkbenchDatabase {
   }
 
   bindNativeTurn(run, turn) {
-    this.db.prepare('INSERT OR IGNORE INTO run_turns(session_id, turn_number, run_id) VALUES (?, ?, ?)')
-      .run(run.sessionId, turn, run.id)
+    this.db.prepare(`INSERT INTO run_turns(session_id, turn_number, run_id)
+      SELECT session_id, ?, id FROM runs WHERE session_id = ? AND id = ? AND status NOT IN ('steered', 'discarded')
+      ON CONFLICT(session_id, turn_number) DO UPDATE SET run_id=excluded.run_id
+      WHERE EXISTS (SELECT 1 FROM runs previous WHERE previous.id=run_turns.run_id
+        AND previous.session_id=run_turns.session_id AND previous.status IN ('steered', 'discarded'))`)
+      .run(turn, run.sessionId, run.id)
     const start = this.db.prepare('SELECT start_seq FROM pending_turns WHERE session_id=? AND turn_number=?').get(run.sessionId, turn)
     this.db.prepare('UPDATE runs SET turn_number=COALESCE(turn_number, ?), source_start_seq=COALESCE(source_start_seq, ?) WHERE id=?')
       .run(turn, start?.start_seq ?? null, run.id)
@@ -532,6 +539,13 @@ export class WorkbenchDatabase {
   }
 
   runForTurn(sessionId, turn) {
+    // The durable native turn binding is authoritative. Resolve its primary key
+    // before considering legacy receipts without a binding; scanning all runs
+    // also traverses every large frozen resource snapshot during recovery.
+    const bound = this.db.prepare(`SELECT r.* FROM run_turns t JOIN runs r ON r.id=t.run_id
+      WHERE t.session_id=? AND t.turn_number=? AND r.session_id=t.session_id
+      AND r.status NOT IN ('steered', 'discarded')`).get(sessionId, turn)
+    if (bound) return decodeRun(bound)
     const row = this.db.prepare(`SELECT r.* FROM runs r LEFT JOIN run_turns t ON t.run_id=r.id
       WHERE r.session_id = ? AND (t.turn_number = ? OR r.turn_number = ?)
       AND r.status NOT IN ('steered', 'discarded') ORDER BY r.queue_order LIMIT 1`).get(sessionId, turn, turn)
@@ -540,6 +554,13 @@ export class WorkbenchDatabase {
 
   /** Streaming needs only the current binding, never the frozen MCP schemas. */
   streamRunForTurn(sessionId, turn) {
+    this.boundStreamRunStatement ??= this.db.prepare(`SELECT r.id, r.owner_id AS ownerId FROM run_turns t
+      JOIN runs r ON r.id=t.run_id AND r.session_id=t.session_id
+      JOIN chats c ON c.id=r.chat_id AND c.session_id=r.session_id AND c.owner_id=r.owner_id
+      WHERE t.session_id=? AND t.turn_number=? AND c.deleted_at IS NULL
+      AND r.status NOT IN ('steered', 'discarded')`)
+    const bound = this.boundStreamRunStatement.get(sessionId, turn)
+    if (bound) return bound
     this.streamRunStatement ??= this.db.prepare(`SELECT r.id, r.owner_id AS ownerId FROM runs r
       JOIN chats c ON c.id=r.chat_id AND c.session_id=r.session_id AND c.owner_id=r.owner_id
       LEFT JOIN run_turns t ON t.run_id=r.id
