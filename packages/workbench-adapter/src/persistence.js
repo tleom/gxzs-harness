@@ -468,7 +468,7 @@ export class WorkbenchDatabase {
       WHERE session_id = ? AND id = ? AND (turn_number IS NULL OR turn_number = ?)`)
       .run(turn, messageId, sessionId, requestId, turn)
     const assigned = this.runForTurn(sessionId, turn)
-    if (!assigned) this.db.prepare(`INSERT OR IGNORE INTO run_turns(session_id, turn_number, run_id)
+    if (!assigned || assigned.id === requestId) this.db.prepare(`INSERT OR IGNORE INTO run_turns(session_id, turn_number, run_id)
       SELECT session_id, ?, id FROM runs WHERE session_id = ? AND id = ? AND status NOT IN ('steered', 'discarded')`)
       .run(turn, sessionId, requestId)
     const start = this.db.prepare('SELECT start_seq FROM pending_turns WHERE session_id = ? AND turn_number = ?').get(sessionId, turn)
