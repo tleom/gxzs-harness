@@ -17,7 +17,7 @@ const END_STATUS = {
 // snapshot while replay yields to I/O. Keep the barrier across failed attempts
 // so newer live facts cannot overtake the retry's unacknowledged history.
 const nativeReplays = new WeakMap()
-const replayKey = (sessionId, event) => `${sessionId}:${event.seq}`
+const replayKey = (sessionId, event) => Number.isInteger(event.seq) ? `${sessionId}:${event.seq}` : Symbol()
 
 export function createAssistantStreamProjector(database, expectedOwnerId) {
   const attempts = new Map()

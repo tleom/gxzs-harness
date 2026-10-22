@@ -97,3 +97,18 @@ it('uses the live context for an event also included in the observed snapshot', 
     expect(db.hasProjectedEvent('session', 1)).toBe(true)
   } finally { db.close() }
 })
+
+it('preserves separate unsequenced live events in arrival order', async () => {
+  const db = new WorkbenchDatabase(':memory:')
+  try {
+    db.createChat({ id: 'chat', ownerId: 'owner', sessionId: 'session', selection: {} })
+    const events = Array.from({ length: 96 }, (_, i) => title(i, 'old title'))
+    const recovery = reconcileNativeSessions(db, { observeSession: async () => ({ events }) }, 'owner')
+    await yieldToEventLoop()
+    projectSessionEvent(db, 'session', title(undefined, 'live title'), 'owner')
+    projectSessionEvent(db, 'session', goal(undefined, 'live goal'), 'owner')
+    await recovery
+    expect(db.getChat('owner', 'chat').title).toBe('live title')
+    expect(db.getControl('owner', 'chat').goal.objective).toBe('live goal')
+  } finally { db.close() }
+})
