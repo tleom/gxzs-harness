@@ -29,7 +29,14 @@ it.each([100, 250])('recovers %s messages without loading complete run inventori
     let receiptReads = 0
     const receipt = database.runForTurn.bind(database)
     database.runForTurn = (...args) => { receiptReads++; return receipt(...args) }
-    await reconcileNativeSessions(database, { observeSession: async () => ({ events, [Symbol.dispose]() {} }) }, ownerId)
+    let heartbeat, heartbeats = 0, replaying = true, disposed = false
+    const pulse = () => { heartbeats++; if (replaying) heartbeat = setImmediate(pulse) }
+    heartbeat = setImmediate(pulse)
+    try {
+      await reconcileNativeSessions(database, { observeSession: async () => ({ events, [Symbol.dispose]() { disposed = true } }) }, ownerId)
+    } finally { replaying = false; clearImmediate(heartbeat) }
+    expect(heartbeats).toBeGreaterThan(1)
+    expect(disposed).toBe(true)
     expect(calls).toBe(0)
     expect(decoded).toBe(0)
     expect(receiptReads).toBeLessThanOrEqual(count)

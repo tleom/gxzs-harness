@@ -6,6 +6,7 @@ import { presentRunEvent } from './run-failure.js'
 import { contextUsage } from './context-usage.js'
 import { goalMentionResources } from './resource-mentions.js'
 import { scheduleOccurrences } from './schedule-notifications.js'
+import { setImmediate as yieldToEventLoop } from 'node:timers/promises'
 
 const END_STATUS = {
   completed: 'completed', aborted: 'cancelled', error: 'failed',
@@ -400,6 +401,7 @@ export async function reconcileNativeSessions(database, sessionQuery, ownerId, c
   // Only receipts that existed on entry belong to this startup interruption pass.
   const initialRunIds = startupRunIds ?? chats.flatMap(chat => database.listRunReferences(ownerId, chat.id).map(run => run.id))
   const queued = []
+  let replayed = 0
   for (const chat of chats) {
     const resources = message => {
       if ((!['schedule', 'tool-jobs'].includes(message?.source?.kind) && !isNativeNotice(message)) || database.getRun(ownerId, message.id)) return undefined
@@ -431,6 +433,9 @@ export async function reconcileNativeSessions(database, sessionQuery, ownerId, c
       // Claims are transient notifications. Reconstruct the turn relation from
       // the durable user/message records before replaying their projected output.
       for (const event of events) {
+        // Large transcripts must leave time for native SSH lease heartbeats and
+        // health requests. A microtask yield alone does not service that I/O.
+        if (++replayed % 32 === 0) await yieldToEventLoop()
         if (event.type === 'agent/inbox/spliced') {
           const data = event.data
           inbox[data.target].splice(data.start, data.removedCount ?? 0, ...(data.inserted ?? []))
@@ -455,6 +460,7 @@ export async function reconcileNativeSessions(database, sessionQuery, ownerId, c
         }
       }
       for (const event of events) {
+        if (++replayed % 32 === 0) await yieldToEventLoop()
         if (event.type === 'assistant/message' && !database.hasProjectedEvent(chat.sessionId, event.seq)) {
           const run = database.runForTurn(chat.sessionId, event.data.turn)
           if (run && database.isStreamedStep(ownerId, run.id, event.data.turn, event.data.step)) {
@@ -476,6 +482,7 @@ export async function reconcileNativeSessions(database, sessionQuery, ownerId, c
         projectSessionEvent(database, chat.sessionId, event, ownerId)
       }
       for (const message of [...inbox['next-turn'], ...inbox['next-step']]) {
+        if (++replayed % 32 === 0) await yieldToEventLoop()
         const requestId = runPromptId(message)
         const run = requestId ? database.getRun(ownerId, requestId)
           : message.source?.kind === 'schedule' ? adoptMessage(database, chat.sessionId, message, resources(message))
