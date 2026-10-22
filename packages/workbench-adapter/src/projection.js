@@ -6,16 +6,23 @@ import { presentRunEvent } from './run-failure.js'
 import { contextUsage } from './context-usage.js'
 import { goalMentionResources } from './resource-mentions.js'
 import { scheduleOccurrences } from './schedule-notifications.js'
+import { setImmediate as yieldToEventLoop } from 'node:timers/promises'
 
 const END_STATUS = {
   completed: 'completed', aborted: 'cancelled', error: 'failed',
   'max-tokens': 'failed', blocked: 'failed', interrupted: 'interrupted',
 }
 
+// Live native facts are durable already, but must not overtake an older startup
+// snapshot while replay yields to I/O. Keep the barrier across failed attempts
+// so newer live facts cannot overtake the retry's unacknowledged history.
+const nativeReplays = new WeakMap()
+const eventIdentity = event => Number.isInteger(event.seq) ? event.seq : event
+const streamStep = (sessionId, turn, step) => `${sessionId}:${turn}:${step}`
+
 export function createAssistantStreamProjector(database, expectedOwnerId) {
   const attempts = new Map()
-  return ({ agent, frame }) => {
-    const sessionId = agent?.session?.id ?? agent?.id
+  const applyFrame = (sessionId, frame, snapshotSteps) => {
     if (frame.type === 'start') {
       attempts.set(String(frame.attemptId), { sessionId, turn: frame.turn, step: frame.step, tools: new Map() })
       return undefined
@@ -23,6 +30,8 @@ export function createAssistantStreamProjector(database, expectedOwnerId) {
     const attempt = attempts.get(String(frame.attemptId))
     if (!attempt || attempt.sessionId !== sessionId) return undefined
     if (frame.type === 'end') attempts.delete(String(frame.attemptId))
+    // A durable final message in the snapshot already represents these deltas.
+    if (snapshotSteps?.has(streamStep(sessionId, attempt.turn, attempt.step))) return undefined
     const run = database.streamRunForTurn(sessionId, attempt.turn)
     if (!run || (expectedOwnerId && run.ownerId !== expectedOwnerId)) return undefined
     if (frame.type === 'end') {
@@ -53,9 +62,34 @@ export function createAssistantStreamProjector(database, expectedOwnerId) {
       },
     }, attempt.turn, attempt.step)
   }
+  return ({ agent, frame }) => {
+    const sessionId = agent?.session?.id ?? agent?.id
+    const replay = nativeReplays.get(database)
+    if (replay?.sessions.has(sessionId)) {
+      replay.queue.push({ apply: () => applyFrame(sessionId, frame, replay.snapshotSteps) })
+      return undefined
+    }
+    return applyFrame(sessionId, frame)
+  }
 }
 
 export function projectSessionEvent(database, sessionId, event, expectedOwnerId, context) {
+  const replay = nativeReplays.get(database)
+  if (replay?.sessions.has(sessionId)) {
+    let events = replay.events.get(sessionId)
+    if (!events) replay.events.set(sessionId, events = new Map())
+    const key = eventIdentity(event)
+    if (!events.has(key)) {
+      const entry = { sessionId, event, expectedOwnerId, context }
+      events.set(key, entry)
+      replay.queue.push(entry)
+    }
+    return undefined
+  }
+  return applySessionEvent(database, sessionId, event, expectedOwnerId, context)
+}
+
+function applySessionEvent(database, sessionId, event, expectedOwnerId, context) {
   database.flushStreamEvents()
   const projected = database.hasProjectedEvent(sessionId, event.seq)
   // Settled history can contain thousands of events backed by megabyte-sized
@@ -134,7 +168,7 @@ function projectEvent(database, sessionId, event, expectedOwnerId, context) {
   }
   if (['todo/write', 'goal/change', 'compaction/start', 'compaction/summary', 'compaction/end'].includes(event.type)) {
     const result = projectControlEvent(database, chat, sessionId, event)
-    if (event.type === 'goal/change' && context?.nativeIdle) settleNativeIdle(database, sessionId, event.data?.goal)
+    if (event.type === 'goal/change' && context?.nativeIdle) applyNativeIdle(database, sessionId, event.data?.goal)
     return result
   }
 
@@ -216,6 +250,13 @@ export function claimNeedsResources(database, { agent, message, turn }, ownerId)
 
 /** Shared, side-effect-free display projection for live events and native history pages. */
 export function projectInboxClaim(database, { agent, message, turn }, expectedOwnerId, context) {
+  const run = applyInboxClaim(database, { agent, message, turn }, expectedOwnerId, context)
+  const replay = nativeReplays.get(database)
+  if (run && replay?.sessions.has(agent?.session?.id ?? agent?.id)) replay.claimedRuns.add(run.id)
+  return run
+}
+
+function applyInboxClaim(database, { agent, message, turn }, expectedOwnerId, context) {
   const sessionId = agent?.session?.id ?? agent?.id
   if (!Number.isInteger(turn) || typeof message?.id !== 'string') return undefined
   const chat = database.getChatBySession(sessionId)
@@ -385,6 +426,19 @@ function projectControlEvent(database, chat, sessionId, event) {
 }
 
 export function settleNativeIdle(database, sessionId, goal) {
+  const replay = nativeReplays.get(database)
+  if (replay?.sessions.has(sessionId)) {
+    replay.queue.push({ apply: () => {
+      const run = database.goalRun(sessionId)
+      applyNativeIdle(database, sessionId, goal)
+      if (run) replay.endedRuns.add(run.id)
+    } })
+    return
+  }
+  return applyNativeIdle(database, sessionId, goal)
+}
+
+function applyNativeIdle(database, sessionId, goal) {
   const run = database.goalRun(sessionId)
   if (!run || !['running', 'waiting_input', 'stopping'].includes(run.status)) return
   if (goal?.phase === 'active' && goal.activation !== 'disarmed') return
@@ -396,10 +450,52 @@ export function settleNativeIdle(database, sessionId, goal) {
 /** Replay native facts before declaring readiness; never wake a recovered agent. */
 export async function reconcileNativeSessions(database, sessionQuery, ownerId, context, startupRunIds, archivedSessionIds = () => []) {
   const chats = database.listChats(ownerId)
-  // Native timers may deliver while asynchronous cold history reads are pending.
-  // Only receipts that existed on entry belong to this startup interruption pass.
-  const initialRunIds = startupRunIds ?? chats.flatMap(chat => database.listRunReferences(ownerId, chat.id).map(run => run.id))
+  const replay = nativeReplays.get(database) ?? {
+    ownerId, sessions: new Set(), events: new Map(), queue: [],
+    snapshotSteps: new Set(), claimedRuns: new Set(), endedRuns: new Set(),
+    initialRunIds: startupRunIds ?? chats.flatMap(chat => database.listRunReferences(ownerId, chat.id).map(run => run.id)),
+  }
+  if (replay.running || replay.ownerId !== ownerId) throw new Error('Native session recovery is already running')
+  for (const chat of chats) replay.sessions.add(chat.sessionId)
+  replay.running = true
+  nativeReplays.set(database, replay)
+  try {
+    const queued = await reconcileNativeSessionSnapshots(database, sessionQuery, ownerId, context, archivedSessionIds, replay)
+    let drained = 0
+    for (const entry of replay.queue) {
+      if (entry.applied) continue
+      if (++drained % 32 === 0) await yieldToEventLoop()
+      if (entry.apply) entry.apply()
+      else applySessionEvent(database, entry.sessionId, entry.event, entry.expectedOwnerId, entry.context)
+      acknowledgeReplayEntry(database, replay, entry)
+    }
+    // An observed inbox may predate a buffered completion. Do not revive that
+    // completed receipt or classify it as interrupted from the stale snapshot.
+    const pending = queued.filter(id => !replay.claimedRuns.has(id) && (!replay.endedRuns.has(id)
+      || ['queued', 'running', 'waiting_input', 'stopping'].includes(database.getRun(ownerId, id)?.status)))
+    database.recoverInterrupted(Date.now(), pending, replay.initialRunIds.filter(id => !replay.claimedRuns.has(id)))
+    nativeReplays.delete(database)
+    return pending
+  } finally { replay.running = false }
+}
+
+function acknowledgeReplayEntry(database, replay, entry) {
+  if (Number.isInteger(entry.event?.seq) && !database.hasProjectedEvent(entry.sessionId, entry.event.seq)) return
+  if (entry.event?.type === 'turn/end') {
+    const run = database.runForTurn(entry.sessionId, entry.event.data.turn)
+    if (run) replay.endedRuns.add(run.id)
+  }
+  if (entry.event?.type === 'goal/change' && entry.context?.nativeIdle) {
+    const run = database.goalRun(entry.sessionId)
+    if (run) replay.endedRuns.add(run.id)
+  }
+  entry.applied = true
+}
+
+async function reconcileNativeSessionSnapshots(database, sessionQuery, ownerId, context, archivedSessionIds, replay) {
+  const chats = database.listChats(ownerId)
   const queued = []
+  let replayed = 0
   for (const chat of chats) {
     const resources = message => {
       if ((!['schedule', 'tool-jobs'].includes(message?.source?.kind) && !isNativeNotice(message)) || database.getRun(ownerId, message.id)) return undefined
@@ -431,6 +527,9 @@ export async function reconcileNativeSessions(database, sessionQuery, ownerId, c
       // Claims are transient notifications. Reconstruct the turn relation from
       // the durable user/message records before replaying their projected output.
       for (const event of events) {
+        // Large transcripts must leave time for native SSH lease heartbeats and
+        // health requests. A microtask yield alone does not service that I/O.
+        if (++replayed % 32 === 0) await yieldToEventLoop()
         if (event.type === 'agent/inbox/spliced') {
           const data = event.data
           inbox[data.target].splice(data.start, data.removedCount ?? 0, ...(data.inserted ?? []))
@@ -445,7 +544,7 @@ export async function reconcileNativeSessions(database, sessionQuery, ownerId, c
           if (isNativeNotice(message) && admitted) database.bindNativeTurn(admitted, turn)
           if (message.source?.kind === 'tool-jobs' && admitted) database.bindNativeTurn(admitted, turn)
           if (message.source?.kind === 'schedule' && admitted)
-            projectInboxClaim(database, { agent: { id: chat.sessionId }, message, turn }, ownerId)
+            applyInboxClaim(database, { agent: { id: chat.sessionId }, message, turn }, ownerId)
           if (runPromptId(message) || (message.source?.kind === 'user' && admitted))
             database.bindRunMessage(chat.sessionId, message.source.rpcId ?? admitted.id, turn, message.id)
           else if (message.source?.kind === 'goal' || (message.source?.kind === 'user' && !message.source.rpcId)) {
@@ -455,6 +554,12 @@ export async function reconcileNativeSessions(database, sessionQuery, ownerId, c
         }
       }
       for (const event of events) {
+        if (++replayed % 32 === 0) await yieldToEventLoop()
+        // Observe can include a fact that also arrived through the live listener.
+        // Preserve its captured plan/goal/context before acknowledging the seq.
+        const buffered = replay.events.get(chat.sessionId)?.get(eventIdentity(event))
+        if (buffered?.applied) continue
+        const eventContext = buffered?.context
         if (event.type === 'assistant/message' && !database.hasProjectedEvent(chat.sessionId, event.seq)) {
           const run = database.runForTurn(chat.sessionId, event.data.turn)
           if (run && database.isStreamedStep(ownerId, run.id, event.data.turn, event.data.step)) {
@@ -465,17 +570,22 @@ export async function reconcileNativeSessions(database, sessionQuery, ownerId, c
             database.transaction(() => {
               database.clearStreamedStep(ownerId, run.id, event.data.turn, event.data.step)
               database.appendEvent(ownerId, run.id, { event: 'workbench_stream_reset', segment_prefix: `t${event.data.turn}s${event.data.step}a` })
-              projectSessionEvent(database, chat.sessionId, event, ownerId)
+              applySessionEvent(database, chat.sessionId, event, ownerId, eventContext)
             })()
+            replay.snapshotSteps.add(streamStep(chat.sessionId, event.data.turn, event.data.step))
+            if (buffered) acknowledgeReplayEntry(database, replay, buffered)
             continue
           }
         }
         if (event.type === 'agent/inbox/spliced')
           for (const message of event.data?.inserted ?? [])
             if (message.source?.kind === 'schedule') adoptMessage(database, chat.sessionId, message, resources(message))
-        projectSessionEvent(database, chat.sessionId, event, ownerId)
+        applySessionEvent(database, chat.sessionId, event, ownerId, eventContext)
+        if (event.type === 'assistant/message') replay.snapshotSteps.add(streamStep(chat.sessionId, event.data.turn, event.data.step))
+        if (buffered) acknowledgeReplayEntry(database, replay, buffered)
       }
       for (const message of [...inbox['next-turn'], ...inbox['next-step']]) {
+        if (++replayed % 32 === 0) await yieldToEventLoop()
         const requestId = runPromptId(message)
         const run = requestId ? database.getRun(ownerId, requestId)
           : message.source?.kind === 'schedule' ? adoptMessage(database, chat.sessionId, message, resources(message))
@@ -489,7 +599,6 @@ export async function reconcileNativeSessions(database, sessionQuery, ownerId, c
       }
     } finally { observed[Symbol.dispose]?.() }
   }
-  database.recoverInterrupted(Date.now(), queued, initialRunIds)
   return queued
 }
 
