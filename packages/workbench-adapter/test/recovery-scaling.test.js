@@ -42,6 +42,7 @@ it('keeps large historical resource snapshots out of the recovery heap and prese
     import assert from 'node:assert/strict';
     import { WorkbenchDatabase } from ${JSON.stringify(new URL('../src/persistence.js', import.meta.url).href)};
     import { reconcileNativeSessions } from ${JSON.stringify(new URL('../src/projection.js', import.meta.url).href)};
+    import { WorkbenchService } from ${JSON.stringify(new URL('../src/service.js', import.meta.url).href)};
     const database = new WorkbenchDatabase(':memory:');
     try {
       const owner = 'owner', chat = 'chat', session = 'session';
@@ -53,12 +54,30 @@ it('keeps large historical resource snapshots out of the recovery heap and prese
       }
       database.db.prepare('UPDATE runs SET mcp_tools_json=?').run(snapshot);
       database.db.prepare('UPDATE runs SET message_id=? WHERE id=?').run('pending-message', 'run-199');
+      database.db.prepare('UPDATE runs SET source_start_seq=2 WHERE id=?').run('run-0');
+      database.db.prepare('UPDATE runs SET selection_json=?,created_at=1 WHERE id IN (?,?)')
+        .run(JSON.stringify({ subagent_ids: ['child'] }), 'run-197', 'run-198');
+      database.requireRunFence(owner, 'run-198');
+      database.confirmRunFence(owner, 'run-198');
       const refs = database.listRunReferences(owner, chat);
       assert.equal(refs.length, 200);
-      assert.equal(refs[199].messageId, 'pending-message');
-      assert.equal(refs[0].messageId, null);
+      assert.equal(refs.find(r => r.id === 'run-199').messageId, 'pending-message');
+      assert.equal(refs.find(r => r.id === 'run-0').messageId, null);
       assert.deepEqual(database.listRunReferences('foreign', chat), []);
       assert.deepEqual(database.listRunReferences(owner, 'foreign'), []);
+      assert.equal(database.runForSubagent(owner, chat, 'child').id, 'run-198');
+      assert.equal(database.runForSubagent(owner, chat, 'child').stopConfirmation.fenced, true);
+      assert.equal(database.runForSubagent('foreign', chat, 'child'), undefined);
+      assert.equal(database.runForSubagent(owner, 'foreign', 'child'), undefined);
+      const service = new WorkbenchService({ database, agents: new Map(), sessionQuery: { observeSession: async () => ({
+        events: [{ seq: 1, type: 'command/run', data: { commandId: 'command', name: 'plan', args: '' } }],
+      }) } });
+      assert.equal(service.getChat({ ownerId: owner }, chat).runs.length, 200);
+      const control = await service.getControl({ ownerId: owner }, chat);
+      assert.equal(control.commands[0].before_run_id, 'run-0');
+      const view = service.historyPageView({ ownerId: owner }, database.getChat(owner, chat), { records: [], through_seq: 1000 }, true, true);
+      assert.equal(view.runs.length, 199);
+      assert.equal(view.runs.some(run => run.id === 'run-0'), false);
       const events = [{ seq: 1, type: 'agent/inbox/spliced', data: {
         target: 'next-turn', start: 0, removedCount: 0,
         inserted: [{ id: 'pending-message', source: { kind: 'user' }, role: 'user', content: [] }],

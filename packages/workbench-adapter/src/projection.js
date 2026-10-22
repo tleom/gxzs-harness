@@ -262,7 +262,7 @@ export function projectInboxClaim(database, { agent, message, turn }, expectedOw
     }
   }
   else if (message.source?.kind === 'goal' || (message.source?.kind === 'user' && !message.source.rpcId)) {
-    const admitted = database.listRuns(chat.ownerId, chat.id).find(item => item.messageId === message.id) ?? nativeCommandRun(sessionId)
+    const admitted = database.runForMessage(sessionId, message.id) ?? nativeCommandRun(sessionId)
     if (admitted) {
       const current = database.runForTurn(sessionId, turn)
       run = database.bindRunMessage(sessionId, admitted.id, turn, message.id)
@@ -302,12 +302,12 @@ function adoptJobNotice(database, chat, message, context) {
   return run
 }
 function noticeParent(database, chat, message) {
-  return database.listRuns(chat.ownerId, chat.id).reverse().find(run =>
-    run.selection?.subagent_ids?.includes(message.source.senderSessionId))
+  return database.runForSubagent(chat.ownerId, chat.id, message.source.senderSessionId)
 }
 function adoptNativeNotice(database, chat, message, context) {
   if (chat.deletedAt || !isNativeNotice(message) || typeof message.id !== 'string') return
-  const existing = database.listRuns(chat.ownerId, chat.id).find(run => run.id === message.id)
+  const match = database.listRunReferences(chat.ownerId, chat.id).find(run => run.id === message.id)
+  const existing = match && database.getRun(chat.ownerId, match.id)
   if (existing) return existing
   const parent = noticeParent(database, chat, message)
   // The native inbox starts a new turn after the old task has settled. Retain

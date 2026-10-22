@@ -34,7 +34,7 @@ export async function forkChat(service, owner, sourceRunId, body) {
     let prepared = db.getCommandReceipt(owner.ownerId, chat.id, nativeKey)
     if (prepared && (prepared.origin.sessionId !== origin.sessionId || prepared.origin.endSeq !== origin.endSeq))
       throw httpError(409, '原回答已变化，请刷新后重新分叉')
-    const runs = db.listRuns(owner.ownerId, chat.id)
+    const runs = db.listRunReferences(owner.ownerId, chat.id)
     const byId = new Map(runs.map(run => [run.id, run]))
     const chain = []
     const seen = new Set()
@@ -50,7 +50,7 @@ export async function forkChat(service, owner, sourceRunId, body) {
     // A child reply/goal continuation can point to an earlier triggering run.
     // DSH forks the complete event prefix, including intervening settled turns.
     for (const run of runs) {
-      if (!seen.has(run.id) && !run.selection?.native_child
+      if (!seen.has(run.id) && !run.nativeChild
         && Number.isSafeInteger(run.sourceEndSeq) && run.sourceEndSeq <= origin.endSeq) {
         seen.add(run.id)
         chain.push(run)
@@ -106,10 +106,11 @@ export async function forkChat(service, owner, sourceRunId, body) {
       db.importChat({ id, ownerId: owner.ownerId, sessionId, title, selection, directory, createdAt: now, updatedAt: now })
       for (const run of chain) {
         const row = db.db.prepare('SELECT * FROM runs WHERE id = ? AND owner_id = ?').get(run.id, owner.ownerId)
+        const selection = JSON.parse(row.selection_json)
         insert('runs', {
           ...row, id: ids.get(run.id), chat_id: id, session_id: sessionId, request_key: null,
           parent_run_id: ids.get(run.parentRunId) ?? null,
-          selection_json: JSON.stringify({ ...run.selection, fork_source: run.selection.fork_source ?? { sessionId: run.sessionId, endSeq: run.sourceEndSeq } }),
+          selection_json: JSON.stringify({ ...selection, fork_source: selection.fork_source ?? { sessionId: run.sessionId, endSeq: run.sourceEndSeq } }),
         })
         for (const binding of db.db.prepare('SELECT * FROM run_turns WHERE run_id=?').all(run.id))
           insert('run_turns', { ...binding, session_id: sessionId, run_id: ids.get(run.id) })

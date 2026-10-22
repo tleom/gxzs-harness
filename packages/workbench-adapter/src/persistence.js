@@ -606,10 +606,20 @@ export class WorkbenchDatabase {
       .all(ownerId, chatId).map(decodeRun)
   }
 
-  // Recovery needs receipt identities, not every frozen tool catalog and payload.
+  // Index and display selection must not hydrate every frozen resource snapshot.
   listRunReferences(ownerId, chatId) {
-    return this.db.prepare(`SELECT id, session_id AS sessionId, message_id AS messageId FROM runs
+    return this.db.prepare(`SELECT id, session_id AS sessionId, message_id AS messageId, status,
+      parent_run_id AS parentRunId, source_start_seq AS sourceStartSeq, source_end_seq AS sourceEndSeq,
+      json_extract(selection_json, '$.native_child') AS nativeChild FROM runs
       WHERE owner_id = ? AND chat_id = ? ORDER BY created_at, rowid`).all(ownerId, chatId)
+  }
+
+  runForSubagent(ownerId, chatId, childId) {
+    const row = this.db.prepare(`SELECT r.*, f.result_json AS stop_confirmation_json FROM runs r
+      LEFT JOIN run_fences f ON f.run_id=r.id WHERE r.owner_id=? AND r.chat_id=?
+      AND EXISTS (SELECT 1 FROM json_each(r.selection_json, '$.subagent_ids') WHERE value=?)
+      ORDER BY r.created_at DESC, r.rowid DESC LIMIT 1`).get(ownerId, chatId, childId)
+    return row ? decodeRun(row) : undefined
   }
 
   // Read existing native completion receipts; this is a display projection,
