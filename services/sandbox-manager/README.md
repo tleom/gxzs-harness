@@ -6,4 +6,4 @@ The service is deployed independently from the legacy Dify stack. Its HTTP surfa
 
 During migration, the copy under the legacy agent repository remains only to support old workbench export and rollback. After migration acceptance, build and deploy this directory's Dockerfile and remove the legacy stack.
 
-Validation uses the POSIX suites mirrored under `services/sandbox-manager/tests`; production rollout additionally requires the live helper, Landlock, network, file manifest and MCP authorization checks documented under `docs/`.
+Validation uses the POSIX suites mirrored under `services/sandbox-manager/tests`; production rollout additionally requires the live helper, Landlock, network, file manifest and MCP authorization checks.

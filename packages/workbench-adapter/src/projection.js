@@ -97,6 +97,10 @@ function applySessionEvent(database, sessionId, event, expectedOwnerId, context)
   // older adapters may have acknowledged the event before binding its end.
   if (projected && event.type !== 'turn/end') return undefined
   const turn = event.data?.turn
+  if (projected) {
+    const receipt = Number.isInteger(turn) ? database.streamRunForTurn(sessionId, turn) : undefined
+    if (!receipt || receipt.sourceEndSeq != null) return undefined
+  }
   const run = Number.isInteger(turn) ? database.runForTurn(sessionId, turn) : undefined
   // Earlier adapter versions could acknowledge a native completion before its
   // autonomous receipt existed. Recover that durable end once after binding.
@@ -498,7 +502,7 @@ async function reconcileNativeSessionSnapshots(database, sessionQuery, ownerId, 
   let replayed = 0
   for (const chat of chats) {
     const resources = message => {
-      if ((!['schedule', 'tool-jobs'].includes(message?.source?.kind) && !isNativeNotice(message)) || database.getRun(ownerId, message.id)) return undefined
+      if ((!['schedule', 'tool-jobs'].includes(message?.source?.kind) && !isNativeNotice(message)) || database.getRunState(ownerId, message.id)) return undefined
       if (isNativeNotice(message) && !noticeParent(database, chat, message)) return undefined
       return typeof context === 'function' ? context() : context
     }
@@ -522,6 +526,7 @@ async function reconcileNativeSessionSnapshots(database, sessionQuery, ownerId, 
       // replay rather than decoding every run once for every user message.
       const byMessage = new Map(database.listRunReferences(chat.ownerId, chat.id)
         .filter(run => run.messageId).map(run => [run.messageId, run]))
+      const settled = run => run && ['completed', 'failed', 'cancelled', 'interrupted', 'discarded', 'steered'].includes(run.status)
       const inbox = { 'next-turn': [], 'next-step': [] }
       let turn
       // Claims are transient notifications. Reconstruct the turn relation from
@@ -537,6 +542,13 @@ async function reconcileNativeSessionSnapshots(database, sessionQuery, ownerId, 
         if (event.type === 'turn/start') turn = event.data.turn
         if (event.type === 'user/message' && Number.isInteger(turn)) {
           const message = event.data
+          const known = byMessage.get(message.id)
+          // Reconstruct inbox changes in full, but an already projected, settled
+          // turn with matching durable ownership needs no resource hydration or
+          // rebinding. Missing bindings/cursors still follow normal recovery.
+          if (settled(known) && known.sourceStartSeq != null && known.sourceEndSeq != null
+            && database.hasProjectedEvent(chat.sessionId, event.seq)
+            && database.reconcileSettledTurn(known, turn)) continue
           const admitted = message.source?.kind === 'schedule' ? adoptMessage(database, chat.sessionId, message, resources(message))
             : message.source?.kind === 'tool-jobs' ? (database.runForTurn(chat.sessionId, turn) ?? adoptJobNotice(database, chat, message, resources(message)))
             : isNativeNotice(message) ? (database.runForTurn(chat.sessionId, turn) ?? adoptNativeNotice(database, chat, message, resources(message)))
@@ -579,7 +591,8 @@ async function reconcileNativeSessionSnapshots(database, sessionQuery, ownerId, 
         }
         if (event.type === 'agent/inbox/spliced')
           for (const message of event.data?.inserted ?? [])
-            if (message.source?.kind === 'schedule') adoptMessage(database, chat.sessionId, message, resources(message))
+            if (message.source?.kind === 'schedule' && !settled(byMessage.get(message.id)))
+              adoptMessage(database, chat.sessionId, message, resources(message))
         applySessionEvent(database, chat.sessionId, event, ownerId, eventContext)
         if (event.type === 'assistant/message') replay.snapshotSteps.add(streamStep(chat.sessionId, event.data.turn, event.data.step))
         if (buffered) acknowledgeReplayEntry(database, replay, buffered)

@@ -90,6 +90,14 @@ export class WorkbenchDatabase {
       );
       CREATE INDEX IF NOT EXISTS runs_chat_created ON runs(chat_id, created_at, id);
       CREATE INDEX IF NOT EXISTS runs_owner_status ON runs(owner_id, status);
+      CREATE INDEX IF NOT EXISTS runs_session_turn ON runs(session_id, turn_number, queue_order);
+      CREATE INDEX IF NOT EXISTS runs_active_queue ON runs(chat_id, queue_order)
+        WHERE status IN ('queued', 'running', 'waiting_input', 'stopping');
+      -- Health and delivery read only pending occurrence metadata. A covering
+      -- partial index avoids traversing every historical frozen tool snapshot.
+      CREATE INDEX IF NOT EXISTS runs_pending_notifications ON runs(
+        owner_id, created_at, id, chat_id, session_id, query, status, selection_json, updated_at
+      ) WHERE json_extract(selection_json, '$.schedule_notification_pending')=1;
       CREATE TABLE IF NOT EXISTS run_submissions (
         run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
         content_json TEXT NOT NULL,
@@ -463,10 +471,24 @@ export class WorkbenchDatabase {
       ON CONFLICT(session_id, turn_number) DO UPDATE SET start_seq = excluded.start_seq`).run(sessionId, turn, seq)
   }
 
+  reconcileSettledTurn(run, turn) {
+    // A legacy fallback can resolve the run while its durable binding still
+    // points to an excluded receipt. Leave that case to normal binding repair.
+    if (this.boundStreamRunForTurn(run.sessionId, turn)?.id !== run.id) return false
+    const start = this.db.prepare('SELECT start_seq FROM pending_turns WHERE session_id=? AND turn_number=?')
+      .get(run.sessionId, turn)
+    // A differing start still needs the normal binding repair. Otherwise only
+    // consume the transient start marker, without rereading the frozen receipt.
+    if (start && start.start_seq !== run.sourceStartSeq) return false
+    this.db.prepare('DELETE FROM pending_turns WHERE session_id=? AND turn_number=?').run(run.sessionId, turn)
+    return true
+  }
+
   bindRunMessage(sessionId, requestId, turn, messageId) {
     this.db.prepare(`UPDATE runs SET turn_number = ?, message_id = ?
-      WHERE session_id = ? AND id = ? AND (turn_number IS NULL OR turn_number = ?)`)
-      .run(turn, messageId, sessionId, requestId, turn)
+      WHERE session_id = ? AND id = ? AND (turn_number IS NULL OR turn_number = ?)
+      AND (turn_number IS NOT ? OR message_id IS NOT ?)`)
+      .run(turn, messageId, sessionId, requestId, turn, turn, messageId)
     const assigned = this.runForTurn(sessionId, turn)
     if (!assigned || assigned.id === requestId) this.db.prepare(`INSERT INTO run_turns(session_id, turn_number, run_id)
       SELECT session_id, ?, id FROM runs WHERE session_id = ? AND id = ? AND status NOT IN ('steered', 'discarded')
@@ -489,8 +511,9 @@ export class WorkbenchDatabase {
         AND previous.session_id=run_turns.session_id AND previous.status IN ('steered', 'discarded'))`)
       .run(turn, run.sessionId, run.id)
     const start = this.db.prepare('SELECT start_seq FROM pending_turns WHERE session_id=? AND turn_number=?').get(run.sessionId, turn)
-    this.db.prepare('UPDATE runs SET turn_number=COALESCE(turn_number, ?), source_start_seq=COALESCE(source_start_seq, ?) WHERE id=?')
-      .run(turn, start?.start_seq ?? null, run.id)
+    this.db.prepare(`UPDATE runs SET turn_number=COALESCE(turn_number, ?), source_start_seq=COALESCE(source_start_seq, ?)
+      WHERE id=? AND (turn_number IS NULL OR (source_start_seq IS NULL AND ? IS NOT NULL))`)
+      .run(turn, start?.start_seq ?? null, run.id, start?.start_seq ?? null)
     this.db.prepare('DELETE FROM pending_turns WHERE session_id=? AND turn_number=?').run(run.sessionId, turn)
     return this.runForTurn(run.sessionId, turn)
   }
@@ -546,27 +569,32 @@ export class WorkbenchDatabase {
       WHERE t.session_id=? AND t.turn_number=? AND r.session_id=t.session_id
       AND r.status NOT IN ('steered', 'discarded')`).get(sessionId, turn)
     if (bound) return decodeRun(bound)
-    const row = this.db.prepare(`SELECT r.* FROM runs r LEFT JOIN run_turns t ON t.run_id=r.id
-      WHERE r.session_id = ? AND (t.turn_number = ? OR r.turn_number = ?)
-      AND r.status NOT IN ('steered', 'discarded') ORDER BY r.queue_order LIMIT 1`).get(sessionId, turn, turn)
+    // A valid durable binding was handled above. Search legacy receipts by
+    // their indexed native turn, including the common case of an absent turn.
+    const row = this.db.prepare(`SELECT * FROM runs WHERE session_id=? AND turn_number=?
+      AND status NOT IN ('steered', 'discarded') ORDER BY queue_order LIMIT 1`).get(sessionId, turn)
     return row ? decodeRun(row) : undefined
   }
 
-  /** Streaming needs only the current binding, never the frozen MCP schemas. */
-  streamRunForTurn(sessionId, turn) {
-    this.boundStreamRunStatement ??= this.db.prepare(`SELECT r.id, r.owner_id AS ownerId FROM run_turns t
+  /** Authoritative native binding without hydrating frozen resource snapshots. */
+  boundStreamRunForTurn(sessionId, turn) {
+    this.boundStreamRunStatement ??= this.db.prepare(`SELECT r.id, r.owner_id AS ownerId, r.source_end_seq AS sourceEndSeq FROM run_turns t
       JOIN runs r ON r.id=t.run_id AND r.session_id=t.session_id
       JOIN chats c ON c.id=r.chat_id AND c.session_id=r.session_id AND c.owner_id=r.owner_id
       WHERE t.session_id=? AND t.turn_number=? AND c.deleted_at IS NULL
       AND r.status NOT IN ('steered', 'discarded')`)
-    const bound = this.boundStreamRunStatement.get(sessionId, turn)
+    return this.boundStreamRunStatement.get(sessionId, turn)
+  }
+
+  /** Streaming also supports legacy receipts without a valid durable binding. */
+  streamRunForTurn(sessionId, turn) {
+    const bound = this.boundStreamRunForTurn(sessionId, turn)
     if (bound) return bound
-    this.streamRunStatement ??= this.db.prepare(`SELECT r.id, r.owner_id AS ownerId FROM runs r
+    this.streamRunStatement ??= this.db.prepare(`SELECT r.id, r.owner_id AS ownerId, r.source_end_seq AS sourceEndSeq FROM runs r
       JOIN chats c ON c.id=r.chat_id AND c.session_id=r.session_id AND c.owner_id=r.owner_id
-      LEFT JOIN run_turns t ON t.run_id=r.id
-      WHERE r.session_id=? AND (t.turn_number=? OR r.turn_number=?) AND c.deleted_at IS NULL
+      WHERE r.session_id=? AND r.turn_number=? AND c.deleted_at IS NULL
       AND r.status NOT IN ('steered', 'discarded') ORDER BY r.queue_order LIMIT 1`)
-    return this.streamRunStatement.get(sessionId, turn, turn)
+    return this.streamRunStatement.get(sessionId, turn)
   }
 
   runForMessage(sessionId, messageId) {
@@ -615,8 +643,11 @@ export class WorkbenchDatabase {
   }
 
   acknowledgeScheduleNotification(ownerId, runId) {
-    const run = this.getRun(ownerId, runId)
-    if (run) this.updateRunResources(run, { ...run.selection, schedule_notification_pending: false }, run.mcpTools)
+    this.flushStreamEvents()
+    this.db.prepare(`UPDATE runs SET selection_json=json_set(selection_json, '$.schedule_notification_pending', json('false'))
+      WHERE id=? AND owner_id=? AND json_extract(selection_json, '$.schedule_notification_pending')=1
+      AND EXISTS (SELECT 1 FROM chats c WHERE c.id=runs.chat_id AND c.deleted_at IS NULL)`)
+      .run(runId, ownerId)
   }
 
   scheduleNotificationEnd(ownerId, runId) {

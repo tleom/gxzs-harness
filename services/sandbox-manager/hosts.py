@@ -800,6 +800,9 @@ class Hosts:
                 # so saturated workers cannot permanently skip later records.
                 if requested_workspace is None:
                     self._maintenance_cursor = workspace
+            if requested_workspace is not None:
+                requested = self._maintenance_pending.get(requested_workspace)
+                return (requested,) if requested is not None else ()
             return tuple(self._maintenance_pending.values())
 
     def _run_maintenance(self, record, future):
