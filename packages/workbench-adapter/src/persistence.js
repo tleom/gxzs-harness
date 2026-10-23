@@ -472,7 +472,9 @@ export class WorkbenchDatabase {
   }
 
   reconcileSettledTurn(run, turn) {
-    if (this.streamRunForTurn(run.sessionId, turn)?.id !== run.id) return false
+    // A legacy fallback can resolve the run while its durable binding still
+    // points to an excluded receipt. Leave that case to normal binding repair.
+    if (this.boundStreamRunForTurn(run.sessionId, turn)?.id !== run.id) return false
     const start = this.db.prepare('SELECT start_seq FROM pending_turns WHERE session_id=? AND turn_number=?')
       .get(run.sessionId, turn)
     // A differing start still needs the normal binding repair. Otherwise only
@@ -574,14 +576,19 @@ export class WorkbenchDatabase {
     return row ? decodeRun(row) : undefined
   }
 
-  /** Streaming needs only the current binding, never the frozen MCP schemas. */
-  streamRunForTurn(sessionId, turn) {
+  /** Authoritative native binding without hydrating frozen resource snapshots. */
+  boundStreamRunForTurn(sessionId, turn) {
     this.boundStreamRunStatement ??= this.db.prepare(`SELECT r.id, r.owner_id AS ownerId, r.source_end_seq AS sourceEndSeq FROM run_turns t
       JOIN runs r ON r.id=t.run_id AND r.session_id=t.session_id
       JOIN chats c ON c.id=r.chat_id AND c.session_id=r.session_id AND c.owner_id=r.owner_id
       WHERE t.session_id=? AND t.turn_number=? AND c.deleted_at IS NULL
       AND r.status NOT IN ('steered', 'discarded')`)
-    const bound = this.boundStreamRunStatement.get(sessionId, turn)
+    return this.boundStreamRunStatement.get(sessionId, turn)
+  }
+
+  /** Streaming also supports legacy receipts without a valid durable binding. */
+  streamRunForTurn(sessionId, turn) {
+    const bound = this.boundStreamRunForTurn(sessionId, turn)
     if (bound) return bound
     this.streamRunStatement ??= this.db.prepare(`SELECT r.id, r.owner_id AS ownerId, r.source_end_seq AS sourceEndSeq FROM runs r
       JOIN chats c ON c.id=r.chat_id AND c.session_id=r.session_id AND c.owner_id=r.owner_id

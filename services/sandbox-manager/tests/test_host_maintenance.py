@@ -105,6 +105,8 @@ def test_full_capacity_stays_bounded_and_resumes_after_the_last_owner(host):
         assert all(started[f'{index:02}'].wait(1) for index in range(16))
         for _ in range(20):
             assert len(host.maintain()) == 16
+        assert host.maintain('16') == ()
+        assert host.maintain('00') == (host._maintenance_pending['00'],)
         assert len(calls) == 16
         assert not started['16'].is_set() and not started['17'].is_set()
         first = host._maintenance_pending['00']

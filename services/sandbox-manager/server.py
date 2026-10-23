@@ -434,13 +434,19 @@ def operation(key, action, payload):
             # transition in this response instead of imposing another UI retry.
             # Slow bootstrap keeps running in the bounded pool without blocking
             # this HTTP request for its full health-check timeout.
-            if probes and not wait(probes, timeout=0.25).not_done:
-                with HOSTS.lock(key):
-                    current = json.loads((HOSTS.root / key / 'host.json').read_text())
-                    fields = ('owner_id', 'generation', 'instance_id')
-                    if any(current.get(field) != result.get(field) for field in fields):
-                        raise ResourceUnavailable('个人工作环境正在恢复，请稍后重试', 'HOST_NOT_READY', 2)
-                    result = current
+            if probes:
+                wait(probes, timeout=0.25)
+            # Ready is published before heartbeat/cleanup finishes. Host records
+            # are replaced atomically: read that snapshot even after a timeout,
+            # without waiting on a lifecycle lock held by slow recovery work.
+            try:
+                current = json.loads((HOSTS.root / key / 'host.json').read_text(encoding='utf-8'))
+            except FileNotFoundError:
+                raise ResourceUnavailable('个人工作环境正在恢复，请稍后重试', 'HOST_NOT_READY', 2) from None
+            fields = ('owner_id', 'generation', 'instance_id')
+            if any(current.get(field) != result.get(field) for field in fields):
+                raise ResourceUnavailable('个人工作环境正在恢复，请稍后重试', 'HOST_NOT_READY', 2)
+            result = current
         return result
     if action == 'replace-host':
         return HOSTS.replace(key, payload)

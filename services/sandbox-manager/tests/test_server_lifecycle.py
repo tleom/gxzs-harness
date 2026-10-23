@@ -33,6 +33,9 @@ def test_ensure_host_probes_only_the_waiting_owner_after_provisioning(server, mo
     key = str(uuid4())
     payload = {'owner_id': 'tenant:7'}
     result = {'state': state, 'ready': ready}
+    folder = server.HOSTS.root / key
+    folder.mkdir()
+    (folder / 'host.json').write_text(json.dumps(result))
     ensure = Mock(return_value=result)
     maintain = Mock(return_value=[])
     monkeypatch.setattr(server.HOSTS, 'ensure', ensure)
@@ -68,12 +71,83 @@ def test_ensure_does_not_wait_for_a_slow_startup_probe(server, monkeypatch):
     import time
     key = str(uuid4())
     pending = dict(owner_id='tenant:7', generation=1, instance_id='host-1', state='provisioning', ready=False)
+    folder = server.HOSTS.root / key
+    folder.mkdir()
+    (folder / 'host.json').write_text(json.dumps(pending))
     probe = Future()
     monkeypatch.setattr(server.HOSTS, 'ensure', Mock(return_value=pending))
     monkeypatch.setattr(server.HOSTS, 'maintain', Mock(return_value=[probe]))
     start = time.monotonic()
     assert server.operation(key, 'ensure-host', pending) == pending
     assert time.monotonic()-start < 1
+    assert not probe.cancelled()
+
+
+@pytest.mark.parametrize('blocked_work', ['other-owner', 'post-probe', 'lifecycle-lock'])
+def test_ensure_observes_its_own_ready_snapshot_with_bounded_wait(server, monkeypatch, blocked_work):
+    import threading
+    import time
+    key, other = str(uuid4()), str(uuid4())
+    pending = dict(owner_id='tenant:7', workspace_id=key, generation=1,
+                   instance_id='host-1', state='provisioning', ready=False)
+    for workspace in (key, other):
+        folder = server.HOSTS.root / workspace
+        folder.mkdir()
+        (folder / 'host.json').write_text(json.dumps(dict(pending, workspace_id=workspace)))
+    entered, release = threading.Event(), threading.Event()
+    def maintain(record):
+        if record.parent.name == other:
+            entered.set()
+            assert release.wait(3)
+        elif blocked_work == 'lifecycle-lock':
+            with server.HOSTS.lock(key):
+                entered.set()
+                assert release.wait(3)
+        else:
+            server.HOSTS._save(record, dict(pending, state='ready', ready=True))
+            entered.set()
+            if blocked_work == 'post-probe':
+                assert release.wait(3)
+    monkeypatch.setattr(server.HOSTS, '_maintain_one', maintain)
+    monkeypatch.setattr(server.HOSTS, 'ensure', Mock(return_value=pending))
+    waited = []
+    original_wait = server.wait
+    def wait(probes, **kwargs):
+        waited.extend(probes)
+        return original_wait(probes, **kwargs)
+    monkeypatch.setattr(server, 'wait', wait)
+    if blocked_work == 'other-owner':
+        other_probe, = server.HOSTS.maintain(other)
+        assert entered.wait(1)
+    try:
+        start = time.monotonic()
+        result = server.operation(key, 'ensure-host', pending)
+        assert time.monotonic() - start < 1
+        assert entered.is_set()
+        assert result['ready'] is (blocked_work != 'lifecycle-lock')
+        assert len(waited) == 1
+        if blocked_work == 'other-owner':
+            assert other_probe not in waited
+            assert not other_probe.done()
+    finally:
+        release.set()
+
+
+@pytest.mark.parametrize('changed', ['owner_id', 'generation', 'instance_id', 'deleted'])
+def test_ensure_revalidates_identity_even_when_probe_has_not_finished(server, monkeypatch, changed):
+    from concurrent.futures import Future
+    key = str(uuid4())
+    pending = dict(owner_id='tenant:7', generation=1, instance_id='host-1', state='provisioning', ready=False)
+    folder = server.HOSTS.root / key
+    folder.mkdir()
+    if changed != 'deleted':
+        value = 2 if changed == 'generation' else 'replacement'
+        (folder / 'host.json').write_text(json.dumps(dict(pending, **{changed: value})))
+    probe = Future()
+    monkeypatch.setattr(server.HOSTS, 'ensure', Mock(return_value=pending))
+    monkeypatch.setattr(server.HOSTS, 'maintain', Mock(return_value=[probe]))
+    with pytest.raises(server.ResourceUnavailable):
+        server.operation(key, 'ensure-host', pending)
     assert not probe.cancelled()
 
 

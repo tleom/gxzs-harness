@@ -3,6 +3,48 @@ import { spawnSync } from 'node:child_process'
 import { WorkbenchDatabase } from '../src/persistence.js'
 import { reconcileNativeSessions } from '../src/projection.js'
 
+it.each([
+  ['user', 'missing'], ['user', 'steered'], ['user', 'discarded'],
+  ['schedule', 'missing'], ['schedule', 'steered'], ['schedule', 'discarded'],
+])('repairs the durable binding of a settled %s receipt after startup (%s)', async (kind, retiredStatus) => {
+  const db = new WorkbenchDatabase(':memory:')
+  try {
+    const ownerId = 'owner', sessionId = 'session', chatId = 'chat', id = 'valid'
+    db.createChat({ id: chatId, ownerId, sessionId, selection: {} })
+    db.createRun({ id: 'retired', ownerId, sessionId, chatId, query: 'retired', selection: {} })
+    db.createRun({ id, ownerId, sessionId, chatId, query: 'preserved', selection: {},
+      requestKey: kind === 'schedule' ? `schedule:${id}` : undefined,
+      mcpTools: [{ schema: 'x'.repeat(512 * 1024) }] })
+    db.bindRunMessage(sessionId, id, 1, id)
+    db.setRunSourceSeq(ownerId, id, 'source_start_seq', 1)
+    db.setRunSourceSeq(ownerId, id, 'source_end_seq', 3)
+    db.transitionRun(ownerId, id, 'completed')
+    if (retiredStatus === 'missing') db.db.prepare('DELETE FROM run_turns').run()
+    else {
+      db.db.prepare('UPDATE runs SET status=? WHERE id=?').run(retiredStatus, 'retired')
+      db.db.prepare('UPDATE run_turns SET run_id=?').run('retired')
+    }
+    const events = [
+      { seq: 1, type: 'turn/start', data: { turn: 1 } },
+      { seq: 2, type: 'user/message', data: { id, source: { kind, rpcId: id }, content: [] } },
+      { seq: 3, type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } },
+    ]
+    for (const event of events) db.markProjectedEvent(sessionId, event.seq)
+    db.migrate()
+    const binding = () => db.db.prepare('SELECT run_id FROM run_turns WHERE session_id=? AND turn_number=1').get(sessionId)?.run_id
+    expect(binding()).toBe(retiredStatus === 'missing' ? id : 'retired')
+    const expected = db.getRun(ownerId, id)
+    for (let replay = 0; replay < 2; replay++) {
+      expect(await reconcileNativeSessions(db, { observeSession: async () => ({ events }) }, ownerId)).toEqual([])
+      expect(binding()).toBe(id)
+      expect(db.getRun(ownerId, id)).toMatchObject({ status: 'completed', sourceStartSeq: 1, sourceEndSeq: 3,
+        mcpTools: expected.mcpTools })
+      expect(db.listRunReferences(ownerId, chatId)).toHaveLength(2)
+      expect(db.db.prepare('SELECT COUNT(*) AS n FROM pending_turns').get().n).toBe(0)
+    }
+  } finally { db.close() }
+})
+
 it.each([false, true])('reuses settled schedule receipts while repairing missing completion cursors (%s)', missingEnd => {
   return (async () => {
     const db = new WorkbenchDatabase(':memory:')
