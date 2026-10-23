@@ -1213,6 +1213,32 @@ def test_failed_transport_activity_requires_explicit_failure_and_complete_counts
         assert Hosts.dependency_degraded(host, 'http://host') is False
 
 
+@pytest.mark.parametrize('writing', [0, 1])
+def test_failed_ssh_pending_schedule_reports_survive_recovery_without_masking_writes(tmp_path, monkeypatch, writing):
+    from io import BytesIO
+    from urllib.error import HTTPError
+    host, docker, _, _, _, _, _ = failed_ssh_setup(tmp_path, monkeypatch)
+    activity = dict(protocol=2, status='ready', runningAgents=0, pendingMessages=16, runningJobs=0,
+                    activeSchedules=2, registeredSchedules=0, pendingScheduleReports=9,
+                    activeSidebarResources=0, activeSettingsWrites=writing)
+    payload = dict(live=True, ready=False, runtime_error='SSH_UNAVAILABLE', activity=activity)
+    def reply(*_args, **_kwargs):
+        raise HTTPError('http://host/health', 503, 'unready', {}, BytesIO(json.dumps(payload).encode()))
+    host.opener.open = Mock(side_effect=reply)
+    # Idle shutdown still waits for every undelivered report.
+    assert Hosts._activity_counts(payload)['activeSettingsWrites'] == writing + 9
+    counts = Hosts.failed_transport_activity(host, 'http://host')
+    assert counts['activeSettingsWrites'] == writing
+    host.failed_transport_activity.return_value = counts
+    maintain(host)
+    if writing:
+        host.admission.fence.assert_not_called()
+        assert not any(call.args[0] in ('stop', 'rename', 'create') for call in docker.call_args_list)
+    else:
+        host.admission.fence.assert_called_once_with('t:1', 'host-1', preserve_pending=True)
+        assert any(call.args == ('start', 'host-1') for call in docker.call_args_list)
+
+
 def test_unhealthy_sandbox_does_not_interrupt_admitted_work(tmp_path, monkeypatch):
     host, docker, _, payload, created = setup(tmp_path, monkeypatch)
     host.ensure('workspace', payload)

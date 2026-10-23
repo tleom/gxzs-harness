@@ -91,6 +91,9 @@ export class WorkbenchDatabase {
       CREATE INDEX IF NOT EXISTS runs_chat_created ON runs(chat_id, created_at, id);
       CREATE INDEX IF NOT EXISTS runs_owner_status ON runs(owner_id, status);
       CREATE INDEX IF NOT EXISTS runs_session_turn ON runs(session_id, turn_number, queue_order);
+      CREATE INDEX IF NOT EXISTS runs_owner_chat_created ON runs(owner_id, chat_id, created_at);
+      CREATE INDEX IF NOT EXISTS runs_active_session ON runs(session_id)
+        WHERE status IN ('queued', 'running', 'waiting_input', 'stopping');
       CREATE INDEX IF NOT EXISTS runs_active_queue ON runs(chat_id, queue_order)
         WHERE status IN ('queued', 'running', 'waiting_input', 'stopping');
       -- Health and delivery read only pending occurrence metadata. A covering
@@ -769,7 +772,7 @@ export class WorkbenchDatabase {
   }
 
   listPendingInputs(ownerId, runId) {
-    if (!this.getRun(ownerId, runId)) throw notFound('任务不存在')
+    if (!this.getRunState(ownerId, runId)) throw notFound('任务不存在')
     const rows = this.db.prepare(`SELECT p.request_id, p.run_id, p.status, p.deadline_at,
       p.interacted, p.created_at, p.settled_at,
       CASE WHEN length(CAST(p.payload_json AS BLOB)) + length(CAST(COALESCE(p.answer_json, '') AS BLOB)) <= 8388608
@@ -946,7 +949,9 @@ export class WorkbenchDatabase {
   }
 
   runTiming(ownerId, runId) {
-    const run = this.getRun(ownerId, runId)
+    this.flushStreamEvents()
+    const run = this.db.prepare(`SELECT r.status, r.updated_at AS updatedAt FROM runs r JOIN chats c ON c.id=r.chat_id
+      WHERE r.id=? AND r.owner_id=? AND c.deleted_at IS NULL`).get(runId, ownerId)
     if (!run) throw notFound('任务不存在')
     const timing = this.db.prepare(`WITH endings AS (
       SELECT seq, created_at FROM run_events INDEXED BY run_events_end WHERE run_id=? AND json_extract(payload_json, '$.event')='workbench_end'
@@ -969,7 +974,7 @@ export class WorkbenchDatabase {
   }
 
   latestContextEvent(ownerId, runId) {
-    if (!this.getRun(ownerId, runId)) throw notFound('任务不存在')
+    if (!this.getRunState(ownerId, runId)) throw notFound('任务不存在')
     const row = this.db.prepare(`SELECT CASE WHEN length(CAST(payload_json AS BLOB)) <= 8388608
       THEN payload_json END AS payload_json FROM run_events WHERE run_id = ?
       AND json_extract(payload_json, '$.event') = 'workbench_context' ORDER BY seq DESC LIMIT 1`).get(runId)
@@ -993,7 +998,7 @@ export class WorkbenchDatabase {
   }
 
   steeringEvents(ownerId, runId, through = Number.MAX_SAFE_INTEGER) {
-    if (!this.getRun(ownerId, runId)) throw notFound('任务不存在')
+    if (!this.getRunState(ownerId, runId)) throw notFound('任务不存在')
     const rows = this.db.prepare(`SELECT CASE WHEN length(CAST(payload_json AS BLOB)) <= 8388608
       THEN payload_json END AS payload_json FROM run_events WHERE run_id = ? AND seq <= ?
       AND json_extract(payload_json, '$.event') IN ('workbench_steering', 'workbench_steered') ORDER BY seq`)
@@ -1156,20 +1161,19 @@ export class WorkbenchDatabase {
   }
 
   activeRunBySession(sessionId) {
-    const placeholders = [...TERMINAL].map(() => '?').join(', ')
-    const row = this.db.prepare(`SELECT * FROM runs WHERE session_id = ? AND status NOT IN (${placeholders})
+    const row = this.db.prepare(`SELECT id, owner_id FROM runs WHERE session_id = ?
+      AND status IN ('queued', 'running', 'waiting_input', 'stopping')
       ORDER BY CASE WHEN status='queued' THEN 1 ELSE 0 END,
-        (SELECT MAX(turn_number) FROM run_turns WHERE run_id=runs.id) DESC, queue_order, created_at, id LIMIT 1`).get(sessionId, ...TERMINAL)
-    return row ? decodeRun(row) : undefined
+        (SELECT MAX(turn_number) FROM run_turns WHERE run_id=runs.id) DESC, queue_order, created_at, id LIMIT 1`).get(sessionId)
+    return row ? this.getRun(row.owner_id, row.id) : undefined
   }
 
   activeRun(ownerId, chatId) {
-    const placeholders = [...TERMINAL].map(() => '?').join(', ')
-    const row = this.db.prepare(`SELECT * FROM runs WHERE owner_id = ? AND chat_id = ?
-      AND status NOT IN (${placeholders}) ORDER BY CASE WHEN status='queued' THEN 1 ELSE 0 END,
+    const row = this.db.prepare(`SELECT id FROM runs INDEXED BY runs_active_queue WHERE owner_id = ? AND chat_id = ?
+      AND status IN ('queued', 'running', 'waiting_input', 'stopping') ORDER BY CASE WHEN status='queued' THEN 1 ELSE 0 END,
         (SELECT MAX(turn_number) FROM run_turns WHERE run_id=runs.id) DESC, queue_order, created_at, id LIMIT 1`)
-      .get(ownerId, chatId, ...TERMINAL)
-    return row ? decodeRun(row) : undefined
+      .get(ownerId, chatId)
+    return row ? this.getRun(ownerId, row.id) : undefined
   }
 }
 

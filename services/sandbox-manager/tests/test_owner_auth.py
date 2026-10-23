@@ -54,6 +54,21 @@ def test_domains_and_generations_produce_distinct_credentials():
     assert assertion_key(root, 'tenant:7', 1, 'host-1') != assertion_key(root, 'tenant:8', 1, 'host-1')
 
 
+def test_degraded_current_identity_keeps_owner_operations_without_coordinator_access(registered):
+    root, headers, record = registered
+    record['state'] = 'degraded'
+    record['ready'] = False
+    (root / 'workspace' / 'host.json').write_text(json.dumps(record))
+    for action in OWNER_ACTIONS:
+        assert authorize(headers, 'root-test-key', root, 'workspace', action) == 'owner'
+    for action in ('ensure-host', 'replace-host', 'schedule', 'stop-binding'):
+        with pytest.raises(PermissionError):
+            authorize(headers, 'root-test-key', root, 'workspace', action)
+    headers.replace_header('x-gxzs-host-generation', '1')
+    with pytest.raises(PermissionError):
+        authorize(headers, 'root-test-key', root, 'workspace', 'files')
+
+
 def test_fixed_credential_contract_fixture():
     fixture = json.loads((Path(__file__).parent / 'fixtures' / 'owner-credentials-v1.json').read_text(encoding='utf-8'))
     identity = fixture['owner_id'], fixture['workspace_id'], fixture['generation'], fixture['instance_id']
