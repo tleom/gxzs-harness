@@ -29,7 +29,7 @@ def authorize(headers, root_token, hosts_root, workspace, action):
         owner, instance = headers.get("X-GXZS-Owner", ""), headers.get("X-GXZS-Host-Instance", "")
         if (record["owner_id"], record["workspace_id"], record["generation"], record["instance_id"]) != (owner, workspace, generation, instance):
             raise PermissionError("Manager host identity mismatch")
-        if record.get("state", "ready" if record.get("ready") else "provisioning") not in {"ready", "provisioning", "draining"}:
+        if record.get("state", "ready" if record.get("ready") else "provisioning") not in {"ready", "provisioning", "draining", "degraded"}:
             raise PermissionError("Manager host generation has been fenced")
         expected = owner_token(root_token, owner, workspace, generation, instance)
         if not hmac.compare_digest(supplied, "Bearer " + expected):

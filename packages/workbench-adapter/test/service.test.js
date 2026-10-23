@@ -17,6 +17,17 @@ function referenceResolver(test, candidates) {
 }
 
 const opened = []
+it('presents history metadata without materializing an unmentioned frozen tool catalog', () => {
+  const { service, database, owner, chat } = setup()
+  const run = database.createRun({ ownerId: owner.ownerId, chatId: chat.id, sessionId: chat.sessionId,
+    query: 'history', selection: { mentioned_resources: [{ kind: 'skills', id: 'report' }] } }).run
+  Object.defineProperty(run, 'mcpTools', { get() { throw new Error('Frozen catalog must stay lazy') } })
+  vi.spyOn(database, 'getRun').mockImplementation(() => { throw new Error('Metadata must not hydrate a full receipt') })
+  const view = service.inputRunDto(owner, run)
+  expect(view).toMatchObject({ id: run.id, query: 'history', mentioned_resources: [{ kind: 'skills', id: 'report' }],
+    human_input_history: [], started_at: null, completed_at: null })
+})
+
 it('uses database publication order for the global skill catalog', async () => {
   const { service, skills } = setup()
   skills.list.mockResolvedValue([

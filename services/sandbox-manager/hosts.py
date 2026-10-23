@@ -755,7 +755,13 @@ class Hosts:
                 payload = json.loads(error.read(4096))
                 if (payload.get('live') is True and payload.get('ready') is False
                         and payload.get('runtime_error') == 'SSH_UNAVAILABLE'):
-                    return self._activity_counts(payload)
+                    counts = self._activity_counts(payload)
+                    if counts is not None:
+                        # Durable undelivered reports block sleep, but survive
+                        # transport recovery just like queued messages. Only
+                        # an actual settings write must prevent a restart.
+                        counts['activeSettingsWrites'] = payload['activity']['activeSettingsWrites']
+                    return counts
             except (ValueError, OSError, AttributeError, TypeError):
                 pass
         except Exception:

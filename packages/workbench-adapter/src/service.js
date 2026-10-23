@@ -1370,8 +1370,9 @@ export class WorkbenchService {
     const context = this.database.latestContextEvent(owner.ownerId, run.id)
     const steering = steeringSnapshot ?? (events.length ? events.filter(event => event.event === 'workbench_steering' || event.event === 'workbench_steered')
       : this.database.steeringEvents(owner.ownerId, run.id))
+    if (run.error && !run.errorCode) run.errorCode = this.database.runErrorCode(owner.ownerId, run.id)
     return {
-      ...runDto({ ...run, errorCode: run.errorCode ?? (run.error ? this.database.runErrorCode(owner.ownerId, run.id) : undefined) }, events,
+      ...runDto(run, events,
         inputs.findLast(input => input.status === 'pending') ?? inputs.at(-1)),
       context_usage: context ? presentRunEvent(context) : undefined,
       input_supplement: this.inputSupplement(run),
@@ -1465,12 +1466,13 @@ function normalizeSelection(value) {
 export function runDto(run, events = [], pending = null) {
   const waiting = pending?.status === 'pending' ? pending : null
   const forkEnd = run.sourceEndSeq ?? run.selection?.fork_source?.endSeq
+  const mentioned = run.selection?.mentioned_resources ?? []
   return {
     id: run.id, chat_id: run.chatId, revision_id: run.id, version: 1, query: run.query,
     created_at: run.createdAt / 1000,
     can_fork: ['completed', 'failed', 'cancelled', 'interrupted'].includes(run.status) && Number.isSafeInteger(forkEnd) && forkEnd >= 0,
     resource_mentions: normalizeResourceMentions(run.selection?.resource_mentions),
-    mentioned_resources: groupPluginMentions(run.selection?.mentioned_resources ?? [], run.mcpTools ?? []),
+    mentioned_resources: groupPluginMentions(mentioned, mentioned.some(resource => resource.kind === 'tools') ? run.mcpTools ?? [] : []),
     ...(run.selection?.input_supplement ? { input_supplement: run.selection.input_supplement } : {}),
     ...(run.selection?.command ? { command: run.selection.command } : {}),
     ...(run.selection?.silent_resume || run.selection?.is_continuation ? { is_continuation: true } : {}),

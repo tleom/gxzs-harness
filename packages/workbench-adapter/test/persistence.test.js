@@ -22,6 +22,30 @@ function seed(database, ownerId = 'user-a') {
 }
 
 describe('workbench durable projection', () => {
+  it('uses active and chronological indexes for chat summaries without sorting frozen catalogs', () => {
+    const database = open()
+    const { chat, ownerId } = seed(database)
+    for (const id of ['settled', 'queued', 'running']) {
+      database.createRun({ id, ownerId, chatId: chat.id, sessionId: chat.sessionId, query: id, selection: {}, now: 1 })
+    }
+    database.transitionRun(ownerId, 'settled', 'completed')
+    database.transitionRun(ownerId, 'running', 'running')
+    const prepare = database.db.prepare.bind(database.db), queries = []
+    database.db.prepare = sql => { queries.push(sql); return prepare(sql) }
+    expect(database.activeRun(ownerId, chat.id)?.id).toBe('running')
+    expect(database.activeRunBySession(chat.sessionId)?.id).toBe('running')
+    expect(database.latestRunStatus(ownerId, chat.id)).toBe('running')
+    expect(database.activeRun('foreign', chat.id)).toBeUndefined()
+    const chatSql = queries.find(sql => sql.startsWith('SELECT id FROM runs INDEXED BY runs_active_queue'))
+    const sessionSql = queries.find(sql => sql.startsWith('SELECT id, owner_id FROM runs WHERE session_id'))
+    expect(prepare('EXPLAIN QUERY PLAN ' + chatSql).all(ownerId, chat.id).map(r => r.detail).join('\n')).toContain('runs_active_queue')
+    expect(prepare('EXPLAIN QUERY PLAN ' + sessionSql).all(chat.sessionId).map(r => r.detail).join('\n')).toContain('runs_active_session')
+    const latest = queries.find(sql => sql.startsWith('SELECT status FROM runs'))
+    const plan = prepare('EXPLAIN QUERY PLAN ' + latest).all(ownerId, chat.id).map(r => r.detail).join('\n')
+    expect(plan).toContain('runs_owner_chat_created')
+    expect(plan).not.toContain('TEMP B-TREE')
+  })
+
   it('assigns queue order from active receipts without scanning settled tool snapshots', () => {
     const database = open()
     const { chat, ownerId } = seed(database)
