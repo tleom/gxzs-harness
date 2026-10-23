@@ -34,7 +34,7 @@ def test_ensure_host_probes_only_the_waiting_owner_after_provisioning(server, mo
     payload = {'owner_id': 'tenant:7'}
     result = {'state': state, 'ready': ready}
     ensure = Mock(return_value=result)
-    maintain = Mock()
+    maintain = Mock(return_value=[])
     monkeypatch.setattr(server.HOSTS, 'ensure', ensure)
     monkeypatch.setattr(server.HOSTS, 'maintain', maintain)
     assert server.operation(key, 'ensure-host', payload) == result
@@ -43,6 +43,59 @@ def test_ensure_host_probes_only_the_waiting_owner_after_provisioning(server, mo
         maintain.assert_called_once_with(key)
     else:
         maintain.assert_not_called()
+
+
+def test_ensure_returns_a_completed_readiness_probe_without_an_extra_client_retry(server, monkeypatch):
+    from concurrent.futures import Future
+    key = str(uuid4())
+    pending = dict(owner_id='tenant:7', generation=1, instance_id='host-1', state='provisioning', ready=False)
+    ready = dict(pending, state='ready', ready=True)
+    folder = server.HOSTS.root / key
+    folder.mkdir()
+    (folder / 'host.json').write_text(json.dumps(ready))
+    probe = Future()
+    probe.set_result(None)
+    monkeypatch.setattr(server.HOSTS, 'ensure', Mock(return_value=pending))
+    monkeypatch.setattr(server.HOSTS, 'maintain', Mock(return_value=[probe]))
+    assert server.operation(key, 'ensure-host', pending) == ready
+    (folder / 'host.json').write_text(json.dumps(dict(ready, instance_id='replacement')))
+    with pytest.raises(server.ResourceUnavailable):
+        server.operation(key, 'ensure-host', pending)
+
+
+def test_ensure_does_not_wait_for_a_slow_startup_probe(server, monkeypatch):
+    from concurrent.futures import Future
+    import time
+    key = str(uuid4())
+    pending = dict(owner_id='tenant:7', generation=1, instance_id='host-1', state='provisioning', ready=False)
+    probe = Future()
+    monkeypatch.setattr(server.HOSTS, 'ensure', Mock(return_value=pending))
+    monkeypatch.setattr(server.HOSTS, 'maintain', Mock(return_value=[probe]))
+    start = time.monotonic()
+    assert server.operation(key, 'ensure-host', pending) == pending
+    assert time.monotonic()-start < 1
+    assert not probe.cancelled()
+
+
+def test_first_creation_keeps_host_home_isolated_from_personal_environment_initialization(server, monkeypatch):
+    key = str(uuid4())
+    folder = server.HOSTS.root / key
+    folder.mkdir()
+    (folder / 'host.json').write_text(json.dumps(dict(owner_id='tenant:7', workspace_id=key, home_volume='owner-host-home')))
+    calls = []
+    def docker(*args, **kwargs):
+        calls.append(args)
+        return SimpleNamespace(returncode=1 if args[0]=='inspect' else 0, stdout='')
+    monkeypatch.setattr(server, 'docker', docker)
+    monkeypatch.setattr(server, 'ensure_network', lambda _: 'owner-network')
+    server.ensure(key)
+    helpers = [args for args in calls if args[0]=='run']
+    assert len(helpers) == 2
+    attachment = next(args for args in helpers if 'owner-host-home:/srv/dsh' in args)
+    environment = next(args for args in helpers if any('/opt/user-env' in value for value in args[:-1]))
+    assert not any('/workspace' in value or '/opt/user-env' in value for value in attachment)
+    assert not any('/srv/dsh' in value for value in environment)
+    assert environment[-1].index('os.setuid(1000)') < environment[-1].index('workbench_office.pth')
 
 
 def test_profile_upgrade_route_uses_the_registered_host_authority(server, monkeypatch):

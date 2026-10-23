@@ -3,6 +3,46 @@ import { spawnSync } from 'node:child_process'
 import { WorkbenchDatabase } from '../src/persistence.js'
 import { reconcileNativeSessions } from '../src/projection.js'
 
+it.each([false, true])('reuses settled schedule receipts while repairing missing completion cursors (%s)', missingEnd => {
+  return (async () => {
+    const db = new WorkbenchDatabase(':memory:')
+    try {
+      const ownerId = 'owner', sessionId = 'session', chatId = 'chat', id = 'scheduled-message'
+      const message = { id, source: { kind: 'schedule' }, content: [{ type: 'text', text: 'schedule_id_json: "task"\noccurrence_at: 2026-10-23T01:00:00Z' }] }
+      db.createChat({ id: chatId, ownerId, sessionId, selection: {} })
+      db.createRun({ id, ownerId, sessionId, chatId, requestKey: `schedule:${id}`, query: message.content[0].text,
+        selection: { schedule_notification_pending: true }, mcpTools: [{ schema: 'x'.repeat(512 * 1024) }] })
+      db.bindRunMessage(sessionId, id, 1, id)
+      db.setRunSourceSeq(ownerId, id, 'source_start_seq', 3)
+      if (!missingEnd) db.setRunSourceSeq(ownerId, id, 'source_end_seq', 6)
+      db.transitionRun(ownerId, id, 'completed')
+      db.observeTurnStart(sessionId, 1, 3)
+      const events = [
+        { seq: 1, type: 'agent/inbox/spliced', data: { target: 'next-turn', start: 0, removedCount: 0, inserted: [message] } },
+        { seq: 2, type: 'agent/inbox/spliced', data: { target: 'next-turn', start: 0, removedCount: 1, inserted: [] } },
+        { seq: 3, type: 'turn/start', data: { turn: 1 } },
+        { seq: 4, type: 'user/message', data: message },
+        { seq: 5, type: 'assistant/message', data: { turn: 1, step: 1, content: [] } },
+        { seq: 6, type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } },
+      ]
+      for (const event of events) db.markProjectedEvent(sessionId, event.seq)
+      let receipts = 0
+      for (const name of ['getRun', 'createRun', 'runForTurn']) {
+        const original = db[name].bind(db)
+        db[name] = (...args) => { receipts++; return original(...args) }
+      }
+      expect(await reconcileNativeSessions(db, { observeSession: async () => ({ events }) }, ownerId)).toEqual([])
+      if (missingEnd) expect(receipts).toBeGreaterThan(0)
+      else expect(receipts).toBe(0)
+      expect(db.getRun(ownerId, id)).toMatchObject({ status: 'completed', sourceStartSeq: 3, sourceEndSeq: 6,
+        selection: { schedule_notification_pending: true } })
+      expect(db.getRun(ownerId, id).mcpTools[0].schema).toHaveLength(512 * 1024)
+      expect(db.listRunReferences(ownerId, chatId)).toHaveLength(1)
+      expect(db.db.prepare('SELECT COUNT(*) AS n FROM pending_turns').get().n).toBe(0)
+    } finally { db.close() }
+  })()
+})
+
 it.each([100, 250])('recovers %s messages without loading complete run inventories', async count => {
   const database = new WorkbenchDatabase(':memory:')
   try {

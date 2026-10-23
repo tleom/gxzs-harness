@@ -1,6 +1,48 @@
 import { expect, it } from 'vitest'
 import { WorkbenchDatabase } from '../src/persistence.js'
 
+it('looks up absent and legacy turns without scanning other historical receipts', () => {
+  const db = new WorkbenchDatabase(':memory:')
+  try {
+    db.createChat({ id: 'chat', sessionId: 'session', ownerId: 'owner', selection: {} })
+    for (let i = 0; i < 20; i++) {
+      db.createRun({ id: `run-${i}`, sessionId: 'session', chatId: 'chat', ownerId: 'owner', query: '', selection: {} })
+      db.db.prepare('UPDATE runs SET turn_number=? WHERE id=?').run(i, `run-${i}`)
+    }
+    const queries = []
+    const prepare = db.db.prepare.bind(db.db)
+    db.db.prepare = sql => { queries.push(sql); return prepare(sql) }
+    expect(db.runForTurn('session', 99)).toBeUndefined()
+    expect(db.streamRunForTurn('session', 99)).toBeUndefined()
+    expect(db.runForTurn('session', 12).id).toBe('run-12')
+    expect(db.streamRunForTurn('session', 12).id).toBe('run-12')
+    const fallbacks = queries.filter(sql => sql.includes('ORDER BY') && sql.includes('queue_order'))
+    expect(fallbacks.length).toBeGreaterThan(0)
+    for (const sql of fallbacks) {
+      const plan = prepare('EXPLAIN QUERY PLAN ' + sql).all('session', 99).map(row => row.detail).join('\n')
+      expect(plan).toContain('runs_session_turn (session_id=? AND turn_number=?)')
+      expect(plan).not.toContain('SCAN r')
+    }
+  } finally { db.close() }
+})
+
+it.each(['message', 'native'])('replaying an existing %s binding does not rewrite the frozen history row', kind => {
+  const db = new WorkbenchDatabase(':memory:')
+  try {
+    db.createChat({ id: 'chat', sessionId: 'session', ownerId: 'owner', selection: {} })
+    db.createRun({ id: 'run', sessionId: 'session', chatId: 'chat', ownerId: 'owner', query: '', selection: {}, mcpTools: [{ schema: 'x'.repeat(512 * 1024) }] })
+    const bind = () => kind === 'message' ? db.bindRunMessage('session', 'run', 1, 'message') : db.bindNativeTurn(db.getRun('owner', 'run'), 1)
+    bind()
+    const before = db.db.prepare('SELECT total_changes() AS count').get().count
+    expect(bind().id).toBe('run')
+    expect(db.db.prepare('SELECT total_changes() AS count').get().count).toBe(before)
+    // A durable start discovered after the binding still fills the missing cursor.
+    db.observeTurnStart('session', 1, 8)
+    bind()
+    expect(db.getRun('owner', 'run').sourceStartSeq).toBe(8)
+  } finally { db.close() }
+})
+
 it('uses the durable native binding while retaining legacy and excluded-receipt recovery', () => {
   const db = new WorkbenchDatabase(':memory:')
   try {

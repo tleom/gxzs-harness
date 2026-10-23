@@ -22,6 +22,57 @@ function seed(database, ownerId = 'user-a') {
 }
 
 describe('workbench durable projection', () => {
+  it('assigns queue order from active receipts without scanning settled tool snapshots', () => {
+    const database = open()
+    const { chat, ownerId } = seed(database)
+    const create = id => database.createRun({ id, ownerId, chatId: chat.id, sessionId: chat.sessionId, query: id, selection: {} }).run
+    create('settled')
+    database.db.prepare("UPDATE runs SET status='completed',queue_order=999,mcp_tools_json=?").run(JSON.stringify([{ schema: 'x'.repeat(1024 * 1024) }]))
+    expect(create('first').queueOrder).toBe(1)
+    database.transitionRun(ownerId, 'first', 'running')
+    const queries = []
+    const prepare = database.db.prepare.bind(database.db)
+    database.db.prepare = sql => { queries.push(sql); return prepare(sql) }
+    expect(create('second').queueOrder).toBe(2)
+    const query = queries.find(sql => sql.includes('MAX(queue_order)'))
+    const plan = prepare('EXPLAIN QUERY PLAN ' + query).all(chat.id).map(row => row.detail).join('\n')
+    expect(plan).toContain('runs_active_queue')
+    expect(database.getRun(ownerId, 'settled').mcpTools[0].schema).toHaveLength(1024 * 1024)
+  })
+
+  it('reads pending notification metadata through a covering index and acknowledges without rewriting frozen resources', () => {
+    const database = open()
+    const { chat, ownerId } = seed(database)
+    const selection = { schedule_notification_pending: true, schedule_occurrences: [{ jobId: 'task', occurrenceAt: 123 }], model: 'p/m' }
+    for (const id of ['pending', 'older', 'settled']) {
+      database.createRun({ id, ownerId, chatId: chat.id, sessionId: chat.sessionId, query: id,
+        selection: id === 'settled' ? {} : selection, now: id === 'older' ? 1 : 2 })
+    }
+    const frozen = '[\n  { "description": "' + 'x'.repeat(1024 * 1024) + '" }\n]'
+    database.db.prepare('UPDATE runs SET mcp_tools_json=?').run(frozen)
+    const queries = []
+    const prepare = database.db.prepare.bind(database.db)
+    database.db.prepare = sql => { queries.push(sql); return prepare(sql) }
+    expect(database.pendingScheduleNotifications(ownerId).map(run => run.id)).toEqual(['older', 'pending'])
+    expect(database.pendingScheduleNotifications('foreign')).toEqual([])
+    const sql = queries.find(sql => sql.includes('ORDER BY r.created_at,r.id'))
+    const plan = prepare('EXPLAIN QUERY PLAN ' + sql).all(ownerId).map(row => row.detail).join('\n')
+    expect(plan).toContain('COVERING INDEX runs_pending_notifications')
+    expect(plan).not.toContain('TEMP B-TREE')
+    database.acknowledgeScheduleNotification('foreign', 'pending')
+    expect(database.pendingScheduleNotifications(ownerId)).toHaveLength(2)
+    database.acknowledgeScheduleNotification(ownerId, 'pending')
+    expect(database.getRun(ownerId, 'pending').selection).toEqual({ ...selection, schedule_notification_pending: false })
+    const before = prepare('SELECT total_changes() AS n').get().n
+    database.acknowledgeScheduleNotification(ownerId, 'pending')
+    expect(prepare('SELECT total_changes() AS n').get().n).toBe(before)
+    expect(prepare('SELECT COUNT(*) AS n FROM runs WHERE mcp_tools_json=?').get(frozen).n).toBe(3)
+    database.db.prepare('UPDATE chats SET deleted_at=1 WHERE id=?').run(chat.id)
+    database.acknowledgeScheduleNotification(ownerId, 'older')
+    expect(JSON.parse(prepare('SELECT selection_json FROM runs WHERE id=?').get('older').selection_json)).toEqual(selection)
+    expect(database.pendingScheduleNotifications(ownerId)).toEqual([])
+  })
+
   it('indexes state metadata without scanning unrelated history payloads', () => {
     const database = open()
     const { chat, ownerId } = seed(database)

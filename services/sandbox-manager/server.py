@@ -15,7 +15,7 @@ import tempfile
 import time
 import uuid
 from contextlib import contextmanager
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from urllib.request import ProxyHandler, Request, build_opener
 
 from admission import Admission
@@ -311,6 +311,8 @@ def ensure(key, *, track_activity=True, allow_existing_image=False):
         if info.returncode:
             if home_volume:
                 docker('volume', 'create', '--label', 'gxzs.owner=' + host['owner_id'], home_volume)
+                # Keep the Host home out of helpers that traverse user-controlled
+                # workspace/venv paths, even when they later drop privileges.
                 docker('run', '--rm', *cgroup_args(key), '--memory', '256m', '--cpus', '1', '--pids-limit', '128',
                        '--user', '0', '--network', 'none', '--entrypoint', MANAGER_PYTHON[0],
                        '-v', home_volume + ':/srv/dsh', IMAGE, *MANAGER_PYTHON[1:], '-c',
@@ -320,16 +322,16 @@ def ensure(key, *, track_activity=True, allow_existing_image=False):
                        "os.makedirs(p,exist_ok=True); os.chown(p,1000,1000); os.chmod(p,0o700)")
             for suffix in ("home", "files", "env"):
                 docker("volume", "create", "--label", "workbench=" + PREFIX, volumes + "-" + suffix)
+            # One short-lived helper prepares only this owner's volumes. Drop
+            # privileges before touching a personal venv, just as its runtime does.
             docker("run", "--rm", *cgroup_args(key), '--memory', '256m', '--cpus', '1', '--pids-limit', '128',
                    "--user", "0", "--network", "none", "--entrypoint", MANAGER_PYTHON[0],
                    "-v", volumes + "-home:/home/gxzs", "-v", volumes + "-files:/workspace", "-v", volumes + "-env:/opt/user-env",
-                   IMAGE, *MANAGER_PYTHON[1:], "-c", "import os; paths=['/home/gxzs','/workspace','/workspace/conversations','/opt/user-env']; "
-                   "[(os.makedirs(p,exist_ok=True),os.chown(p,1000,1000)) for p in paths]")
-            # Existing personal venvs gain the immutable office fallback without replacing their packages.
-            docker("run", "--rm", *cgroup_args(key), '--memory', '256m', '--cpus', '1', '--pids-limit', '128',
-                   "--user", "1000", "--network", "none", "--entrypoint", MANAGER_PYTHON[0],
-                   "-v", volumes + "-env:/opt/user-env", IMAGE, *MANAGER_PYTHON[1:], "-c",
-                   "from pathlib import Path; site=Path('/opt/user-env/current/python/lib/python3.12/site-packages'); "
+                   IMAGE, *MANAGER_PYTHON[1:], "-c", "import os; from pathlib import Path; "
+                   "paths=['/home/gxzs','/workspace','/workspace/conversations','/opt/user-env']; "
+                   "[(os.makedirs(p,exist_ok=True),os.chown(p,1000,1000)) for p in paths]; "
+                   "os.setgroups([]); os.setgid(1000); os.setuid(1000); "
+                   "site=Path('/opt/user-env/current/python/lib/python3.12/site-packages'); "
                    "base=Path('/opt/office/python/lib/python3.12/site-packages'); "
                    "(site/'workbench_office.pth').write_text(str(base)+'\\n') if site.exists() and base.exists() else None")
             docker("create", "--name", name, "--label", "workbench=" + PREFIX,
@@ -427,7 +429,18 @@ def operation(key, action, payload):
         if not result.get('ready') and result.get('state') in {'provisioning', 'ready'}:
             # Probe the waiting owner now, after ensure releases its lock. Reuse
             # the bounded worker pool instead of waiting for the 10-second sweep.
-            HOSTS.maintain(key)
+            probes = HOSTS.maintain(key)
+            # A healthy probe normally finishes immediately. Return its verified
+            # transition in this response instead of imposing another UI retry.
+            # Slow bootstrap keeps running in the bounded pool without blocking
+            # this HTTP request for its full health-check timeout.
+            if probes and not wait(probes, timeout=0.25).not_done:
+                with HOSTS.lock(key):
+                    current = json.loads((HOSTS.root / key / 'host.json').read_text())
+                    fields = ('owner_id', 'generation', 'instance_id')
+                    if any(current.get(field) != result.get(field) for field in fields):
+                        raise ResourceUnavailable('个人工作环境正在恢复，请稍后重试', 'HOST_NOT_READY', 2)
+                    result = current
         return result
     if action == 'replace-host':
         return HOSTS.replace(key, payload)
