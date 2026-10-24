@@ -1,5 +1,6 @@
 import { Service } from '@deepseek-ai/cordis'
 import { createHash } from 'node:crypto'
+import { taskCapabilities } from './tasks.js'
 
 // This bridge exposes host-authorized metadata, never another Agent's scoped
 // ToolRuntime. The discovery plugin only controls presentation and activation.
@@ -35,6 +36,7 @@ export class ToolDiscoveryCatalog extends Service {
     const stamps = []
     const preferred = new Set(run?.selection?.resource_mentions?.plugins ?? [])
     const selectedTools = new Set(run?.selection?.resource_mentions?.tools ?? [])
+    const servers = new Map((runtime.mcpPlugins?.() ?? []).map(server => [server.id, server]))
     if (ready) {
       const providersWithTools = new Set([...this.registrations.values()].map(({ tool }) => `${tool.scope}:mcp:${tool.server_id}`))
       for (const plugin of runtime.mcpPlugins?.() ?? []) {
@@ -51,6 +53,10 @@ export class ToolDiscoveryCatalog extends Service {
     for (const { tool, definition } of this.registrations.values()) {
       if (!allowed.has(tool.public_name)) continue
       const pluginId = `${tool.scope}:mcp:${tool.server_id}`
+      const server = servers.get(pluginId)
+      const taskUnavailable = tool.execution?.taskSupport === 'required' && (!runtime.database
+        || server?.version !== tool.version || server?.manifest_version !== tool.manifest_version
+        || server?.available === false || taskCapabilities(server).generation === 'none')
       const order = plugins.get(pluginId)?.order_num ?? tool.order_num
       plugins.set(pluginId, {
         id: pluginId, name: tool.provider_call_name ?? tool.server_id,
@@ -65,8 +71,17 @@ export class ToolDiscoveryCatalog extends Service {
         version: tool.version, manifestVersion: tool.manifest_version,
         parameters: definition.parameters, inputSchema: tool.sourceInputSchema,
         outputSchema: tool.outputSchema, annotations: tool.annotations, execution: tool.execution,
-        ...(tool.execution?.taskSupport === 'required' ? { unavailableReason: 'task_execution_required' } : {}) })
-      stamps.push([tool.id, tool.discoveryStamp])
+        ...(taskUnavailable ? { unavailableReason: 'task_capability_unavailable' } : {}) })
+      stamps.push([tool.id, tool.discoveryStamp, taskUnavailable])
+    }
+    if (ready) for (const issue of runtime.mcpCatalogIssues?.() ?? []) {
+      const pluginId = `${issue.scope}:mcp:${issue.server_id}`
+      if (!plugins.has(pluginId)) continue
+      tools.push({ id: issue.id, name: `unavailable_${createHash('sha256').update(issue.id).digest('hex').slice(0, 24)}`,
+        rawName: issue.tool_name, pluginId, pluginCallName: plugins.get(pluginId).name,
+        description: issue.description, version: issue.version ?? '',
+        parameters: { type: 'object', properties: {} }, unavailableReason: issue.reason })
+      stamps.push([issue.id, issue.reason])
     }
     tools.sort((a, b) => a.id.localeCompare(b.id))
     const authorityKey = validRun ? `${runtime.ownerId}\0${run.id}` : ''

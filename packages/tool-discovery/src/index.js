@@ -10,12 +10,7 @@ export { MCP_NAME, TOOL_SEARCH_NAME } from './catalog.js'
 export const name = 'tool-discovery'
 export const inject = ['tools', 'systemPrompt', 'agents', 'sessionProjections', 'toolDiscoveryCatalog']
 export const Config = z.object({
-  pageSize: z.number().min(1).max(50).step(1).default(8),
-  maxActiveTools: z.number().min(1).max(256).step(1).default(64),
-  maxActiveDefinitionBytes: z.number().min(1024).step(1).default(131072),
-  maxToolDefinitionBytes: z.number().min(512).step(1).default(32768),
-  maxCatalogTools: z.number().min(1).step(1).default(10000),
-  maxIndexBytes: z.number().min(1024).step(1).default(16777216),
+  pageSize: z.number().min(1).step(1).default(8),
 })
 
 /** Register one native DSH discovery capability backed by an injected catalogue. */
@@ -71,7 +66,7 @@ export function apply(ctx, supplied = {}) {
       try { state.catalog = buildCatalog(snapshot, config); state.catalogKey = key }
       catch (error) {
         // Keep native conversation usable while every MCP tool remains hidden.
-        // Invalid or over-budget input is never published as a verified empty catalog.
+        // Invalid input is never published as a verified empty catalog.
         state.catalog = { authorityKey: typeof snapshot.authorityKey === 'string' && snapshot.authorityKey.length <= 4096 ? snapshot.authorityKey : null, revision: String(snapshot.revision ?? ''),
           ready: false, byId: new Map(), plugins: [],
           unavailableMessage: `插件目录暂不可用：${error.message}。可继续处理其他任务。` }
@@ -95,14 +90,10 @@ export function apply(ctx, supplied = {}) {
       // During HMR bootstrap the bridge still holds its missing-core mask.
       // Validate native policy only after that independent fallback is released.
       const admitted = visibleEntries(state, state.active)
-      const bounded = new Map()
-      for (const [id, entry] of admitted) {
-        if (!capacity(catalog, bounded, catalog.byId.get(id))) bounded.set(id, entry)
-      }
-      if (bounded.size !== state.active.size) {
+      if (admitted.size !== state.active.size) {
         state.deniedCount = state.active.size - admitted.size
-        state.active = bounded; state.unpersisted = true
-        installMask(state, prepareMask(state, bounded))
+        state.active = admitted; state.unpersisted = true
+        installMask(state, prepareMask(state, admitted))
       }
     }
     return state
@@ -138,21 +129,6 @@ export function apply(ctx, supplied = {}) {
     }
   }
 
-  function reserved(state) {
-    const entries = new Map(state.active)
-    for (const pending of state.pending.values()) for (const entry of pending.tools) entries.set(entry.id, entry)
-    return entries
-  }
-
-  function capacity(catalog, entries, tool) {
-    if (tool.unavailableReason) return tool.unavailableReason
-    if (entries.has(tool.id)) return undefined
-    if (tool.definitionBytes > config.maxToolDefinitionBytes) return 'definition_too_large'
-    if (entries.size >= config.maxActiveTools) return 'active_tool_limit'
-    const used = [...entries.values()].reduce((sum, item) => sum + (catalog.byId.get(item.id)?.definitionBytes ?? 0), 0)
-    return used + tool.definitionBytes > config.maxActiveDefinitionBytes ? 'active_definition_budget' : undefined
-  }
-
   function executionContext(exec) {
     exec.signal.throwIfAborted()
     if (!exec.agent) throw new Error('工具发现需要有效的智能体会话')
@@ -178,14 +154,14 @@ export function apply(ctx, supplied = {}) {
   function prepareTools(state, exec, tools, replace = false) {
     if (state.pending.size && (replace || [...state.pending.values()].some(item => item.replace)))
       throw new Error('replace_active 必须独占本步骤的工具发现；请在下一步单独调用。')
-    const catalog = state.catalog, reservations = replace ? new Map() : reserved(state), prepared = []
+    const catalog = state.catalog, prepared = []
     const items = tools.map(tool => {
       const active = !replace && state.active.has(tool.id)
-      const reason = tool.unavailableReason ?? (!active ? capacity(catalog, reservations, tool) : undefined)
+      const reason = tool.unavailableReason
       const status = reason ? 'unavailable' : active ? 'active' : 'prepared'
       if (status === 'prepared') {
         const entry = activationEntry(tool)
-        prepared.push(entry); reservations.set(entry.id, entry)
+        prepared.push(entry)
       }
       return resultRow(tool, status, reason)
     })
@@ -230,7 +206,7 @@ export function apply(ctx, supplied = {}) {
   function executeSearch(args, exec) {
     const state = executionContext(exec), catalog = state.catalog
     const query = typeof args.query === 'string' ? args.query.trim() : ''
-    if (!query || query.length > 512) throw new Error('请提供 1 至 512 字符的查找关键词')
+    if (!query) throw new Error('请提供查找关键词')
     if (!catalog.ready || !catalog.authorityKey) return unavailable(catalog)
     const plugin = args.name === undefined ? undefined : findPlugin(catalog, args.name)
     if (args.name !== undefined && !plugin) return { status: 'not_found', items: [], message: '指定插件未找到或当前不可用，可通过 mcp({}) 查看插件目录。' }
@@ -238,15 +214,19 @@ export function apply(ctx, supplied = {}) {
     const matches = search(catalog, query, plugin?.id)
     if (!matches.length) return { status: 'no_match', items: [], message: '未找到匹配工具。搜索未命中不代表工具不存在；可用 mcp 查看插件的完整工具目录，再按准确名称加载。' }
     const limit = args.limit ?? config.pageSize
-    if (!Number.isInteger(limit) || limit < 1 || limit > 50) throw new Error('limit 必须是 1 至 50 的整数')
+    if (!Number.isSafeInteger(limit) || limit < 1) throw new Error('limit 必须为正整数')
     return { ...loadingResult(prepareTools(state, exec, matches.slice(0, limit), args.replace_active === true)), total: matches.length }
   }
 
-  const replacementParameter = { type: 'boolean', description: '加载预算不足时设为 true，用本次成功加载的工具替换已加载集合；须在本步骤单独调用。' }
+  const replacementParameter = { type: 'boolean', description: '设为 true，用本次成功加载的工具替换已加载集合；须在本步骤单独调用。' }
   const output = kind => ({
     schema: { type: 'object', additionalProperties: true },
-    render: (_args, value) => [{ type: 'text', text: JSON.stringify({ ...value,
-      items: kind === 'mcp' ? value.items : value.items.map(({ definition: _definition, ...item }) => item) }) }],
+    render: (_args, value) => {
+      const { items, ...metadata } = value
+      const visible = kind === 'mcp' ? items : items.map(({ definition: _definition, ...item }) => item)
+      // Native spill/read can navigate entries by line; the programmatic value is unchanged.
+      return [{ type: 'text', text: JSON.stringify({ ...metadata, items: visible }, null, 2) }]
+    },
     presentationMeta: (_args, value) => ({ tool_discovery: { kind, status: value.status, matched: value.items.length,
       prepared: value.items.filter(item => item.status === 'prepared').length,
       definitions: value.items.filter(item => item.definition).map(item => ({ name: item.name, plugin: item.plugin, definition: item.definition })),
@@ -258,7 +238,7 @@ export function apply(ctx, supplied = {}) {
     parameters: { type: 'object', properties: {
       query: { type: 'string', description: '任务用途、能力关键词或准确工具名' },
       name: { type: 'string', description: '可选：插件的唯一英文 name' },
-      limit: { type: 'integer', minimum: 1, maximum: 50, description: '最多加载的搜索结果数量，默认 8；需要完整目录时使用 mcp' },
+      limit: { type: 'integer', minimum: 1, description: '最多加载的搜索结果数量，默认 8；需要完整目录时使用 mcp' },
       replace_active: replacementParameter,
     }, required: ['query'], additionalProperties: false },
     isConcurrencySafe: () => false, output: output('search'), execute: executeSearch,
@@ -296,12 +276,12 @@ export function apply(ctx, supplied = {}) {
       if (candidate.replace) next = new Map()
       for (const entry of candidate.tools) {
         const current = catalog.byId.get(entry.id)
-        if (matchesEntry(current, entry) && !capacity(catalog, next, current)) next.set(entry.id, entry)
+        if (matchesEntry(current, entry) && !current.unavailableReason) next.set(entry.id, entry)
       }
     }
     if (JSON.stringify([...next]) === JSON.stringify([...state.active])) return
     // Native scope policy remains authoritative after our discovery mask lifts.
-    // A denied candidate must not consume active budget or survive in hints.
+    // A denied candidate must not survive in the active set or hints.
     installMask(state, prepareMask(state, next))
     const admitted = visibleEntries(state, next)
     state.deniedCount = next.size - admitted.size

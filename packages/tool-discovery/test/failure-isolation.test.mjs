@@ -6,10 +6,10 @@ import { ACTIVE_EVENT, PROJECTION_KEY } from '../src/projection.js'
 const cleanups = []
 afterEach(async () => { for (const cleanup of cleanups.splice(0)) await cleanup() })
 
-for (const mode of ['native', 'ptc']) for (const budget of ['count', 'bytes']) {
-  test(`${mode}: ${budget} catalog overflow leaves ordinary tools usable and can recover`, async () => {
+for (const mode of ['native', 'ptc']) {
+  test(`${mode}: invalid catalog leaves ordinary tools usable and can recover`, async () => {
     const rows = Array.from({ length: 6 }, (_, i) => row(`id-${i}`, `lookup_${i}`, 'global', '案件记录'.repeat(30)))
-    const h = await mount({ mode, rows, config: budget === 'count' ? { maxCatalogTools: 2 } : { maxIndexBytes: 1024 },
+    const h = await mount({ mode, rows,
       script: [call('native_status', {}, mode), call('tool_search', { query: 'lookup_0' }, mode), response(),
         call('tool_search', { query: 'lookup_0' }, mode), call('lookup_0', {}, mode), response()],
     })
@@ -19,6 +19,7 @@ for (const mode of ['native', 'ptc']) for (const budget of ['count', 'bytes']) {
       output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },
       execute: async () => { builtinCalls.push('ok'); return 'ok' },
     })
+    h.bridge.rows = [rows[0], rows[0]]
     const agent = await h.create()
     await h.send(agent, 'Ordinary conversation can continue')
     assert.deepEqual(builtinCalls, ['ok'])
@@ -47,9 +48,9 @@ test('a missing discovery allowlist entry leaves an empty catalog without policy
   assert.doesNotMatch(JSON.stringify(h.adapter.requests[0].messages), /需要插件能力时先调用/)
 })
 
-for (const mode of ['native', 'ptc']) test(`${mode}: independently denied candidates do not persist or consume activation budget`, async () => {
+for (const mode of ['native', 'ptc']) test(`${mode}: independently denied candidates do not persist or block authorized tools`, async () => {
   const rows = [row('denied', 'lookup_denied'), row('allowed', 'lookup_allowed')]
-  const h = await mount({ rows, mode, config: { maxActiveTools: 1 }, script: [
+  const h = await mount({ rows, mode, script: [
     call('tool_search', { query: 'lookup_denied' }, mode),
     call('tool_search', { query: 'lookup_allowed' }, mode), call('lookup_allowed', {}, mode), response(),
   ] }); cleanups.push(() => h.close())

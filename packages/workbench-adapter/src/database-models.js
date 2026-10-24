@@ -50,23 +50,34 @@ export async function databaseModelCatalog(platformClient, sessions, owner, sett
   const payload = await platformClient.json({ owner, method: 'GET', route: 'workbench/config', timeoutMs: 5000 })
   const config = payload?.data
   if (!config?.enabled || !config.models || typeof config.models.providers !== 'object' || !config.models.providers)
-    throw httpError(503, '后台尚未发布模型配置')
+    throw httpError(503, '后台尚未发布模型配置', 'INVALID_CONFIGURATION')
   if (typeof config.models.default !== 'string' || config.models.default.indexOf('/') <= 0)
-    throw httpError(503, '后台默认模型配置无效')
+    throw httpError(503, '后台默认模型配置无效', 'INVALID_CONFIGURATION')
+  for (const provider of Object.values(config.models.providers)) {
+    if (!provider || typeof provider !== 'object')
+      throw httpError(503, '后台模型配置格式无效', 'INVALID_CONFIGURATION')
+    if (provider.enabled === false) continue
+    if (!Array.isArray(provider.models))
+      throw httpError(503, '后台模型配置格式无效', 'INVALID_CONFIGURATION')
+    for (const model of provider.models) {
+      if (!model || typeof model !== 'object')
+        throw httpError(503, '后台模型配置格式无效', 'INVALID_CONFIGURATION')
+      if (model.enabled === false) continue
+      if (typeof model.id !== 'string' || !model.id || typeof model.name !== 'string' || !model.name.trim())
+        throw httpError(503, '后台模型配置格式无效', 'INVALID_CONFIGURATION')
+    }
+  }
   const declaredDefault = Object.entries(config.models.providers).some(([id, provider]) =>
     provider?.enabled !== false && Array.isArray(provider?.models) && provider.models.some((model) =>
       model?.enabled !== false && `${id}/${model?.id}` === config.models.default))
-  if (!declaredDefault) throw httpError(503, '后台默认模型未启用')
+  if (!declaredDefault) throw httpError(503, '后台默认模型未启用', 'INVALID_CONFIGURATION')
   await synchronize(settings, config.models)
   const native = await nativeCatalog(sessions, settings, config.models)
   const groups = []
   for (const [id, provider] of Object.entries(config.models.providers)) {
-    if (!provider || provider.enabled === false) continue
-    if (!Array.isArray(provider.models)) throw httpError(503, '后台模型配置格式无效')
+    if (provider.enabled === false) continue
     const routes = native.groups?.find((group) => group.id === id)?.models ?? []
     const models = provider.models.filter((model) => model.enabled !== false).flatMap((model) => {
-      if (typeof model.id !== 'string' || !model.id || typeof model.name !== 'string' || !model.name.trim())
-        throw httpError(503, '后台模型配置格式无效')
       const route = routes.find((route) => route.id === model.id)
       return route ? [{ ...route, name: model.name, description: model.description || '' }] : []
     })

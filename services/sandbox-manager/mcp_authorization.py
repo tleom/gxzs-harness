@@ -14,6 +14,12 @@ def same_json(left, right):
 
 
 def validate_grant(key, payload, resource_id):
+    if payload.get('operation') == 'mcp_request' and not same_json(
+            payload.get('arguments'), {'method': payload.get('method'), 'params': payload.get('params', {})}):
+        raise ValueError('MCP request does not match its signed parameters')
+    if payload.get('operation') == 'mcp_task' and not same_json(payload.get('arguments'),
+            {'method': payload.get('method'), 'params': payload.get('params', {}), 'connection_id': payload.get('connection_id', '')}):
+        raise ValueError('MCP task does not match its signed parameters')
     grant = payload.get('authorization') or {}
     binding = str(UUID(grant.get('binding_id', '')))
     if (grant.get('workspace_id') != key or grant.get('run_id') != binding

@@ -1,3 +1,4 @@
+import { runMcpResources } from './mcp-catalog.js'
 import { Service } from '@deepseek-ai/cordis'
 import { nativeTurn } from './native-turn.js'
 
@@ -150,7 +151,7 @@ export class WorkbenchRuntime extends Service {
     const run = this.executionRun(sessionId)
     if (!run || run.status !== 'running' || run.ownerId !== this.ownerId || run.stopConfirmation?.fenced) return undefined
     if (this.scheduler && !this.scheduler.hasAdmission(run.sessionId)) return undefined
-    const resource = (run.mcpTools ?? []).find((item) => item.id === resourceId && item.version === version)
+    const resource = runMcpResources(run).find((item) => item.id === resourceId && item.version === version)
     return resource ? { runId: run.id, ownerId: run.ownerId, resource } : undefined
   }
 
@@ -163,7 +164,7 @@ export class WorkbenchRuntime extends Service {
     if (!run || run.ownerId !== this.ownerId || run.stopConfirmation?.fenced
       || !['running', 'queued'].includes(run.status)
       || (run.status === 'queued' && !this.database.submission(this.ownerId, run.id)?.dispatched)
-      || !(run.mcpTools ?? []).some(item => item.id === resourceId && item.version === version)) return undefined
+      || !runMcpResources(run).some(item => item.id === resourceId && item.version === version)) return undefined
     if (this.scheduler && !this.scheduler.hasAdmission(run.sessionId))
       await this.scheduler.admitRun(run, signal, () => true)
     signal.throwIfAborted()
@@ -179,7 +180,7 @@ export class WorkbenchRuntime extends Service {
     if (!run || run.stopConfirmation?.fenced) return false
     if ((['completed', 'waiting_input'].includes(run.status) || (run.status === 'running' && run.selection?.native_child)) && this.hasOwnedWork(run.sessionId, run.id)) {
       return (!this.scheduler || this.scheduler.hasAdmission(run.sessionId))
-        && run.mcpTools.some(resource => resource.id === resourceId && resource.version === version)
+        && runMcpResources(run).some(resource => resource.id === resourceId && resource.version === version)
     }
     return this.authorizeMcp(run.sessionId, resourceId, version)?.runId === runId
   }

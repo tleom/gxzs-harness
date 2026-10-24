@@ -41,6 +41,8 @@ it('settles two original queued Schedule turns without leaving the second receip
   const test = await fixture(['first reminder complete', 'second reminder complete'], { scheduledClaims: true })
   test.runtime.mcpCatalogState = { ready: true }
   test.runtime.mcpResources = () => []
+  const resourceServer = { id: 'global:mcp:records', version: '1', manifest_version: 'm', capabilities: { resources: {} } }
+  test.runtime.mcpPlugins = () => [resourceServer]
   test.scheduler.start()
   const first = createUserMessage({ source: { kind: 'schedule' }, content: [{ type: 'text', text: 'first scheduled reminder' }] })
   const second = createUserMessage({ source: { kind: 'schedule' }, content: [{ type: 'text', text: 'second scheduled reminder' }] })
@@ -51,6 +53,8 @@ it('settles two original queued Schedule turns without leaving the second receip
   expect(test.agent.session.snapshotEvents().filter(event => event.type === 'turn/end').map(event => event.data.reason.kind)).toEqual(['completed', 'completed'])
   expect(test.db.getRun(test.owner.ownerId, first.id)).toMatchObject({ status: 'completed' })
   expect(test.db.getRun(test.owner.ownerId, second.id)).toMatchObject({ status: 'completed' })
+  expect(test.db.getRun(test.owner.ownerId, first.id).selection.mcp_servers).toEqual([resourceServer])
+  expect(test.db.getRun(test.owner.ownerId, second.id).selection.mcp_servers).toEqual([resourceServer])
 })
 
 it('admits an owned child notice as a fresh turn with current permissions after the parent completed', async () => {
@@ -177,6 +181,8 @@ it('waits for the current MCP catalog before a native job wake freezes its scope
   const test = await fixture(['collected'], { scheduledClaims: true })
   test.runtime.mcpCatalogState = { ready: false }
   test.runtime.mcpResources = () => test.runtime.mcpCatalogState.ready ? [{ id: 'current-catalog' }] : []
+  const resourceServer = { id: 'personal:mcp:resources', version: '2', manifest_version: 'current', capabilities: { resources: {} } }
+  test.runtime.mcpPlugins = () => test.runtime.mcpCatalogState.ready ? [resourceServer] : []
   const message = createUserMessage({ content: [{ type: 'text', text: 'Background output is ready' }],
     source: { kind: 'tool-jobs', form: 'notice', summary: 'Background job completed' } })
   test.agent.followup(message)
@@ -187,6 +193,7 @@ it('waits for the current MCP catalog before a native job wake freezes its scope
   await test.agent.whenIdle()
   expect(test.model.requests).toHaveLength(1)
   expect(test.db.getRun(test.owner.ownerId, message.id).mcpTools).toEqual([{ id: 'current-catalog' }])
+  expect(test.db.getRun(test.owner.ownerId, message.id).selection.mcp_servers).toEqual([resourceServer])
 })
 
 class FakeModel extends LlmAdapter {
@@ -316,7 +323,7 @@ async function fixture(script, { scheduledClaims = false } = {}) {
   ctx.on('session/event', (session, event) => projectSessionEvent(db, session.id, event, owner.ownerId,
     { goal: ctx.goals.get(agent), nativeIdle: agent.status === 'idle',
       ...(scheduledClaims ? { mcpCatalogReady: runtime.mcpCatalogState?.ready === true,
-        mcpTools: runtime.mcpResources?.() ?? [] } : {}) }))
+        mcpTools: runtime.mcpResources?.() ?? [], mcpServers: runtime.mcpPlugins?.() ?? [] } : {}) }))
   ctx.on('agent/status', ({ agent: current, status }) => {
     if (status === 'idle') settleNativeIdle(db, current.id, ctx.goals.get(current))
   })

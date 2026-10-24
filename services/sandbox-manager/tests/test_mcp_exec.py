@@ -14,6 +14,75 @@ BASE = Path(__file__).resolve().parents[1]
 
 @unittest.skipUnless(sys.platform == 'linux', 'Linux process groups required')
 class SupervisorTests(unittest.TestCase):
+    def test_reaping_adopted_children_preserves_the_main_worker_exit_status(self):
+        from mcp_exec import reap_exited
+        process = subprocess.Popen([sys.executable, '-I', '-c', 'raise SystemExit(7)'])
+        try:
+            deadline = time.monotonic()+3
+            while process.returncode is None and time.monotonic()<deadline:
+                reap_exited(process)
+                time.sleep(.01)
+            self.assertEqual(process.returncode, 7)
+            self.assertEqual(process.wait(timeout=1), 7)
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=3)
+
+    def test_live_supervisor_reaps_adopted_children_without_ending_the_worker(self):
+        source = '''import os,json,time
+for _ in range(12):
+ child=os.fork()
+ if child==0:
+  if os.fork()==0:os._exit(0)
+  os._exit(0)
+ os.waitpid(child,0)
+print(json.dumps({'ready':True}),flush=True)
+time.sleep(30)
+'''
+        process = self.start(source)
+        try:
+            self.assertTrue(json.loads(process.stdout.readline())['ready'])
+            deadline = time.monotonic()+2
+            while True:
+                zombies = []
+                for entry in Path('/proc').iterdir():
+                    if not entry.name.isdecimal():
+                        continue
+                    try:
+                        fields = (entry/'stat').read_text().rsplit(')',1)[1].split()
+                        if fields[0] == 'Z' and int(fields[1]) == process.pid:
+                            zombies.append(entry.name)
+                    except (OSError, ValueError):
+                        pass
+                if not zombies or time.monotonic() >= deadline:
+                    break
+                time.sleep(.02)
+            self.assertEqual(zombies, [])
+            self.assertIsNone(process.poll())
+        finally:
+            process.stdin.close()
+            process.wait(timeout=5)
+            process.stdout.close()
+
+    def test_large_bundled_source_uses_the_existing_supervisor_without_argv_overflow(self):
+        from mcp_exec import command_source
+        from mcp_policy import current
+        source = '# bundled module\n' * 20000 + 'print("ready", flush=True)'
+        supervisor = (BASE / 'mcp_exec.py').read_text()
+        process = subprocess.Popen([sys.executable, '-I', '-u', '-c',
+            command_source(supervisor + '\nsupervise(' + repr(source) + ',[],limits=' + repr(current()) + ')')],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        try:
+            self.assertEqual(process.stdout.readline(), b'ready\n')
+            process.wait(timeout=5)
+            self.assertTrue(json.loads(process.stdout.readline())['worker_group_fenced'])
+            self.assertEqual(process.returncode, 0)
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.communicate(timeout=3)
+
     def start(self, source):
         supervisor = (BASE / 'mcp_exec.py').read_text()
         return subprocess.Popen([sys.executable, '-u', '-c', supervisor + '\nsupervise(' + repr(source) + ',[])'],

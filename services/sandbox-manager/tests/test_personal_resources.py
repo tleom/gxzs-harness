@@ -64,6 +64,72 @@ def test_skill_inspect_rejects_unsafe_archive_without_writing(resources, tmp_pat
     assert not (tmp_path / "skills").exists()
 
 
+@pytest.mark.parametrize("archive", [False, True])
+def test_skill_package_with_many_assets_can_be_imported(resources, tmp_path, archive):
+    entries = {"SKILL.md": b"---\nname: report\ndescription: Reports\n---\nUse the assets."}
+    entries.update({f"references/item-{index}.txt": str(index).encode()
+                    for index in range(13025 if archive else 250)})
+    if archive:
+        stream = io.BytesIO()
+        with zipfile.ZipFile(stream, "w", compression=zipfile.ZIP_DEFLATED) as bundle:
+            for path, data in entries.items():
+                bundle.writestr(path, data)
+        payload = {"archive": base64.b64encode(stream.getvalue()).decode()}
+    else:
+        payload = {"files": [{"path": path, "data": base64.b64encode(data).decode()}
+                             for path, data in entries.items()]}
+    inspected = resources.personal({"operation": "skill_inspect", **payload}, str(tmp_path))
+    assert inspected["content"] == entries["SKILL.md"].decode()
+    result = resources.personal({"operation": "skill_import", "name": "report", **payload}, str(tmp_path))
+    assert result["version"]
+    assert {path.relative_to(tmp_path / "skills/report").as_posix(): path.read_bytes()
+            for path in (tmp_path / "skills/report").rglob("*") if path.is_file()} == entries
+    assert resources.personal({"operation": "list"}, str(tmp_path))["skills"][0]["id"] == "report"
+
+
+def test_skill_archive_can_expand_past_200_mib(resources, tmp_path):
+    source = b"---\nname: report\ndescription: Reports\n---\nUse the assets."
+    stream = io.BytesIO()
+    chunk = b"x" * (1024 * 1024)
+    with zipfile.ZipFile(stream, "w", compression=zipfile.ZIP_DEFLATED) as bundle:
+        bundle.writestr("SKILL.md", source)
+        with bundle.open("asset.bin", "w") as asset:
+            for _ in range(201):
+                asset.write(chunk)
+    payload = {"archive": base64.b64encode(stream.getvalue()).decode()}
+    with resources.members(payload) as files:
+        assert files["asset.bin"].size == 201 * 1024 * 1024
+    imported = resources.personal({"operation": "skill_import", "name": "report", **payload}, str(tmp_path))
+    assert imported["version"]
+    assert (tmp_path / "skills/report/asset.bin").stat().st_size == 201 * 1024 * 1024
+
+
+def test_large_skill_directory_supports_listing_and_mutations(resources, tmp_path):
+    source = "---\nname: report\ndescription: Reports\n---\nUse the assets."
+    root = tmp_path / "skills/report"
+    assets = root / "references/icons"
+    assets.mkdir(parents=True)
+    (root / "SKILL.md").write_text(source, encoding="utf-8")
+    for index in range(13025):
+        (assets / f"icon-{index}.svg").write_text(f"<svg>{index}</svg>")
+    listed = resources.personal({"operation": "list"}, str(tmp_path))
+    assert not listed["warnings"]
+    assert listed["skills"][0]["id"] == "report"
+    first = listed["skills"][0]["version"]
+    renamed = resources.personal({"operation": "skill_update", "name": "report", "new_name": "slides",
+                                  "version": first, "content": source.replace("name: report", "name: slides")}, str(tmp_path))
+    assert renamed["version"] != first
+    assert (tmp_path / "skills/slides/references/icons/icon-13024.svg").read_text() == "<svg>13024</svg>"
+    replacement = resources.personal({"operation": "skill_import", "name": "slides", "version": renamed["version"],
+                                      **package(source.replace("name: report", "name: slides"))}, str(tmp_path))
+    assert replacement["version"]
+    assert not (tmp_path / "skills/slides/references").exists()
+    removed = resources.personal({"operation": "skill_uninstall", "name": "slides",
+                                  "version": replacement["version"]}, str(tmp_path))
+    assert removed["uninstalled"]
+    assert resources.personal({"operation": "list"}, str(tmp_path))["skills"] == []
+
+
 def test_import_toggle_replace_and_recoverable_backup(resources, tmp_path):
     first = resources.personal({"operation": "skill_import", "name": "report", **package()}, str(tmp_path))
     resources.personal({"operation": "skill_toggle", "name": "report", "enabled": False}, str(tmp_path))
@@ -98,7 +164,8 @@ def test_archive_path_traversal_rejected_before_write(resources, bad):
         archive.writestr("SKILL.md", "skill")
         archive.writestr(bad, "bad")
     with pytest.raises(ValueError):
-        resources.members({"archive": base64.b64encode(stream.getvalue()).decode()})
+        with resources.members({"archive": base64.b64encode(stream.getvalue()).decode()}):
+            pass
 
 
 def test_zip_symlinks_and_live_symlinks_do_not_escape(resources, tmp_path):
@@ -108,7 +175,8 @@ def test_zip_symlinks_and_live_symlinks_do_not_escape(resources, tmp_path):
         info.external_attr = (stat.S_IFLNK | 0o777) << 16
         archive.writestr(info, "/etc/passwd")
     with pytest.raises(ValueError):
-        resources.members({"archive": base64.b64encode(stream.getvalue()).decode()})
+        with resources.members({"archive": base64.b64encode(stream.getvalue()).decode()}):
+            pass
     (tmp_path / "memory.md").symlink_to("/etc/passwd")
     listing = resources.personal({"operation": "list"}, str(tmp_path))
     assert "memory" not in listing

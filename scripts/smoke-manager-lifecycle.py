@@ -47,11 +47,15 @@ def docker(*args, stdin=None, check=True):
 
 
 REQUEST = '''
-import json, os, sys, urllib.request, urllib.error
+import base64, json, os, sys, urllib.request, urllib.error
 value=json.load(sys.stdin)
 data=json.dumps(value['body']).encode() if 'body' in value else None
+binary=value.get('binary')
+if binary is not None:
+ data=json.dumps(binary).encode()+b'\\n'+base64.b64decode(value['data'])
 request=urllib.request.Request('http://127.0.0.1:5010'+value['path'], data=data,
- headers={'Authorization':'Bearer '+os.environ['WORKBENCH_SANDBOX_MANAGER_TOKEN'], 'Content-Type':'application/json'})
+ headers={'Authorization':'Bearer '+os.environ['WORKBENCH_SANDBOX_MANAGER_TOKEN'],
+          'Content-Type':'application/octet-stream' if binary is not None else 'application/json'})
 try:
  response=urllib.request.urlopen(request, timeout=100)
 except urllib.error.HTTPError as error:
@@ -156,7 +160,8 @@ try:
     # Exercise Node's actual streaming manager client, not a JSON/base64 test double.
     def streaming_probe(phase):
         script = str(Path(__file__).with_name('smoke-streaming-files.mjs').resolve())
-        output = docker('run', '--rm', '--network', 'container:' + manager, '--memory', '512m', '--cpus', '1',
+        output = docker('run', '--rm', '--network', 'container:' + manager, '--memory',
+                        '1g' if phase == 'legacy-skill-json' else '512m', '--cpus', '1',
                         '--entrypoint', 'node', '-v', script + ':/smoke-streaming-files.mjs:ro',
                         '-e', 'TEST_MANAGER_TOKEN=' + token, '-e', 'GXZS_HOST_OWNER_ID=fixture:1',
                         '-e', 'GXZS_HOST_GENERATION=1', '-e', 'GXZS_HOST_INSTANCE_ID=streaming-fixture',
@@ -167,6 +172,22 @@ try:
         print(output.stdout.strip(), flush=True)
     streaming_probe('file')
     sandbox = prefix + '-' + workspaces[0]
+    docker('exec', '--user', '1000', sandbox, '/usr/local/bin/python', '-I', '-S', '-c', """
+import os, zipfile
+path='/workspace/probe/legacy-skill-json.zip'
+skill='---\\nname: legacy-json-large\\ndescription: Legacy JSON boundary fixture\\n---\\nBody'
+def write(size):
+ with zipfile.ZipFile(path,'w',compression=zipfile.ZIP_STORED) as archive:
+  archive.writestr('SKILL.md',skill)
+  with archive.open('asset.bin','w') as asset:
+   while size:
+    chunk=b'z'*min(size,1024*1024)
+    asset.write(chunk);size-=len(chunk)
+write(0)
+write(100*1024*1024-os.stat(path).st_size)
+assert os.stat(path).st_size==100*1024*1024
+""")
+    streaming_probe('legacy-skill-json')
     mixed_before = json.loads(docker('inspect', sandbox).stdout)[0]
     streaming_probe('mixed')
     streaming_probe('mixed-boundary')
@@ -174,6 +195,77 @@ try:
     assert mixed_after['State']['Running'] and not mixed_after['State']['OOMKilled']
     assert mixed_after['Id'] == mixed_before['Id'] and mixed_after['State']['StartedAt'] == mixed_before['State']['StartedAt']
     print('PASS mixed attachment operations: sandbox stayed running without recreation or OOM', flush=True)
+    docker('exec', '--user', '1000', sandbox, '/usr/local/bin/python', '-I', '-S', '-c', """
+import zipfile
+with zipfile.ZipFile('/workspace/probe/skill-package.zip', 'w', compression=zipfile.ZIP_DEFLATED) as archive:
+    archive.writestr('SKILL.md', '---\\nname: streamed-package\\ndescription: Streaming fixture\\n---\\nBody')
+    with archive.open('asset.bin', 'w') as asset:
+        chunk = b'x' * (1024 * 1024)
+        for _ in range(256): asset.write(chunk)
+    for index in range(256):
+        archive.writestr('extra/' + str(index), b'x' * 65536)
+""")
+    memory = mixed_after['HostConfig']['Memory']
+    memory_swap = mixed_after['HostConfig']['MemorySwap']
+    docker('update', '--memory', '128m', '--memory-swap', '128m', sandbox)
+    try:
+        streaming_probe('skill-package')
+        assert not json.loads(docker('inspect', sandbox).stdout)[0]['State']['OOMKilled']
+    finally:
+        docker('update', '--memory', str(memory), '--memory-swap', str(memory_swap), sandbox)
+    # Freeze a real importer during extraction, then restart only its manager.
+    # MCP supervision must stop the sandbox child; the durable journal then
+    # resolves the result without replaying the import or losing the old skill.
+    import_id = uuid.uuid4().hex
+    resources_path = '/sandboxes/' + workspaces[0] + '/personal-resources'
+    old_content = '---\nname: streamed-package\ndescription: Old fixture\n---\nOld package'
+    import base64
+    old = request(resources_path, {'operation': 'skill_import', 'name': 'streamed-package', 'version': None,
+        'files': [{'path': 'SKILL.md', 'data': base64.b64encode(old_content.encode()).decode()}]})
+    assert old['status'] == 200, old
+    archived = files(workspaces[0], 'get', path='probe/skill-package.zip')['data']
+    staged = json.loads(docker('exec', '-i', manager, 'python', '-c', REQUEST, stdin=json.dumps({
+        'path': resources_path, 'binary': {'operation': 'skill_stage', 'import_id': import_id,
+        'archive': True, 'files': [{'path': 'skill.zip', 'size': len(base64.b64decode(archived))}]},
+        'data': archived})).stdout)
+    assert staged['status'] == 200, staged
+    assert request(resources_path, {'operation': 'skill_prepare', 'import_id': import_id, 'name': 'streamed-package'})['status'] == 200
+    running = request(resources_path, {'operation': 'skill_import', 'import_id': import_id,
+                                     'name': 'streamed-package', 'version': old['body']['version']})
+    assert running['status'] == 200 and running['body']['status'] == 'running', running
+    pause = '''
+import json, os, signal, sys, time
+from pathlib import Path
+token=sys.argv[1]
+path=Path('/workspace/.skill-imports')/token/'state.json'
+deadline=time.monotonic()+10
+while time.monotonic()<deadline:
+ state=json.loads(path.read_text())
+ if state.get('phase')=='extracting':
+  for entry in Path('/proc').iterdir():
+   if not entry.name.isdecimal(): continue
+   try: command=(entry/'cmdline').read_bytes().split(b'\\0')
+   except (FileNotFoundError,ProcessLookupError): continue
+   if command[-3:-1]==[token.encode(),b'skill-import']:
+    os.kill(int(entry.name),signal.SIGSTOP)
+    print('paused');sys.exit(0)
+ time.sleep(.005)
+raise RuntimeError('Importer extraction was not captured')
+'''
+    assert docker('exec', '--user', '1000', sandbox, '/usr/local/bin/python', '-I', '-S', '-c', pause, import_id).stdout.strip() == 'paused'
+    docker('restart', manager)
+    healthy()
+    for _ in range(30):
+        recovered = request(resources_path, {'operation': 'skill_import_status', 'import_id': import_id})
+        if recovered['body'].get('status') != 'running':
+            break
+        time.sleep(.1)
+    assert recovered['status'] == 200 and recovered['body']['status'] == 'failed', recovered
+    snapshot = request(resources_path, {'operation': 'list'})
+    current = next(skill for skill in snapshot['body']['skills'] if skill['id'] == 'streamed-package')
+    assert current['version'] == old['body']['version'] and current['content'] == old_content
+    assert request(resources_path, {'operation': 'skill_uninstall', 'name': 'streamed-package', 'version': current['version']})['status'] == 200
+    print('PASS import manager restart: real paused child fenced, interrupted import settled, old package preserved', flush=True)
     prepare_directory = """
 from pathlib import Path
 import os
@@ -188,27 +280,13 @@ for index in range(10005): (root/('empty-'+str(index))).touch()
     docker('exec', '--user', '1000', sandbox, '/usr/local/bin/python', '-I', '-S', '-c',
            "from pathlib import Path;Path('/workspace/probe/stream-dir/extra').write_bytes(b'x')")
     streaming_probe('oversize-directory')
-    metadata_limit = request('/sandboxes/' + workspaces[0] + '/files',
-                             {'operation': 'stat', 'path': 'probe/stream-dir'})
-    assert metadata_limit['status'] == 400 and metadata_limit['body']['error'] == 'Folder contains too many entries', metadata_limit
-    # Streaming download has no entry-count cap; ordinary metadata deliberately
-    # retains its existing budget. Restore this synthetic fixture to that budget
-    # before exercising the unrelated versioned-delete lifecycle below.
-    docker('exec', '--user', '1000', sandbox, '/usr/local/bin/python', '-I', '-S', '-c', """
-from pathlib import Path
-import stat
-root=Path('/workspace/probe/stream-dir')
-assert root.resolve() == root and root.is_dir()
-for index in range(10005):
-    child=root/('empty-'+str(index))
-    info=child.lstat()
-    assert stat.S_ISREG(info.st_mode) and info.st_size == 0
-    child.unlink()
-assert len(list(root.iterdir())) == 12
-""")
-    print('PASS directory metadata: oversized entry count rejected; bounded fixture restored for versioned deletion', flush=True)
     folder = files(workspaces[0], 'stat', path='probe/stream-dir')
+    assert folder['kind'] == 'directory' and folder['downloadable'] is False, folder
+    manifest = files(workspaces[0], 'manifest', path='.')
+    directory_files = [item for item in manifest['files'] if item['path'].startswith('probe/stream-dir/')]
+    assert len(directory_files) == 10017 and all(len(item['sha256']) == 64 for item in directory_files)
     files(workspaces[0], 'delete', path='probe/stream-dir', version=folder['version'])
+    print('PASS large directory: complete metadata and migration manifest, size-bounded download, versioned deletion', flush=True)
     large = files(workspaces[0], 'stat', path='probe/large.bin')
     files(workspaces[0], 'delete', path='probe/large.bin', version=large['version'])
     sandbox = prefix + '-' + workspaces[0]

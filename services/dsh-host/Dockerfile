@@ -34,10 +34,12 @@ COPY scripts/native-settings-controllers.mjs /opt/workbench/scripts/native-setti
 COPY scripts/migrate-platform-patch.mjs /opt/workbench/scripts/migrate-platform-patch.mjs
 COPY scripts/prepare-sidebar-terminal.mjs /opt/workbench/scripts/prepare-sidebar-terminal.mjs
 COPY scripts/check-runtime-imports.mjs ./check-runtime-imports.mjs
+COPY scripts/patch-dsh-mcp-tasks.mjs /opt/workbench/scripts/patch-dsh-mcp-tasks.mjs
 COPY scripts/patch-dsh-skill-catalog.mjs /opt/workbench/scripts/patch-dsh-skill-catalog.mjs
 COPY scripts/check-dsh-skill-catalog.mjs /opt/workbench/scripts/check-dsh-skill-catalog.mjs
 RUN ln -s profiles/workbench/node_modules /opt/workbench/node_modules \
     && cd profiles/workbench && npm ci --no-audit --no-fund \
+    && node /opt/workbench/scripts/patch-dsh-mcp-tasks.mjs \
     && node /opt/workbench/scripts/patch-dsh-skill-catalog.mjs \
     && node /opt/workbench/scripts/prepare-sidebar-terminal.mjs \
     && node /opt/workbench/scripts/check-dsh-skill-catalog.mjs \

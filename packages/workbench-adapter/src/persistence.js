@@ -406,7 +406,7 @@ export class WorkbenchDatabase {
     return row ? decodeRun(row) : undefined
   }
 
-  createRun({ ownerId, chatId, sessionId, query, attachments = [], mcpTools = [], selection, requestKey, parentRunId, id = randomUUID(), now = Date.now() }) {
+  createRun({ ownerId, chatId, sessionId, query, attachments = [], mcpTools = [], mcpServers, selection, requestKey, parentRunId, id = randomUUID(), now = Date.now() }) {
     const create = this.transaction(() => {
       const chat = this.db.prepare('SELECT id FROM chats WHERE id = ? AND owner_id = ? AND deleted_at IS NULL')
         .get(chatId, ownerId)
@@ -422,6 +422,7 @@ export class WorkbenchDatabase {
       // Only forkChat's copied historical rows carry this marker. New Goal,
       // child and ordinary turns must expose their own native file changes.
       const { fork_source: _forkSource, ...currentSelection } = selection
+      if (mcpServers !== undefined) currentSelection.mcp_servers = mcpServers
       this.db.prepare(`INSERT INTO runs
         (id, owner_id, chat_id, session_id, request_key, query, attachments_json, mcp_tools_json, status, selection_json,
          parent_run_id, queue_order, created_at, updated_at)

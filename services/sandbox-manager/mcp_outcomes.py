@@ -6,6 +6,7 @@ import threading
 import time
 from contextlib import closing
 from pathlib import Path
+from mcp_policy import get as policy
 
 _GUARD = threading.RLock()
 _INITIALIZED = set()
@@ -15,10 +16,10 @@ def _connect():
     root = Path(os.environ.get('WORKBENCH_MANAGER_STATE', '/state'))
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
     database = root / 'mcp-outcomes.sqlite3'
-    connection = sqlite3.connect(database, timeout=10)
+    connection = sqlite3.connect(database, timeout=policy('outcome_lock_seconds'))
     try:
         os.chmod(database, 0o600)
-        connection.execute('PRAGMA busy_timeout=10000')
+        connection.execute('PRAGMA busy_timeout=' + str(round(policy('outcome_lock_seconds') * 1000)))
         connection.execute('PRAGMA synchronous=FULL')
         if database not in _INITIALIZED:
             connection.execute('PRAGMA journal_mode=WAL')

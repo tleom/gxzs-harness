@@ -96,10 +96,23 @@ describe('native workspace boundary', () => {
     })
     expect(fileManager.operate).toHaveBeenCalledTimes(2)
   })
-  it('rejects oversized and stalled directory pages instead of truncating or retrying forever', async () => {
+  it('reads more than 100000 directory entries across native pages without truncating', async () => {
     const { bridge, owner, fileManager } = fixture()
-    fileManager.operate.mockResolvedValueOnce({ entries: Array.from({ length: 100001 }, () => ({ name: 'a', kind: 'file' })) })
-    await expect(bridge.mutate(owner, { operation: 'browse', path: '.' })).rejects.toMatchObject({ status: 413 })
+    const count = 100001, pageSize = 2000
+    fileManager.operate.mockImplementation(async ({ cursor }) => {
+      const offset = Number(cursor ?? 0), end = Math.min(offset + pageSize, count)
+      return { entries: Array.from({ length: end - offset }, (_, index) => ({
+        name: 'folder-' + (offset + index), kind: 'directory',
+      })), ...(end < count ? { next_cursor: String(end) } : {}) }
+    })
+    const result = await bridge.mutate(owner, { operation: 'browse', path: '.' })
+    expect(result.entries).toHaveLength(count)
+    expect(result.entries[0]).toEqual({ name: 'folder-0', path: 'folder-0' })
+    expect(result.entries.at(-1)).toEqual({ name: 'folder-100000', path: 'folder-100000' })
+    expect(fileManager.operate).toHaveBeenCalledTimes(51)
+  })
+  it('rejects stalled directory pages instead of retrying forever', async () => {
+    const { bridge, owner, fileManager } = fixture()
     fileManager.operate.mockResolvedValue({ entries: [{ name: 'a', kind: 'directory' }], next_cursor: 'same' })
     await expect(bridge.mutate(owner, { operation: 'browse', path: '.' })).rejects.toMatchObject({ status: 502 })
   })

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import { httpError, sendError } from '../src/http.js'
+import { httpError, sendError, readBody } from '../src/http.js'
+import { Readable } from 'node:stream'
 
 function serialize(error) {
   let status, body
@@ -8,6 +9,15 @@ function serialize(error) {
 }
 
 describe('public HTTP error contract', () => {
+  it('expands a cold streamed request once without truncating chunks or consulting policy for small bodies', async () => {
+    let refreshes = 0
+    const expand = async () => { refreshes++; return 4096 }
+    expect((await readBody(Readable.from([Buffer.alloc(1000), Buffer.alloc(1200)]), 1024, expand)).length).toBe(2200)
+    expect(refreshes).toBe(1)
+    await readBody(Readable.from([Buffer.alloc(100)]), 1024, expand)
+    expect(refreshes).toBe(1)
+    await expect(readBody(Readable.from([Buffer.alloc(5000)]), 1024, expand)).rejects.toMatchObject({ status: 413 })
+  })
   it.each([
     ['MODEL_DOES_NOT_SUPPORT_IMAGES', '所选模型不支持图片输入'],
     ['FILE_NOT_STAGED', '附件上传凭据已失效'],

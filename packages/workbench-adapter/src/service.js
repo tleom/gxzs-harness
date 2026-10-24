@@ -9,7 +9,9 @@ import { decodeSessionReferenceUri, formatSessionReferenceMention } from '@deeps
 import { admitSandboxAttachments, prepareNativeFiles } from './attachments.js'
 import { normalizeResourceMentions, appendResourceInstructions, pluginId, pluginName, resolvePlugin, positionResourceMentions, resourceTextHash, goalMentionResources } from './resource-mentions.js'
 import { appendSkillInvocations, assertSkillInvocationClaims, resolveSkillInvocations, skillGestureNames, skillInvocationClaims } from './skill-invocations.js'
+import { mentionProviders } from './mcp-catalog.js'
 import { httpError } from './http.js'
+import { isSkillImportFailure, skillImportFailure } from './skill-import.js'
 import { decodeCursor } from './cursor.js'
 import { resolveWorkspacePath } from './paths.js'
 import { forkChat } from './fork-chat.js'
@@ -531,19 +533,20 @@ export class WorkbenchService {
     }
     // Plugin references express preference inside the authorized MCP catalog.
     // Skill references become explicit native user invocation gestures.
-    const mcpTools = await this.freezeMcpTools(owner, mentions.tools, mentions.plugins)
+    const { tools: mcpTools, servers: mcpServers } = await this.freezeMcpCatalog(owner, mentions.tools, mentions.plugins)
+    const mentionTools = mentionProviders(mcpTools, mcpServers)
     checkCancelled()
     const admitted = await admitSandboxAttachments({ fileManager: this.fileManager, workspace: this.workspace, query, files, nativeFiles: this.nativeFileAttachments, attachmentStore: this.attachments })
     chat = await this.ensureChatSession(owner, chat)
     const agent = this.agents.get(chat.sessionId)
     const selectedSkills = await this.selectedSkills(mentions, agent)
-    admitted.content = await this.resourceContent(admitted.content, mentions, mcpTools, agent, selectedSkills, body.mention_positions)
+    admitted.content = await this.resourceContent(admitted.content, mentions, mentionTools, agent, selectedSkills, body.mention_positions)
     checkCancelled()
     const { run, created } = this.database.createRun({
       ownerId: owner.ownerId, chatId, sessionId: chat.sessionId, query, attachments: admitted.attachments, mcpTools,
-      selection: { ...chat.selection, ...(silentResume ? { silent_resume: true } : {}),
+      selection: { ...chat.selection, mcp_servers: mcpServers, ...(silentResume ? { silent_resume: true } : {}),
         ...(!silentResume && body.mode ? { prompt_mode: body.mode } : {}), resource_mentions: mentions,
-        mentioned_resources: await this.mentionSnapshot(mentions, mcpTools, agent, body.mention_positions, query),
+        mentioned_resources: await this.mentionSnapshot(mentions, mentionTools, agent, body.mention_positions, query),
         skill_names: await this.skillNames(agent), skill_invocations: skillInvocationClaims(selectedSkills), ...(command ? { command } : {}) }, requestKey,
       parentRunId,
     })
@@ -651,7 +654,8 @@ export class WorkbenchService {
 
   async mcpCatalog(owner, { required = false, includePlugins = false } = {}) {
     try {
-      const payload = await this.platformClient.json({ owner, method: 'GET', route: 'mcp/catalog', timeoutMs: 15_000 })
+      const payload = await this.platformClient.json({ owner, method: 'GET', route: 'mcp/catalog',
+        timeoutMs: (this.platformClient.mcpPolicy?.catalog_timeout_seconds ?? 180) * 1000 })
       const tools = payload.data?.tools ?? payload.tools ?? []
       if (!Array.isArray(tools)) throw httpError(502, '平台 MCP 目录格式无效')
       const normalized = tools.map(normalizeMcpResource)
@@ -669,15 +673,21 @@ export class WorkbenchService {
   }
 
   async freezeMcpTools(owner, selectedIds, selectedPlugins = []) {
-    const catalog = this.refreshMcpCatalog
-      ? (await this.refreshMcpCatalog(owner)).map(normalizeMcpResource)
-      : await this.mcpCatalog(owner, { required: true })
+    return (await this.freezeMcpCatalog(owner, selectedIds, selectedPlugins)).tools
+  }
+
+  async freezeMcpCatalog(owner, selectedIds, selectedPlugins = []) {
+    const snapshot = this.refreshMcpCatalog ? await this.refreshMcpCatalog(owner)
+      : await this.mcpCatalog(owner, { required: true, includePlugins: true })
+    const rawTools = Array.isArray(snapshot) ? snapshot : snapshot.tools
+    const catalog = this.refreshMcpCatalog ? rawTools.map(normalizeMcpResource) : rawTools
+    const servers = (Array.isArray(snapshot) ? [] : snapshot.plugins ?? []).filter(server => server.available !== false)
     const byId = new Map(catalog.map((tool) => [tool.id, tool]))
     for (const id of selectedIds ?? [])
       if (!byId.has(id)) throw httpError(409, `MCP 工具已不可用：${id}`)
     for (const id of selectedPlugins)
-      resolvePlugin(catalog, id)
-    return catalog
+      resolvePlugin(mentionProviders(catalog, servers), id)
+    return { tools: catalog, servers }
   }
 
   async pluginInventory(owner) {
@@ -727,9 +737,29 @@ export class WorkbenchService {
     }
   }
 
-  async mutateResource(body, owner, sendPackage = payload => this.fileManager.personalResources(payload)) {
+  async mutateResource(body, owner, sendPackage = payload => signal
+    ? this.fileManager.personalResources(payload, signal) : this.fileManager.personalResources(payload), signal) {
     const operation = body?.operation
     if (typeof operation !== 'string') throw httpError(400, '缺少资源操作')
+    if (['skill_import_cancel', 'skill_import_status'].includes(operation))
+      return this.fileManager.personalResources(body)
+    if (operation === 'skill_stage') {
+      let staged
+      try {
+        staged = await sendPackage(body)
+        const metadata = await readImportedSkill(staged.content)
+        await this.assertNoGlobalSkillCollision(metadata.name)
+        const prepared = await this.fileManager.personalResources({ operation: 'skill_prepare',
+          import_id: staged.import_id, name: metadata.name,
+          ...(Object.hasOwn(body, 'version') ? { version: body.version } : {}) }, signal)
+        if (prepared.conflict)
+          await this.fileManager.personalResources({ operation: 'skill_import_cancel', import_id: staged.import_id }).catch(() => {})
+        return { ...prepared, displayName: metadata.displayName }
+      } catch (error) {
+        if (staged?.import_id) await this.fileManager.personalResources({ operation: 'skill_import_cancel', import_id: staged.import_id }).catch(() => {})
+        throw error
+      }
+    }
     if (operation === 'skill_inspect') {
       const inspected = await sendPackage(body)
       const metadata = await readImportedSkill(inspected.content)
@@ -738,10 +768,44 @@ export class WorkbenchService {
       return { name: metadata.name, displayName: metadata.displayName, version: previous?.version ?? null }
     }
     if (operation === 'skill_import') {
-      const inspected = await sendPackage({ ...body, operation: 'skill_inspect' })
-      const metadata = await readImportedSkill(inspected.content)
-      await this.assertNoGlobalSkillCollision(metadata.name)
-      return sendPackage({ ...body, name: metadata.name })
+      if (body.import_id) {
+        const current = await this.fileManager.personalResources({ operation: 'skill_import_status', import_id: body.import_id }, signal)
+        if (current.status === 'completed') return current
+        if (current.status !== 'ready')
+          return this.fileManager.personalResources(body, signal)
+        const inspected = await this.fileManager.personalResources({ operation: 'skill_inspect', import_id: body.import_id }, signal)
+        const metadata = await readImportedSkill(inspected.content)
+        await this.assertNoGlobalSkillCollision(metadata.name)
+        return this.fileManager.personalResources({ ...body, name: metadata.name }, signal)
+      }
+      const import_id = randomUUID().replaceAll('-', '')
+      let prepared
+      try {
+        prepared = await this.mutateResource({ ...body, operation: 'skill_stage', import_id,
+          version: body.version ?? null }, owner, sendPackage, signal)
+        if (prepared.conflict) return { conflict: true }
+        let result = await this.mutateResource({ operation: 'skill_import', import_id,
+          version: prepared.version }, owner, sendPackage, signal)
+        const deadline = Date.now() + 600_000
+        while (['ready', 'running', 'pending'].includes(result.status) && Date.now() < deadline) {
+          await new Promise(resolve => setTimeout(resolve, 200))
+          signal?.throwIfAborted()
+          result = await this.fileManager.personalResources({ operation: 'skill_import_status', import_id }, signal)
+        }
+        if (result.conflict || result.status === 'conflict') return { conflict: true }
+        if (result.status !== 'completed') throw skillImportFailure(result)
+        return Object.fromEntries(['id', 'version', 'path'].filter(key => Object.hasOwn(result, key)).map(key => [key, result[key]]))
+      } catch (error) {
+        if (!prepared || isSkillImportFailure(error)) throw error
+        const settled = await this.fileManager.personalResources({ operation: 'skill_import_cancel', import_id }).catch(stopError => {
+          if (isSkillImportFailure(stopError)) throw stopError
+          return null
+        })
+        if (settled?.status === 'completed')
+          return Object.fromEntries(['id', 'version', 'path'].filter(key => Object.hasOwn(settled, key)).map(key => [key, settled[key]]))
+        if (settled && ['failed', 'cancelled', 'conflict'].includes(settled.status)) throw skillImportFailure(settled)
+        throw error
+      }
     }
     if (operation === 'skill_update') {
       const metadata = await readImportedSkill(body.content)
@@ -758,7 +822,7 @@ export class WorkbenchService {
         if (plugins.some(plugin => plugin.name === name && plugin.id !== `personal:mcp:${body.name}`))
           throw httpError(409, `插件调用名已存在：${name}`)
       }
-      return this.fileManager.personalMcp(body)
+      return this.fileManager.personalMcp(body, signal)
     }
     if (!['skill_import', 'skill_update', 'skill_uninstall', 'skill_toggle', 'skill_reorder'].includes(operation))
       throw httpError(400, '不支持的个人资源操作')
@@ -848,15 +912,16 @@ export class WorkbenchService {
       const planTask = /^\/plan\s+(?!off\s*$)([\s\S]+)$/.exec(line)
       if (planTask || line === '/plan' && body.files?.length) {
         const mentions = normalizeResourceMentions(body.resource_mentions)
-        const mcpTools = await this.freezeMcpTools(owner, mentions.tools, mentions.plugins)
+        const { tools: mcpTools, servers: mcpServers } = await this.freezeMcpCatalog(owner, mentions.tools, mentions.plugins)
+        const mentionTools = mentionProviders(mcpTools, mcpServers)
         const selectedSkills = await this.selectedSkills(mentions, agent)
         const admitted = body.files?.length
           ? await admitSandboxAttachments({ fileManager: this.fileManager, workspace: this.workspace, query: '', files: body.files, nativeFiles: this.nativeFileAttachments, attachmentStore: this.attachments })
           : { content: [], attachments: [] }
-        const resourceContext = appendResourceInstructions(admitted.content.filter(item => item.type === 'text'), mentions, mcpTools)
+        const resourceContext = appendResourceInstructions(admitted.content.filter(item => item.type === 'text'), mentions, mentionTools)
           .map(item => item.text).join('\n')
         const planQuery = planTask?.[1] ?? admitted.content.filter(item => item.type === 'text').map(item => item.text).join('\n')
-        const nativeQuery = appendSkillInvocations(appendResourceInstructions([{ type: 'text', text: planQuery }], mentions, mcpTools, body.mention_positions).slice(0, 1), selectedSkills)
+        const nativeQuery = appendSkillInvocations(appendResourceInstructions([{ type: 'text', text: planQuery }], mentions, mentionTools, body.mention_positions).slice(0, 1), selectedSkills)
           .map(item => item.text).join('\n')
         const planLine = `/plan${nativeQuery ? ` ${nativeQuery}` : ''}`
         if (agent.status !== 'running' && chat.selection.model) {
@@ -865,8 +930,8 @@ export class WorkbenchService {
             ...(chat.selection.model_parameters?.reasoning_effort ? { reasoningEffort: chat.selection.model_parameters.reasoning_effort } : {}) })
         }
         const run = this.database.createRun({ ownerId: owner.ownerId, chatId, sessionId: chat.sessionId,
-          query: planQuery, attachments: admitted.attachments, selection: { ...chat.selection, command: 'plan',
-            resource_mentions: mentions, mentioned_resources: await this.mentionSnapshot(mentions, mcpTools, agent, body.mention_positions, planQuery),
+          query: planQuery, attachments: admitted.attachments, selection: { ...chat.selection, mcp_servers: mcpServers, command: 'plan',
+            resource_mentions: mentions, mentioned_resources: await this.mentionSnapshot(mentions, mentionTools, agent, body.mention_positions, planQuery),
             skill_names: await this.skillNames(agent), skill_invocations: skillInvocationClaims(selectedSkills),
             resource_context: resourceContext }, mcpTools, requestKey: `plan:${requestKey}` }).run
         let execution
@@ -909,20 +974,26 @@ export class WorkbenchService {
       if (editsGoal && !startsGoal && previousGoalRun && (body.resource_mentions !== undefined
         || previousGoalRun.selection.resource_position_hash || body.mention_positions?.length)) {
         const mentions = goalMentions
-        const mcpTools = body.resource_mentions === undefined ? previousGoalRun.mcpTools : await this.freezeMcpTools(owner, mentions.tools, mentions.plugins)
+        const { tools: mcpTools, servers: mcpServers } = body.resource_mentions === undefined
+          ? { tools: previousGoalRun.mcpTools, servers: previousGoalRun.selection.mcp_servers ?? [] }
+          : await this.freezeMcpCatalog(owner, mentions.tools, mentions.plugins)
+        const mentionTools = mentionProviders(mcpTools, mcpServers)
         const objective = line.replace(/^\/goal\s+(?:edit\s+)?/i, '')
-        editedResources = { mcpTools, selection: { ...previousGoalRun.selection,
-          resource_mentions: mentions, mentioned_resources: await this.mentionSnapshot(mentions, mcpTools, agent, body.mention_positions, objective),
+        editedResources = { mcpTools, selection: { ...previousGoalRun.selection, mcp_servers: mcpServers,
+          resource_mentions: mentions, mentioned_resources: await this.mentionSnapshot(mentions, mentionTools, agent, body.mention_positions, objective),
           resource_position_hash: resourceTextHash(objective),
           skill_names: await this.skillNames(agent), skill_invocations: skillInvocationClaims(selectedGoalSkills),
           resource_context: body.resource_mentions === undefined ? previousGoalRun.selection.resource_context
-            : appendResourceInstructions([], mentions, mcpTools).map(item => item.text).join('\n') } }
+            : appendResourceInstructions([], mentions, mentionTools).map(item => item.text).join('\n') } }
       }
       if (startsGoal) {
         const previous = /^\/goal\s+resume\s*$/i.test(line) ? this.database.goalRun(chat.sessionId) : undefined
         const mentions = goalMentions
-        const mcpTools = previous?.mcpTools ?? await this.freezeMcpTools(owner, mentions.tools, mentions.plugins)
-        const resourceContext = previous?.selection.resource_context ?? appendResourceInstructions(admitted.content.filter(item => item.type === 'text'), mentions, mcpTools)
+        const { tools: mcpTools, servers: mcpServers } = previous
+          ? { tools: previous.mcpTools, servers: previous.selection.mcp_servers ?? [] }
+          : await this.freezeMcpCatalog(owner, mentions.tools, mentions.plugins)
+        const mentionTools = mentionProviders(mcpTools, mcpServers)
+        const resourceContext = previous?.selection.resource_context ?? appendResourceInstructions(admitted.content.filter(item => item.type === 'text'), mentions, mentionTools)
           .map(item => item.text).join('\n')
         if (agent.status !== 'running' && chat.selection.model) {
           await requireDatabaseModel(this.platformClient, this.sessions, owner, chat.selection.model, this.modelSettings)
@@ -934,8 +1005,8 @@ export class WorkbenchService {
             ? this.goals?.get(agent)?.objective ?? '继续目标' : line.replace(/^\/goal\s+(?:edit\s+)?/i, '')
           goalRun = this.database.createRun({ ownerId: owner.ownerId, chatId, sessionId: chat.sessionId,
             query: objective, attachments: previous?.attachments ?? admitted.attachments, selection: /^\/goal\s+resume\s*$/i.test(line)
-              ? { ...resumeGoalSelection(previous?.selection, chat.selection, objective), skill_invocations: skillInvocationClaims(selectedGoalSkills) } : { ...chat.selection, command: 'goal', resource_mentions: mentions,
-              mentioned_resources: await this.mentionSnapshot(mentions, mcpTools, agent, body.mention_positions, objective), skill_names: await this.skillNames(agent),
+              ? { ...resumeGoalSelection(previous?.selection, chat.selection, objective), skill_invocations: skillInvocationClaims(selectedGoalSkills) } : { ...chat.selection, mcp_servers: mcpServers, command: 'goal', resource_mentions: mentions,
+              mentioned_resources: await this.mentionSnapshot(mentions, mentionTools, agent, body.mention_positions, objective), skill_names: await this.skillNames(agent),
               skill_invocations: skillInvocationClaims(selectedGoalSkills), resource_context: resourceContext,
               ...(Array.isArray(body.mention_positions) && body.mention_positions.length
                 ? { resource_position_hash: resourceTextHash(objective) } : {}) }, mcpTools, requestKey: `goal:${requestKey}`,
@@ -1048,10 +1119,11 @@ export class WorkbenchService {
         const previous = this.database.goalRun(chat.sessionId)
         const active = this.database.activeRunBySession(chat.sessionId)
         if (!active || !['running', 'waiting_input'].includes(active.status)) {
+          const resources = previous ? { tools: previous.mcpTools, servers: previous.selection.mcp_servers ?? [] } : await this.freezeMcpCatalog(owner, [])
           resumedRun = this.database.createRun({ ownerId: owner.ownerId, chatId, sessionId: chat.sessionId,
-            query: current.objective, selection: { ...resumeGoalSelection(previous?.selection, chat.selection, current.objective),
+            query: current.objective, selection: { ...resumeGoalSelection(previous?.selection, chat.selection, current.objective), mcp_servers: resources.servers,
               skill_invocations: skillInvocationClaims(selectedSkills) },
-            attachments: previous?.attachments ?? [], mcpTools: previous?.mcpTools ?? await this.freezeMcpTools(owner, []),
+            attachments: previous?.attachments ?? [], mcpTools: resources.tools,
             parentRunId: previous?.id,
           }).run
           this.database.setGoalRun(chat.sessionId, resumedRun.id)
@@ -1193,10 +1265,13 @@ export class WorkbenchService {
       && !isDeepStrictEqual(existing.selection.input_supplement, inputSupplement(input.payload.questions ?? [], nativeAnswer.answers)))))
       throw httpError(409, '该补答请求已使用不同的回答')
     const active = currentExecutionRun(this.database, this.agents, chat.sessionId)
+    const inherited = existing ?? active
+    const resources = inherited ? { tools: inherited.mcpTools, servers: inherited.selection.mcp_servers ?? [] }
+      : await this.freezeMcpCatalog(owner, [])
     const { run, created } = this.database.createRun({
       ownerId: owner.ownerId, chatId: chat.id, sessionId: chat.sessionId,
-      query: answer, mcpTools: existing?.mcpTools ?? (active ? active.mcpTools : await this.freezeMcpTools(owner, [])),
-      selection: { ...chat.selection, silent_resume: false, is_continuation: false, prompt_mode: 'steer',
+      query: answer, mcpTools: resources.tools,
+      selection: { ...chat.selection, mcp_servers: resources.servers, silent_resume: false, is_continuation: false, prompt_mode: 'steer',
         input_supplement: inputSupplement(input.payload.questions ?? [], nativeAnswer.answers) }, requestKey,
       parentRunId: source.id,
     })
@@ -1253,8 +1328,8 @@ export class WorkbenchService {
     const agent = this.agents.get(run.sessionId)
     const selectedSkills = await this.selectedSkills(normalizeResourceMentions(run.selection.resource_mentions), agent)
     if (run.selection.skill_invocations) assertSkillInvocationClaims(selectedSkills, run.selection.skill_invocations)
-    const content = await this.resourceContent(body.content, run.selection.resource_mentions, run.mcpTools, agent, selectedSkills, body.mention_positions)
-    const mentionedResources = await this.mentionSnapshot(normalizeResourceMentions(run.selection.resource_mentions), run.mcpTools, agent, body.mention_positions, text)
+    const content = await this.resourceContent(body.content, run.selection.resource_mentions, mentionProviders(run.mcpTools, run.selection.mcp_servers), agent, selectedSkills, body.mention_positions)
+    const mentionedResources = await this.mentionSnapshot(normalizeResourceMentions(run.selection.resource_mentions), mentionProviders(run.mcpTools, run.selection.mcp_servers), agent, body.mention_positions, text)
     // Before dispatch update the durable admission payload; afterward DSH's
     // inbox decides whether the message is still editable.
     if (!run.messageId) {

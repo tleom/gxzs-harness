@@ -1,6 +1,7 @@
 """Platform memory backed by dsh-memory, always executed in the owner's sandbox."""
 import json
 import logging
+import math
 import os
 import sqlite3
 import sys
@@ -9,6 +10,12 @@ import threading
 import copy
 from uuid import uuid4
 from pathlib import Path
+
+
+def mcp_limit(key):
+    from mcp_policy import get
+    return get(key)
+
 
 REVISION = "32ac237fb56afa43f73d668f1dfe9b306d71b025"
 VERSION = "2-" + REVISION[:12]
@@ -81,11 +88,13 @@ def platform_tools(upstream):
 
 class MemoryWorker:
     def __init__(self, container):
-        from mcp_runtime import Worker
+        from mcp_runtime import Worker, module_source
+        from mcp_policy import current
         engine = Path(__file__).read_text(encoding='utf-8')
         supervisor = Path(__file__).with_name('memory_exec.py').read_text(encoding='utf-8')
-        source = supervisor + '\nserve(' + repr(engine) + ')\n'
-        self.transport = Worker(container, 'memory', VERSION, 60, source=source, interpreter='/usr/local/bin/python')
+        policy_source = module_source('mcp_policy', 'file_ops', 'resource_ops') + "sys.modules['mcp_policy'].configure(" + repr(current()) + " ); "
+        source = policy_source + supervisor + '\nserve(' + repr(module_source('mcp_policy') + "sys.modules['mcp_policy'].configure(" + repr(current()) + " ); " + engine) + ')\n'
+        self.transport = Worker(container, 'memory', VERSION, mcp_limit('call_timeout_seconds'), source=source, interpreter='/usr/local/bin/python')
 
     def response(self, cancelled=None, timeout=None):
         response = self.transport.response(cancelled, timeout)
@@ -95,7 +104,7 @@ class MemoryWorker:
 
     def send(self, tool, arguments, remaining, cancelled=None, on_dispatch=None):
         from mcp_runtime import write_request
-        return write_request(self.transport.process, {'tool': tool, 'arguments': arguments, 'remaining_seconds': remaining}, cancelled, timeout=min(5, remaining), guard=self.transport.close_guard, on_dispatch=on_dispatch)
+        return write_request(self.transport.process, {'tool': tool, 'arguments': arguments, 'remaining_seconds': remaining}, cancelled, timeout=min(mcp_limit('write_timeout_seconds'), remaining), guard=self.transport.close_guard, on_dispatch=on_dispatch)
 
     def close(self):
         return self.transport.close()
@@ -128,7 +137,7 @@ def close_calls(calls):
             with GUARD:
                 ACTIVE.discard(call)
         return confirmed
-    deadline = time.monotonic() + 6
+    deadline = time.monotonic() + mcp_limit('cleanup_timeout_seconds')
     outcomes = []
     for call in sorted(calls, key=lambda item: getattr(getattr(item.worker, 'transport', None), 'last_close_attempt', 0)):
         if time.monotonic() >= deadline:
@@ -180,8 +189,8 @@ def catalog(source=SOURCE):
 def validate(name, arguments):
     if name not in {"cg", "stg"} or not isinstance(arguments, dict):
         raise MemoryInputError("记忆工具或参数无效")
-    if len(json.dumps(arguments).encode()) > 1024 * 1024:
-        raise MemoryInputError("记忆参数超过 1 MiB")
+    if len(json.dumps(arguments).encode()) > mcp_limit('request_bytes'):
+        raise MemoryInputError("记忆参数超过传输预算")
     if any(key in arguments for key in ("root", "source", "owner_id", "workspace_id")):
         raise MemoryInputError("工具参数不能指定记忆存储或用户身份")
     ops = CG_OPS if name == "cg" else STG_OPS
@@ -275,8 +284,8 @@ def operate(key, payload, *, docker, ensure, identity, lock, authorize, worker_f
         return descriptor
     if payload.get("operation") != "call":
         raise ValueError("未知记忆操作")
-    deadline = payload.get('deadline_ms', int(time.time() * 1000) + 350_000)
-    if not isinstance(deadline, (int, float)) or deadline > time.time() * 1000 + 350_000:
+    deadline = payload.get('deadline_ms', int(time.time() * 1000 + mcp_limit('max_call_seconds') * 1000))
+    if type(deadline) not in (int, float) or not math.isfinite(deadline) or deadline > time.time() * 1000 + mcp_limit('max_call_seconds') * 1000:
         raise ValueError('Invalid memory deadline')
     if payload.get("version") != descriptor["version"] or payload.get("manifest_version") != descriptor["manifest_version"]:
         return {"conflict": True}
@@ -288,10 +297,12 @@ def operate(key, payload, *, docker, ensure, identity, lock, authorize, worker_f
     grant = payload.get("authorization") or {}
     binding = validate_grant(key, payload, 'global:mcp:' + SERVER_ID + ':' + tool)
     call = MemoryCall(key, binding)
-    with GUARD:
-        if len(ACTIVE) >= 32 or sum(item.key == key for item in ACTIVE) >= 8:
-            return {'error': '记忆调用达到并发上限，本次操作未执行', 'code': 'MCP_BUSY'}
-        ACTIVE.add(call)
+    from mcp_runtime import GUARD as admission_guard, capacity_available
+    with admission_guard:
+        with GUARD:
+            if not capacity_available(key):
+                return {'error': '记忆调用达到并发上限，本次操作未执行', 'code': 'MCP_BUSY'}
+            ACTIVE.add(call)
     tracked, outcome_uncertain = False, True
     try:
         if not authorize({"authorization": grant, "action": "validate"}):
@@ -323,7 +334,7 @@ def operate(key, payload, *, docker, ensure, identity, lock, authorize, worker_f
             return {'error': '记忆连接启动失败，本次操作未执行', 'code': 'MCP_START_FAILED'}
         with GUARD:
             call.worker = worker
-        ready = call.worker.response(call.cancelled, timeout=min(10, max(0, (deadline - time.time() * 1000) / 1000)))
+        ready = call.worker.response(call.cancelled, timeout=min(mcp_limit('startup_timeout_seconds'), max(0, (deadline - time.time() * 1000) / 1000)))
         if not ready.get('ready'):
             return ready
         if not authorize({"authorization": grant, "action": "consume"}):
@@ -332,7 +343,7 @@ def operate(key, payload, *, docker, ensure, identity, lock, authorize, worker_f
         tracked = True
         try:
             with GUARD:
-                remaining = min(60, (deadline - time.time() * 1000) / 1000)
+                remaining = min(mcp_limit('max_call_seconds'), (deadline - time.time() * 1000) / 1000)
                 if call.cancelled.is_set() or remaining <= 0:
                     output = {'error': '记忆调用已停止或过期，本次操作未执行'}
                 else:
@@ -372,9 +383,9 @@ def install():
     from urllib.request import urlopen
     target = Path(SOURCE)
     url = "https://codeload.github.com/FuRongJun-1999/dsh-memory/tar.gz/" + REVISION
-    with urlopen(url, timeout=120) as response:
-        data = response.read(50 * 1024 * 1024 + 1)
-    if len(data) > 50 * 1024 * 1024:
+    with urlopen(url, timeout=mcp_limit('source_download_timeout_seconds')) as response:
+        data = response.read(mcp_limit('source_archive_bytes') + 1)
+    if len(data) > mcp_limit('source_archive_bytes'):
         raise ValueError("Memory source archive exceeds limit")
     prefix = "dsh-memory-" + REVISION + "/"
     with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as archive:

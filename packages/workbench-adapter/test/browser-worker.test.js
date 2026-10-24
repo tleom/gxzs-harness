@@ -46,6 +46,82 @@ function worker(displayFactory, options = {}) {
   return {page,browser,runtime,frames,exit,command,input,context,launch}
 }
 
+it.each(['element-click', 'element-text'])('returns lookup counts without mutating the page for %s', async action => {
+  const value = worker()
+  let count = 0
+  const locator = { count: vi.fn(async () => count), ariaSnapshot: async () => '',
+    scrollIntoViewIfNeeded: vi.fn(async () => {}), boundingBox: async () => ({ x: 0, y: 0, width: 20, height: 20 }),
+    isEditable: async () => true, focus: vi.fn(async () => {}) }
+  value.page.locator = () => locator
+  value.page.getByRole = vi.fn(() => locator)
+  value.page.frames = () => []
+  value.page.evaluate = async () => ({ text: '', elements: [], viewport: {} })
+  value.page.mouse.click = vi.fn(async () => {})
+  try {
+    await value.command(1, 'init', { width: 1000, height: 700 })
+    await value.command(2, 'snapshot')
+    const revision = value.frames.find(frame => frame.id === 2).value.revision
+    for (const [id, matches, kind] of [[3, 0, 'not_found'], [4, 2, 'ambiguous']]) {
+      count = matches
+      await value.command(id, action, { role: 'img', name: 'arrows-alt', text: 'value', expected_revision: revision })
+      expect(value.frames.find(frame => frame.id === id)).toMatchObject({ value: { outcome: { kind, match_count: matches } } })
+      expect(value.frames.find(frame => frame.id === id).error).toBeUndefined()
+    }
+    await value.command(5, 'snapshot')
+    expect(value.frames.find(frame => frame.id === 5).value.revision).toBe(revision)
+    expect(locator.focus).not.toHaveBeenCalled()
+    expect(value.page.mouse.click).not.toHaveBeenCalled()
+    expect(value.page.keyboard.insertText).not.toHaveBeenCalled()
+    count = 1
+    await value.command(6, action, { role: 'img', name: 'arrows-alt', text: 'value', expected_revision: revision })
+    expect(value.frames.find(frame => frame.id === 6).error).toBeUndefined()
+    expect(action === 'element-click' ? value.page.mouse.click : value.page.keyboard.insertText).toHaveBeenCalledOnce()
+  } finally { await value.runtime.shutdown() }
+})
+
+it('returns a fresh-observation outcome instead of acting on an outdated revision', async () => {
+  const value = worker()
+  value.page.getByRole = vi.fn()
+  try {
+    await value.command(1, 'init', { width: 1000, height: 700 })
+    await value.command(2, 'key', { key: 'Tab' })
+    await value.command(3, 'element-click', { role: 'button', name: 'Search', expected_revision: 0 })
+    expect(value.frames.find(frame => frame.id === 3)).toMatchObject({ value: { outcome: { kind: 'stale' } } })
+    expect(value.page.getByRole).not.toHaveBeenCalled()
+  } finally { await value.runtime.shutdown() }
+})
+
+it.each(['element-click', 'element-text'])('does not deliver %s after navigation during target preparation', async action => {
+  const value = worker(), main = { url: () => 'https://example.com/next' }
+  value.page.mainFrame = () => main
+  const navigate = async () => value.page.emit('framenavigated', main)
+  const locator = { count: async () => 1, isEditable: async () => true, focus: navigate,
+    scrollIntoViewIfNeeded: navigate, boundingBox: async () => ({ x: 0, y: 0, width: 10, height: 10 }) }
+  value.page.getByRole = () => locator
+  value.page.mouse.click = vi.fn(async () => {})
+  try {
+    await value.command(1, 'init', { width: 1000, height: 700 })
+    await value.command(2, action, { role: 'textbox', name: 'Query', text: 'private input', expected_revision: 0 })
+    expect(value.page.mouse.click).not.toHaveBeenCalled()
+    expect(value.page.keyboard.press).not.toHaveBeenCalled()
+    expect(value.page.keyboard.insertText).not.toHaveBeenCalled()
+    expect(value.frames.find(frame => frame.id === 2)).toMatchObject({ value: { outcome: { kind: 'stale' } } })
+  } finally { await value.runtime.shutdown() }
+})
+
+it('does not insert text into a document that navigated during field selection', async () => {
+  const value = worker(), main = { url: () => 'https://example.com/next' }
+  value.page.mainFrame = () => main
+  value.page.getByRole = () => ({ count: async () => 1, isEditable: async () => true, focus: async () => {} })
+  value.page.keyboard.press.mockImplementation(async () => value.page.emit('framenavigated', main))
+  try {
+    await value.command(1, 'init', { width: 1000, height: 700 })
+    await value.command(2, 'element-text', { role: 'textbox', name: 'Query', text: 'fixture', expected_revision: 0 })
+    expect(value.page.keyboard.insertText).not.toHaveBeenCalled()
+    expect(value.frames.find(frame => frame.id === 2)).toMatchObject({ value: { outcome: { kind: 'stale' } } })
+  } finally { await value.runtime.shutdown() }
+})
+
 it.each([true, false])('terminates a stuck observation before any queued mutation (cancel=%s)', async cancel => {
   const value = worker(null, { commandTimeoutMs: cancel ? 2000 : 100, cancelGraceMs: 50 })
   let release

@@ -92,6 +92,18 @@ it('refuses new admission while native MCP registration is unavailable', async (
   expect(runtime.database.listRuns('t:42', chat.id)).toEqual([])
 })
 
+it('reports resource capabilities from loaded native services', async () => {
+  const { handler, key, context } = setup()
+  const runtime = context.reflect.provide.mock.calls.find(([name]) => name === 'workbenchRuntime')[1]
+  const capabilities = async () => (await call(handler, key, 'GET', '/health', undefined, false)).body.mcp_capabilities
+  expect(await capabilities()).toMatchObject({ server_instructions: false, resources: false, resource_templates: false })
+  runtime.mcpPlugins = () => []
+  context.mcpResources = { register: vi.fn() }
+  expect(await capabilities()).toMatchObject({ server_instructions: true, resources: true, resource_templates: true })
+  delete context.mcpResources
+  expect(await capabilities()).toMatchObject({ server_instructions: true, resources: false, resource_templates: false })
+})
+
 it('serializes absent native changes as null without hiding ownership or diff failures', async () => {
   const summary = vi.fn(() => undefined)
   const { handler, key } = setup({ configure: context => {
@@ -137,6 +149,82 @@ async function call(handler, key, method, route, value, authenticated = true, us
 }
 
 describe('authenticated workbench HTTP handler', () => {
+  it('invalidates the skill catalog when status polling confirms asynchronous publication', async () => {
+    const { handler, key, context } = setup()
+    let receipt = { import_id: 'a'.repeat(32), status: 'running' }
+    context.workbenchFileManager.personalResources = vi.fn(async () => receipt)
+    context.emit.mockClear()
+    for (const status of ['ready', 'running', 'unknown', 'failed', 'cancelled', 'conflict']) {
+      receipt = { ...receipt, status }
+      expect((await call(handler, key, 'POST', '/resources', {
+        operation: 'skill_import_status', import_id: receipt.import_id,
+      })).body.data.status).toBe(status)
+      expect(context.emit).not.toHaveBeenCalledWith('workbench/resources-changed')
+    }
+    receipt = { ...receipt, status: 'completed', id: 'report', version: 'v2' }
+    const response = await call(handler, key, 'POST', '/resources', {
+      operation: 'skill_import_status', import_id: receipt.import_id,
+    })
+    expect(response.status).toBe(200)
+    expect(response.body.data).toEqual(receipt)
+    expect(context.emit).toHaveBeenCalledWith('workbench/resources-changed')
+  })
+  it('accepts a 100 MiB package encoded through legacy skill JSON with a small MCP budget', async () => {
+    const { handler, key, context } = setup()
+    const runtime = context.reflect.provide.mock.calls.find(([name]) => name === 'workbenchRuntime')[1]
+    runtime.mcpPolicy = { request_bytes: 1024 }
+    const content = '---\nname: large-json\ndescription: Legacy JSON fixture\n---\nBody'
+    context.workbenchFileManager.personalResources = vi.fn(async body => {
+      if (body.operation === 'skill_stage') return { import_id: body.import_id, content }
+      if (body.operation === 'skill_prepare') return { name: 'large-json', version: null }
+      if (body.operation === 'skill_import_status') return { status: 'ready' }
+      if (body.operation === 'skill_inspect') return { content }
+      if (body.operation === 'skill_import') return { status: 'completed', id: 'large-json', version: 'v1' }
+      throw new Error('unexpected ' + body.operation)
+    })
+    const archive = Buffer.alloc(100 * 1024 * 1024).toString('base64')
+    const response = await call(handler, key, 'POST', '/resources', { operation: 'skill_import', archive, version: null })
+    expect(response.status).toBe(200)
+    expect(response.body.data).toMatchObject({ id: 'large-json', version: 'v1' })
+    const packages = context.workbenchFileManager.personalResources.mock.calls.filter(([body]) => body.archive)
+    expect(packages).toHaveLength(1)
+    expect(packages[0][0].archive).toBe(archive)
+  }, 30_000)
+  it('keeps small skill mutations independent from MCP budgets while enforcing MCP operations separately', async () => {
+    const { handler, key, context } = setup()
+    const runtime = context.reflect.provide.mock.calls.find(([name]) => name === 'workbenchRuntime')[1]
+    runtime.mcpPolicy = { request_bytes: 1024 }
+    context.workbenchFileManager.personalResources = vi.fn(async () => ({ saved: true }))
+    const skill = { operation: 'skill_update', name: 'demo', content: '---\nname: demo\ndescription: fixture\n---\n' + 'x'.repeat(2100) }
+    const response = await call(handler, key, 'POST', '/resources', skill)
+    expect(response.status).toBe(200)
+    expect(context.workbenchFileManager.personalResources).toHaveBeenCalled()
+    expect((await call(handler, key, 'POST', '/resources', { ...skill, operation: 'mcp_save' })).status).toBe(413)
+  })
+  it('accepts a cold MCP body above the generic ingress budget and refuses ordinary resources borrowing that budget', async () => {
+    const { handler, key, context } = setup()
+    const policy = { request_bytes: 40 * 1024 * 1024 }
+    context.workbenchPlatformClient.loadMcpPolicy = vi.fn(async () => policy)
+    const originalJson = context.workbenchPlatformClient.json
+    context.workbenchPlatformClient.json = vi.fn(value => value.route === 'mcp/plugins' ? { plugins: [] } : originalJson(value))
+    context.workbenchFileManager.personalMcp = vi.fn(async () => ({ saved: true }))
+    const body = { content: 'x'.repeat(33 * 1024 * 1024), operation: 'mcp_save', name: 'demo' }
+    expect((await call(handler, key, 'POST', '/resources', body)).status).toBe(200)
+    expect(context.workbenchPlatformClient.loadMcpPolicy).toHaveBeenCalledOnce()
+    expect(context.workbenchFileManager.personalMcp).toHaveBeenCalledWith(body, expect.any(AbortSignal))
+    const runtime = context.reflect.provide.mock.calls.find(([name]) => name === 'workbenchRuntime')[1]
+    runtime.mcpPolicy = policy
+    expect((await call(handler, key, 'POST', '/resources', { ...body, operation: 'skill_update' })).status).toBe(413)
+  })
+  it('uses the authenticated platform client for the public MCP content preview', async () => {
+    const { handler, key, context } = setup()
+    const runtime = context.reflect.provide.mock.calls.find(([name]) => name === 'workbenchRuntime')[1]
+    runtime.mcpPolicy = { request_bytes: 4096, max_call_seconds: 350 }
+    const body = { server_id: 'global:mcp:fixture', version: '1', method: 'resources/list', params: {} }
+    expect((await call(handler, key, 'POST', '/mcp/request', body)).status).toBe(200)
+    expect(context.workbenchPlatformClient.json).toHaveBeenCalledWith(expect.objectContaining({ route: 'mcp/request',
+      owner: expect.objectContaining({ ownerId: 't:42' }), signal: expect.any(AbortSignal) }))
+  })
   it('correlates unexpected failures without logging secrets and bounds repeated diagnostics', async () => {
     const { handler, key, context } = setup()
     context.skills.list.mockRejectedValue(new TypeError('Bearer private-token /private/config'))

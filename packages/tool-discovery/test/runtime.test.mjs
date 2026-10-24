@@ -169,7 +169,7 @@ test('temporary catalog loss hides activation; removal revokes it and invalid ca
 
 test('replace_active releases the old working set only after a successful replacement step', async () => {
   const rows = [row('a', 'lookup_alpha', 'global', 'alpha'), row('b', 'lookup_beta', 'personal', 'beta')]
-  const h = await mount({ rows, config: { maxActiveTools: 1 }, script: [
+  const h = await mount({ rows, script: [
     call('tool_search', { query: 'lookup_alpha' }), call('tool_search', { query: 'lookup_beta' }),
     call('tool_search', { query: 'lookup_beta', replace_active: true }), call('lookup_beta'), response(),
   ] })
@@ -180,7 +180,7 @@ test('replace_active releases the old working set only after a successful replac
   assert.deepEqual(h.adapter.requests[3].tools.map(t => t.name), ['lookup_beta', 'mcp', 'tool_search'])
   assert.deepEqual(h.ctx.sessionProjections.stateOf(agent.session, PROJECTION_KEY).tools.map(t => t.name), ['lookup_beta'])
   const results = agent.session.snapshotEvents().filter(e => e.type === 'tool/result')
-  assert.match(JSON.stringify(results[1]), /active_tool_limit/)
+  assert.equal(JSON.parse(results[1].data.message.content[0].text).items[0].status, 'prepared')
 })
 
 test('same-step replacement conflicts explicitly and failed replacement retains the old working set', async () => {
@@ -206,18 +206,18 @@ test('successful replacement rejects a second discovery in the same step', async
   assert.ok(agent.session.snapshotEvents().some(e => e.type === 'tool/result' && e.data.message.isError))
 })
 
-test('fresh native Agent from replayed history enforces reduced configuration budgets before first assembly', async () => {
+test('fresh native Agent from replayed history retains the complete authorized working set before first assembly', async () => {
   const rows = [row('a', 'lookup_alpha'), row('b', 'lookup_beta')]
   const first = await mount({ rows, script: [call('tool_search', { query: '案件' }), response()] })
   const original = await first.create(); await first.send(original)
   const seed = original.session.snapshotEvents(); await first.close()
-  const h = await mount({ rows, config: { maxActiveTools: 1 }, script: [response()] })
+  const h = await mount({ rows, script: [response()] })
   cleanups.push(() => h.close())
   const handle = await h.ctx.agents.create({ sessionId: 'replayed', seed, agentOptions: { provider: 'fixture', model: 'fixture' } })
   assert.ok(h.ctx.tools.get('lookup_alpha', handle.agent))
-  assert.equal(h.ctx.tools.get('lookup_beta', handle.agent), undefined)
+  assert.ok(h.ctx.tools.get('lookup_beta', handle.agent))
   await h.send(handle.agent)
-  assert.deepEqual(h.adapter.requests[0].tools.map(t => t.name), ['lookup_alpha', 'mcp', 'tool_search'])
+  assert.deepEqual(h.adapter.requests[0].tools.map(t => t.name), ['lookup_alpha', 'lookup_beta', 'mcp', 'tool_search'])
 })
 
 test('native owned child and sibling roots have independent activation sets', async () => {
@@ -304,10 +304,10 @@ for (const mode of ['native', 'ptc']) test(`${mode}: adding an unloaded tool dur
   assert.equal(agent.session.snapshotEvents().at(-1).data.reason.kind, 'completed')
 })
 
-test('browse returns the whole directory without activation and definition budgets report actionable statuses', async () => {
+test('browse returns the whole readable directory without activation and selected large definitions load', async () => {
   const rows = Array.from({ length: 12 }, (_, index) => row(`r${index}`, `record_${index}`, 'global', '案件记录检索'.repeat(35)))
   rows.push(row('huge', 'huge_schema', 'global', 'large definition', { parameters: { type: 'object', properties: { query: { type: 'string', description: 'x'.repeat(3000) } } } }))
-  const h = await mount({ rows, config: { maxToolDefinitionBytes: 2048 }, script: [
+  const h = await mount({ rows, script: [
     call('mcp', { name: 'records' }), call('tool_search', { query: '案件' }),
     call('tool_search', { query: 'huge_schema' }), response(),
   ] })
@@ -319,6 +319,8 @@ test('browse returns the whole directory without activation and definition budge
   assert.equal(results[0].items[0].description, rows[0].description)
   assert.equal(results[0].next_cursor, undefined)
   assert.equal(results[0].status, 'browse')
-  assert.equal(results[2].items[0].reason, 'definition_too_large')
-  assert.equal(h.ctx.tools.get('huge_schema', agent), undefined)
+  assert.equal(results[2].items[0].status, 'prepared')
+  assert.ok(h.ctx.tools.get('huge_schema', agent))
+  const browseText = agent.session.snapshotEvents().filter(e => e.type === 'tool/result')[0].data.message.content[0].text
+  assert.ok(browseText.split('\n').length > rows.length)
 })

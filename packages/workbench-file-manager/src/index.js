@@ -20,7 +20,7 @@ export const Config = z.object({
 
 const ACTIONS = {
   files: new Set(['list', 'stat', 'manifest', 'get', 'upload', 'delete', 'mkdir']),
-  'personal-resources': new Set(['list', 'skill_inspect', 'skill_import', 'skill_update', 'skill_uninstall', 'skill_toggle', 'skill_reorder']),
+  'personal-resources': new Set(['list', 'skill_stage', 'skill_inspect', 'skill_prepare', 'skill_import', 'skill_import_cancel', 'skill_import_status', 'skill_update', 'skill_uninstall', 'skill_toggle', 'skill_reorder']),
   'personal-mcp': new Set(['mcp_list', 'mcp_read', 'mcp_save', 'mcp_delete', 'mcp_toggle', 'mcp_reorder', 'mcp_test']),
   'host-settings': new Set(['check']),
 }
@@ -45,9 +45,32 @@ export class FileManagerClient {
     this.fetch = fetchImpl
   }
 
+  setMcpPolicy(policy) { this.mcpPolicy = Object.freeze({ ...policy }) }
+
   operate(payload, signal) { return this.request('files', payload, signal) }
-  personalResources(payload) { return this.request('personal-resources', payload) }
-  personalMcp(payload) { return this.request('personal-mcp', payload) }
+  async personalResources(payload, signal) {
+    if (payload?.operation !== 'skill_import' || !payload.import_id)
+      return this.request('personal-resources', payload, signal)
+    let result
+    try { result = await this.request('personal-resources', payload, signal) }
+    catch (error) {
+      if (['RESOURCE_CONFLICT', 'SKILL_IMPORT_FAILED', 'SKILL_IMPORT_CANCELLED'].includes(error.code)
+          || error.status && error.status < 500 && !signal?.aborted) throw error
+      // The transport may disappear after publication. Settle using the same
+      // durable import identity; never replay an uncertain mutation.
+      result = await this.request('personal-resources', {
+        operation: 'skill_import_cancel', import_id: payload.import_id,
+      }).catch(() => ({ status: 'unknown' }))
+    }
+    if (['completed', 'running'].includes(result.status)) return result
+    if (result.conflict || result.status === 'conflict') throw Object.assign(new Error('技能已修改，请重新导入'), { status: 409, code: 'RESOURCE_CONFLICT' })
+    if (result.status === 'cancelled') throw Object.assign(new Error('技能导入已停止'), { status: 409, code: 'SKILL_IMPORT_CANCELLED' })
+    throw Object.assign(new Error(result.error || '导入结果待确认，请刷新技能列表后重试查询'), {
+      status: result.status === 'failed' ? 400 : 503,
+      code: result.status === 'failed' ? 'SKILL_IMPORT_FAILED' : 'SKILL_IMPORT_UNCERTAIN',
+    })
+  }
+  personalMcp(payload, signal) { return this.request('personal-mcp', payload, signal) }
   async assertSettingsWritable() {
     const result = await this.request('host-settings', { operation: 'check' })
     if (result.writable !== true) throw Object.assign(new Error('工作台正在维护，请稍后保存设置'), { status: 503, code: 'HOST_UPDATING' })
@@ -104,13 +127,23 @@ export class FileManagerClient {
           status: result.conflict ? 409 : response.status, code: result.code || (result.conflict ? 'RESOURCE_CONFLICT' : 'UPLOAD_FAILED'),
         })
         return result
+      } catch (error) {
+        if (upload.metadata.operation === 'skill_stage' && upload.metadata.import_id) {
+          await this.request('personal-resources', { operation: 'skill_import_cancel',
+            import_id: upload.metadata.import_id }).catch(() => {})
+        }
+        throw error
       } finally { stream.destroy() }
     }
   }
 
   async request(action, payload, signal) {
+    const policy = this.mcpPolicy
     if (!ACTIONS[action]?.has(payload?.operation)) throw new TypeError(action === 'files' ? 'unsupported file operation' : `unsupported ${action} operation`)
-    const requestSignal = signal ? AbortSignal.any([signal, AbortSignal.timeout(this.timeoutMs)]) : AbortSignal.timeout(this.timeoutMs)
+    const timeoutMs = action === 'personal-resources' && (payload.import_id || ['skill_stage', 'skill_inspect', 'skill_import'].includes(payload.operation))
+      ? ['skill_stage', 'skill_import'].includes(payload.operation) || !payload.import_id ? 600_000 : 10_000
+      : Math.ceil(action === 'personal-mcp' ? (policy?.catalog_timeout_seconds ?? this.timeoutMs / 1000) * 1000 : this.timeoutMs)
+    const requestSignal = signal ? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]) : AbortSignal.timeout(timeoutMs)
     const body = JSON.stringify(payload)
     for (let attempt = 0; ; attempt++) {
       requestSignal.throwIfAborted()
@@ -122,7 +155,7 @@ export class FileManagerClient {
         signal: requestSignal,
         redirect: 'error',
       })
-      const result = await managerJson(response, this.maxResponseBytes)
+      const result = await managerJson(response, action === 'personal-mcp' ? policy?.response_bytes ?? this.maxResponseBytes : this.maxResponseBytes)
       const metadata = {
         code: typeof result.code === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/.test(result.code) ? result.code : undefined,
         request_id: typeof result.request_id === 'string' && /^[a-zA-Z0-9_-]{1,128}$/.test(result.request_id) ? result.request_id : undefined,
@@ -133,8 +166,8 @@ export class FileManagerClient {
       { ...metadata, status: 409, code: metadata.code ?? 'RESOURCE_CONFLICT' })
       // MANAGER_BUSY is issued before dispatch, so this exact request has not
       // run. Transport failures and other errors may have executed a mutation.
-      if (response.status === 503 && result.code === 'MANAGER_BUSY' && attempt < 3) {
-        await delay(100 * 2 ** attempt * (0.8 + Math.random() * 0.4), undefined, { signal: requestSignal })
+      if (response.status === 503 && result.code === 'MANAGER_BUSY' && attempt < (action === 'personal-mcp' ? policy?.control_retry_attempts ?? 3 : 3)) {
+        await delay(Math.min(timeoutMs, 100 * 2 ** attempt) * (0.8 + Math.random() * 0.4), undefined, { signal: requestSignal })
         continue
       }
       if (!response.ok) throw Object.assign(new Error(result.error || '工作台资源操作失败'), {
@@ -194,7 +227,7 @@ export class WorkbenchFileManager extends Service {
   upload(action, upload, signal) { return this.client.upload(action, upload, signal) }
   download(path, signal) { return this.client.download(path, signal) }
   operate(payload, signal) { return this.client.operate(payload, signal) }
-  personalResources(payload) { return this.client.personalResources(payload) }
+  personalResources(payload, signal) { return this.client.personalResources(payload, signal) }
   personalMcp(payload) { return this.client.personalMcp(payload) }
   assertSettingsWritable() { return this.client.assertSettingsWritable() }
 }

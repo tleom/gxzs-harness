@@ -28,7 +28,7 @@ def manager(tmp_path, monkeypatch):
     calls, entered = [], threading.Event()
 
     class Worker:
-        def __init__(self, container, name, version, timeout):
+        def __init__(self, container, name, version, timeout, *, deadline=None):
             self.version, self.ready = version, None
             self.process = SimpleNamespace(poll=lambda: None)
             self.closed, self.pending = threading.Event(), None
@@ -48,7 +48,7 @@ def manager(tmp_path, monkeypatch):
             calls.append(payload)
             entered.set()
 
-        def close(self):
+        def close(self, *, deadline=None):
             self.closed.set()
             return True
 
@@ -347,6 +347,7 @@ def test_worker_wire_payload_keeps_utf8_arguments_within_frame_limit():
     from mcp_runtime import Worker
     worker = object.__new__(Worker)
     worker.close_guard = threading.Lock()
+    worker.write_guard = threading.Lock()
     worker.process = SimpleNamespace(stdin=BytesIO())
     arguments = {'query': '中' * 340000}
     request = {'operation': 'mcp_call', 'tool': 'search', 'arguments': arguments,
@@ -364,7 +365,7 @@ def test_stop_does_not_confirm_unfinished_personal_worker(manager):
     key, binding = str(uuid4()), str(uuid4())
     class PendingWorker:
         stopped = False
-        def close(self):
+        def close(self, *, deadline=None):
             return self.stopped
     worker = PendingWorker()
     runtime.CLOSING[worker] = (key, 'demo', binding)
@@ -392,7 +393,7 @@ def test_cleanup_works_when_new_threads_cannot_start(manager, monkeypatch):
     _, runtime, _, _ = manager
     key = str(uuid4())
     class Closing:
-        def close(self): return True
+        def close(self, *, deadline=None): return True
     worker = Closing()
     runtime.CLOSING[worker] = (key, 'demo', None)
     monkeypatch.setattr(threading.Thread, 'start', lambda self: (_ for _ in ()).throw(RuntimeError('cannot start thread')))

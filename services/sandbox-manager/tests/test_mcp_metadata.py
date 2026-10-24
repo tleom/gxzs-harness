@@ -102,7 +102,7 @@ def test_discovery_age_requests_refresh_and_authentication_edit_invalidates(ops,
     ops.personal_mcp({"operation": "mcp_cache", "name": "demo", "version": save["version"],
                       "tools": tools}, str(tmp_path))
     assert ops.personal_mcp({"operation": "mcp_list"}, str(tmp_path))["mcp"][0]["status"] == "ready"
-    monkeypatch.setattr(ops.time, "time", lambda: now + ops.DISCOVERY_TTL)
+    monkeypatch.setattr(ops.time, "time", lambda: now + ops.policy('discovery_cache_seconds'))
     item = ops.personal_mcp({"operation": "mcp_list"}, str(tmp_path))["mcp"][0]
     assert item["status"] == "ready" and item["refresh_due"] and item["tools"] == tools
     monkeypatch.setattr(ops.time, "time", lambda: now)

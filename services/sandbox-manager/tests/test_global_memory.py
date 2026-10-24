@@ -155,6 +155,33 @@ class RoutingTests(unittest.TestCase):
         self.assertEqual(self.worker.send.call_count, 2)
         self.assertEqual(self.worker.send.call_args.args[:2], ('cg', {'op': 'read', 'query': 'preference'}))
 
+    def test_policy_controls_long_deadlines_startup_and_owner_concurrency(self):
+        import mcp_policy
+        import time
+        limits = {**mcp_policy.current(), 'max_call_seconds': 900, 'startup_timeout_seconds': 75, 'max_owner_calls': 1}
+        deadline = int(time.time() * 1000) + 800_000
+        self.payload['deadline_ms'] = deadline
+        self.payload['authorization']['deadline_ms'] = deadline
+        with patch.object(mcp_policy, '_policy', limits):
+            self.assertFalse(self.run_call()['isError'])
+            self.assertEqual(self.worker.response.call_args_list[0].kwargs['timeout'], 75)
+            self.assertGreater(self.worker.send.call_args.args[2], 350)
+            occupied = memory.MemoryCall('owner-a', 'other-binding')
+            memory.ACTIVE.add(occupied)
+            try:
+                self.assertEqual(self.run_call()['code'], 'MCP_BUSY')
+            finally:
+                memory.ACTIVE.discard(occupied)
+            import mcp_runtime
+            personal = Mock(key='owner-a')
+            with mcp_runtime.GUARD:
+                mcp_runtime.ACTIVE.add(personal)
+            try:
+                self.assertEqual(self.run_call()['code'], 'MCP_BUSY')
+            finally:
+                with mcp_runtime.GUARD:
+                    mcp_runtime.ACTIVE.discard(personal)
+
     def test_cancel_during_consume_prevents_dispatch(self):
         def authorize(callback):
             if callback['action'] == 'consume':

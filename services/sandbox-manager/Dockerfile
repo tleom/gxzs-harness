@@ -7,10 +7,11 @@ RUN apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=docker-cli /usr/local/bin/docker /usr/local/bin/docker
 WORKDIR /app
-COPY mcp_outcomes.py global_memory.py ./
+COPY mcp_policy.py mcp_outcomes.py global_memory.py ./
 RUN python global_memory.py --install
 COPY server.py file_ops.py resource_ops.py binary_upload.py file_download.py environment.py stop_jobs.py office_preview.py office_conversions.py planning.py planning_exec.py ./
-COPY mcp_ops.py mcp_worker.py mcp_runtime.py mcp_exec.py ./
+COPY skill_imports.py skill_import_runtime.py ./
+COPY mcp_policy.py mcp_ops.py mcp_protocol.py mcp_task_transport.py mcp_worker.py mcp_runtime.py mcp_exec.py mcp_isolation.py ./
 COPY hosts.py admission.py owner_auth.py mcp_authorization.py resource_limits.py runtime_names.py ./
 COPY owner_networks.py docker_inspect.py global_skills.py ./
 COPY memory_exec.py ./

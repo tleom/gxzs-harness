@@ -14,6 +14,43 @@ function create(fetchImpl) {
 }
 
 describe('restricted sandbox-manager file client', () => {
+  it('preserves a confirmed conflict even when the caller aborts after the response', async () => {
+    const controller = new AbortController()
+    const fetchImpl = vi.fn(async () => {
+      controller.abort()
+      return new Response(JSON.stringify({ error: 'changed', code: 'RESOURCE_CONFLICT' }), { status: 409 })
+    })
+    await expect(create(fetchImpl).personalResources({ operation: 'skill_import', import_id: 'd'.repeat(32), version: null }, controller.signal))
+      .rejects.toMatchObject({ status: 409, code: 'RESOURCE_CONFLICT' })
+    expect(fetchImpl).toHaveBeenCalledOnce()
+  })
+  it('keeps the initial personal MCP response budget for an in-flight request', async () => {
+    const client = create(async () => {
+      client.setMcpPolicy({ catalog_timeout_seconds: 1, response_bytes: 128 })
+      return new Response(JSON.stringify({ value: 'x'.repeat(2048) }))
+    })
+    client.setMcpPolicy({ catalog_timeout_seconds: 3, response_bytes: 4096 })
+    await expect(client.personalMcp({ operation: 'mcp_list' })).resolves.toEqual({ value: 'x'.repeat(2048) })
+  })
+
+  it('settles an aborted import from a remote receipt without replaying its mutation', async () => {
+    const controller = new AbortController()
+    const fetchImpl = vi.fn().mockImplementationOnce(async () => {
+      controller.abort()
+      throw new DOMException('aborted', 'AbortError')
+    }).mockResolvedValueOnce(new Response(JSON.stringify({ status: 'completed', id: 'demo', version: 'v1' })))
+    await expect(create(fetchImpl).personalResources({ operation: 'skill_import', import_id: 'a'.repeat(32), version: null }, controller.signal))
+      .resolves.toMatchObject({ status: 'completed', version: 'v1' })
+    expect(fetchImpl).toHaveBeenCalledTimes(2)
+    expect(fetchImpl.mock.calls.map(([, options]) => JSON.parse(options.body).operation)).toEqual(['skill_import', 'skill_import_cancel'])
+    expect(fetchImpl.mock.calls[1][1].signal.aborted).toBe(false)
+  })
+  it.each([['cancelled', 'SKILL_IMPORT_CANCELLED'], ['unknown', 'SKILL_IMPORT_UNCERTAIN'], ['failed', 'SKILL_IMPORT_FAILED']])
+    ('distinguishes a %s import result', async (status, code) => {
+      const manager = create(async () => new Response(JSON.stringify({ status })))
+      await expect(manager.personalResources({ operation: 'skill_import', import_id: 'a'.repeat(32), version: null }))
+        .rejects.toMatchObject({ code })
+    })
   it.each(['PROFILE_UPGRADE_PREPARING', 'FILE_VERSION_CONFLICT'])('preserves %s conflict identity without retrying a mutation', async code => {
     const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ error: '当前状态冲突', code, request_id: 'request-1', retry_after: 5 }), { status: 409 }))
     await expect(create(fetchImpl).operate({ operation: 'delete', path: 'large.bin', version: 'old' }))

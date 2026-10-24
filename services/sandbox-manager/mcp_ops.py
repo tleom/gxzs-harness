@@ -7,6 +7,7 @@ All file traversal follows the same no-symlink contract as personal skills.
 
 import fcntl
 import json
+import math
 import os
 import re
 import stat
@@ -17,10 +18,7 @@ from urllib.parse import urlsplit
 from file_ops import parent_fd, read_file, version
 from resource_ops import SETTINGS, ORDER, atomic_write, directory, resource_directory, read_order, order_items, reorder_resources
 
-MAX_CONFIG = 65536
-MAX_MANIFEST = 1024 * 1024
-DISCOVERY_TTL = 300
-
+from mcp_policy import get as policy
 
 class ManifestError(ValueError):
     """Safe, actionable discovery failures; never include server-provided text."""
@@ -44,33 +42,31 @@ def plugin_name(value):
 
 
 def string_map(value, label):
-    if not isinstance(value, dict) or len(value) > 100:
-        raise ValueError(label + " 必须是字符串键值对象，最多 100 项")
+    if not isinstance(value, dict):
+        raise ValueError(label + " 必须是字符串键值对象")
     if any(not isinstance(k, str) or not isinstance(v, str) or "\x00" in k + v for k, v in value.items()):
         raise ValueError(label + " 必须是字符串键值对象")
     return value
 
 
 def configuration(raw):
-    if not raw or len(raw) > MAX_CONFIG:
-        raise ValueError("mcp.json 必须是非空且不超过 64 KiB 的 UTF-8 JSON")
+    if not raw or len(raw) > policy('request_bytes'):
+        raise ValueError("mcp.json 必须是非空且符合传输预算的 UTF-8 JSON")
     value = json.loads(raw.decode("utf-8-sig"))
     if not isinstance(value, dict):
         raise ValueError("MCP 配置必须是 JSON 对象")
-    allowed = {"name", "display_name", "description", "transport", "url", "headers", "command", "args", "env", "cwd", "timeout"}
-    if set(value) - allowed:
-        raise ValueError("MCP 配置包含不支持的字段")
-    for key, maximum in (("name", 120), ("display_name", 120), ("description", 2000)):
-        if key in value and (not isinstance(value[key], str) or len(value[key]) > maximum):
+    # Preserve extension fields; only explicitly supported connection fields are executed.
+    for key in ("name", "display_name", "description"):
+        if key in value and (not isinstance(value[key], str)):
             raise ValueError("MCP 名称或说明格式无效")
     transport = value.get("transport") or ("stdio" if value.get("command") else "streamable-http")
     if transport == "http":
         transport = "streamable-http"
     if transport not in {"stdio", "streamable-http", "sse"}:
         raise ValueError("transport 需为 stdio、streamable-http 或 sse")
-    timeout = value.get("timeout", 60)
-    if type(timeout) not in (int, float) or not 5 <= timeout <= 300:
-        raise ValueError("MCP 超时需为 5–300 秒")
+    timeout = value.get("timeout", policy("call_timeout_seconds"))
+    if type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("MCP 超时需为正数秒")
     value = {**value, "transport": transport, "timeout": timeout}
     if transport == "stdio":
         if any(key in value for key in ("url", "headers")):
@@ -78,8 +74,8 @@ def configuration(raw):
         command, args = value.get("command"), value.get("args", [])
         if not isinstance(command, str) or not command.strip() or "\x00" in command:
             raise ValueError("缺少有效的 MCP 启动命令")
-        if not isinstance(args, list) or len(args) > 100 or any(not isinstance(v, str) or "\x00" in v for v in args):
-            raise ValueError("args 必须是字符串数组，最多 100 项")
+        if not isinstance(args, list) or any(not isinstance(v, str) or "\x00" in v for v in args):
+            raise ValueError("args 必须是字符串数组")
         value["args"] = args
         value["env"] = string_map(value.get("env", {}), "env")
         cwd = value.get("cwd", "/workspace")
@@ -92,7 +88,7 @@ def configuration(raw):
         if any(key in value for key in ("command", "args", "env", "cwd")):
             raise ValueError("远程 MCP 配置使用 url 和 headers")
         url = value.get("url")
-        if not isinstance(url, str) or len(url) > 4096 or any(c in url for c in "\r\n\x00"):
+        if not isinstance(url, str) or any(c in url for c in "\r\n\x00"):
             raise ValueError("缺少有效的 MCP URL")
         parsed = urlsplit(url)
         if (
@@ -177,12 +173,15 @@ def tool_manifest(tools):
                 for key, value in part.items():
                     if key in {"$ref", "$dynamicRef"} and (not isinstance(value, str) or not value.startswith("#")):
                         raise ManifestError("MCP 参数声明不能引用外部 JSON Schema")
-                    pending.append(value)
-            elif isinstance(part, list):
-                pending.extend(part)
+                    if key in {"properties", "patternProperties", "$defs", "definitions", "dependentSchemas", "dependencies"} and isinstance(value, dict):
+                        pending.extend(child for child in value.values() if isinstance(child, (dict, bool)))
+                    elif key in {"anyOf", "allOf", "oneOf", "prefixItems", "items"} and isinstance(value, list):
+                        pending.extend(value)
+                    elif key in {"additionalProperties", "unevaluatedProperties", "propertyNames", "contains", "additionalItems", "unevaluatedItems", "if", "then", "else", "not", "contentSchema", "items"}:
+                        pending.append(value)
         description = tool.get("description", "")
-        if not isinstance(description, str) or len(description) > 16000:
-            raise ManifestError("MCP 工具说明过长或无效")
+        if not isinstance(description, str):
+            raise ManifestError("MCP 工具说明无效")
         declaration = {"name": name, "description": description, "inputSchema": schema}
         if output_schema is not None:
             declaration["outputSchema"] = output_schema
@@ -193,8 +192,6 @@ def tool_manifest(tools):
                 declaration[key] = tool[key]
         result.append(declaration)
         seen.add(name)
-    if len(json.dumps(result).encode()) > MAX_MANIFEST:
-        raise ManifestError("MCP 工具目录超过 1 MiB", "MCP_MANIFEST_TOO_LARGE")
     return result
 
 
@@ -216,7 +213,7 @@ def raw_configuration(rootfd, name):
     finally:
         os.close(mcpfd)
     try:
-        return read_file(fd, "mcp.json")
+        return read_file(fd, "mcp.json", max_bytes=policy('request_bytes'))
     finally:
         os.close(fd)
 
@@ -276,7 +273,7 @@ def snapshot(rootfd, selected=None):
                     items.append(item)
                     continue
                 try:
-                    cached = json.loads(read_file(cachefd, name + ".json") or b"{}")
+                    cached = json.loads(read_file(cachefd, name + ".json", max_bytes=policy('response_bytes')) or b"{}")
                     if (isinstance(cached, dict) and cached.get("version") == revision
                             and cached.get("connection_fingerprint") == connection_fingerprint(config)
                             and cached.get("authentication_version") == authentication_version(config)
@@ -289,8 +286,8 @@ def snapshot(rootfd, selected=None):
                             # Age requests revalidation; it is not evidence that a
                             # previously verified, unchanged plugin is unavailable.
                             if not cached.get("refresh_failed"):
-                                item.update(tools=tools, manifest_version=fingerprint, status="ready",
-                                            refresh_due=time.time() - cached["discovered_at"] >= DISCOVERY_TTL)
+                                item.update(server_info=cached.get("server_info", {}), tools=tools, manifest_version=fingerprint, status="ready",
+                                            refresh_due=time.time() - cached["discovered_at"] >= policy('discovery_cache_seconds'))
                 except (ValueError, OSError, RecursionError):
                     warnings.append(f"个人 MCP {name} 的目录缓存无效，正在重新发现")
                 items.append(item)
@@ -349,7 +346,7 @@ def personal_mcp(payload, root="/workspace"):
                 else os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=mcpfd)
             )
             try:
-                raw = read_file(fd, "mcp.json")
+                raw = read_file(fd, "mcp.json", max_bytes=policy('request_bytes'))
                 revision = version(raw)
                 if operation == "mcp_read":
                     return {"id": name, "content": (raw or b"").decode("utf-8-sig"), "version": revision}
@@ -377,7 +374,7 @@ def personal_mcp(payload, root="/workspace"):
                             if connection_configuration(configuration(raw)) == connection_configuration(config):
                                 cachefd = directory(statefd, ".cache")
                                 try:
-                                    cached = json.loads(read_file(cachefd, name + ".json") or b"{}")
+                                    cached = json.loads(read_file(cachefd, name + ".json", max_bytes=policy('response_bytes')) or b"{}")
                                     if (not isinstance(cached, dict) or cached.get("version") != revision
                                             or cached.get("connection_fingerprint") != connection_fingerprint(config)
                                             or cached.get("authentication_version") != authentication_version(config)):
@@ -424,7 +421,7 @@ def personal_mcp(payload, root="/workspace"):
                         if cached is not None or renamed:
                             cachefd = directory(statefd, ".cache")
                             target_cache = target_name + ".json"
-                            changed_cache.append((target_cache, read_file(cachefd, target_cache)))
+                            changed_cache.append((target_cache, read_file(cachefd, target_cache, max_bytes=policy('response_bytes'))))
                             if cached is not None:
                                 atomic_write(cachefd, target_cache, json.dumps({
                                     **cached, "version": version(data)
@@ -436,7 +433,7 @@ def personal_mcp(payload, root="/workspace"):
                                     pass
                             if renamed:
                                 old_cache = name + ".json"
-                                changed_cache.append((old_cache, read_file(cachefd, old_cache)))
+                                changed_cache.append((old_cache, read_file(cachefd, old_cache, max_bytes=policy('response_bytes'))))
                                 try:
                                     os.unlink(old_cache, dir_fd=cachefd)
                                 except FileNotFoundError:
@@ -511,7 +508,7 @@ def personal_mcp(payload, root="/workspace"):
                     cachefd = directory(statefd, ".cache")
                     try:
                         fcntl.flock(cachefd, fcntl.LOCK_EX)
-                        cached = json.loads(read_file(cachefd, name + ".json") or b"{}")
+                        cached = json.loads(read_file(cachefd, name + ".json", max_bytes=policy('response_bytes')) or b"{}")
                         # A late failure must not invalidate a newer discovery.
                         if (cached.get("version") != revision or payload.get("discovered_at") is None
                                 or cached.get("discovered_at") != payload["discovered_at"]):
@@ -531,7 +528,7 @@ def personal_mcp(payload, root="/workspace"):
                                 "version": revision, "connection_fingerprint": connection_fingerprint(config),
                                 "authentication_version": authentication_version(config),
                                 "discovered_at": time.time(), "manifest_version": manifest_version(tools),
-                                "tools": tools,
+                                "tools": tools, "server_info": payload.get("server_info", {}),
                             }).encode()
                         )
                     finally:

@@ -1,5 +1,6 @@
 import { test, afterEach } from 'vitest'
 import assert from 'node:assert/strict'
+import { DatabaseSync } from 'node:sqlite'
 import * as mcp from '../../workbench-mcp-tools/src/index.js'
 import { platformToolNames } from '../../workbench-mcp-tools/src/names.js'
 import { mount, call, response } from './helpers.mjs'
@@ -16,19 +17,24 @@ const catalog = ['global', 'personal'].map(scope => ({
   description: '检索案件记录', inputSchema: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] },
 }))
 
-async function setup(mode = 'native') {
+async function setup(mode = 'native', taskReply) {
   const names = platformToolNames(catalog), calls = []
   let available = catalog, plugins = [], run = { id: 'run-1', ownerId: 'owner-a', status: 'running', mcpTools: catalog }
   const personalName = names.get(catalog[1].id)
+  const db = taskReply ? new DatabaseSync(':memory:') : undefined
+  db?.exec("PRAGMA foreign_keys=ON; CREATE TABLE runs(id TEXT PRIMARY KEY); INSERT INTO runs VALUES ('run-1')")
   const h = await mount({ rows: [], mode, mountDiscovery: false,
     script: [call('tool_search', { query: '档案', name: 'my_records' }, mode), call(personalName, { query: 'one' }, mode), response()],
     bridgeFactory: async ctx => {
       ctx.provide('workbenchPlatformClient', { json: async request => {
         if (request.route === 'mcp/catalog') return { tools: available, plugins }
-        calls.push(JSON.parse(request.body.toString()))
+        const payload = JSON.parse(request.body.toString())
+        calls.push(payload)
+        if (request.route === 'mcp/task' && taskReply) return { data: taskReply(payload) }
         return { data: { result: { result: { content: [{ type: 'text', text: 'fixture archived record' }] } } } }
       } })
       ctx.provide('workbenchRuntime', { ownerId: 'owner-a', agents: ctx.agents,
+        ...(db ? { database: { db } } : {}),
         executionRun: () => run,
         authorizeMcpCall: async (_sessionId, id, version) => {
           const resource = run.ownerId === 'owner-a' && run.status === 'running' && run.mcpTools.find(item => item.id === id && item.version === version)
@@ -39,7 +45,7 @@ async function setup(mode = 'native') {
       return ctx.toolDiscoveryCatalog
     },
   })
-  cleanups.push(() => h.close())
+  cleanups.push(async () => { try { await h.close() } finally { db?.close() } })
   return { ...h, names, calls, personalName,
     setRun: value => { run = value }, getRun: () => run,
     setAvailable: async value => { available = value; await h.ctx.parallel('workbench/resources-changed') },
@@ -68,7 +74,7 @@ for (const mode of ['native', 'ptc']) test(`${mode}: publication reorder reaches
   const moved = [first[0], tool('zeta', 5), first[1]]
   await h.setAvailable(moved)
   const admitted = await h.ctx.workbenchRuntime.refreshMcpCatalog()
-  assert.deepEqual(admitted.map(item => item.server_id), ['alpha', 'zeta', 'beta'])
+  assert.deepEqual(admitted.tools.map(item => item.server_id), ['alpha', 'zeta', 'beta'])
   assert.deepEqual(h.ctx.workbenchRuntime.mcpResources().map(item => item.server_id), ['alpha', 'zeta', 'beta'])
   assert.ok(h.ctx.tools.get(zetaName, agent), 'an order-only refresh retains the loaded tool')
   h.adapter.script = [call(zetaName, { query: 'after' }, mode), response(), response()]
@@ -143,7 +149,7 @@ test('actual bridge rejects a changed manifest and an owner/run change before a 
   assert.equal(h.ctx.tools.get(h.personalName, agent), undefined)
 })
 
-for (const mode of ['native', 'ptc']) test(`${mode}: required-task declarations remain visible as unsupported and cannot be activated`, async () => {
+for (const mode of ['native', 'ptc']) test(`${mode}: required-task declarations without task capability stay unavailable`, async () => {
   const h = await setup(mode)
   const required = catalog.map(tool => ({ ...tool, execution: { taskSupport: 'required' } }))
   h.setRun({ ...h.getRun(), mcpTools: required }); await h.setAvailable(required)
@@ -152,7 +158,7 @@ for (const mode of ['native', 'ptc']) test(`${mode}: required-task declarations 
   const agent = await h.create(); await h.send(agent)
   assert.equal(h.calls.length, 0)
   assert.deepEqual(h.ctx.sessionProjections.stateOf(agent.session, PROJECTION_KEY).tools, [])
-  assert.ok(agent.session.snapshotEvents().some(event => JSON.stringify(event.data).includes('task_execution_required')))
+  assert.ok(agent.session.snapshotEvents().some(event => JSON.stringify(event.data).includes('task_capability_unavailable')))
   assert.equal(h.ctx.tools.get(h.personalName, agent), undefined)
   const optional = required.map(tool => ({ ...tool, execution: { taskSupport: 'optional' }, manifest_version: 'm2' }))
   h.setRun({ ...h.getRun(), mcpTools: optional }); await h.setAvailable(optional)
@@ -162,6 +168,44 @@ for (const mode of ['native', 'ptc']) test(`${mode}: required-task declarations 
   assert.equal(h.calls.length, 1)
   assert.equal(h.calls[0].manifest_version, 'm2')
 })
+
+for (const mode of ['native', 'ptc']) for (const modern of [false, true])
+  test(`${mode}: discovers, loads and executes an authorized ${modern ? 'modern' : 'legacy'} required task`, async () => {
+    const task = { taskId: 'discovered-task', createdAt: '2026-10-24T00:00:00Z', lastUpdatedAt: '2026-10-24T00:00:00Z',
+      ...(modern ? { ttlMs: 60000, pollIntervalMs: 1 } : { ttl: 60000, pollInterval: 1 }) }
+    const result = { content: [{ type: 'text', text: 'discovered task result' }], ...(modern ? { resultType: 'complete' } : {}) }
+    const h = await setup(mode, request => {
+      if (request.method === 'tools/call') return { task_ticket: 'ticket', result: modern
+        ? { ...task, status: 'working', resultType: 'task' } : { task: { ...task, status: 'working' } } }
+      if (request.method === 'tasks/get') return { result: { ...task, status: 'completed',
+        ...(modern ? { resultType: 'complete', result } : {}) } }
+      if (request.method === 'tasks/result') return { result }
+      throw new Error(`unexpected task method: ${request.method}`)
+    })
+    const required = catalog.map(tool => ({ ...tool, execution: { taskSupport: 'required' } }))
+    h.setRun({ ...h.getRun(), mcpTools: required })
+    await h.setAvailable(required)
+    const servers = required.map(tool => ({ id: `${tool.scope}:mcp:${tool.server_id}`, name: tool.provider_call_name, scope: tool.scope,
+      version: tool.version, manifest_version: tool.manifest_version, protocol_version: modern ? '2026-07-28' : '2025-11-25',
+      capabilities: modern ? { extensions: { 'io.modelcontextprotocol/tasks': {} } }
+        : { tasks: { requests: { tools: { call: {} } }, cancel: {} } } }))
+    await h.setPlugins(servers)
+    await h.remount()
+    const agent = await h.create()
+    const revision = h.bridge.snapshot(agent).revision
+    assert.equal(h.bridge.snapshot(agent).tools.length, required.length)
+    assert.ok(h.bridge.snapshot(agent).tools.every(tool => !tool.unavailableReason))
+    await h.send(agent)
+    assert.deepEqual(h.calls.map(request => request.method), modern ? ['tools/call', 'tasks/get'] : ['tools/call', 'tasks/get', 'tasks/result'])
+    assert.equal(h.calls[0].resource_id, catalog[1].id)
+    assert.equal(h.calls[0].params.arguments.query, 'one')
+    assert.ok(agent.session.snapshotEvents().some(event => JSON.stringify(event.data).includes('discovered task result')))
+    assert.equal(h.ctx.sessionProjections.stateOf(agent.session, PROJECTION_KEY).tools.length, 1)
+    await h.setPlugins(servers.map(server => ({ ...server, capabilities: {} })))
+    assert.notEqual(h.bridge.snapshot(agent).revision, revision)
+    assert.ok(h.bridge.snapshot(agent).tools.every(tool => tool.unavailableReason === 'task_capability_unavailable'))
+    assert.equal(h.ctx.tools.get(h.personalName, agent), undefined, 'capability removal revokes the loaded tool')
+  })
 
 test('a scoped same-name definition is not mistaken for the catalog MCP executor', async () => {
   const h = await setup(); await h.remount()
@@ -182,7 +226,7 @@ test('HMR applies current policy before a reduced active budget when restoring r
   const before = h.ctx.sessionProjections.stateOf(agent.session, PROJECTION_KEY).tools.map(item => item.name)
   assert.equal(before.length, 2)
   await plugin.dispose(); agent.ctx.tools.restrict({ deny: [before[0]] })
-  await h.ctx.plugin(discovery, { maxActiveTools: 1 })
+  await h.ctx.plugin(discovery)
   h.adapter.script = [response()]; await h.send(agent)
   assert.equal(h.ctx.tools.get(before[0], agent), undefined)
   assert.ok(h.ctx.tools.get(before[1], agent))

@@ -10,6 +10,180 @@ from uuid import uuid4
 import pytest
 
 
+@pytest.mark.skipif(os.name != 'posix', reason='Linux binary descriptor handoff')
+@pytest.mark.parametrize('action,op', [('files', 'upload'), ('personal-resources', 'skill_inspect'), ('personal-resources', 'skill_stage')])
+def test_upload_header_inspection_preserves_raw_stdin_bytes(server, monkeypatch, action, op):
+    import tempfile
+    import mcp_runtime
+    payload = json.dumps({'operation': op}).encode() + b'\n' + b'\x00binary-data\xff'
+    observed = []
+    def run(*args, stdin, **kwargs):
+        observed.append(os.read(stdin.fileno(), len(payload) + 1))
+        return SimpleNamespace(returncode=0, stdout=b'{}')
+    monkeypatch.setattr(server, 'ensure', lambda key: None)
+    monkeypatch.setattr(mcp_runtime, 'module_source', lambda *names: '')
+    monkeypatch.setattr(server.subprocess, 'run', run)
+    with tempfile.TemporaryFile() as source:
+        source.write(payload)
+        server.upload_operation(str(uuid4()), action, source)
+    assert observed == [payload]
+
+
+@pytest.mark.parametrize('op', ['skill_import_cancel', 'skill_import_status'])
+def test_skill_import_control_does_not_provision_or_wait_on_workspace_lock(server, monkeypatch, op):
+    import skill_import_runtime
+    key = str(uuid4())
+    operation = 'cancel' if op == 'skill_import_cancel' else 'status'
+    control = Mock(return_value={'status': 'cancelled' if operation == 'cancel' else 'running'})
+    monkeypatch.setattr(skill_import_runtime, operation, control)
+    monkeypatch.setattr(server, 'ensure', Mock(side_effect=AssertionError('control must not provision')))
+    monkeypatch.setattr(server, 'lock', Mock(side_effect=AssertionError('control must not wait')))
+    payload = {'operation': op, 'import_id': 'a' * 32}
+    assert server.operation(key, 'personal-resources', payload) == control.return_value
+    control.assert_called_once_with(key, server.identity(key)[0], payload)
+
+
+def test_legacy_skill_job_transfers_existing_admission_slot(server, monkeypatch):
+    import skill_import_runtime
+    capacity = Mock()
+    invoke = Mock(return_value={'status': 'running'})
+    monkeypatch.setattr(server, 'OPERATION_CAPACITY', capacity)
+    monkeypatch.setattr(server, 'ensure', lambda key: None)
+    monkeypatch.setattr(skill_import_runtime, 'invoke', invoke)
+    server.REQUEST_CONTEXT.operation_capacity = True
+    payload = {'operation': 'skill_import', 'import_id': 'd' * 32, 'name': 'demo', 'version': None}
+    try:
+        assert server.operation(str(uuid4()), 'personal-resources', payload)['status'] == 'running'
+        assert server.REQUEST_CONTEXT.operation_capacity is False
+        capacity.acquire.assert_not_called()
+        capacity.release.assert_not_called()
+        invoke.call_args.kwargs['on_finish']()
+        capacity.release.assert_called_once()
+    finally:
+        server.REQUEST_CONTEXT.operation_capacity = False
+
+
+@pytest.mark.parametrize('terminal,status,code', [('failed', 400, 'SKILL_IMPORT_FAILED'),
+    ('cancelled', 409, 'SKILL_IMPORT_CANCELLED'), ('unknown', 503, 'SKILL_IMPORT_UNCERTAIN')])
+def test_legacy_skill_wrapper_preserves_outcomes_and_cancels_only_unsettled(server, monkeypatch, terminal, status, code):
+    calls = []
+    def operation(key, action, payload):
+        calls.append(payload['operation'])
+        return {'version': None} if payload['operation'] == 'skill_prepare' else {'status': terminal, 'import_id': 'a' * 32}
+    monkeypatch.setattr(server, 'operation', operation)
+    with pytest.raises(server.SkillImportFailure) as raised:
+        server.finish_legacy_import('owner', {'name': 'report'}, 'a' * 32)
+    assert (raised.value.http_status, raised.value.code) == (status, code)
+    assert ('skill_import_cancel' in calls) == (terminal == 'unknown')
+
+
+@pytest.mark.parametrize('terminal,status,code', [('failed', 400, 'SKILL_IMPORT_FAILED'),
+    ('cancelled', 409, 'SKILL_IMPORT_CANCELLED'), ('unknown', 503, 'SKILL_IMPORT_UNCERTAIN')])
+def test_legacy_skill_http_errors_keep_structured_terminal_outcomes(server, monkeypatch, terminal, status, code):
+    body = json.dumps({'operation': 'skill_import', 'import_id': 'a' * 32}).encode()
+    handler = object.__new__(server.Handler)
+    handler.path = '/sandboxes/' + str(uuid4()) + '/personal-resources'
+    handler.headers = {'Authorization': 'Bearer ' + server.TOKEN, 'Content-Length': str(len(body)), 'Content-Type': 'application/json'}
+    handler.rfile, handler.write_json = BytesIO(body), Mock()
+    monkeypatch.setattr(server, 'operation', Mock(side_effect=server.SkillImportFailure({'status': terminal, 'import_id': 'a' * 32})))
+    handler.do_POST()
+    response_status, raw = handler.write_json.call_args.args
+    assert response_status == status
+    response = json.loads(raw)
+    assert response['code'] == code and response['import_id'] == 'a' * 32
+
+
+@pytest.mark.parametrize('operation,expected', [('skill_stage', 200), ('skill_inspect', 200),
+    ('skill_import', 200), ('skill_update', 400), ('global_install', 200)])
+def test_json_ingress_budget_expands_only_skill_packages(server, monkeypatch, operation, expected):
+    body = json.dumps({'operation': operation, 'archive': 'a' * 40}).encode()
+    handler = object.__new__(server.Handler)
+    action = 'global-resources' if operation == 'global_install' else 'personal-resources'
+    handler.path = '/sandboxes/' + str(uuid4()) + '/' + action
+    handler.headers = {'Authorization': 'Bearer ' + server.TOKEN, 'Content-Length': str(len(body)), 'Content-Type': 'application/json'}
+    handler.rfile, handler.write_json = BytesIO(body), Mock()
+    monkeypatch.setattr(server, 'MAX_BODY', 32)
+    monkeypatch.setattr(server, 'MAX_SKILL_JSON_BYTES', 256)
+    forwarded = Mock(return_value={'ok': True})
+    monkeypatch.setattr(server, 'operation', forwarded)
+    handler.do_POST()
+    assert handler.write_json.call_args.args[0] == expected
+    assert forwarded.called == (expected == 200)
+
+
+@pytest.mark.parametrize('action', ['personal-mcp', 'global-mcp'])
+def test_task_cancel_does_not_wait_for_business_operation_capacity(server, monkeypatch, action):
+    import threading
+    capacity = threading.BoundedSemaphore(1)
+    assert capacity.acquire(blocking=False)
+    monkeypatch.setattr(server, 'OPERATION_CAPACITY', capacity)
+    operation = Mock(return_value={'ok': True})
+    monkeypatch.setattr(server, 'operation', operation)
+    for method, expected in [('tasks/get', 503), ('tasks/cancel', 200)]:
+        body = json.dumps({'operation': 'mcp_task', 'method': method}).encode()
+        handler = object.__new__(server.Handler)
+        handler.path = '/sandboxes/' + str(uuid4()) + '/' + action
+        handler.headers = {'Authorization': 'Bearer ' + server.TOKEN, 'Content-Length': str(len(body)), 'Content-Type': 'application/json'}
+        handler.rfile, handler.write_json = BytesIO(body), Mock()
+        handler.do_POST()
+        assert handler.write_json.call_args.args[0] == expected
+    operation.assert_called_once()
+    assert not capacity.acquire(blocking=False)
+
+
+@pytest.mark.parametrize('action', ['personal-mcp', 'global-mcp'])
+def test_missing_task_cancel_connection_never_provisions_or_probes(server, monkeypatch, action):
+    monkeypatch.setattr(server, 'ensure', Mock(side_effect=AssertionError('cancel must not provision')))
+    monkeypatch.setattr(server, 'lock', Mock(side_effect=AssertionError('cancel must not wait for workspace IO')))
+    monkeypatch.setattr(server, 'docker', Mock(side_effect=AssertionError('cancel must not start Docker work')))
+    payload = {'operation': 'mcp_task', 'method': 'tasks/cancel', 'name': 'reports', 'connection_id': 'missing'}
+    assert '连接已失效' in server.operation(str(uuid4()), action, payload)['error']
+
+
+@pytest.mark.parametrize('inspection,confirmed', [(None, True), ({'State': {'Running': False}}, True),
+    ({'State': {'Running': True}}, False)])
+def test_idle_sandbox_reaper_releases_skill_jobs_only_after_stop_proof(server, monkeypatch, inspection, confirmed):
+    import global_memory
+    import mcp_runtime
+    import skill_import_runtime
+    key = str(uuid4())
+    marker = server.STATE / key
+    marker.touch()
+    os.utime(marker, (1, 1))
+    monkeypatch.setattr(server, 'docker', Mock())
+    monkeypatch.setattr(server.HOSTS, '_upgrade_inspect', Mock(return_value=inspection))
+    monkeypatch.setattr(mcp_runtime, 'invalidate', Mock())
+    monkeypatch.setattr(mcp_runtime, 'reap_workers', Mock())
+    monkeypatch.setattr(global_memory, 'reap_calls', Mock())
+    monkeypatch.setattr(skill_import_runtime, 'reap_calls', Mock())
+    fenced = Mock()
+    monkeypatch.setattr(skill_import_runtime, 'fence_workspace', fenced)
+    monkeypatch.setattr(server.time, 'sleep', lambda _: (_ for _ in ()).throw(SystemExit()))
+    with pytest.raises(SystemExit):
+        server.reap()
+    assert fenced.called == confirmed
+
+
+@pytest.mark.parametrize('op', ['skill_import_cancel', 'skill_import_status'])
+def test_skill_import_control_authorizes_owner_without_operation_capacity_or_workspace_lock(server, monkeypatch, op):
+    key = str(uuid4())
+    payload = {'operation': op, 'import_id': 'a' * 32}
+    body = json.dumps(payload).encode()
+    handler = object.__new__(server.Handler)
+    handler.path = '/sandboxes/' + key + '/personal-resources'
+    handler.headers = {'Authorization': 'Bearer owner-token', 'Content-Length': str(len(body)), 'Content-Type': 'application/json'}
+    handler.rfile = BytesIO(body)
+    handler.write_json = Mock()
+    authorized = Mock(return_value='owner')
+    monkeypatch.setattr(server, 'authorize_request', authorized)
+    monkeypatch.setattr(server, 'operation', Mock(return_value={'status': 'cancelled'}))
+    monkeypatch.setattr(server, 'lock', Mock(side_effect=AssertionError('control must not wait')))
+    monkeypatch.setattr(server, 'OPERATION_CAPACITY', Mock(acquire=Mock(side_effect=AssertionError('control must bypass capacity'))))
+    handler.do_POST()
+    assert handler.write_json.call_args.args[0] == 200
+    authorized.assert_called_once()
+
+
 @pytest.fixture
 def server(tmp_path, monkeypatch):
     base = Path(__file__).parents[1]
@@ -46,6 +220,20 @@ def test_ensure_host_probes_only_the_waiting_owner_after_provisioning(server, mo
         maintain.assert_called_once_with(key)
     else:
         maintain.assert_not_called()
+
+
+def test_mcp_policy_requires_coordinator_credentials(server):
+    from owner_auth import owner_token
+    owner = owner_token(server.TOKEN, 'tenant:7', 'workspace', 1, 'host-1')
+    for token, status in ((owner, 403), (server.TOKEN, 200)):
+        handler = object.__new__(server.Handler)
+        handler.path = '/mcp-policy'
+        handler.headers = {'Authorization': 'Bearer ' + token}
+        handler.write_json = Mock()
+        handler.do_GET()
+        assert handler.write_json.call_args.args[0] == status
+        if status == 200:
+            assert json.loads(handler.write_json.call_args.args[1]) == server.mcp_policy()
 
 
 def test_ensure_returns_a_completed_readiness_probe_without_an_extra_client_retry(server, monkeypatch):
@@ -699,6 +887,67 @@ def post_handler(server, body, declared_size, **headers):
     handler.rfile, handler.wfile = BytesIO(body), BytesIO()
     handler.send_response, handler.send_header, handler.end_headers = Mock(), Mock(), Mock()
     return handler
+
+
+@pytest.mark.parametrize('status,code', [(409, 'HOST_STATE_CONFLICT'), (503, 'HOST_PLATFORM_UNAVAILABLE')])
+def test_platform_failure_retains_status_code_and_correlation(server, monkeypatch, status, code):
+    def fail(*args):
+        raise server.HostPlatformError(status, '个人工作环境状态正在同步', code, 'upstream-1', 3)
+    monkeypatch.setattr(server, 'operation', fail)
+    handler = post_handler(server, b'{}', 2)
+    handler.do_POST()
+    assert handler.send_response.call_args.args[0] == status
+    assert json.loads(handler.wfile.getvalue()) == {
+        'error': '个人工作环境状态正在同步', 'code': code,
+        'request_id': 'upstream-1', 'retry_after': 3,
+    }
+    assert server.REQUEST_CONTEXT.owner is None
+
+
+def test_real_heartbeat_http_conflict_survives_manager_http_boundary(server, monkeypatch):
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib.error import HTTPError
+    from urllib.request import Request, ProxyHandler, build_opener
+
+    class Platform(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_POST(self):
+            self.rfile.read(int(self.headers['Content-Length']))
+            data = json.dumps({'code': 409, 'message': '宿主状态已推进，不能应用过期状态',
+                               'request_id': 'platform-conflict-1', 'retry_after': 3}).encode()
+            self.send_response(409)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+    platform = ThreadingHTTPServer(('127.0.0.1', 0), Platform)
+    manager = server.BoundedHTTPServer(('127.0.0.1', 0), server.Handler)
+    threads = [threading.Thread(target=value.serve_forever, daemon=True) for value in (platform, manager)]
+    monkeypatch.setenv('GXZS_HOST_PLATFORM_URL', f'http://127.0.0.1:{platform.server_port}/internal/workbench')
+    monkeypatch.setenv('GXZS_ORCHESTRATOR_TOKEN', 'test-coordinator')
+    monkeypatch.setattr(server, 'operation', lambda *args: server.HOSTS.heartbeat({}, 'ready'))
+    for thread in threads:
+        thread.start()
+    try:
+        request = Request(f'http://127.0.0.1:{manager.server_port}/sandboxes/{uuid4()}/ensure-host',
+                          data=b'{}', headers={'Authorization': 'Bearer ' + server.TOKEN})
+        with pytest.raises(HTTPError) as failed:
+            build_opener(ProxyHandler({})).open(request, timeout=3)
+        with failed.value as response:
+            assert response.code == 409
+            body = json.loads(response.read())
+        assert body == {'error': '宿主状态已推进，不能应用过期状态', 'code': 'HOST_STATE_CONFLICT',
+                        'request_id': 'platform-conflict-1', 'retry_after': 3}
+    finally:
+        for listener in (manager, platform):
+            listener.shutdown()
+            listener.server_close()
+        for thread in threads:
+            thread.join(2)
 
 
 @pytest.mark.parametrize('body', [b'', b'{"action":"acq'])

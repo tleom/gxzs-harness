@@ -11,7 +11,7 @@ const entrySchema = z.object({
 })
 export const activeStateSchema = z.object({
   version: z.literal(1), authorityKey: z.string().max(4096).nullable(),
-  tools: z.array(entrySchema).max(256),
+  tools: z.array(entrySchema),
 })
 
 /** Whole-value native Session state; never grants authority to recovered IDs. */

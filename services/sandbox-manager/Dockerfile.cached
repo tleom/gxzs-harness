@@ -1,7 +1,7 @@
 FROM langgenius/dify-agent-local-sandbox@sha256:f4d404c9dcdf80bd72f65e84c3f2bbd1f3404fd4b363db837176da8aaf771b1d
 USER root
 WORKDIR /app
-COPY mcp_outcomes.py global_memory.py ./
+COPY mcp_policy.py mcp_outcomes.py global_memory.py ./
 RUN python3 global_memory.py --install
 COPY *.py ./
 # Test deployment mounts the host's Docker CLI read-only at /usr/local/bin/docker.

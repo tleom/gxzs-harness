@@ -42,6 +42,22 @@ it('carries its last observation revision to the next operation', async () => {
   expect(test.browser.command).toHaveBeenCalledWith({action:'element-click',selector:'#submit',expected_revision:7},test.exec.signal)
 })
 
+it.each(['not_found', 'ambiguous', 'stale'])('returns a new snapshot for %s without replaying the operation', async kind => {
+  const test = fixture()
+  const outcome = { kind, message: 'Lookup result', ...(kind === 'stale' ? {} : { match_count: kind === 'not_found' ? 0 : 2 }) }
+  let revision = 7
+  test.browser.command.mockImplementation(async value => value.action === 'snapshot'
+    ? { url: 'https://example.com/', title: 'Current page', text: 'Current content', elements: [], revision: revision++ }
+    : { outcome })
+  await test.definition.execute({ action: 'snapshot' }, test.exec)
+  const result = await test.definition.execute({ action: 'click', role: 'img', name: 'arrows-alt' }, test.exec)
+  expect(JSON.parse(result.content)).toMatchObject({ outcome, revision: 8, text: 'Current content' })
+  expect(test.definition.output.presentationMeta({}, result)).toMatchObject({ outcome })
+  expect(test.browser.command.mock.calls.filter(([value]) => value.action === 'element-click')).toHaveLength(1)
+  await test.definition.execute({ action: 'key', key: 'Tab' }, test.exec)
+  expect(test.browser.command).toHaveBeenCalledWith({ action: 'key', key: 'Tab', expected_revision: 8 }, test.exec.signal)
+})
+
 it('does not carry an old observation into a browser reopened with the same chat id', async () => {
   const test = fixture()
   test.browser.command.mockResolvedValue({ url: 'https://example.com/', title: 'Old page', revision: 7 })
