@@ -224,11 +224,12 @@ export class WorkbenchFileManager extends Service {
     this.client = new FileManagerClient(config)
   }
   get workspaceId() { return this.client.workspaceId }
+  setMcpPolicy(policy) { this.client.setMcpPolicy(policy) }
   upload(action, upload, signal) { return this.client.upload(action, upload, signal) }
   download(path, signal) { return this.client.download(path, signal) }
   operate(payload, signal) { return this.client.operate(payload, signal) }
   personalResources(payload, signal) { return this.client.personalResources(payload, signal) }
-  personalMcp(payload) { return this.client.personalMcp(payload) }
+  personalMcp(payload, signal) { return this.client.personalMcp(payload, signal) }
   assertSettingsWritable() { return this.client.assertSettingsWritable() }
 }
 

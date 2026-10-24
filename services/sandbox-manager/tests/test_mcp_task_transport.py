@@ -97,7 +97,7 @@ def test_task_frames_retain_capabilities_and_same_session_without_replaying(modu
             final=request('tasks/get', {'taskId':'one-task'})
             assert final['result']['status']=='cancelled'
             assert final['tasks_active_until']==0
-        assert '连接已失效' in request('tasks/get', {'taskId':'one-task'})['error']
+        assert request('tasks/get', {'taskId':'one-task'})['result']['status']=='cancelled'
         assert '连接已失效' in request('tasks/get', {'taskId':'another-owner-task'})['error']
         assert conn.call('report', operation='mcp_test')['ready'], 'settling a task keeps the shared worker alive'
     finally:
@@ -131,6 +131,11 @@ def test_terminal_task_pins_and_result_retry(modules, tmp_path, generation, stat
             terminal=request('tasks/result', {'taskId':'one-task'})
             assert terminal['result']['content'][0]['text']=='1'
         assert terminal['tasks_active_until']==0
+        # Treat the previous reply as lost between worker and manager. Recovery
+        # reuses this task and connection, without another tools/call or active pin.
+        recovered=request('tasks/result' if status=='completed' and generation=='legacy' else 'tasks/get', {'taskId':'one-task'})
+        assert recovered['result']==terminal['result']
+        assert recovered['tasks_active_until']==0
         assert conn.call('report', operation='mcp_test')['ready']
     finally:
         conn.close()

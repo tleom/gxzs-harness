@@ -14,6 +14,22 @@ function create(fetchImpl) {
 }
 
 describe('restricted sandbox-manager file client', () => {
+  it('applies published MCP policy and cancellation through the registered service', async () => {
+    const timeout = vi.spyOn(AbortSignal, 'timeout')
+    const client = create(async () => new Response(JSON.stringify({ value: 'x'.repeat(2048) })))
+    const service = Object.assign(Object.create(WorkbenchFileManager.prototype), { client })
+    try {
+      service.setMcpPolicy({ catalog_timeout_seconds: 180, response_bytes: 1024 })
+      await expect(service.personalMcp({ operation: 'mcp_test' })).rejects.toMatchObject({ code: 'UPSTREAM_RESPONSE_TOO_LARGE' })
+      expect(timeout).toHaveBeenCalledWith(180_000)
+      service.setMcpPolicy({ catalog_timeout_seconds: 200, response_bytes: 4096 })
+      await expect(service.personalMcp({ operation: 'mcp_test' })).resolves.toEqual({ value: 'x'.repeat(2048) })
+      expect(timeout).toHaveBeenCalledWith(200_000)
+      const controller = new AbortController()
+      controller.abort()
+      await expect(service.personalMcp({ operation: 'mcp_test' }, controller.signal)).rejects.toMatchObject({ name: 'AbortError' })
+    } finally { timeout.mockRestore() }
+  })
   it('preserves a confirmed conflict even when the caller aborts after the response', async () => {
     const controller = new AbortController()
     const fetchImpl = vi.fn(async () => {

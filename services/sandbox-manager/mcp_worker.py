@@ -201,6 +201,7 @@ async def serve_connection(name, expected_version, root, config, revision, globa
             )
         server_info = task_transport.server_info or metadata(client)
         task_expiries = {}
+        active_tasks = set()
         tools = await asyncio.wait_for(discover(client), policy("discovery_timeout_seconds")) if "tools" in server_info["capabilities"] else []
         fingerprint = manifest_version(tools)
         if not publish_catalog(name, root, revision, tools, fingerprint, server_info, global_scope):
@@ -226,6 +227,10 @@ async def serve_connection(name, expected_version, root, config, revision, globa
                     value['request_id'] = request['request_id']
                 emit(value)
             try:
+                for task_id, expiry in list(task_expiries.items()):
+                    if expiry <= time.time() * 1000:
+                        task_expiries.pop(task_id)
+                        active_tasks.discard(task_id)
                 if request.get('manifest_version') != fingerprint:
                     raise ValueError('MCP 能力声明已改变')
                 method, params = request['method'], request['params']
@@ -243,14 +248,17 @@ async def serve_connection(name, expected_version, root, config, revision, globa
                 task = result.get('task', result if result.get('resultType') == 'task' else {})
                 if method == 'tools/call' and isinstance(task.get('taskId'), str):
                     task_expiries[task['taskId']] = request['deadline_ms']
+                    active_tasks.add(task['taskId'])
                 settled = (method == 'tasks/result' and isinstance(result.get('content'), list)
                            or result.get('taskId') == params.get('taskId') and (
                                result.get('status') in {'failed', 'cancelled'}
                                or result.get('status') == 'completed' and isinstance(result.get('result'), dict)
                                and isinstance(result['result'].get('content'), list)))
                 if settled:
-                    task_expiries.pop(params.get('taskId'), None)
-                response['tasks_active_until'] = max(task_expiries.values(), default=0)
+                    active_tasks.discard(params.get('taskId'))
+                # Keep the known reference until its original deadline so a lost
+                # reply can be queried again without pinning an already settled task.
+                response['tasks_active_until'] = max((task_expiries[t] for t in active_tasks), default=0)
                 respond(response)
             except ValueError as error:
                 respond({'error': str(error)})
@@ -279,7 +287,7 @@ async def serve_connection(name, expected_version, root, config, revision, globa
                 if request.get("operation") == "mcp_test":
                     # Active Tasks retain their negotiated declarations. Normal
                     # refresh reuses this SDK connection and private data.
-                    if max(task_expiries.values(), default=0) <= time.time() * 1000 and 'tools' in server_info['capabilities']:
+                    if max((task_expiries[t] for t in active_tasks), default=0) <= time.time() * 1000 and 'tools' in server_info['capabilities']:
                         remaining = (request.get('deadline_ms', int(time.time()*1000 + policy('discovery_timeout_seconds')*1000)) - time.time()*1000) / 1000
                         tools = await connected(discover(client), disconnected, min(policy('discovery_timeout_seconds'), remaining))
                         fingerprint = manifest_version(tools)
