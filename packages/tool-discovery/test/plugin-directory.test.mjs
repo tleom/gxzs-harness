@@ -7,13 +7,13 @@ const cleanups = []
 afterEach(async () => { for (const close of cleanups.splice(0)) await close() })
 
 for (const mode of ['native', 'ptc']) {
-  test(`${mode}: source metadata neither doubles callable budgets nor bypasses single and batch limits`, async () => {
+  test(`${mode}: complete source metadata and large callable schemas remain available together`, async () => {
     const schema = { type: 'object', properties: Object.fromEntries(Array.from({ length: 100 }, (_, i) =>
       [`field_${i}`, { type: 'string', description: 'x'.repeat(180) }])) }
     const rows = ['one', 'two', 'three'].map(name => row(name, `lookup_${name}`, 'global', 'lookup records',
       { parameters: schema, inputSchema: { ...schema, additionalProperties: false } }))
     rows.push(row('large', 'lookup_large', 'global', 'lookup records', { parameters: { ...schema, description: 'x'.repeat(20000) } }))
-    const h = await mount({ rows, mode, config: { maxActiveDefinitionBytes: 50000 }, script: [
+    const h = await mount({ rows, mode, script: [
       call('mcp', { name: 'records', tools: rows.map(tool => tool.name) }, mode),
       call('lookup_one', {}, mode), call('lookup_two', {}, mode), response(),
     ] })
@@ -21,10 +21,9 @@ for (const mode of ['native', 'ptc']) {
     const agent = await h.create(); await h.send(agent)
     assert.deepEqual(h.executions, ['lookup_one', 'lookup_two'])
     const result = JSON.stringify(h.adapter.requests[1].messages)
-    assert.match(result, /active_definition_budget/)
-    assert.match(result, /definition_too_large/)
+    assert.doesNotMatch(result, /"status":"rejected"/)
     assert.match(result, /inputSchema/)
-    assert.deepEqual(h.ctx.sessionProjections.stateOf(agent.session, PROJECTION_KEY).tools.map(tool => tool.name).sort(), ['lookup_one', 'lookup_two'])
+    assert.deepEqual(h.ctx.sessionProjections.stateOf(agent.session, PROJECTION_KEY).tools.map(tool => tool.name).sort(), rows.map(tool => tool.name).sort())
   })
 
   test(`${mode}: recovered but unauthorized plugins explain their status instead of disappearing`, async () => {

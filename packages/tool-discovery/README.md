@@ -1,6 +1,6 @@
 # DSH tool discovery
 
-`@gxzs/dsh-tool-discovery` is a DSH 0.2.1-alpha.2 plugin. It registers the native
+`@gxzs/dsh-tool-discovery` is a DSH 0.2.1-rc.2 plugin. It registers the native
 `mcp` and `tool_search` capabilities and restricts managed tools per Agent. Original tool
 definitions and executors remain registered with DSH; authorization stays with
 the host bridge and the original executor.
@@ -78,7 +78,7 @@ readiness before releasing them. This protects initialization and hot reload.
   native request's snapshot; changed loaded definitions or authorization still
   block that step before it reaches the provider.
 - Restore: intersect persisted hints with current authorization, exact definitions
-  and current budgets. A different authority starts without loaded tools.
+  and current visibility. A different authority starts without loaded tools.
 
 Native function calling and PTC share this lifecycle. Newly found tools cannot
 be called in the same tool-call batch or the same `run_code` execution. Native
@@ -86,15 +86,13 @@ tools outside `managedNames` remain available, including later registrations.
 
 ## Bounds and recovery
 
-Defaults: 8 matches per search, 64 active tools, 128 KiB active definition budget,
-32 KiB per definition, 10,000 indexed tools and 16 MiB index memory budget. Plugin
-summaries and directory descriptions are not clipped. Definition limits reject
-loading explicitly; they never return a truncated schema. Platform transport,
-MCP manifest and model context limits still apply and must report failures.
+Search defaults to 8 matches; `pageSize` is the plugin's search presentation setting.
+Plugin summaries, schemas and directory descriptions remain complete. The
+manager publishes transport and execution policy; actual model context capacity
+still applies. The host receives the complete catalog in one authorized snapshot.
 
-Activation byte budgets count the callable `name`, `description` and `parameters`.
-The full source metadata still counts toward the index budget and definition
-fingerprint. `inputSchema` is returned separately only when it differs from
+Complete source metadata participates in the definition fingerprint.
+`inputSchema` is returned separately only when it differs from
 `parameters`, preserving source constraints without duplicating an identical schema.
 The complete installed inventory is retained internally after recovery, including
 plugins excluded by the run's frozen authorization. Model-facing directories
@@ -102,9 +100,8 @@ filter those entries; an explicit call naming an unauthorized plugin still repor
 `run_authorization_required` and never grants new capabilities itself.
 
 Use `replace_active: true` with a query to replace the loaded set at the next
-successful step boundary when its budget is full. That discovery call must be
+successful step boundary. That discovery call must be
 the only discovery call in the step. Empty/failed searches do not clear the set.
-These limits are configurable through the exported `Config` schema.
 
 Plugin names follow `^[a-z][a-z0-9_-]{0,63}$` and are unique in the owner's combined
 global/personal catalog. `mcp/plugins` supplies a connection-free name inventory
@@ -121,7 +118,7 @@ tool results remain in conversation history; this plugin does not erase history.
 
 The repository's `pnpm check` includes deterministic real DSH AgentLoop tests,
 native and PTC dispatch, the GXZS MCP bridge, restore and permission changes,
-failure/cancellation, budgets, lifecycle cleanup and 1/50/600/1000-tool payload
+failure/cancellation, lifecycle cleanup and 1/50/600/1000-tool payload
 measurements. Workbench composition tests cover native continuation, human
 answers, Goal and schedule runs, child/job notices, and compaction followed by
 JSONL cold recovery or a fork with new authorization.

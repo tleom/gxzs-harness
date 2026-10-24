@@ -2,6 +2,55 @@ import { describe, expect, it } from 'vitest'
 import { adaptInputSchema } from '../src/schema.js'
 
 describe('MCP schema projection', () => {
+  it.each([undefined, 'https://json-schema.org/draft/2020-12/schema'])('validates the MCP default 2020-12 dialect (%s)', ($schema) => {
+    const source = { ...($schema ? { $schema } : {}), type: 'object', properties: {
+      credit: { type: 'string' }, billing: { type: 'string' },
+      pair: { type: 'array', prefixItems: [{ type: 'string' }, { type: 'integer' }], items: false },
+    }, dependentRequired: { credit: ['billing'] } }
+    const before = structuredClone(source)
+    const adapted = adaptInputSchema(source)
+    expect(source).toEqual(before)
+    expect(() => adapted.validate({ credit: 'a' })).toThrow('billing')
+    expect(() => adapted.validate({ pair: ['a', 'wrong'] })).toThrow('integer')
+    expect(() => adapted.validate({ pair: ['a', 2, 3] })).toThrow()
+    expect(() => adapted.validate({ credit: 'a', billing: 'b', pair: ['a', 2] })).not.toThrow()
+  })
+
+  it.each([
+    ['https://json-schema.org/draft/2019-09/schema', { dependentRequired: { credit: ['billing'] } }],
+    ['http://json-schema.org/draft-07/schema#', { dependencies: { credit: ['billing'] } }],
+    ['http://json-schema.org/draft-06/schema#', { dependencies: { credit: ['billing'] } }],
+  ])('preserves an explicit dialect %s', ($schema, constraints) => {
+    const adapted = adaptInputSchema({ $schema, type: 'object', properties: {
+      credit: { type: 'string' }, billing: { type: 'string' },
+    }, ...constraints })
+    expect(() => adapted.validate({ credit: 'a' })).toThrow('billing')
+    expect(() => adapted.validate({ credit: 'a', billing: 'b' })).not.toThrow()
+  })
+  it('keeps local reference constraints authoritative when widening the model-facing schema', () => {
+    const source = { type: 'object', properties: { value: { $ref: '#/$defs/positive' } }, required: ['value'],
+      $defs: { positive: { type: 'integer', minimum: 1 } } }
+    const adapted = adaptInputSchema(source)
+    expect(() => adapted.validate({ value: 2 })).not.toThrow()
+    expect(() => adapted.validate({ value: 0 })).toThrow('schema')
+    expect(() => adapted.validate({ value: '2' })).toThrow('schema')
+    expect(adapted.schema.properties.value).toEqual({ type: 'integer', description: 'minimum: 1' })
+    expect(adapted.schema.description).not.toContain(JSON.stringify(source))
+  })
+  it('preserves supported siblings when only one branch needs a fallback', () => {
+    const source = { type: 'object', properties: { mode: { type: 'string', enum: ['a', 'b'], default: 'a' },
+      value: { anyOf: [{ type: 'integer' }, { type: 'number' }] } } }
+    const projected = adaptInputSchema(source)
+    expect(projected.schema.properties.mode).toEqual(source.properties.mode)
+    expect(() => projected.validate({ mode: 'c' })).toThrow('schema')
+    expect(() => projected.validate({ mode: 'a', value: 1.5 })).not.toThrow()
+  })
+  it('retains literal schema-like data and terminates recursive local references', () => {
+    const literal = { type: 'object', properties: { $ref: { type: 'string' }, options: { type: 'object', default: { required: 'data' } } } }
+    expect(adaptInputSchema(literal).schema).toEqual(literal)
+    const recursive = { type: 'object', properties: { child: { $ref: '#' } } }
+    expect(() => adaptInputSchema(recursive).validate({ child: {} })).not.toThrow()
+  })
   it('projects nullable weather fields to equivalent disjoint unions and preserves source validation', () => {
     const source = { type: 'object', properties: {
       latitude: { type: 'number' }, longitude: { type: 'number' },
@@ -20,8 +69,11 @@ describe('MCP schema projection', () => {
   it.each([
     [{ type: 'number' }, { type: 'integer' }],
     [{ type: 'string', enum: ['temperature'] }, { type: 'string' }],
-  ])('retains rejection of overlapping anyOf branches', branches => {
-    expect(() => adaptInputSchema({ type: 'object', properties: { value: { anyOf: branches } } })).toThrow('anyOf')
+  ])('validates overlapping anyOf against the original schema', (...branches) => {
+    const adapted = adaptInputSchema({ type: 'object', properties: { value: { anyOf: branches } } })
+    const valid = branches[0].type === 'number' ? 1.5 : 'temperature'
+    expect(() => adapted.validate({ value: valid })).not.toThrow()
+    expect(() => adapted.validate({ value: false })).toThrow('schema')
   })
 
   it('projects nested string lengths while enforcing the original Unicode bounds', () => {
@@ -107,7 +159,7 @@ describe('MCP schema projection', () => {
 
   it('does not remove unknown constraint keywords or data properties named _req', () => {
     expect(() => adaptInputSchema({ type: 'object', properties: { op: { type: 'string', _secretConstraint: true } } }))
-      .toThrow('not a supported keyword')
+      .toThrow('unknown keyword')
     const source = { type: 'object', properties: { _req: { type: 'boolean' } }, required: ['_req'] }
     expect(adaptInputSchema(source).schema).toEqual(source)
   })

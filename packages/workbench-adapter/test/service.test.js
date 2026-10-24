@@ -275,7 +275,7 @@ it('shows one badge per MCP provider while preserving its complete tool scope an
 it('persists inline plugin positions and canonical names while keeping the displayed query unchanged', async () => {
   const { service, owner, chat } = setup()
   const tools = [{ id: 'global:mcp:law:lookup', provider: 'global:mcp:law', server_id: 'law', scope: 'global', provider_name: '法律检索' }]
-  service.freezeMcpTools = vi.fn(async () => tools)
+  service.freezeMcpCatalog = vi.fn(async () => ({ tools, servers: [] }))
   const run = await service.submitRun(owner, chat.id, { query: '之前 后文', resource_mentions: { plugins: ['global:mcp:law'] },
     mention_positions: [{ kind: 'tools', id: 'plugin:mcp:global:mcp:law', offset: 3 }] })
   expect(run.query).toBe('之前 后文')
@@ -1090,7 +1090,7 @@ describe('followup and control service', () => {
     await service.mutateResource({ operation: 'skill_toggle', name: 'demo', enabled: false })
     await service.mutateResource({ operation: 'mcp_reorder', order: ['server'], order_version: null })
     expect(fileManager.personalResources).toHaveBeenCalledWith({ operation: 'skill_toggle', name: 'demo', enabled: false })
-    expect(fileManager.personalMcp).toHaveBeenCalledWith({ operation: 'mcp_reorder', order: ['server'], order_version: null })
+    expect(fileManager.personalMcp).toHaveBeenCalledWith({ operation: 'mcp_reorder', order: ['server'], order_version: null }, undefined)
     fileManager.personalResources
       .mockResolvedValueOnce({ content: '---\nname: demo\ndescription: Demo\n---\nBody' })
       .mockResolvedValueOnce({ skills: [{ id: 'demo', version: 'v1' }] })
@@ -1109,11 +1109,78 @@ describe('followup and control service', () => {
   it('derives import names from safely inspected package metadata', async () => {
     const { service, fileManager } = setup()
     fileManager.personalResources
+      .mockImplementationOnce(async body => ({ import_id: body.import_id, content: '---\nname: demo\ndescription: Demo\n---\nBody' }))
+      .mockResolvedValueOnce({ name: 'demo', version: null })
+      .mockResolvedValueOnce({ status: 'ready' })
       .mockResolvedValueOnce({ content: '---\nname: demo\ndescription: Demo\n---\nBody' })
-      .mockResolvedValueOnce({ id: 'demo', version: 'v2' })
+      .mockResolvedValueOnce({ status: 'running' })
+      .mockResolvedValueOnce({ status: 'completed', id: 'demo', version: 'v2' })
     const payload = { operation: 'skill_import', archive: 'safe-package', version: null }
     await expect(service.mutateResource(payload)).resolves.toEqual({ id: 'demo', version: 'v2' })
-    expect(fileManager.personalResources).toHaveBeenLastCalledWith({ ...payload, name: 'demo' })
+    const calls = fileManager.personalResources.mock.calls.map(call => call[0])
+    expect(calls.filter(call => call.archive)).toHaveLength(1)
+    expect(calls[0]).toMatchObject({ ...payload, operation: 'skill_stage', import_id: expect.stringMatching(/^[a-f0-9]{32}$/) })
+    expect(calls.find(call => call.operation === 'skill_import')).toMatchObject({ name: 'demo', version: null })
+  })
+
+  it('transfers a staged package once and validates its manifest before binding the target', async () => {
+    const { service, fileManager } = setup()
+    const import_id = 'a'.repeat(32), signal = new AbortController().signal
+    const send = vi.fn(async () => ({ import_id, content: '---\nname: demo\ndescription: Demo\n---\nBody' }))
+    fileManager.personalResources.mockResolvedValueOnce({ import_id, name: 'demo', version: 'v1' })
+    const body = { operation: 'skill_stage', import_id, files: [{ path: 'demo.zip', size: 100 }] }
+    await expect(service.mutateResource(body, undefined, send, signal)).resolves.toMatchObject({ import_id, name: 'demo', version: 'v1' })
+    expect(send).toHaveBeenCalledExactlyOnceWith(body)
+    expect(fileManager.personalResources).toHaveBeenCalledExactlyOnceWith({ operation: 'skill_prepare', import_id, name: 'demo' }, signal)
+  })
+
+  it('keeps legacy missing-version imports from overwriting an existing skill', async () => {
+    const { service, fileManager } = setup()
+    fileManager.personalResources
+      .mockImplementationOnce(async body => ({ import_id: body.import_id, content: '---\nname: demo\ndescription: Demo\n---\nBody' }))
+      .mockResolvedValueOnce({ conflict: true })
+      .mockResolvedValueOnce({ status: 'cancelled' })
+    await expect(service.mutateResource({ operation: 'skill_import', files: [] })).resolves.toEqual({ conflict: true })
+    const calls = fileManager.personalResources.mock.calls.map(call => call[0])
+    expect(calls.map(call => call.operation)).toEqual(['skill_stage', 'skill_prepare', 'skill_import_cancel'])
+    expect(calls[1]).toMatchObject({ name: 'demo', version: null })
+  })
+
+  it.each([['failed', 400, 'SKILL_IMPORT_FAILED'], ['cancelled', 409, 'SKILL_IMPORT_CANCELLED']])
+    ('preserves a confirmed legacy %s receipt without another cancellation', async (status, httpStatus, code) => {
+      const { service, fileManager } = setup()
+      fileManager.personalResources
+        .mockImplementationOnce(async body => ({ import_id: body.import_id, content: '---\nname: demo\ndescription: Demo\n---\nBody' }))
+        .mockResolvedValueOnce({ name: 'demo', version: null })
+        .mockResolvedValueOnce({ status: 'ready' })
+        .mockResolvedValueOnce({ content: '---\nname: demo\ndescription: Demo\n---\nBody' })
+        .mockResolvedValueOnce({ status: 'running' })
+        .mockResolvedValueOnce({ status, error: 'confirmed ' + status })
+      await expect(service.mutateResource({ operation: 'skill_import', files: [], version: null }))
+        .rejects.toMatchObject({ status: httpStatus, code })
+      expect(fileManager.personalResources.mock.calls.some(([body]) => body.operation === 'skill_import_cancel')).toBe(false)
+    })
+
+  it('rechecks staged metadata and global collisions without retransferring package bytes', async () => {
+    const { service, fileManager } = setup()
+    const import_id = 'b'.repeat(32), signal = new AbortController().signal
+    fileManager.personalResources
+      .mockResolvedValueOnce({ status: 'ready' })
+      .mockResolvedValueOnce({ content: '---\nname: demo\ndescription: Demo\n---\nBody' })
+      .mockResolvedValueOnce({ status: 'completed', id: 'demo', version: 'v2' })
+    const send = vi.fn()
+    await expect(service.mutateResource({ operation: 'skill_import', import_id, name: 'forged', version: 'v1' }, undefined, send, signal))
+      .resolves.toMatchObject({ status: 'completed' })
+    expect(send).not.toHaveBeenCalled()
+    expect(fileManager.personalResources).toHaveBeenLastCalledWith({ operation: 'skill_import', import_id, name: 'demo', version: 'v1' }, signal)
+  })
+
+  it('returns completed import receipts without another validation or publication', async () => {
+    const { service, fileManager } = setup()
+    fileManager.personalResources.mockResolvedValueOnce({ status: 'completed', id: 'demo', version: 'v2' })
+    await expect(service.mutateResource({ operation: 'skill_import', import_id: 'c'.repeat(32), version: null }))
+      .resolves.toMatchObject({ status: 'completed' })
+    expect(fileManager.personalResources).toHaveBeenCalledOnce()
   })
 
   it('accepts a skill rename only when SKILL.md matches the requested call name', async () => {
@@ -1136,12 +1203,13 @@ describe('followup and control service', () => {
 
   it('uses the platform catalog retry deadline without replaying an exhausted read', async () => {
     const { service, platformClient, owner } = setup()
+    service.platformClient.mcpPolicy = { catalog_timeout_seconds: 321 }
     const tool = { id: 'personal:mcp:gaode:maps_geo', runtime_name: 'maps_geo', version: 'v1',
       scope: 'personal', server_id: 'gaode', tool_name: 'maps_geo', description: 'Geocode',
       inputSchema: { type: 'object' } }
     platformClient.json.mockResolvedValueOnce({ data: { tools: [tool] } })
     await expect(service.freezeMcpTools(owner, [tool.id])).resolves.toMatchObject([{ id: tool.id }])
-    expect(platformClient.json).toHaveBeenLastCalledWith(expect.objectContaining({ route: 'mcp/catalog', timeoutMs: 15_000 }))
+    expect(platformClient.json).toHaveBeenLastCalledWith(expect.objectContaining({ route: 'mcp/catalog', timeoutMs: 321_000 }))
     platformClient.json.mockRejectedValueOnce(Object.assign(new Error('temporary'), { status: 502 }))
     await expect(service.freezeMcpTools(owner, [tool.id])).rejects.toMatchObject({ code: 'MCP_CATALOG_UNAVAILABLE' })
     expect(platformClient.json).toHaveBeenCalledTimes(2)
@@ -1857,7 +1925,7 @@ describe('explicit resource mentions', () => {
   it('delivers selected plugin and skill instructions without changing user text or title, and retains them on fork', async () => {
     const { service, owner, chat, database, sessionController, skills } = setup()
     const tool = { id: 'law', runtime_name: 'global_law_search', provider: 'global:mcp:law', provider_name: '法律检索', name: '检索' }
-    vi.spyOn(service, 'freezeMcpTools').mockResolvedValue([tool])
+    vi.spyOn(service, 'freezeMcpCatalog').mockResolvedValue({ tools: [tool], servers: [] })
     skills.list.mockResolvedValue([{ name: 'legal-review', description: '审查', invocation: { userInvocable: true, modelInvocable: true } }])
     const mentions = { tools: ['law'], plugins: [], skills: ['legal-review'], knowledge: [] }
     const run = await service.submitRun(owner, chat.id, { query: '融资租赁', resource_mentions: mentions })
@@ -2015,10 +2083,10 @@ describe('submission cancellation', () => {
   it('cancels during slow tool discovery before any prompt is dispatched', async () => {
     const { service, owner, chat, sessionController } = setup()
     let release
-    service.freezeMcpTools = vi.fn(() => new Promise(resolve => { release = resolve }))
+    service.freezeMcpCatalog = vi.fn(() => new Promise(resolve => { release = () => resolve({ tools: [], servers: [] }) }))
     const submission = service.submitRun(owner, chat.id, { query: 'slow', request_key: 'slow-key' })
     const rejected = expect(submission).rejects.toMatchObject({ status: 409 })
-    await vi.waitFor(() => expect(service.freezeMcpTools).toHaveBeenCalled())
+    await vi.waitFor(() => expect(service.freezeMcpCatalog).toHaveBeenCalled())
     await service.stopSubmission(owner, chat.id, 'slow-key')
     release([])
     await rejected

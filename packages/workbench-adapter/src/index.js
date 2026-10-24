@@ -10,7 +10,8 @@ import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import { RunEventBus } from './events.js'
 import { HumanInputBridge } from './human-input.js'
-import { errorResponse, httpError, parseJson, readBody, sendJson, withResponseSignal } from './http.js'
+import { errorResponse, httpError, parseJson, readBody, sendJson, withResponseSignal, MAX_JSON_BYTES } from './http.js'
+import { isSkillPackage, SKILL_JSON_BYTES } from './skill-import.js'
 import { streamRunEvents } from './sse.js'
 import { streamHistoryEvents, streamNativeEvents } from './history-events.js'
 import { WorkbenchDatabase } from './persistence.js'
@@ -181,7 +182,7 @@ export function apply(ctx, config) {
         // recovery until its first verified sync; an unavailable read is not empty.
         if (!runtime.mcpCatalogState?.ready) throw Object.assign(
           new Error('MCP catalog is not ready for native notice recovery'), { code: 'MCP_CATALOG_UNAVAILABLE' })
-        return { mcpTools: runtime.mcpResources?.() ?? [] }
+        return { mcpTools: runtime.mcpResources?.() ?? [], mcpServers: runtime.mcpPlugins?.() ?? [] }
       }, startupRunIds, () => ctx.get('workspaceRegistry')?.archivedSessionIds ?? [])
       await scheduler.flushFences()
       const resumeInboxes = await prepareRecoveredInboxes(database, ctx.sessionController, config.ownerId, queued,
@@ -244,7 +245,7 @@ export function apply(ctx, config) {
       payload.signal?.throwIfAborted()
       for (const message of autonomous) {
         const claimed = projectInboxClaim(database, { agent: payload.agent, message, turn: payload.turn }, config.ownerId,
-          needsResources ? { mcpTools: runtime.mcpResources?.() ?? [] } : undefined)
+          needsResources ? { mcpTools: runtime.mcpResources?.() ?? [], mcpServers: runtime.mcpPlugins?.() ?? [] } : undefined)
         rememberSchedule(claimed)
       }
     }
@@ -282,7 +283,7 @@ export function apply(ctx, config) {
       context = { ...context, goal: agent ? ctx.goals?.get(agent) : undefined, nativeIdle: agent?.status === 'idle' }
     }
     projectSessionEvent(database, session?.id ?? session?.header?.id, event, config.ownerId,
-      { ...context, mcpCatalogReady: runtime.mcpCatalogState?.ready === true, mcpTools: runtime.mcpResources?.() ?? [] })
+      { ...context, mcpCatalogReady: runtime.mcpCatalogState?.ready === true, mcpTools: runtime.mcpResources?.() ?? [], mcpServers: runtime.mcpPlugins?.() ?? [] })
   }, { global: true })
 
   const buildCatalog = async (owner, modelsOnly = false, chatId) => {
@@ -552,11 +553,22 @@ export function apply(ctx, config) {
     })],
     ['POST', /^\/workspaces$/, async ({ owner, json }, res) => sendJson(res, 200, { data: await workspaces.mutate(owner, json) })],
     ['GET', /^\/models\/parameters$/, async ({ url, owner }, res) => sendJson(res, 200, { data: await service.modelParameters(url.searchParams.get('model'), owner) })],
-    ['GET', /^\/resources$/, async ({ owner }, res) => sendJson(res, 200, { data: await service.resources(owner) })],
+    ['POST', /^\/mcp\/request$/, async ({ owner, json }, res) => {
+      if (Object.keys(json).some(key => !['server_id', 'version', 'method', 'params'].includes(key)))
+        throw httpError(400, 'MCP 预览参数无效')
+      const timeoutMs = Math.ceil((runtime.mcpPolicy?.max_call_seconds ?? 350) * 1000)
+      const result = await withResponseSignal(res, signal => ctx.workbenchPlatformClient.json({ owner, method: 'POST',
+        route: 'mcp/request', body: Buffer.from(JSON.stringify(json)), contentType: 'application/json', signal, timeoutMs }))
+      if (!res.destroyed) sendJson(res, 200, { data: result.data ?? result })
+    }],
+    ['GET', /^\/resources$/,  async ({ owner }, res) => sendJson(res, 200, { data: await service.resources(owner) })],
     ['POST', /^\/resources$/, async ({ owner, json }, res) => {
-      const result = await service.mutateResource(json, owner)
-      if (json.operation !== 'skill_inspect' && json.operation !== 'mcp_read') ctx.emit('workbench/resources-changed')
-      sendJson(res, 200, { data: result })
+      const result = await withResponseSignal(res, signal => service.mutateResource(json, owner, undefined, signal))
+      // A running import may refill the cache before its atomic publication.
+      // Invalidate again when polling confirms the published result.
+      if (!['skill_inspect', 'skill_import_status', 'skill_prepare', 'mcp_read'].includes(json.operation)
+        || (json.operation === 'skill_import_status' && result?.status === 'completed')) ctx.emit('workbench/resources-changed')
+      if (!res.destroyed) sendJson(res, 200, { data: result })
     }],
     ['GET', /^\/chats$/, async ({ owner }, res) => sendJson(res, 200, { data: service.listChats(owner) })],
     ['POST', /^\/chats$/, async ({ owner, json }, res) => {
@@ -734,8 +746,10 @@ export function apply(ctx, config) {
         sendJson(res, ready ? 200 : 503, { live: true, ready, recovery: recovered ? 'ready' : recoveryError ? 'failed' : 'recovering',
           recovery_dependency: recoveryError?.code === 'MCP_CATALOG_UNAVAILABLE' ? 'mcp_catalog' : undefined,
           resources: runtime.mcpCatalogState?.status ?? 'initializing',
-          mcp_capabilities: { protocol: 'platform-tools-v1', tools: true, server_instructions: false,
-            resources: false, resource_templates: false },
+          mcp_capabilities: { protocol: 'platform-tools-v1', tools: Boolean(runtime.mcpResources && ctx.get('tools')),
+            server_instructions: Boolean(runtime.mcpPlugins && ctx.get('systemPrompt')),
+            resources: Boolean(runtime.mcpPlugins && ctx.get('mcpResources')),
+            resource_templates: Boolean(runtime.mcpPlugins && ctx.get('mcpResources')) },
           runtime_error: transportFailed ? 'SSH_UNAVAILABLE' : disk.blocked ? 'STORAGE_PRESSURE' : undefined,
           storage: disk,
           activity })
@@ -748,7 +762,15 @@ export function apply(ctx, config) {
       const path = url.pathname.slice(config.basePath.length) || '/'
       const target = `${config.assertionAudiencePath}${path}${url.search}`
       const streaming = req.method === 'POST' && ['/files/upload', '/resources/upload', '/images/upload'].includes(path)
-      const body = streaming ? Buffer.alloc(0) : await readBody(req)
+      let requestPolicy = runtime.mcpPolicy
+      const loadPolicy = async () => {
+        requestPolicy = await withResponseSignal(res, signal => ctx.workbenchPlatformClient.loadMcpPolicy({ ownerId: config.ownerId }, signal))
+        return requestPolicy.request_bytes
+      }
+      const body = streaming ? Buffer.alloc(0) : await readBody(req,
+        path === '/resources' ? Math.max(SKILL_JSON_BYTES, requestPolicy?.request_bytes ?? 0)
+          : path === '/mcp/request' ? requestPolicy?.request_bytes ?? await loadPolicy() : undefined,
+        path === '/resources' && !requestPolicy ? loadPolicy : undefined)
       const owner = verifier.verify(req.headers['x-gxzs-assertion'], {
         method: req.method, target, body, streaming,
         contentType: req.headers['content-type'] ?? '', lastEventId: req.headers['last-event-id'] ?? '',
@@ -771,9 +793,9 @@ export function apply(ctx, config) {
           if (action === 'files') {
             if (upload.metadata.operation !== 'upload') throw httpError(400, '文件上传操作无效')
             upload.metadata.path = managerPath(upload.metadata.path)
-          } else if (!['skill_inspect', 'skill_import'].includes(upload.metadata.operation)) throw httpError(400, '技能包上传操作无效')
+          } else if (!['skill_inspect', 'skill_import', 'skill_stage'].includes(upload.metadata.operation)) throw httpError(400, '技能包上传操作无效')
           const result = action === 'files' ? await ctx.workbenchFileManager.upload(action, upload, signal)
-            : await service.mutateResource(upload.metadata, owner, metadata => ctx.workbenchFileManager.upload(action, { ...upload, metadata }, signal))
+            : await service.mutateResource(upload.metadata, owner, metadata => ctx.workbenchFileManager.upload(action, { ...upload, metadata }, signal), signal)
           if (action === 'personal-resources' && upload.metadata.operation === 'skill_import') ctx.emit('workbench/resources-changed')
           sendJson(res, 200, { data: result })
         })
@@ -781,6 +803,11 @@ export function apply(ctx, config) {
       }
       const contentType = req.headers['content-type'] ?? ''
       const context = { owner, req, url, body, json: body.length && contentType.includes('application/json') ? parseJson(body) : {} }
+      if (path === '/resources') {
+        const mcp = typeof context.json.operation === 'string' && context.json.operation.startsWith('mcp_')
+        if (mcp && !requestPolicy) await loadPolicy()
+        if (body.length > (mcp ? requestPolicy.request_bytes : isSkillPackage(context.json) ? SKILL_JSON_BYTES : MAX_JSON_BYTES)) throw httpError(413, '请求体过大')
+      }
       let methodNotAllowed = false
       for (const [method, pattern, route] of routes) {
         const match = pattern.exec(path)

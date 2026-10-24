@@ -33,24 +33,24 @@ export function terms(value) {
 }
 
 /** Normalize the bridge's current authorized catalogue without touching execution. */
-export function buildCatalog(snapshot, config) {
+export function buildCatalog(snapshot) {
   if (!snapshot || typeof snapshot !== 'object' || !Array.isArray(snapshot.tools)) throw new Error('工具发现目录格式无效')
-  if (snapshot.tools.length > config.maxCatalogTools) throw new Error('工具发现目录超过数量上限')
   const byId = new Map(), byName = new Set(), rawNames = new Set(), plugins = new Map(), pluginNames = new Map()
   function addPlugin(source) {
     const name = source.callName ?? source.name ?? source.id.split(':').at(-1)
-    if (!PLUGIN_NAME.test(name)) throw new Error(`插件名称无效：${name}`)
-    if (pluginNames.has(name) && pluginNames.get(name) !== source.id) throw new Error(`插件名称重复：${name}`)
+    const invalid = !PLUGIN_NAME.test(name)
+    const conflicting = pluginNames.has(name) && pluginNames.get(name) !== source.id
+    if (conflicting && plugins.has(pluginNames.get(name))) Object.assign(plugins.get(pluginNames.get(name)), { available: false, unavailableReason: 'plugin_name_conflict' })
     pluginNames.set(name, source.id)
     const plugin = { id: source.id, name, displayName: source.displayName ?? source['display-name'] ?? source.name ?? name,
       description: String(source.description ?? ''), preferred: source.preferred === true, available: source.available !== false,
       scope: source.scope === 'personal' ? 'personal' : 'global',
       order_num: Number.isInteger(source.order_num) && source.order_num >= -2147483648 && source.order_num <= 2147483647 ? source.order_num : 0,
       unavailableReason: source.unavailableReason, count: 0 }
+    if (invalid || conflicting) Object.assign(plugin, { available: false, unavailableReason: invalid ? 'invalid_plugin_name' : 'plugin_name_conflict' })
     plugins.set(source.id, plugin)
     return plugin
   }
-  let indexBytes = 0
   for (const source of snapshot.plugins ?? []) {
     if (typeof source.id !== 'string' || !source.id) continue
     addPlugin(source)
@@ -74,7 +74,6 @@ export function buildCatalog(snapshot, config) {
       ...(source.execution === undefined ? {} : { execution: source.execution }),
       ...(source.unavailableReason ? { unavailableReason: clip(source.unavailableReason, 80) } : {}),
     }
-    const definitionJson = JSON.stringify(definition)
     const plugin = plugins.get(source.pluginId) ?? addPlugin({ id: source.pluginId,
       name: source.pluginCallName ?? source.pluginId.split(':').at(-1), displayName: source.pluginName,
       description: source.pluginDescription, scope: source.pluginScope, order_num: source.order_num })
@@ -87,9 +86,7 @@ export function buildCatalog(snapshot, config) {
       pluginName: plugin.displayName, pluginCallName: plugin.name, pluginScope: source.pluginScope === 'personal' ? 'personal' : 'global',
       description: String(source.description ?? ''), version: source.version, manifestVersion: String(source.manifestVersion ?? ''),
       definition,
-      // Activation budgets measure the callable schema sent on each model step.
-      // Source constraints/metadata still count toward the full catalog index.
-      definitionBytes: bytes(callable), fingerprint: hash(definition),
+      fingerprint: hash(definition),
       unavailableReason: definition.unavailableReason,
     }
     item.nameText = normalized(item.name.replace(/([a-z\d])([A-Z])/g, '$1 $2'))
@@ -99,8 +96,6 @@ export function buildCatalog(snapshot, config) {
     item.parameterTerms = new Set(terms(JSON.stringify(definition.parameters)))
     item.pluginText = normalized(`${item.pluginName} ${item.pluginCallName} ${plugins.get(item.pluginId)?.description ?? ''}`)
     item.pluginTerms = new Set(terms(item.pluginText))
-    indexBytes += bytes(definitionJson) + bytes(item.pluginText)
-    if (indexBytes > config.maxIndexBytes) throw new Error('工具发现目录超过索引大小上限')
     byId.set(item.id, item); byName.add(item.name)
     plugin.count++
   }

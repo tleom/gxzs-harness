@@ -1,4 +1,7 @@
 import { createMcpToolDefinition } from '@deepseek-ai/dsh-mcp-client'
+import { McpTaskJournal, executeMcpTask } from './tasks.js'
+import { isTaskRecoveryName, taskRecoveryScopes } from './task-recovery.js'
+import { resourceScopes } from './resources.js'
 import { adaptInputSchema } from './schema.js'
 import { platformToolNames } from './names.js'
 import { ToolDiscoveryCatalog } from './discovery-catalog.js'
@@ -9,9 +12,7 @@ export const name = 'workbench-mcp-tools'
 export const inject = ['tools', 'workbenchPlatformClient', 'workbenchRuntime']
 export const Config = z.object({ discovery: z.boolean().default(false) })
 
-// Java and the manager reject absolute deadlines more than 350 seconds ahead
-// of their own clocks. Reserve clock skew inside that limit, not above it.
-const MCP_CALL_TIMEOUT_MS = 350_000 - 5_000
+// Reserve clock skew inside the published absolute call budget.
 // Providers may serialize identical nested schema objects in a different order.
 // Keep registration identity stable without discarding any definition fields.
 const definitionStamp = value => JSON.stringify(value, (_key, item) => item && typeof item === 'object' && !Array.isArray(item)
@@ -19,7 +20,16 @@ const definitionStamp = value => JSON.stringify(value, (_key, item) => item && t
 
 export async function apply(ctx, config = {}) {
   const registrations = new Map()
+  const resources = resourceScopes(ctx)
+  const journal = ctx.workbenchRuntime.database ? new McpTaskJournal(ctx.workbenchRuntime.database) : undefined
+  const recovery = taskRecoveryScopes(ctx, journal, (record, exec) => {
+    const tool = [...registrations.values()].find(item => item.tool.id === record.resourceId)?.tool
+    if (!tool) throw new Error('MCP 任务工具已不可用')
+    return callProxy(ctx, tool, record.args, exec, { task: true, recovery: record, journal })
+  })
   let pluginMetadata = []
+  let catalogIssues = []
+  ctx.workbenchRuntime.mcpCatalogIssues = () => catalogIssues
   ctx.workbenchRuntime.mcpResources = () => [...registrations.values()].map(({ tool }) => ({ ...tool }))
   ctx.workbenchRuntime.mcpPlugins = () => pluginMetadata.map(plugin => ({ ...plugin }))
   const restrictions = new Map()
@@ -37,7 +47,10 @@ export async function apply(ctx, config = {}) {
     discoveryCatalog?.notify()
   }
   const clear = () => {
+    resources.clear()
+    recovery.clear()
     pluginMetadata = []
+    catalogIssues = []
     for (const restriction of restrictions.values()) restriction.dispose()
     restrictions.clear()
     for (const registration of registrations.values()) registration.dispose()
@@ -58,6 +71,8 @@ export async function apply(ctx, config = {}) {
     return allowed
   }
   const restrictAgent = (agent) => {
+    resources.sync(agent, pluginMetadata)
+    recovery.sync(agent)
     if (!agent?.ctx?.tools?.restrict) return
     const allowed = config.discovery && !discoveryReady ? new Set() : allowedNames(agent)
     const deny = [...registrations.values()].map(({ tool }) => tool.public_name).filter(name => !allowed.has(name)).sort()
@@ -83,10 +98,19 @@ export async function apply(ctx, config = {}) {
   const sync = async () => {
     let payload
     try {
+      const currentPolicy = ctx.workbenchPlatformClient.loadMcpPolicy
+        ? await ctx.workbenchPlatformClient.loadMcpPolicy({ ownerId: ctx.workbenchRuntime.ownerId }, lifetime.signal)
+        : undefined
+      if (currentPolicy) {
+        ctx.workbenchRuntime.mcpPolicy = currentPolicy
+        ctx.get?.('workbenchFileManager')?.setMcpPolicy?.(currentPolicy)
+      }
+      const deadline = Date.now() + Math.ceil((ctx.workbenchRuntime.mcpPolicy?.catalog_timeout_seconds ?? 180) * 1000)
       payload = await ctx.workbenchPlatformClient.json({
         owner: { ownerId: ctx.workbenchRuntime.ownerId }, method: 'GET', route: 'mcp/catalog',
-        signal: lifetime.signal, timeoutMs: 15_000,
+        signal: lifetime.signal, timeoutMs: Math.max(1, deadline - Date.now()), deadlineMs: deadline,
       })
+
     } catch (error) {
       const transient = [502, 503, 504].includes(error?.status) || ['TypeError', 'TimeoutError'].includes(error?.name)
       state(transient && catalogLoaded, error)
@@ -99,10 +123,18 @@ export async function apply(ctx, config = {}) {
       throw error
     }
     if (disposed) return
+    const policy = payload.data?.policy ?? payload.policy
+    if (policy && typeof policy === 'object' && ['request_bytes', 'response_bytes', 'max_call_seconds', 'catalog_timeout_seconds'].every(key => Number.isFinite(policy[key]) && policy[key] > 0)) {
+      ctx.workbenchRuntime.mcpPolicy = Object.freeze({ ...policy })
+      ctx.workbenchPlatformClient.mcpPolicy = ctx.workbenchRuntime.mcpPolicy
+      ctx.get?.('workbenchFileManager')?.setMcpPolicy?.(policy)
+    }
     const catalog = normalizeCatalog(payload.data?.tools ?? payload.tools ?? [], name => {
+      if (isTaskRecoveryName(name) || ['list_mcp_resources', 'list_mcp_resource_templates', 'read_mcp_resource'].includes(name)) return true
       const existing = ctx.tools.get?.(name)
       return Boolean(existing && ![...registrations.values()].some(item => item.definition === existing))
     })
+    catalogIssues = catalog.issues ?? []
     const plugins = payload.data?.plugins ?? payload.plugins ?? []
     if (!Array.isArray(plugins) || plugins.some(plugin => !plugin || typeof plugin.id !== 'string' || typeof plugin.name !== 'string'
       || !['global', 'personal'].includes(plugin.scope))) throw new Error('invalid MCP plugin inventory')
@@ -132,6 +164,7 @@ export async function apply(ctx, config = {}) {
         outputSchema: tool.outputSchema,
         taskRequired: tool.execution?.taskSupport === 'required',
         call: (args, exec) => callProxy(ctx, tool, args, exec),
+        taskCall: (args, exec) => callProxy(ctx, tool, args, exec, { task: true, journal }),
       })
       registrations.set(tool.runtime_name, { tool, definition, dispose: ctx.tools.register(definition) })
     }
@@ -162,10 +195,11 @@ export async function apply(ctx, config = {}) {
     await (inFlight ?? synchronize())
     if (disposed || ctx.workbenchRuntime.mcpCatalogState?.status !== 'ready')
       throw Object.assign(new Error('MCP 工具目录暂不可用，请稍后重试'), { status: 503, code: 'MCP_CATALOG_UNAVAILABLE' })
-    return [...registrations.values()].map(({ tool }) => {
+    const tools = [...registrations.values()].map(({ tool }) => {
       const { public_name, definitionStamp, discoveryStamp, sourceInputSchema, validateArguments, ...resource } = tool
       return { ...resource, runtime_name: public_name, inputSchema: sourceInputSchema }
     })
+    return { tools, plugins: pluginMetadata.map(server => ({ ...server })) }
   }
   // Admission freezes the same verified definitions that native discovery uses,
   // rather than a separate platform read ahead of the periodic registration sync.
@@ -174,7 +208,9 @@ export async function apply(ctx, config = {}) {
     timer = setTimeout(async () => {
       await refresh()
       if (!disposed) schedule()
-    }, ctx.workbenchRuntime.mcpCatalogState.status === 'ready' ? 30_000 : 5_000)
+    }, (ctx.workbenchRuntime.mcpCatalogState.status === 'ready'
+      ? ctx.workbenchRuntime.mcpPolicy?.refresh_interval_seconds ?? 30
+      : ctx.workbenchRuntime.mcpPolicy?.refresh_failure_seconds ?? 5) * 1000)
     timer.unref?.()
   }
   ctx.on('workbench/resources-changed', refresh)
@@ -183,6 +219,8 @@ export async function apply(ctx, config = {}) {
   ctx.on('agent/created', ({ agent }) => { restrictAgent(agent) }, { global: true })
   ctx.on('agent/inbox/claimed', ({ agent }) => { restrictAgent(agent) }, { global: true })
   ctx.on('agent/disposed', ({ agent }) => {
+    resources.dispose(agent)
+    recovery.dispose(agent)
     restrictions.get(agent)?.dispose()
     restrictions.delete(agent)
   }, { global: true })
@@ -230,9 +268,14 @@ export async function apply(ctx, config = {}) {
   schedule()
 }
 
-async function callProxy(ctx, tool, args, exec) {
+async function callProxy(ctx, tool, args, exec, { task = false, recovery, journal } = {}) {
   exec.signal?.throwIfAborted()
-  const deadlineMs = Math.min(Number.isSafeInteger(exec.deadlineMs) ? exec.deadlineMs : Infinity, Date.now() + MCP_CALL_TIMEOUT_MS)
+  const callBudgetMs = Math.ceil((ctx.workbenchRuntime.mcpPolicy?.max_call_seconds ?? 350) * 1000)
+  const callTimeoutMs = Math.max(1, callBudgetMs - Math.min(5_000, Math.floor(callBudgetMs / 10)))
+  const taskDeadlineMs = Math.min(Number.isSafeInteger(exec.deadlineMs) ? exec.deadlineMs : Infinity, Date.now() + callTimeoutMs)
+  const controlTimeoutMs = Math.ceil((ctx.workbenchRuntime.mcpPolicy?.control_timeout_seconds ?? 15) * 1000)
+  const cleanupMs = task ? Math.max(0, Math.min(controlTimeoutMs, 5_000, Math.floor((taskDeadlineMs - Date.now()) / 10))) : 0
+  const deadlineMs = taskDeadlineMs - cleanupMs
   if (deadlineMs <= Date.now()) throw new DOMException('MCP call deadline exceeded', 'TimeoutError')
   const signal = AbortSignal.any([...(exec.signal ? [exec.signal] : []), AbortSignal.timeout(Math.max(0, deadlineMs - Date.now()))])
   if (!ctx.workbenchRuntime.mcpCatalogState?.ready)
@@ -248,10 +291,31 @@ async function callProxy(ctx, tool, args, exec) {
     throw new Error('MCP tool definition has changed; submit a new task to use the current definition')
   if (typeof exec.callId !== 'string' || !exec.callId.trim()) throw new Error('MCP callId is required to correlate this call')
   tool.validateArguments(args)
+  if (task) {
+    const runtime = ctx.workbenchRuntime
+    const server = runtime.mcpPlugins().find(server => server.id === `${tool.scope}:mcp:${tool.server_id}`)
+    if (!server || server.version !== tool.version || server.manifest_version !== tool.manifest_version) throw new Error('MCP 任务能力已改变')
+    // Tool waiting ends before the provider connection's deadline, leaving bounded time for cancellation.
+    return executeMcpTask({ tool, server, args, exec: { ...exec, signal, deadlineMs }, authorization,
+      journal, ...(recovery ? { exec: { ...exec, callId: recovery.callId, signal, deadlineMs },
+        authorization: { ...authorization, runId: recovery.runId } } : {}), controlTimeoutMs,
+      dispatch: async (request, options, ticket) => {
+        const cleanup = request.method === 'tasks/cancel'
+        const dispatchSignal = cleanup ? options?.signal : AbortSignal.any([signal, ...(options?.signal ? [options.signal] : [])])
+        const response = await ctx.workbenchPlatformClient.json({ owner: { ownerId: authorization.ownerId },
+          method: 'POST', route: 'mcp/task', contentType: 'application/json', signal: dispatchSignal,
+          timeoutMs: Math.max(1, (cleanup ? taskDeadlineMs : deadlineMs) - Date.now()), deadlineMs: cleanup ? taskDeadlineMs : deadlineMs,
+          body: Buffer.from(JSON.stringify({ run_id: recovery?.runId ?? authorization.runId, admission_run_id: authorization.runId, resource_id: tool.id, version: tool.version,
+            manifest_version: tool.manifest_version, server_id: tool.server_id, tool_name: tool.tool_name,
+            request_key: recovery?.callId ?? exec.callId, method: request.method, params: request.params,
+            ...(ticket ? { task_ticket: ticket } : {}), deadline_ms: taskDeadlineMs })) })
+        return response.data ?? response
+      } })
+  }
   const payload = await ctx.workbenchPlatformClient.json({
     owner: { ownerId: authorization.ownerId }, method: 'POST', route: 'mcp/call',
     contentType: 'application/json',
-    signal, timeoutMs: MCP_CALL_TIMEOUT_MS, deadlineMs,
+    signal, timeoutMs: callTimeoutMs, deadlineMs,
     body: Buffer.from(JSON.stringify({
       run_id: authorization.runId, resource_id: tool.id, version: tool.version,
       manifest_version: tool.manifest_version, server_id: tool.server_id,
@@ -270,7 +334,9 @@ function normalizeCatalog(value, reserved) {
   if (!Array.isArray(value)) throw new Error('platform MCP catalog must be an array')
   const runtimeNames = new Set()
   const ids = new Set()
-  const tools = value.map((tool) => {
+  const issues = []
+  const tools = value.flatMap((tool) => {
+    try {
     if (!tool || typeof tool !== 'object' || Array.isArray(tool)) throw new Error('invalid MCP tool')
     for (const key of ['id', 'runtime_name', 'version', 'scope', 'server_id', 'tool_name', 'description', 'inputSchema'])
       if (tool[key] === undefined) throw new Error(`MCP tool is missing ${key}`)
@@ -281,12 +347,21 @@ function normalizeCatalog(value, reserved) {
     const adapted = adaptInputSchema(tool.inputSchema)
     runtimeNames.add(tool.runtime_name)
     ids.add(tool.id)
-    return { ...tool, definitionStamp: definitionStamp(tool), sourceInputSchema: tool.inputSchema, inputSchema: adapted.schema, validateArguments: adapted.validate, manifest_version: tool.manifest_version ?? '' }
+    return [{ ...tool, definitionStamp: definitionStamp(tool), sourceInputSchema: tool.inputSchema, inputSchema: adapted.schema, validateArguments: adapted.validate, manifest_version: tool.manifest_version ?? '' }]
+    } catch (error) {
+      if (tool && typeof tool.id === 'string' && typeof tool.server_id === 'string' && typeof tool.tool_name === 'string')
+        issues.push({ id: tool.id, server_id: tool.server_id, scope: tool.scope, tool_name: tool.tool_name,
+          description: typeof tool.description === 'string' ? tool.description : '', version: tool.version,
+          reason: error?.code === 'UNSUPPORTED_SCHEMA' ? 'unsupported_schema' : 'invalid_tool_definition' })
+      return []
+    }
   })
   const names = platformToolNames(tools, reserved)
-  return tools.map(tool => {
+  const normalized = tools.map(tool => {
     const definitionStamp = JSON.stringify([tool.definitionStamp, names.get(tool.id)])
     return { ...tool, public_name: names.get(tool.id), definitionStamp,
       discoveryStamp: createHash('sha256').update(definitionStamp).digest('hex') }
   })
+  normalized.issues = issues
+  return normalized
 }

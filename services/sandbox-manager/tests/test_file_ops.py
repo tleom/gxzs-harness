@@ -1,5 +1,4 @@
 import base64
-from contextlib import contextmanager
 import importlib.util
 from pathlib import Path
 import os
@@ -170,34 +169,38 @@ def test_legacy_directory_download_keeps_its_original_memory_budget(root):
         module.operate({'operation': 'get', 'path': 'legacy'}, root)
 
 
-@pytest.mark.parametrize('operation', ['stat', 'get', 'delete'])
-def test_metadata_and_legacy_paths_stop_before_collecting_an_oversized_directory(root, monkeypatch, operation):
+@pytest.mark.parametrize('layout', ['flat', 'nested'])
+@pytest.mark.parametrize('operation', ['stat', 'manifest'])
+def test_large_directory_fingerprint_and_manifest_include_all_entries(root, layout, operation):
     directory = Path(root) / 'large'
     directory.mkdir()
-    for index in range(20):
-        (directory / str(index)).write_text('preserved')
-    monkeypatch.setattr(module, 'MAX_TREE_ITEMS', 3)
-    original = os.scandir
-    seen = []
-    @contextmanager
-    def counted(fd):
-        with original(fd) as entries:
-            def generate():
-                for entry in entries:
-                    seen.append(entry.name)
-                    yield entry
-            yield generate()
-    monkeypatch.setattr(module.os, 'scandir', counted)
-    monkeypatch.setattr(module.os, 'listdir', lambda *args: pytest.fail('must not allocate all directory names'))
-    monkeypatch.setattr(module, 'read_file', lambda *args: pytest.fail('must reject before reading file data'))
-    monkeypatch.setattr(module, 'remove_contents', lambda *args: pytest.fail('must reject before deleting anything'))
-    with pytest.raises(ValueError, match='too many entries'):
-        module.operate({'operation': operation, 'path': 'large', 'version': 'stale'}, root)
-    assert len(seen) == 4
-    assert all((directory / str(index)).read_text() == 'preserved' for index in range(20))
+    folders = [directory] if layout == 'flat' else [directory / f'group-{index}' for index in range(5)]
+    for folder in folders:
+        folder.mkdir(exist_ok=True)
+    expected, total = set(), 0
+    for index in range(10001):
+        target = folders[index % len(folders)] / f'{index}.txt'
+        content = str(index).encode()
+        target.write_bytes(content)
+        expected.add(target.relative_to(root).as_posix())
+        total += len(content)
+    payload = {'operation': operation, 'path': '.' if operation == 'manifest' else 'large'}
+    first = module.operate(payload, root)
+    assert first == module.operate(payload, root)
+    if operation == 'manifest':
+        assert first['items'] == 10001 and first['size'] == total
+        assert {item['path'] for item in first['files']} == expected
+        assert all(len(item['sha256']) == 64 for item in first['files'])
+    else:
+        assert first['downloadable'] is True
+        (directory / 'changed.txt').write_text('new content')
+        latest = module.operate(payload, root)
+        assert first['version'] != latest['version']
+        assert module.operate({'operation': 'delete', 'path': 'large', 'version': first['version']}, root)['conflict']
+        assert (directory / 'changed.txt').read_text() == 'new content'
 
 
-def test_tree_budget_counts_nested_directories_and_keeps_existing_fingerprint_order(root, monkeypatch):
+def test_tree_entries_keep_existing_fingerprint_order(root):
     directory = Path(root) / 'tree'
     directory.mkdir()
     (directory / 'z').touch()
@@ -205,18 +208,26 @@ def test_tree_budget_counts_nested_directories_and_keeps_existing_fingerprint_or
     (directory / 'a').mkdir()
     (directory / 'a' / 'z').touch()
     (directory / 'a' / 'b').touch()
-    monkeypatch.setattr(module, 'MAX_TREE_ITEMS', 5)
     fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
     try:
         entries = module.tree_entries(fd)
         assert [entry[0] for entry in entries] == ['a', 'a/b', 'a/z', 'a-', 'z']
         first = module.tree_version(fd)
         assert first == module.tree_version(fd)
-        monkeypatch.setattr(module, 'MAX_TREE_ITEMS', 4)
-        with pytest.raises(ValueError, match='too many entries'):
-            module.tree_version(fd)
     finally:
         os.close(fd)
+
+
+@pytest.mark.parametrize('limit', ['MAX_MANIFEST_FILE_BYTES', 'MAX_MANIFEST_TREE_BYTES'])
+def test_workspace_manifest_keeps_size_budgets(root, monkeypatch, limit):
+    directory = Path(root) / 'evidence'
+    nested = directory / 'nested'
+    nested.mkdir(parents=True)
+    (directory / 'a.txt').write_bytes(b'abc')
+    (nested / 'b.txt').write_bytes(b'def')
+    monkeypatch.setattr(module, limit, 2 if limit == 'MAX_MANIFEST_FILE_BYTES' else 5)
+    with pytest.raises(ValueError, match='manifest limits'):
+        module.operate({'operation': 'manifest', 'path': '.'}, root)
 
 
 def test_directory_delete_rejects_stale_version_then_deletes_with_current_version(root):

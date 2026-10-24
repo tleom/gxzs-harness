@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import { symbols } from '@deepseek-ai/cordis'
 import { databaseModelCatalog, requireDatabaseModel } from '../src/database-models.js'
+import { errorResponse } from '../src/http.js'
 
 function setup() {
   const model = { id: 'flash', name: 'Database Flash', contextWindow: 1050000, maxTokens: 128000, input: ['text', 'image'], reasoningEfforts: { off: 'none', high: 'high' } }
@@ -19,6 +20,34 @@ function setup() {
 }
 
 describe('database model publication', () => {
+  it.each(['disabled', 'default-syntax', 'default-disabled', 'provider-models', 'model-name', 'null-model'])(
+    'keeps an invalid publication out of generic retry codes and native side effects: %s', async kind => {
+      const { config, client, sessions, settings } = setup()
+      if (kind === 'disabled') config.enabled = false
+      if (kind === 'default-syntax') config.models.default = 'invalid'
+      if (kind === 'default-disabled') config.models.providers.p.models[0].enabled = false
+      if (kind === 'provider-models') config.models.providers.extra = { models: {} }
+      if (kind === 'model-name') config.models.providers.p.models[0].name = ' '
+      if (kind === 'null-model') config.models.providers.extra = { models: [null] }
+      const failure = await databaseModelCatalog(client, sessions, {}, settings).then(() => null, error => error)
+      expect(errorResponse(failure)).toMatchObject({ status: 503, body: { code: 'INVALID_CONFIGURATION' } })
+      expect(settings.replace).not.toHaveBeenCalled()
+      expect(sessions.modelCatalog).not.toHaveBeenCalled()
+    })
+  it('keeps missing native default routes recoverable after a valid publication', async () => {
+    const { client, sessions, settings } = setup()
+    sessions.modelCatalog.mockResolvedValue({ groups: [], failures: [{ id: 'p' }] })
+    const failure = await databaseModelCatalog(client, sessions, {}, settings).catch(error => error)
+    expect(errorResponse(failure)).toMatchObject({ status: 503, body: { code: 'UNAVAILABLE' } })
+  })
+  it('allows incomplete disabled entries without blocking a valid published default', async () => {
+    const { config, client, sessions, settings } = setup()
+    config.models.providers.disabled = { enabled: false, models: null }
+    config.models.providers.p.models.push({ enabled: false })
+    await expect(databaseModelCatalog(client, sessions, {}, settings)).resolves.toMatchObject({ default: { provider: 'p', model: 'flash' } })
+    expect(settings.get('llm-pi-ai').providers.p.models).toHaveLength(1)
+    expect(settings.get('llm-pi-ai').providers.disabled).toBeUndefined()
+  })
   it('preserves native catalog failures for visible providers without exposing private provider diagnostics', async () => {
     const {client,sessions,settings,config}=setup()
     config.models.providers.failed={name:'Failed provider',models:[{id:'missing',name:'Missing'}]}

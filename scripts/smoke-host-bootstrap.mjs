@@ -130,13 +130,16 @@ const platform = fixture((req, res) => {
   if (req.method === 'POST' && req.url === '/internal/workbench/mcp/cancel') {
     respond(res, 200, { data: { fenced: true } }); return
   }
-  if (req.method === 'GET' && ['/internal/workbench/mcp/catalog', '/internal/workbench/mcp/plugins'].includes(req.url)) {
+  if (req.method === 'GET' && ['/internal/workbench/mcp/policy', '/internal/workbench/mcp/catalog', '/internal/workbench/mcp/plugins'].includes(req.url)) {
     if (!registered) {
       deniedCatalogs += 1
       respond(res, 401, { code: 'HOST_NOT_REGISTERED', message: 'Synthetic host registration pending' })
     } else {
       acceptedCatalogs += 1
-      respond(res, 200, { data: { tools: [fixtureTool], plugins: [fixturePlugin] } })
+      respond(res, 200, { data: req.url.endsWith('/policy') ? { policy: {
+        request_bytes: 30 * 1024 * 1024, response_bytes: 30 * 1024 * 1024,
+        max_call_seconds: 350, catalog_timeout_seconds: 180,
+      } } : { tools: [fixtureTool], plugins: [fixturePlugin] } })
     }
     return
   }

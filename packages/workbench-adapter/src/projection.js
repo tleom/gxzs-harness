@@ -342,7 +342,7 @@ function adoptJobNotice(database, chat, message, context) {
     id: message.id, requestKey: `native-job-notice:${message.id}`, query: contentText(message.content),
     selection: { ...chat.selection, native_source: 'tool-jobs', native_notice: true,
       native_child: false, subagent_ids: [], is_continuation: true, silent_resume: true },
-    mcpTools: context?.mcpTools ?? [] })
+    mcpTools: context?.mcpTools ?? [], mcpServers: context?.mcpServers ?? [] })
   database.adoptInboxMessage(chat.sessionId, run.id, message.id)
   return run
 }
@@ -362,7 +362,7 @@ function adoptNativeNotice(database, chat, message, context) {
     id: message.id, requestKey: `native-notice:${message.id}`, query: contentText(message.content),
     parentRunId: parent.id, selection: { ...chat.selection, native_child: false, subagent_ids: [], native_notice: true,
       native_source: message.source.kind, native_sender_session_id: message.source.senderSessionId,
-      subagent_names: parent.selection?.subagent_names ?? {}, silent_resume: true }, mcpTools: context?.mcpTools ?? [] })
+      subagent_names: parent.selection?.subagent_names ?? {}, silent_resume: true }, mcpTools: context?.mcpTools ?? [], mcpServers: context?.mcpServers ?? [] })
   database.adoptInboxMessage(chat.sessionId, run.id, message.id)
   return run
 }
@@ -376,7 +376,7 @@ function adoptMessage(database, sessionId, message, context) {
     const { run } = database.createRun({ ownerId: chat.ownerId, chatId: chat.id, sessionId,
       id: message.id, requestKey: `schedule:${message.id}`, query: contentText(message.content),
       selection: { ...chat.selection, native_source: 'schedule', schedule_notification_pending: true,
-        schedule_occurrences: scheduleOccurrences(contentText(message.content)) }, mcpTools: context?.mcpTools ?? [] })
+        schedule_occurrences: scheduleOccurrences(contentText(message.content)) }, mcpTools: context?.mcpTools ?? [], mcpServers: context?.mcpServers ?? [] })
     database.adoptInboxMessage(sessionId, run.id, message.id)
     return run
   }

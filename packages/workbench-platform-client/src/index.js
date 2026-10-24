@@ -16,7 +16,7 @@ const ROUTES = new Set([
   'GET files/preview', 'POST files/preview', 'DELETE files/preview',
   'GET files/shares', 'POST files/shares', 'DELETE files/shares',
   'POST audio',
-  'GET mcp/catalog', 'GET mcp/plugins', 'POST mcp/call', 'POST mcp/cancel',
+  'GET mcp/catalog', 'GET mcp/plugins', 'GET mcp/policy', 'POST mcp/call', 'POST mcp/request', 'POST mcp/task', 'POST mcp/cancel',
   'GET workbench/config',
   'POST scheduling',
   'POST jobs',
@@ -53,6 +53,27 @@ export class PlatformClient {
     this.fetch = fetchImpl
   }
 
+  async loadMcpPolicy(owner, signal) {
+    try {
+      const payload = await this.json({ owner, method: 'GET', route: 'mcp/policy', signal })
+      const policy = payload.data?.policy ?? payload.policy
+      if (!policy || !['request_bytes', 'response_bytes', 'max_call_seconds', 'catalog_timeout_seconds']
+        .every(key => Number.isFinite(policy[key]) && policy[key] > 0)) throw new Error('Invalid platform MCP resource policy')
+      this.mcpPolicy = Object.freeze({ ...policy })
+      return this.mcpPolicy
+    } catch (error) {
+      signal?.throwIfAborted()
+      if (!this.mcpPolicy || [401, 403].includes(error?.status)) throw error
+      return this.mcpPolicy
+    }
+  }
+
+  async json(value) {
+    const result = await this.request(value)
+    try { return JSON.parse(Buffer.from(result.bytes).toString('utf8')) }
+    catch { throw Object.assign(new Error('平台服务返回了无效 JSON'), { status: 502 }) }
+  }
+
   async catalogReadSlot(ownerId, signal) {
     const key = JSON.stringify([ownerId, this.generation, this.instance])
     const previous = this.catalogReads.get(key) ?? Promise.resolve()
@@ -78,6 +99,8 @@ export class PlatformClient {
   }
 
   async request({ owner, method, route, query = '', body = Buffer.alloc(0), contentType = '', signal, timeoutMs = this.timeoutMs, deadlineMs }) {
+    const policy = this.mcpPolicy
+    if (['mcp/call', 'mcp/request', 'mcp/task'].includes(route) && body.length > (policy?.request_bytes ?? 30 * 1024 * 1024)) throw Object.assign(new Error('MCP 请求超过传输预算'), { status: 413, code: 'MCP_REQUEST_TOO_LARGE' })
     const key = `${method.toUpperCase()} ${route}`
     if (!ROUTES.has(key)) throw new TypeError('unsupported platform route')
     if (query && !/^\?[^#\r\n]*$/.test(query)) throw new TypeError('invalid platform query')
@@ -114,7 +137,7 @@ export class PlatformClient {
             redirect: 'error',
           })
           if (response.status === 304 && cached) return { status: 200, headers: cached.headers, bytes: cached.bytes.slice() }
-          const bytes = await readBoundedResponse(response, this.maxResponseBytes, requestSignal)
+          const bytes = await readBoundedResponse(response, route.startsWith('mcp/') && route !== 'mcp/policy' ? policy?.response_bytes ?? this.maxResponseBytes : this.maxResponseBytes, requestSignal)
           if (!response.ok) {
             if (cacheKey) this.configCache.delete(cacheKey)
             let message = '平台服务请求失败'
@@ -193,11 +216,10 @@ export class WorkbenchPlatformClient extends Service {
     this.client = new PlatformClient(config)
   }
   request(value) { return this.client.request(value) }
-  async json(value) {
-    const result = await this.client.request(value)
-    try { return JSON.parse(Buffer.from(result.bytes).toString('utf8')) }
-    catch { throw Object.assign(new Error('平台服务返回了无效 JSON'), { status: 502 }) }
-  }
+  get mcpPolicy() { return this.client.mcpPolicy }
+  set mcpPolicy(value) { this.client.mcpPolicy = value }
+  loadMcpPolicy(owner, signal) { return this.client.loadMcpPolicy(owner, signal) }
+  json(value) { return this.client.json(value) }
 }
 
 export function apply(ctx, config) { return new WorkbenchPlatformClient(ctx, config) }

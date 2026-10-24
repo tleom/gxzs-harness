@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { PlatformClient } from '../src/index.js'
+import { PlatformClient, WorkbenchPlatformClient } from '../src/index.js'
 
 function create(fetchImpl) {
   vi.stubEnv('TEST_PLATFORM_TOKEN', 'secret')
@@ -9,6 +9,52 @@ function create(fetchImpl) {
 }
 
 describe('restricted platform client', () => {
+  it('refreshes policy using the bootstrap budget even after a smaller business budget was accepted', async () => {
+    let budget = 256
+    const client = create(async () => new Response(JSON.stringify({ policy: { request_bytes: 4096, response_bytes: budget,
+      max_call_seconds: 350, catalog_timeout_seconds: 180, annotation: 'x'.repeat(1500) } })))
+    expect((await client.loadMcpPolicy({ ownerId: 't:1' })).response_bytes).toBe(256)
+    budget = 4096
+    expect((await client.loadMcpPolicy({ ownerId: 't:1' })).response_bytes).toBe(4096)
+    const controller = new AbortController()
+    controller.abort()
+    await expect(client.loadMcpPolicy({ ownerId: 't:1' }, controller.signal)).rejects.toThrow()
+  })
+  it('retains validated resource settings on refresh failure while propagating authorization failures', async () => {
+    let status = 200
+    const policy = { request_bytes: 4096, response_bytes: 4096, max_call_seconds: 350, catalog_timeout_seconds: 180 }
+    const client = create(async () => new Response(JSON.stringify(status === 200 ? { policy } : { message: 'unavailable' }), { status }))
+    const snapshot = await client.loadMcpPolicy({ ownerId: 't:1' })
+    status = 503
+    expect(await client.loadMcpPolicy({ ownerId: 't:1' })).toBe(snapshot)
+    status = 403
+    await expect(client.loadMcpPolicy({ ownerId: 't:1' })).rejects.toMatchObject({ status: 403 })
+  })
+
+  it('uses its initial response budget even if resource settings change during a call', async () => {
+    const client = create(async () => {
+      client.mcpPolicy = { ...client.mcpPolicy, response_bytes: 128 }
+      return new Response(JSON.stringify({ value: 'x'.repeat(2048) }))
+    })
+    client.mcpPolicy = { request_bytes: 4096, response_bytes: 4096, max_call_seconds: 350, catalog_timeout_seconds: 180 }
+    await expect(client.json({ owner: { ownerId: 't:1' }, method: 'POST', route: 'mcp/call', body: '{}' }))
+      .resolves.toEqual({ value: 'x'.repeat(2048) })
+  })
+
+  it('loads authenticated policy before accepting responses beyond the bootstrap budget', async () => {
+    const policy = { request_bytes: 4096, response_bytes: 4096, max_call_seconds: 900, catalog_timeout_seconds: 300 }
+    const fetchImpl = vi.fn(async url => new Response(JSON.stringify(url.endsWith('mcp/policy') ? { data: { policy } } : { data: { text: 'x'.repeat(2048) } })))
+    const client = create(fetchImpl)
+    client.maxResponseBytes = 1024
+    const service = Object.create(WorkbenchPlatformClient.prototype)
+    service.client = client
+    expect(await service.loadMcpPolicy({ ownerId: 't:1' })).toEqual(policy)
+    expect(service.mcpPolicy).toBe(client.mcpPolicy)
+    await expect(service.json({ owner: { ownerId: 't:1' }, method: 'GET', route: 'mcp/catalog' })).resolves.toMatchObject({ data: { text: expect.any(String) } })
+    service.mcpPolicy = { ...policy, response_bytes: 1024 }
+    await expect(service.json({ owner: { ownerId: 't:1' }, method: 'GET', route: 'mcp/catalog' })).rejects.toMatchObject({ status: 502 })
+    expect(fetchImpl.mock.calls[0][1].headers['x-gxzs-owner']).toBe('t:1')
+  })
   it('forwards preview cancellation with the same owner and correlation identity', async () => {
     const fetchImpl = vi.fn(async () => new Response(null, { status: 204 }))
     const client = create(fetchImpl)

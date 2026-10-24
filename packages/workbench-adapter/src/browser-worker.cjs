@@ -20,7 +20,7 @@ function observePage() {
   const visible = box => box.width > 0 && box.height > 0 && box.bottom > 0 && box.right > 0
     && box.top < innerHeight && box.left < innerWidth
   const elements = []
-  for (const element of document.querySelectorAll('a,button,input,textarea,select,[role="button"],[contenteditable="true"]')) {
+  for (const element of document.querySelectorAll('a,button,input,textarea,select,[role="button"],[role="img"],img[alt],[tabindex],[onclick],[contenteditable="true"]')) {
     if (elements.length >= 120) break
     if (!visible(element.getBoundingClientRect()) || getComputedStyle(element).visibility === 'hidden') continue
     let selector = element.id ? '#' + CSS.escape(element.id) : ''
@@ -44,7 +44,7 @@ function observePage() {
       focused: element === document.activeElement,
       ...(typeof element.checked === 'boolean' ? { checked: element.checked } : {}),
       disabled: element.disabled === true, expanded: element.getAttribute('aria-expanded'),
-      label: (element.getAttribute('aria-label') || element.getAttribute('placeholder') || element.innerText || '').slice(0,200),
+      label: (element.getAttribute('aria-label') || element.getAttribute('placeholder') || element.getAttribute('alt') || element.innerText || '').slice(0,200),
       ...(['INPUT','TEXTAREA','SELECT'].includes(element.tagName) && element.type !== 'password' ? { value: element.value.slice(0,200) } : {}) })
   }
   const parts = [], walker = document.body && document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT)
@@ -158,6 +158,18 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
   function assertCurrent(value) {
     if (closed) throw new Error('browser_closed')
     if (cancelled.has(value.id)) throw new Error('operation_cancelled')
+  }
+  function assertObservation(value, expectedRevision = value.expected_revision) {
+    assertCurrent(value)
+    if (expectedRevision !== undefined && expectedRevision !== revision) throw new Error('stale_observation')
+  }
+  async function resolveElement(value) {
+    const owner = value.frame_ref ? observedFrames.get(value.frame_ref) : page
+    if (!owner || owner.isDetached?.()) throw new Error('stale_observation')
+    const locator = value.role ? owner.getByRole(value.role, { name: value.name, exact: true }) : owner.locator(value.selector)
+    const count = await locator.count()
+    if (count !== 1) throw Object.assign(new Error(count === 0 ? 'element_not_found' : 'ambiguous_element'), { matchCount: count })
+    return locator
   }
   async function releaseInput() {
     for (const button of pressedButtons) await page.mouse.up({ button }).catch(() => {})
@@ -433,8 +445,9 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
       return { image: image.toString('base64'), mediaType: image.mediaType }
     }
     notice = ''
-    if (value.expected_revision !== undefined && value.expected_revision !== revision) throw new Error('stale_observation')
-    revision++
+    assertObservation(value)
+    // Element lookup is observational. Advance only after its preconditions pass.
+    if (!['element-click', 'element-text'].includes(action)) revision++
     const moves = ['navigate', 'reload', 'back', 'forward'].includes(action)
     if (moves) { navigation++; navigating = true }
     const navigationPage = page, navigationDeadline = Date.now() + 20000
@@ -477,25 +490,23 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
         await page.mouse.move(value.x, value.y); assertCurrent(value)
         await page.mouse.up({ button: value.button, clickCount: value.count }); pressedButtons.delete(value.button); break
       case 'element-click': {
-        const owner = value.frame_ref ? observedFrames.get(value.frame_ref) : page
-        if (!owner || owner.isDetached?.()) throw new Error('stale_observation')
-        const locator = value.role ? owner.getByRole(value.role, { name: value.name, exact: true }) : owner.locator(value.selector)
-        if (await locator.count() !== 1) throw new Error('ambiguous_element')
-        await locator.scrollIntoViewIfNeeded(); assertCurrent(value)
-        const box = await locator.boundingBox(); assertCurrent(value)
+        const locator = await resolveElement(value)
+        assertObservation(value)
+        const preparedRevision = ++revision
+        await locator.scrollIntoViewIfNeeded(); assertObservation(value, preparedRevision)
+        const box = await locator.boundingBox(); assertObservation(value, preparedRevision)
         if (!box) throw new Error('element_not_visible')
         await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2)
         break
       }
       case 'element-text': {
-        const owner = value.frame_ref ? observedFrames.get(value.frame_ref) : page
-        if (!owner || owner.isDetached?.()) throw new Error('stale_observation')
-        const locator = value.role ? owner.getByRole(value.role, { name: value.name, exact: true }) : owner.locator(value.selector)
-        if (await locator.count() !== 1) throw new Error('ambiguous_element')
-        await locator.focus(); assertCurrent(value)
+        const locator = await resolveElement(value)
         if (!await locator.isEditable()) throw new Error('element_not_editable')
-        assertCurrent(value)
+        assertObservation(value)
+        const preparedRevision = ++revision, target = page, epoch = navigation
+        await locator.focus(); assertObservation(value, preparedRevision)
         await page.keyboard.press('ControlOrMeta+A'); assertCurrent(value)
+        if (page !== target || navigation !== epoch) throw new Error('stale_observation')
         await page.keyboard.insertText(value.text)
         break
       }
@@ -599,8 +610,17 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
       } catch (failure) {
         if (closed) return
         if (cancelled.has(value?.id)) { await send({ type: 'result', id: value.id, error: '浏览器操作已取消' }); return }
+        const outcome = failure.message === 'element_not_found'
+          ? { kind: 'not_found', message: '未找到网页元素', match_count: 0 }
+          : failure.message === 'ambiguous_element'
+          ? { kind: 'ambiguous', message: `匹配到 ${failure.matchCount} 个网页元素`, match_count: failure.matchCount }
+          : failure.message === 'stale_observation' && !['snapshot', 'screenshot', 'cut-selection'].includes(value?.action)
+          ? { kind: 'stale', message: '页面已更新，请根据最新页面继续操作' } : undefined
+        if (outcome) {
+          await send({ type: 'result', id: value.id, value: { page_id: pageId, outcome } })
+          return
+        }
         const error = failure.message === 'stale_observation' ? '页面已变化，请重新查看页面后操作'
-          : failure.message === 'ambiguous_element' ? '网页元素匹配不唯一，请重新查看页面'
           : ['navigate', 'reload', 'back', 'forward'].includes(value?.action)
           ? '网页加载失败，请检查地址或稍后刷新' : '浏览器操作失败'
         notice = error

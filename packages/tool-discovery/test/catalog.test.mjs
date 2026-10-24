@@ -111,30 +111,29 @@ test('catalog and projection validate identities, schema fingerprints and bounde
   assert.notEqual(buildCatalog(snapshot([{ ...item, parameters: { type: 'object', properties: { changed: { type: 'boolean' } } } }]), config).byId.get('a').fingerprint, entry.fingerprint)
   assert.throws(() => buildCatalog(snapshot([item, item]), config), /重复/)
   assert.throws(() => buildCatalog(snapshot([{ ...item, name: 'tool_search' }]), config), /保留/)
-  assert.throws(() => buildCatalog(snapshot([item]), { ...config, maxIndexBytes: 10 }), /索引/)
   assert.deepEqual(discoveryProjection.apply({ tools: [entry] }, { type: ACTIVE_EVENT, ignorable: true, data: { invalid: true } }).tools, [])
 })
 
 test('plugin names are validated and collisions across scopes are explicit', () => {
   const tools = [row('g', 'global_lookup'), row('p', 'personal_lookup', 'personal')]
-  assert.throws(() => buildCatalog({ ready: true, tools, plugins: [
+  const conflicted = buildCatalog({ ready: true, tools, plugins: [
     { id: 'global:mcp:records', name: 'same' }, { id: 'personal:mcp:records', name: 'same' },
-  ] }, config), /插件名称重复/)
-  assert.throws(() => buildCatalog({ ready: true, tools: [], plugins: [
+  ] }, config)
+  assert.ok(conflicted.plugins.every(plugin => plugin.available === false))
+  const invalid = buildCatalog({ ready: true, tools: [], plugins: [
     { id: 'legacy', name: '中文名称' },
-  ] }, config), /插件名称无效/)
+  ] }, config)
+  assert.equal(invalid.plugins[0].unavailableReason, 'invalid_plugin_name')
   assert.throws(() => buildCatalog(snapshot([row('reserved', 'mcp')]), config), /保留/)
 })
 
-test('activation budgets count callable schemas while source differences remain complete and fingerprinted', () => {
+test('callable schema fingerprints preserve source differences remain complete and fingerprinted', () => {
   const parameters = { type: 'object', properties: { query: { type: 'string' } } }
   const make = inputSchema => buildCatalog(snapshot([row('a', 'lookup', 'global', 'lookup', { parameters, inputSchema })]), config).byId.get('a')
   const base = make(undefined), identical = make({ properties: parameters.properties, type: 'object' })
-  assert.equal(identical.definitionBytes, base.definitionBytes)
   assert.equal(identical.definition.inputSchema, undefined)
   const original = { ...parameters, required: ['query'], additionalProperties: false }
   const different = make(original)
   assert.deepEqual(different.definition.inputSchema, original)
-  assert.equal(different.definitionBytes, base.definitionBytes)
   assert.notEqual(different.fingerprint, base.fingerprint)
 })

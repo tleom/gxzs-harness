@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { DatabaseSync } from 'node:sqlite'
 import { platformToolName, platformToolNames, publicToolName } from '../src/names.js'
 import { apply } from '../src/index.js'
 import { buildCatalog, renderCatalog } from '../../tool-discovery/src/catalog.js'
@@ -29,6 +30,93 @@ function setup({ authorized = true } = {}) {
 }
 
 describe('platform MCP proxy tools', () => {
+  it('registers an implicit 2020-12 tool and validates concurrent requests before platform IO', async () => {
+    const { ctx, definitions, platform } = setup()
+    const inputSchema = { type: 'object', properties: { query: { type: 'string' }, account: { type: 'string' } },
+      dependentRequired: { query: ['account'] } }
+    platform.json.mockResolvedValueOnce({ tools: [{ ...catalogTool, inputSchema }] })
+    await apply(ctx)
+    const tool = definitions.get('search')
+    expect(tool).toBeDefined()
+    const results = await Promise.allSettled(Array.from({ length: 16 }, (_, index) => tool.execute(
+      index % 2 ? { query: 'x', account: 'fixture' } : { query: 'x' },
+      { callId: `dialect-${index}`, agent: { id: 's1' }, signal: new AbortController().signal })))
+    expect(results.filter(result => result.status === 'fulfilled')).toHaveLength(8)
+    expect(results.filter(result => result.status === 'rejected').every(result => result.reason.message.includes('account'))).toBe(true)
+    expect(platform.json.mock.calls.filter(([request]) => request.route === 'mcp/call')).toHaveLength(8)
+  })
+  it('reserves native resource and recovery tool names before those scopes are activated', async () => {
+    const { ctx, platform, definitions } = setup()
+    const names = ['list_mcp_resources', 'read_mcp_resource', 'list_mcp_resource_templates', 'resume_mcp_task_0123456789abcdef']
+    platform.json.mockResolvedValueOnce({ tools: names.map((tool_name, index) => ({ ...catalogTool,
+      id: `personal:mcp:server:${tool_name}`, tool_name, runtime_name: `provider_${index}` })) })
+    await apply(ctx)
+    expect(definitions.size).toBe(names.length)
+    for (const name of names) expect(definitions.has(name)).toBe(false)
+  })
+
+  it('keeps provider time available for task cancellation after the native wait times out', async () => {
+    const { ctx, platform, definitions } = setup()
+    const db = new DatabaseSync(':memory:')
+    db.exec("PRAGMA foreign_keys=ON; CREATE TABLE runs(id TEXT PRIMARY KEY); INSERT INTO runs VALUES ('run-1')")
+    ctx.workbenchRuntime.database = { db }
+    ctx.workbenchRuntime.mcpPolicy = { control_timeout_seconds: 0.2 }
+    const tool = { ...catalogTool, execution: { taskSupport: 'required' } }
+    const server = { id: 'personal:mcp:server', name: 'server', scope: 'personal', version: 'v1', manifest_version: 'm1',
+      protocol_version: '2025-11-25', capabilities: { tasks: { requests: { tools: { call: {} } }, cancel: {} } } }
+    const snapshot = status => ({ taskId: 'task', status, createdAt: '2026-10-24T00:00:00Z', lastUpdatedAt: '2026-10-24T00:00:00Z', ttl: 60000, pollInterval: 1 })
+    let cancellation
+    platform.json.mockImplementation(async request => {
+      if (request.route === 'mcp/catalog') return { tools: [tool], plugins: [server] }
+      const body = JSON.parse(request.body)
+      if (body.method === 'tools/call') return { task_ticket: 'receipt', result: { task: snapshot('working') } }
+      if (body.method === 'tasks/get') return new Promise((_resolve, reject) => {
+        if (request.signal.aborted) reject(request.signal.reason)
+        else request.signal.addEventListener('abort', () => reject(request.signal.reason), { once: true })
+      })
+      if (body.method === 'tasks/cancel') {
+        cancellation = { request, body, at: Date.now() }
+        return { result: snapshot('cancelled') }
+      }
+      throw Error('unexpected request')
+    })
+    try {
+      await apply(ctx)
+      const deadlineMs = Date.now() + 600
+      await expect(definitions.get('search').execute({ query: 'x' }, { callId: 'timed-task', agent: { id: 's1' },
+        signal: new AbortController().signal, deadlineMs })).rejects.toThrow()
+      expect(cancellation).toBeDefined()
+      expect(cancellation.body.deadline_ms).toBe(deadlineMs)
+      expect(cancellation.body.deadline_ms - cancellation.at).toBeGreaterThan(1)
+      expect(cancellation.request.signal.aborted).toBe(false)
+    } finally { db.close() }
+  })
+
+  it('loads one complete catalog and applies the manager-owned call budget', async () => {
+    const { ctx, platform, definitions } = setup()
+    const second = { ...catalogTool, id: 'personal:server:other', runtime_name: 'personal_other', tool_name: 'other' }
+    const policy = { request_bytes: 40 * 1024 * 1024, response_bytes: 40 * 1024 * 1024, max_call_seconds: 900, catalog_timeout_seconds: 300 }
+    platform.loadMcpPolicy = vi.fn(async () => policy)
+    platform.json.mockResolvedValueOnce({ tools: [catalogTool, second] })
+    await apply(ctx)
+    expect(platform.loadMcpPolicy).toHaveBeenCalledOnce()
+    expect(platform.json.mock.calls[0][0].timeoutMs).toBeGreaterThan(180_000)
+    expect([...definitions.keys()]).toEqual(['search', 'other'])
+    expect(platform.json).toHaveBeenCalledOnce()
+    expect(platform.json.mock.calls[0][0].query).toBeUndefined()
+    await definitions.get('search').execute({ query: 'x' }, { callId: 'policy-call', agent: { id: 's1' }, signal: new AbortController().signal })
+    const sent = platform.json.mock.calls.at(-1)[0]
+    expect(sent.timeoutMs).toBe(895000)
+    expect(JSON.parse(sent.body).resource_id).toBe(catalogTool.id)
+  })
+
+  it('keeps a healthy tool registered when a sibling schema is invalid', async () => {
+    const { ctx, definitions, platform } = setup()
+    platform.json.mockResolvedValueOnce({ tools: [catalogTool, { ...catalogTool, id: 'bad', runtime_name: 'bad', tool_name: 'bad', inputSchema: { type: 'string' } }] })
+    await apply(ctx)
+    expect([...definitions.keys()]).toEqual(['search'])
+    expect(ctx.workbenchRuntime.mcpCatalogIssues()).toMatchObject([{ id: 'bad', reason: 'unsupported_schema' }])
+  })
   it('updates live registration order when only one global plugin moves', async () => {
     const { ctx, platform, definitions } = setup()
     const tool = (name, order_num) => ({ ...catalogTool, id: `global:mcp:${name}:lookup`,
@@ -43,7 +131,7 @@ describe('platform MCP proxy tools', () => {
     platform.json.mockResolvedValue({ tools: moved })
     const admitted = await ctx.workbenchRuntime.refreshMcpCatalog()
     expect(ctx.workbenchRuntime.mcpResources().map(item => item.server_id)).toEqual(['alpha', 'zeta', 'beta'])
-    expect(admitted.map(item => item.server_id)).toEqual(['alpha', 'zeta', 'beta'])
+    expect(admitted.tools.map(item => item.server_id)).toEqual(['alpha', 'zeta', 'beta'])
     expect(definitions.get(platformToolNames(first).get(first[0].id))).toBe(unchangedDefinition)
   })
 
@@ -61,7 +149,7 @@ describe('platform MCP proxy tools', () => {
     await apply(ctx, { discovery: true })
     const snapshot = ctx.toolDiscoveryCatalog.snapshot(agent)
     expect(snapshot.plugins.map(item => item.order_num)).toEqual([-10, 20])
-    const catalog = buildCatalog(snapshot, { maxCatalogTools: 100, maxIndexBytes: 1_000_000 })
+    const catalog = buildCatalog(snapshot)
     expect([...renderCatalog(catalog, {}).matchAll(/- `([^`]+)`/g)].map(match => match[1])).toEqual(['zeta', 'alpha'])
   })
 
@@ -141,11 +229,11 @@ describe('platform MCP proxy tools', () => {
     await apply(ctx, { discovery: true })
     platform.json.mockResolvedValueOnce({ tools: [catalogTool], plugins: [{ ...plugin, available: true }] })
     const frozen = await ctx.workbenchRuntime.refreshMcpCatalog()
-    expect(frozen).toMatchObject([{ id: catalogTool.id }])
-    expect(frozen[0].inputSchema).toEqual(catalogTool.inputSchema)
-    expect(frozen[0].runtime_name).toBe('search')
+    expect(frozen.tools).toMatchObject([{ id: catalogTool.id }])
+    expect(frozen.tools[0].inputSchema).toEqual(catalogTool.inputSchema)
+    expect(frozen.tools[0].runtime_name).toBe('search')
     for (const field of ['sourceInputSchema', 'definitionStamp', 'discoveryStamp', 'validateArguments'])
-      expect(frozen[0]).not.toHaveProperty(field)
+      expect(frozen.tools[0]).not.toHaveProperty(field)
     expect(ctx.toolDiscoveryCatalog.snapshot(agent)).toMatchObject({ tools: [], plugins: [
       { name: 'server', available: false, unavailableReason: 'run_authorization_required' },
     ] })
@@ -182,7 +270,7 @@ describe('platform MCP proxy tools', () => {
     const frozen = await Promise.all(admissions)
     await update
     expect(platform.json).toHaveBeenCalledTimes(changed ? 2 : 1)
-    expect(frozen.every(tools => tools.length === (changed ? 0 : 1))).toBe(true)
+    expect(frozen.every(({ tools }) => tools.length === (changed ? 0 : 1))).toBe(true)
   })
   it('keeps empty and unavailable plugin metadata owner-scoped and refreshes its revision', async () => {
     const { ctx, platform } = setup()
@@ -205,13 +293,13 @@ describe('platform MCP proxy tools', () => {
     expect(ctx.toolDiscoveryCatalog.snapshot(agent)).toMatchObject({ ready: false, tools: [], plugins: [] })
   })
 
-  for (const scope of ['global', 'personal']) it(`rejects required-task ${scope} tools through the native guard before proxy dispatch`, async () => {
+  for (const scope of ['global', 'personal']) it(`rejects required-task ${scope} tools without an authorized server declaration`, async () => {
     const { ctx, definitions, platform } = setup()
     platform.json.mockResolvedValueOnce({ tools: [{ ...catalogTool, scope, execution: { taskSupport: 'required' } }] })
     await apply(ctx)
     await expect(definitions.get('search').execute({ query: 'q' }, {
       callId: 'task-required', agent: { id: 's1' }, signal: new AbortController().signal,
-    })).rejects.toThrow('requires task-based execution')
+    })).rejects.toThrow('MCP 任务能力已改变')
     expect(platform.json).toHaveBeenCalledTimes(1)
   })
   it('passes server output schemas to the native MCP definition', async () => {
@@ -467,36 +555,42 @@ describe('platform MCP proxy tools', () => {
     expect(platform.json.mock.calls.filter(([request]) => request.route === 'mcp/call')).toHaveLength(0)
   })
 
-  it('rejects invalid JSON schemas before registering a partial catalog', async () => {
+  it('quarantines an invalid schema while keeping the catalog available', async () => {
     const { ctx } = setup()
     ctx.workbenchPlatformClient.json.mockResolvedValueOnce({ tools: [{ ...catalogTool, inputSchema: { type: 'string' } }] })
     await apply(ctx)
-    expect(ctx.workbenchRuntime.mcpCatalogState.status).not.toBe('ready')
+    expect(ctx.workbenchRuntime.mcpCatalogState.status).toBe('ready')
     expect(ctx.tools.register).not.toHaveBeenCalled()
+    expect(ctx.workbenchRuntime.mcpCatalogIssues()).toHaveLength(1)
   })
 
-  it('rejects duplicate runtime names without registering a partial catalog', async () => {
+  it('quarantines duplicate runtime identities while retaining the valid tool', async () => {
     const { ctx } = setup()
     ctx.workbenchPlatformClient.json.mockResolvedValueOnce({ tools: [catalogTool, { ...catalogTool, id: 'global:other:search' }] })
     await apply(ctx)
-    expect(ctx.workbenchRuntime.mcpCatalogState.status).not.toBe('ready')
-    expect(ctx.tools.register).not.toHaveBeenCalled()
+    expect(ctx.workbenchRuntime.mcpCatalogState.status).toBe('ready')
+    expect(ctx.tools.register).toHaveBeenCalledTimes(1)
+    expect(ctx.workbenchRuntime.mcpCatalogIssues()).toHaveLength(1)
   })
 
   it('keeps same-name providers independently routable and refreshes aliases consistently', async () => {
     const { ctx, definitions, platform } = setup()
     await apply(ctx)
     const other = { ...catalogTool, id: 'global:other:search', scope: 'global', server_id: 'other', runtime_name: 'global_other_search' }
-    platform.json.mockResolvedValueOnce({ tools: [catalogTool, other] })
+    const collisionName = platformToolNames([catalogTool, other]).get(catalogTool.id)
+    const colliding = { ...catalogTool, id: `personal:mcp:alias:${collisionName}`, server_id: 'alias',
+      name: collisionName, tool_name: collisionName, runtime_name: 'personal_alias' }
+    const catalog = [catalogTool, other, colliding]
+    platform.json.mockResolvedValueOnce({ tools: catalog })
     await ctx.on.mock.calls.find(([event]) => event === 'workbench/resources-changed')[1]()
-    const names = platformToolNames([catalogTool, other])
+    const names = platformToolNames(catalog)
     expect(definitions.has('search')).toBe(false)
-    expect(definitions.size).toBe(2)
-    ctx.workbenchRuntime.authorizeMcp.mockImplementation((_session, resourceId) => ({ ownerId: 't:1', runId: 'run-1', resource: resourceId === other.id ? other : catalogTool }))
-    for (const tool of [catalogTool, other]) {
+    expect(definitions.size).toBe(3)
+    ctx.workbenchRuntime.authorizeMcp.mockImplementation((_session, resourceId) => ({ ownerId: 't:1', runId: 'run-1', resource: catalog.find(tool => tool.id === resourceId) }))
+    for (const tool of catalog) {
       await definitions.get(names.get(tool.id)).execute({ query: 'q' }, { callId: `call-${tool.scope}`, agent: { id: 's1' }, signal: new AbortController().signal })
       const body = JSON.parse(platform.json.mock.calls.at(-1)[0].body)
-      expect(body).toMatchObject({ resource_id: tool.id, server_id: tool.server_id, tool_name: 'search' })
+      expect(body).toMatchObject({ resource_id: tool.id, server_id: tool.server_id, tool_name: tool.tool_name })
     }
   })
 
@@ -522,8 +616,9 @@ describe('platform MCP proxy tools', () => {
       ctx.workbenchPlatformClient.json.mockResolvedValueOnce({ tools: [{ ...catalogTool, inputSchema: { type: 'string' } }] })
       await apply(ctx)
       expect(definitions.size).toBe(0)
-      expect(ctx.workbenchRuntime.mcpCatalogState.status).not.toBe('ready')
-      await vi.advanceTimersByTimeAsync(5000)
+      expect(ctx.workbenchRuntime.mcpCatalogState.status).toBe('ready')
+      expect(ctx.workbenchRuntime.mcpCatalogIssues()).toHaveLength(1)
+      await vi.advanceTimersByTimeAsync(30000)
       expect(ctx.workbenchRuntime.mcpCatalogState.status).toBe('ready')
       expect(definitions.has('search')).toBe(true)
     } finally { vi.useRealTimers() }

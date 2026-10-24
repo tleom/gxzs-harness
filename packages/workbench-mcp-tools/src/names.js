@@ -22,7 +22,8 @@ export function platformToolNames(tools, reserved = () => false) {
   }
   const names = new Map()
   const used = new Set()
-  for (const tool of tools) {
+  // Allocate by immutable identity so collision resolution survives reordering.
+  for (const tool of [...tools].sort((a, b) => String(a.id).localeCompare(String(b.id)))) {
     let name = platformToolName(tool)
     if (counts.get(name) > 1 || reserved(name)) {
       const hash = createHash('sha256').update(`${tool.scope}\0${tool.server_id}\0${tool.tool_name}`).digest('hex').slice(0, 12)
@@ -30,7 +31,7 @@ export function platformToolNames(tools, reserved = () => false) {
     }
     // Never replace a native tool, including one whose name already resembles
     // an alias. The identity, not catalog order, determines the fallback name.
-    for (let attempt = 1; reserved(name); attempt++) {
+    for (let attempt = 1; reserved(name) || used.has(name) || (name !== platformToolName(tool) && counts.has(name)); attempt++) {
       if (attempt > 64) throw new Error('MCP public tool namespace is unavailable')
       const hash = createHash('sha256').update(`${tool.scope}\0${tool.server_id}\0${tool.tool_name}\0${attempt}`).digest('hex').slice(0, 12)
       name = `${platformToolName(tool).slice(0, 51)}_${hash}`
@@ -39,5 +40,5 @@ export function platformToolNames(tools, reserved = () => false) {
     used.add(name)
     names.set(tool.id, name)
   }
-  return names
+  return new Map(tools.map(tool => [tool.id, names.get(tool.id)]))
 }

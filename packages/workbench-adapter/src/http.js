@@ -1,6 +1,6 @@
 export const MAX_JSON_BYTES = 32 * 1024 * 1024
 
-/** Bind read-only upstream work to the response connection, including early disconnects. */
+/** Bind upstream work to the connection; mutations must also settle their outcome. */
 export async function withResponseSignal(res, operation) {
   const controller = new AbortController()
   const cancel = () => controller.abort()
@@ -12,11 +12,15 @@ export async function withResponseSignal(res, operation) {
   } finally { res.off('close', cancel) }
 }
 
-export async function readBody(req, limit = MAX_JSON_BYTES) {
+export async function readBody(req, limit = MAX_JSON_BYTES, expand) {
   const chunks = []
   let size = 0
   for await (const chunk of req) {
     size += chunk.length
+    if (size > limit && expand) {
+      limit = Math.max(limit, await expand())
+      expand = undefined
+    }
     if (size > limit) throw httpError(413, '请求体过大')
     chunks.push(Buffer.from(chunk))
   }

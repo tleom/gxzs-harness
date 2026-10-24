@@ -12,7 +12,6 @@ import zipfile
 
 MAX_BYTES = 100 * 1024 * 1024
 MAX_TREE_BYTES = 1024 * 1024 * 1024
-MAX_TREE_ITEMS = 10000
 MAX_MANIFEST_FILE_BYTES = 2 * 1024 * 1024 * 1024
 MAX_MANIFEST_TREE_BYTES = 10 * 1024 * 1024 * 1024
 TEMP_PATH = '/tmp'
@@ -156,12 +155,8 @@ def tree_entries(fd, prefix="", result=None):
     """Fingerprint metadata without following links or reading every file on listing."""
     top = result is None
     result = [] if top else result
-    # Do not allocate listdir/sorted before enforcing the shared tree budget:
-    # a single flat directory can itself exceed the metadata limit.
     with os.scandir(fd) as entries:
         for entry in entries:
-            if len(result) >= MAX_TREE_ITEMS:
-                raise ValueError("Folder contains too many entries")
             name = entry.name
             info = os.stat(name, dir_fd=fd, follow_symlinks=False)
             path = prefix + name
@@ -198,30 +193,45 @@ def hash_file(fd, name, expected_size):
     return digest.hexdigest()
 
 
-def tree_manifest(fd, prefix="", result=None):
+def tree_manifest(fd, prefix="", result=None, *, budget=None):
     result = [] if result is None else result
+    # Share the byte count across recursion without rescanning all prior files.
+    budget = {"size": sum(item["size"] for item in result)} if budget is None else budget
     for name in sorted(os.listdir(fd)):
-        if len(result) >= MAX_TREE_ITEMS:
-            raise ValueError("Folder contains too many entries")
         info = os.stat(name, dir_fd=fd, follow_symlinks=False)
         path = prefix + name
         if stat.S_ISDIR(info.st_mode):
             child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
             try:
-                tree_manifest(child, path + "/", result)
+                tree_manifest(child, path + "/", result, budget=budget)
             finally:
                 os.close(child)
         elif stat.S_ISREG(info.st_mode):
-            if sum(item["size"] for item in result) + info.st_size > MAX_MANIFEST_TREE_BYTES:
+            if budget["size"] + info.st_size > MAX_MANIFEST_TREE_BYTES:
                 raise ValueError("Workspace exceeds migration manifest limits")
             result.append({"path": path, "size": info.st_size, "sha256": hash_file(fd, name, info.st_size)})
+            budget["size"] += info.st_size
         else:
             result.append({"path": path, "size": info.st_size, "kind": "blocked", "sha256": None})
+            budget["size"] += info.st_size
     return result
 
 
 def tree_version(fd):
-    return version(json.dumps(tree_entries(fd), separators=(",", ":")).encode())
+    return entries_version(tree_entries(fd))
+
+
+def entries_version(entries):
+    # Preserve the byte-for-byte token format without a second full JSON copy.
+    digest = hashlib.sha256()
+    digest.update(b'[')
+    encoder = json.JSONEncoder(separators=(",", ":"))
+    for index, entry in enumerate(entries):
+        if index:
+            digest.update(b',')
+        digest.update(encoder.encode(entry).encode())
+    digest.update(b']')
+    return digest.hexdigest()
 
 
 def entry_metadata(fd, name, path, info, *, shallow=False):
@@ -238,7 +248,7 @@ def entry_metadata(fd, name, path, info, *, shallow=False):
         child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
         try:
             entries = tree_entries(child)
-            fingerprint = version(json.dumps(entries, separators=(",", ":")).encode())
+            fingerprint = entries_version(entries)
             downloadable = (
                 all(stat.S_ISDIR(mode) or (stat.S_ISREG(mode) and size <= MAX_BYTES)
                     for _, mode, size, _, _ in entries)

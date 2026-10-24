@@ -57,15 +57,12 @@ def test_directory_budget_uses_uncompressed_bytes_and_has_no_entry_cap(tmp_path,
     directory = tmp_path / 'files'
     directory.mkdir()
     monkeypatch.setattr(file_download, 'MAX_DIRECTORY_BYTES', 10)
-    monkeypatch.setattr(file_ops, 'MAX_TREE_ITEMS', 1)
     for name in ['a', 'b', 'c']:
         (directory / name).write_bytes(b'123')
-    # Frontend downloads use shallow list metadata and call the independent
-    # streaming route directly, even when full metadata cannot be collected.
+    # Both directory metadata and streaming downloads support the complete tree.
     listing = file_ops.operate({'operation': 'list', 'path': '.'}, str(tmp_path))
     assert listing['entries'][0]['downloadable'] is True
-    with pytest.raises(ValueError, match='too many entries'):
-        file_ops.operate({'operation': 'stat', 'path': 'files'}, str(tmp_path))
+    assert file_ops.operate({'operation': 'stat', 'path': 'files'}, str(tmp_path))['downloadable'] is True
     output = io.BytesIO()
     file_download.write_download({'path': 'files'}, output, str(tmp_path))
     with zipfile.ZipFile(io.BytesIO(output.getvalue().split(b'\n', 1)[1])) as archive:
@@ -84,11 +81,35 @@ def test_download_rejects_symlink_and_traversal(tmp_path):
             file_download.write_download({'path': name}, io.BytesIO(), str(tmp_path))
 
 
-def test_package_keeps_skill_validation_and_expansion_budget(tmp_path, monkeypatch):
+def test_package_keeps_skill_text_size_validation(tmp_path):
     data = b'---\nname: test\ndescription: test\n---\n# Test'
     metadata = {'operation': 'skill_inspect', 'archive': False, 'files': [{'path': 'SKILL.md', 'size': len(data)}]}
     result = binary_upload.run(frame(metadata, data), 'personal-resources', str(tmp_path))
     assert result['content'] == data.decode()
-    monkeypatch.setitem(binary_upload.personal.__globals__, 'MAX_PACKAGE', 1)
-    with pytest.raises(ValueError):
+    data = b'x' * (64 * 1024 + 1)
+    metadata['files'][0]['size'] = len(data)
+    with pytest.raises(ValueError, match='64 KiB'):
         binary_upload.run(frame(metadata, data), 'personal-resources', str(tmp_path))
+
+
+@pytest.mark.parametrize('archive', [False, True])
+def test_streamed_skill_package_with_many_assets_can_be_imported(tmp_path, archive):
+    entries = {'SKILL.md': b'---\nname: report\ndescription: Reports\n---\nUse the assets.'}
+    entries.update({f'references/item-{index}.txt': str(index).encode() for index in range(250)})
+    if archive:
+        stream = io.BytesIO()
+        with zipfile.ZipFile(stream, 'w', compression=zipfile.ZIP_DEFLATED) as bundle:
+            for path, data in entries.items():
+                bundle.writestr(path, data)
+        data = stream.getvalue()
+        files = [{'path': 'report.zip', 'size': len(data)}]
+    else:
+        data = b''.join(entries.values())
+        files = [{'path': path, 'size': len(content)} for path, content in entries.items()]
+    metadata = {'operation': 'skill_inspect', 'archive': archive, 'files': files}
+    assert binary_upload.run(frame(metadata, data), 'personal-resources', str(tmp_path))['content'] == entries['SKILL.md'].decode()
+    metadata.update(operation='skill_import', name='report', version=None)
+    result = binary_upload.run(frame(metadata, data), 'personal-resources', str(tmp_path))
+    assert result['version']
+    assert {path.relative_to(tmp_path / 'skills/report').as_posix(): path.read_bytes()
+            for path in (tmp_path / 'skills/report').rglob('*') if path.is_file()} == entries

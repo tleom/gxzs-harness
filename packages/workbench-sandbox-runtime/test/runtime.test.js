@@ -3,7 +3,7 @@ import SshSubprocessRuntime from '@deepseek-ai/dsh-subprocess-ssh'
 import { resolveRgPath } from '@deepseek-ai/dsh-tool-fs-search'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import WorkbenchSubprocess from '../src/subprocess.js'
-import SandboxSpillStore from '../src/spill.js'
+import SandboxSpillStore, { readableText } from '../src/spill.js'
 
 afterEach(() => vi.restoreAllMocks())
 
@@ -99,6 +99,35 @@ describe('sandbox output storage', () => {
     fs.contains.mockReturnValue(false)
     await expect(store.saveText({ owner: { sessionId: 's' }, content: 'text' })).rejects.toThrow('inside the user workspace')
     expect(fs.writeText).not.toHaveBeenCalled()
+    await ctx.fiber.dispose()
+  })
+
+  it('keeps the original exact and provides line-readable UTF-8 tails', async () => {
+    const { ctx, fs, store } = setup()
+    const content = JSON.stringify({ value: '中文😀'.repeat(1600) + 'TAIL_全文末尾' })
+    const saved = await store.saveText({ owner: { sessionId: 's' }, content })
+    expect(fs.writeText.mock.calls[0][1]).toBe(content)
+    expect(saved.locator).not.toContain('.readable.')
+    const [view, text] = fs.writeText.mock.calls[1]
+    expect(view.targetKey).toBe(saved.locator.replace('.txt', '.readable.txt'))
+    expect(saved.retrievalHint).toContain(view.targetKey)
+    expect(text.split('\n').every(line => line.length <= 2000)).toBe(true)
+    expect(text.replaceAll('\n', '')).toBe(content)
+    expect(text.split('\n').at(-1)).toContain('TAIL_全文末尾')
+    expect(Buffer.from(text).toString()).toBe(text)
+    expect(readableText('short\nlines', 10)).toBeUndefined()
+    await ctx.fiber.dispose()
+  })
+
+  it('retains the canonical file reference if only the derived view fails', async () => {
+    const { ctx, fs, store } = setup()
+    fs.writeText.mockResolvedValueOnce({}).mockRejectedValueOnce(new Error('disk full'))
+    const content = 'x'.repeat(3000)
+    const saved = await store.saveText({ owner: { sessionId: 's' }, content })
+    expect(saved.bytes).toBe(3000)
+    expect(saved.retrievalHint).toContain('could not be created')
+    expect(saved.retrievalHint).toContain('character ranges')
+    expect(fs.writeText.mock.calls[0][1]).toBe(content)
     await ctx.fiber.dispose()
   })
 

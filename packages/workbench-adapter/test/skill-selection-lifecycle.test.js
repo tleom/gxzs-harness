@@ -148,6 +148,20 @@ async function personal(h, name) {
   return item
 }
 
+test('completion notification refreshes native skills after the cache was read during import', async () => {
+  const h = await fixture(), rows = []
+  h.ctx.provide('workbenchFileManager', { personalResources: async () => ({ skills: rows }) })
+  personalSkills(h.ctx)
+  assert.deepEqual(await h.service.listSkills(), [])
+  await h.ctx.parallel('workbench/resources-changed') // Submission notification, before publication.
+  assert.deepEqual(await h.service.listSkills(), [])
+  rows.push({ id: 'report', version: 'v1', enabled: true,
+    content: '---\nname: report\ndescription: Imported\n---\nBody' })
+  assert.deepEqual(await h.service.listSkills(), [])
+  await h.ctx.parallel('workbench/resources-changed') // Completed status notification.
+  assert.deepEqual((await h.service.listSkills()).map(skill => skill.name), ['report'])
+})
+
 test.each(['disabled', 'provider', 'policy', 'get-unavailable'])('native execution fails visibly when queued selected skill changes: %s', async change => {
   const h = await fixture(), item = await personal(h, 'selected')
   h.scheduler.pendingTick = new Promise(() => {})

@@ -7,9 +7,8 @@ import sys
 import threading
 import time
 from pathlib import Path
+from mcp_policy import get as mcp_limit
 
-MAX_INPUT = 2 * 1024 * 1024
-MAX_OUTPUT = 1024 * 1024
 
 
 def group_running(group):
@@ -27,8 +26,8 @@ def group_running(group):
 
 def serve(source):
     print('{"ready":true}', flush=True)
-    raw = sys.stdin.buffer.readline(MAX_INPUT + 1)
-    if not raw or len(raw) > MAX_INPUT or not raw.endswith(b'\n'):
+    raw = sys.stdin.buffer.readline(mcp_limit('request_bytes') + 1)
+    if not raw or len(raw) > mcp_limit('request_bytes') or not raw.endswith(b'\n'):
         print('{"process_group_fenced":true,"output":{"error":"Memory operation was not dispatched"}}', flush=True)
         return
     request = json.loads(raw)
@@ -56,7 +55,7 @@ def serve(source):
         os.read(sys.stdin.fileno(), 1)
         stop()
 
-    timeout = max(0.001, min(60, float(request.get('remaining_seconds', 60))))
+    timeout = max(0.001, min(mcp_limit('max_call_seconds'), float(request.get('remaining_seconds', mcp_limit('call_timeout_seconds')))))
     timer = threading.Timer(timeout, stop)
     timer.daemon = True
     try:
@@ -65,13 +64,13 @@ def serve(source):
         child.stdin.write(json.dumps({'tool': request['tool'], 'arguments': request['arguments']}, ensure_ascii=False).encode())
         child.stdin.close()
         # Bound captured output while still draining or killing the child.
-        output = child.stdout.read(MAX_OUTPUT + 1)
-        if len(output) > MAX_OUTPUT:
+        output = child.stdout.read(mcp_limit('response_bytes') + 1)
+        if len(output) > mcp_limit('response_bytes'):
             stop()
         child.wait()
         with guard:
             done.set()
-        if cancelled.is_set() or child.returncode or len(output) > MAX_OUTPUT:
+        if cancelled.is_set() or child.returncode or len(output) > mcp_limit('response_bytes'):
             result = {'error': '记忆调用已停止或失败，执行结果未知，请先核实状态', 'uncertain': True}
         else:
             result = json.loads(output)

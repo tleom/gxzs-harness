@@ -15,12 +15,22 @@ import subprocess
 import threading
 import time
 from urllib.request import Request, build_opener, ProxyHandler
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
+from http.client import IncompleteRead
 from owner_auth import owner_token, assertion_key
 from runtime_names import account_names, host_name, volume_prefix
 from global_skills import mount_arguments as global_skill_mounts, matches_mount, native_root
 
 IDLE_TIMEOUT_SECONDS = 2 * 60 * 60
+
+
+class HostPlatformError(RuntimeError):
+    """A reviewed platform failure, separate from invalid manager input."""
+    def __init__(self, status, message, code, request_id=None, retry_after=None):
+        super().__init__(message)
+        self.status, self.code = status, code
+        self.request_id, self.retry_after = request_id, retry_after
+
 
 class Hosts:
     def __init__(self, state, docker, ensure_sandbox, identity, lock, admission, ensure_network):
@@ -90,17 +100,67 @@ class Hosts:
         owner = payload['owner_id']
         instance = payload['instance_id']
         generation = int(payload['generation'])
+        scheduled_wakeup = payload.get('scheduled_wakeup') is True
         names = account_names(owner, payload.get('account_name'))
         if not re.fullmatch(r'[^:\s/]+:\d+', owner) or not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_.-]{0,100}', instance) or generation < 1:
             raise ValueError('Invalid host identity')
         record = self.root / workspace / 'host.json'
         with self.lock(workspace):
+            self._retry_mcp_fence(record)
             observed = json.loads(record.read_text()) if record.exists() else {}
+            if observed.get('state') in {'ready', 'degraded'}:
+                if (observed['owner_id'], observed['generation'], observed['instance_id']) != (owner, generation, instance):
+                    raise ValueError('Host identity changed; fence the previous generation before replacement')
+                if observed.get('account_name') and names and observed['account_name'] != names['account_name']:
+                    raise ValueError('Runtime account binding cannot change')
+                if scheduled_wakeup and observed['state'] == 'ready' and 'profile_upgrade' not in observed:
+                    # Announce the wake before releasing the idle-stop lock.
+                    # A slow live probe must not let GC stop this generation.
+                    (self.root.parent / workspace).touch()
+        if observed.get('state') == 'ready':
+            if 'profile_upgrade' in observed or observed.get('ready') is False:
+                return {**observed, 'ready': False}
+            # Reconfirm the running pair outside the lifecycle lock. A stale
+            # platform heartbeat does not authorize provisioning or a restart.
+            info = self._upgrade_inspect(host_name(observed))
+            sandbox = observed.get('sandbox_name') or self.identity(workspace)[0]
+            sandbox_info = self._upgrade_inspect(sandbox)
+            self._verify_named_container(observed, info)
+            self._verify_named_container(observed, sandbox_info, sandbox=True)
+            if info is not None:
+                labels = info.get('Config', {}).get('Labels') or {}
+                if any(labels.get(key) != value for key, value in {
+                        'gxzs.owner': owner, 'gxzs.workspace': workspace, 'gxzs.generation': str(generation)}.items()):
+                    raise ValueError('Existing host is not managed for this owner; explicit adoption is required')
+                if labels.get('gxzs.instance') is not None and labels['gxzs.instance'] != instance:
+                    raise ValueError('Existing named Host instance identity changed')
+                desired_digest = json.loads(self.docker('image', 'inspect', os.environ['GXZS_HOST_IMAGE']).stdout)[0]['Id']
+                if (info.get('Image') != observed.get('image_digest')
+                        or info.get('Image') != desired_digest
+                        or payload.get('image_digest') and payload['image_digest'] != desired_digest
+                        or info.get('Config', {}).get('Image') != os.environ['GXZS_HOST_IMAGE']
+                        or labels.get('gxzs.credentials') != 'owner-v1'
+                        or not matches_mount(info)
+                        or (info.get('HostConfig', {}).get('CgroupParent') or '') != owner_cgroup(workspace)):
+                    raise ValueError('Host runtime rollout requires draining before replacement')
+                if set((info.get('NetworkSettings', {}).get('Networks') or {}).keys()) != {self.ensure_network(workspace)}:
+                    raise ValueError('Host network rollout requires draining before replacement')
+            sandbox_state = (sandbox_info or {}).get('State', {})
+            healthy = bool(info and info.get('State', {}).get('Running') is True
+                           and sandbox_state.get('Running') is True
+                           and (sandbox_state.get('Health') or {}).get('Status') in (None, 'healthy')
+                           and observed.get('endpoint') and self.healthy(observed['endpoint']))
+            with self.lock(workspace):
+                current = json.loads(record.read_text())
+                if current != observed:
+                    raise ResourceUnavailable('个人工作环境状态正在同步，请稍后重试', 'HOST_NOT_READY', 2)
+                if healthy and not scheduled_wakeup:
+                    (self.root.parent / workspace).touch()
+                if not healthy or current.get('initial_creation') is True:
+                    current = {**current, 'ready': healthy, 'initial_creation': False}
+                    self._save(record, current)
+                return current
         if observed.get('state') == 'degraded':
-            if (observed['owner_id'], observed['generation'], observed['instance_id']) != (owner, generation, instance):
-                raise ValueError('Host identity changed; fence the previous generation before replacement')
-            if observed.get('account_name') and names and observed['account_name'] != names['account_name']:
-                raise ValueError('Runtime account binding cannot change')
             # An ensure result renews the platform heartbeat. A durable degraded
             # record is not fresh liveness evidence; probe outside the owner lock.
             info = self._upgrade_inspect(host_name(observed))
@@ -138,22 +198,15 @@ class Hosts:
                     raise ResourceUnavailable('个人工作环境正在恢复，请稍后重试', 'HOST_NOT_READY', 2)
                 if current.get('state') == 'ready' and current.get('ready') is False:
                     return current
-                if payload.get('scheduled_wakeup') is True:
+                if current.get('state') == 'ready':
+                    # Another ensure/maintenance completed after our snapshot.
+                    # Retry its live proof instead of regressing the generation.
+                    raise ResourceUnavailable('个人工作环境状态正在同步，请稍后重试', 'HOST_NOT_READY', 2)
+                if scheduled_wakeup:
                     # Serialized with _maintain_one's final idle check/stop.
                     # A wake either renews activity before that check or observes
                     # the stopped pair and starts it again below.
                     (self.root.parent / workspace).touch()
-                    if current.get('state') == 'ready' and current.get('ready') is True:
-                        sandbox, _ = self.identity(workspace)
-                        host_info = self._upgrade_inspect(host_name(current))
-                        sandbox_info = self._upgrade_inspect(sandbox)
-                        self._verify_named_container(current, host_info)
-                        self._verify_named_container(current, sandbox_info, sandbox=True)
-                        if (host_info and sandbox_info
-                                and host_info.get('State', {}).get('Running') is True
-                                and sandbox_info.get('State', {}).get('Running') is True
-                                and self.healthy(current['endpoint'])):
-                            return current
             else:
                 current.update(names)
                 if names:
@@ -348,6 +401,7 @@ class Hosts:
             record = self.root / workspace / 'host.json'
             if not record.exists():
                 raise ValueError('Replacement requires a registered host')
+            self._retry_mcp_fence(record)
             current = json.loads(record.read_text(encoding='utf-8'))
             if 'profile_upgrade' in current and current['profile_upgrade'].get('phase') != 'prepared':
                 return {'conflict': True, 'code': 'PROFILE_UPGRADE_PREPARING',
@@ -507,6 +561,7 @@ class Hosts:
         with self.lock(workspace):
             if not record.exists():
                 raise ValueError('Profile upgrade requires a registered host')
+            self._retry_mcp_fence(record)
             current = json.loads(record.read_text(encoding='utf-8'))
             if current.get('workspace_id') != workspace:
                 raise ValueError('Profile upgrade workspace identity changed')
@@ -603,16 +658,47 @@ class Hosts:
             self._save(record, current)
             return self._upgrade_result(workspace, marker)
 
-    def _fence(self, workspace, owner, instance, *, preserve_pending=False):
-        self.native_snapshots.pop(instance, None)
+    def _retry_mcp_fence(self, record):
+        if not record.exists():
+            return
+        current = json.loads(record.read_text(encoding='utf-8'))
+        pending = current.get('mcp_fence_pending')
+        if isinstance(pending, dict):
+            self._fence(current['workspace_id'], current['owner_id'], current['instance_id'],
+                        preserve_pending=pending.get('preserve_pending') is True,
+                        stopped=pending.get('stopped') is True)
+            return True
+        return False
+
+    def _fence(self, workspace, owner, instance, *, preserve_pending=False, stopped=False):
+        record = self.root / workspace / 'host.json'
+        from mcp_runtime import fence_workspace as fence_mcp
+        if fence_mcp(workspace) is not True:
+            if record.exists():
+                current = json.loads(record.read_text(encoding='utf-8'))
+                if current.get('owner_id') == owner and current.get('instance_id') == instance:
+                    current.update(ready=False, mcp_fence_pending={'preserve_pending': preserve_pending, 'stopped': stopped})
+                    if stopped:
+                        current['state'] = 'fencing'
+                    self._save(record, current)
+            raise ResourceUnavailable('个人工作环境正在完成工具回收，请稍后重试', 'MCP_FENCE_PENDING', 2)
         from global_memory import fence_workspace
         fence_workspace(workspace)
-        from mcp_runtime import fence_workspace as fence_mcp
-        fence_mcp(workspace)
+        from skill_import_runtime import fence_workspace as fence_skills
+        fence_skills(workspace)
+        self.native_snapshots.pop(instance, None)
         if preserve_pending:
             self.admission.fence(owner, instance, preserve_pending=True)
         else:
             self.admission.fence(owner, instance)
+        if record.exists():
+            current = json.loads(record.read_text(encoding='utf-8'))
+            if (current.get('owner_id') == owner and current.get('instance_id') == instance
+                    and 'mcp_fence_pending' in current):
+                pending = current.pop('mcp_fence_pending')
+                if pending.get('stopped') is True:
+                    current.update(state='stopped', ready=False)
+                self._save(record, current)
 
     def _ssh(self, folder, sandbox):
         ssh = folder / 'ssh'
@@ -853,8 +939,46 @@ class Hosts:
         request = Request(os.environ['GXZS_HOST_PLATFORM_URL'].removesuffix('/internal/workbench') + '/internal/ai/orchestration/hosts/heartbeat',
                           data=json.dumps({**item, 'state': state}).encode(),
                           headers={'Authorization': 'Bearer ' + os.environ['GXZS_ORCHESTRATOR_TOKEN'], 'Content-Type': 'application/json'})
-        with self.opener.open(request, timeout=5) as response:
-            response.read(4096)
+        try:
+            with self.opener.open(request, timeout=5) as response:
+                response.read(4096)
+        except HTTPError as error:
+            status = error.code
+            header_retry = error.headers.get('Retry-After') if error.headers else None
+            try:
+                body = error.read(8193)
+                payload = json.loads(body) if len(body) <= 8192 else {}
+                if not isinstance(payload, dict):
+                    payload = {}
+            except (ValueError, OSError, IncompleteRead):
+                payload = {}
+            finally:
+                error.close()
+            code = payload.get('resource_code') or payload.get('code')
+            if not isinstance(code, str) or not re.fullmatch(r'[A-Z][A-Z0-9_]{0,63}', code):
+                code = ('HOST_STATE_CONFLICT' if status == 409 else
+                        'HOST_PLATFORM_UNAVAILABLE' if status in {429, 502, 503, 504} else 'HOST_PLATFORM_ERROR')
+            message = payload.get('message')
+            if not isinstance(message, str) or not message.strip() or len(message) > 512 or any(ord(c) < 32 for c in message):
+                message = '个人工作环境状态确认失败，请稍后重试'
+            request_id = payload.get('request_id')
+            if not isinstance(request_id, str) or not re.fullmatch(r'[a-zA-Z0-9_-]{1,128}', request_id):
+                request_id = None
+            retry_after = None
+            for retry in (payload.get('retry_after'), header_retry):
+                retry_text = str(retry)
+                if re.fullmatch(r'[0-9]{1,2}', retry_text) and int(retry_text) <= 60:
+                    retry_after = int(retry_text)
+                    break
+            if retry_after is None and status in {409, 429, 502, 503, 504}:
+                retry_after = 2
+            # Internal coordinator credentials are not the browser's login.
+            if status in {401, 403}:
+                status, code, message = 502, 'HOST_PLATFORM_AUTH_ERROR', '宿主管理身份验证失败，请联系管理员'
+            raise HostPlatformError(status, message, code, request_id, retry_after) from None
+        except (URLError, OSError):
+            raise HostPlatformError(503, '宿主管理服务连接暂时中断，请稍后重试',
+                                    'HOST_PLATFORM_UNAVAILABLE', retry_after=2) from None
 
     def schedule(self, workspace, payload):
         with self.lock(workspace):
@@ -886,6 +1010,8 @@ class Hosts:
                 item = dict(owner_id=payload['owner_id'], generation=int(payload['generation']), instance_id=instance)
             if (item['owner_id'], item['generation'], item['instance_id']) != (payload['owner_id'], int(payload['generation']), payload['instance_id']):
                 raise ValueError('Scheduling host identity mismatch')
+            if item.get('mcp_fence_pending') and payload['action'] == 'acquire':
+                raise ResourceUnavailable('个人工作环境正在完成工具回收，请稍后重试', 'MCP_FENCE_PENDING', 2)
             draining_ticket = item.get('state') == 'draining' and self.admission.pending(
                 payload['owner_id'], int(payload['generation']), payload['instance_id'],
                 payload.get('ticket_id') or payload['run_id'], payload['chat_id']) is True
@@ -913,7 +1039,11 @@ class Hosts:
         cleanup_item = None
         try:
             with self.lock(record.parent.name):
+                retried_fence = self._retry_mcp_fence(record)
                 item = json.loads(record.read_text())
+                if retried_fence and item.get('state') == 'stopped':
+                    heartbeats.append((dict(item), 'stopped'))
+                    return
                 if item.get('state') == 'fencing':
                     return
                 if 'profile_upgrade' in item:
@@ -986,7 +1116,7 @@ class Hosts:
                         self._stop_pair(item)
                     else:
                         self._stop_pair(item, deadline=deadline)
-                    self._fence(item['workspace_id'], item['owner_id'], item['instance_id'])
+                    self._fence(item['workspace_id'], item['owner_id'], item['instance_id'], stopped=True)
                     item.update(state='stopped', ready=False)
                     self._save(record, item)
                     heartbeats.append((dict(item), 'stopped'))

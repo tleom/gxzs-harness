@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict'
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { createRequire } from 'node:module'
 import { inflateRawSync } from 'node:zlib'
-import { mkdtemp, open, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, open, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { FileManagerClient } from '/opt/workbench/packages/workbench-file-manager/src/index.js'
@@ -70,6 +70,86 @@ try {
       metadata: { ...skillMetadata, operation: 'skill_import', name: 'upload-audit', version: 'stale' } }), error => error.status === 409)
     await manager.personalResources({ operation: 'skill_uninstall', name: 'upload-audit', version: imported.version })
     console.log('PASS streaming files: 100 MiB binary upload/download SHA-256, conflicts, oversize rejection, skill import/version checks')
+  } else if (phase === 'legacy-skill-json') {
+    const download = await manager.download('probe/legacy-skill-json.zip')
+    const path = join(directory, 'legacy-skill-json.zip'), file = await open(path, 'wx')
+    try { for await (const chunk of download.body) await file.write(chunk) }
+    finally { await file.close() }
+    assert.equal(download.size, 100 * mib)
+    const archive = (await readFile(path)).toString('base64')
+    const imported = await manager.personalResources({ operation: 'skill_import', name: 'legacy-json-large', archive, version: null })
+    assert.equal(imported.id, 'legacy-json-large')
+    const asset = await manager.operate({ operation: 'stat', path: 'skills/legacy-json-large/asset.bin' })
+    assert.ok(asset.size > 99 * mib)
+    const tail = Buffer.from(archive.slice(-4), 'base64')
+    assert.equal(tail.length, 1)
+    const oversized = archive.slice(0, -4) + Buffer.from([tail[0], 0]).toString('base64')
+    await assert.rejects(manager.personalResources({ operation: 'skill_import', name: 'legacy-json-large', archive: oversized,
+      version: imported.version }), error => [400, 413].includes(error.status))
+    const current = await manager.personalResources({ operation: 'list' })
+    assert.equal(current.skills.find(skill => skill.id === imported.id).version, imported.version)
+    await manager.personalResources({ operation: 'skill_uninstall', name: imported.id, version: imported.version })
+    console.log('PASS legacy skill JSON: exact 100 MiB ZIP installed, 100 MiB plus one decoded byte rejected, previous skill preserved')
+  } else if (phase === 'skill-package') {
+    const download = await manager.download('probe/skill-package.zip')
+    const metadata = { operation: 'skill_inspect', archive: true,
+      files: [{ path: 'large-skill.zip', size: download.size }] }
+    const header = Buffer.from(JSON.stringify(metadata) + '\n')
+    const path = join(directory, 'large-skill-upload'), file = await open(path, 'wx')
+    try {
+      await file.writeFile(header)
+      for await (const chunk of download.body) await file.writeFile(chunk)
+    } finally { await file.close() }
+    const upload = { path, metadata, size: header.length + download.size, offset: header.length }
+    const prepare = async version => {
+      const import_id = randomUUID().replaceAll('-', '')
+      const staged = await manager.upload('personal-resources', { ...upload,
+        metadata: { ...metadata, operation: 'skill_stage', import_id } })
+      assert.match(staged.content, /name: streamed-package/)
+      const prepared = await manager.personalResources({ operation: 'skill_prepare', import_id,
+        name: 'streamed-package', version })
+      return { operation: 'skill_import', import_id, name: 'streamed-package', version: prepared.version }
+    }
+    const install = async version => {
+      const request = await prepare(version)
+      let result = await manager.personalResources(request)
+      for (let i = 0; result.status === 'running' && i < 600; i++) {
+        await new Promise(resolve => setTimeout(resolve, 100))
+        result = await manager.personalResources({ operation: 'skill_import_status', import_id: request.import_id })
+      }
+      assert.equal(result.status, 'completed', JSON.stringify(result))
+      return result
+    }
+    const first = await install(null)
+    const asset = await manager.operate({ operation: 'stat', path: 'skills/streamed-package/asset.bin' })
+    assert.equal(asset.size, 256 * mib)
+    assert.equal(asset.downloadable, false)
+    const second = await install(first.version)
+    assert.notEqual(second.version, first.version)
+    await assert.rejects(install(first.version), error => error.status === 409)
+    const pending = await prepare(second.version)
+    const stopped = await manager.personalResources({ operation: 'skill_import_cancel', import_id: pending.import_id })
+    assert.equal(stopped.status, 'cancelled')
+    await assert.rejects(manager.personalResources(pending), error => error.code === 'SKILL_IMPORT_CANCELLED')
+    const active = await prepare(second.version)
+    assert.equal((await manager.personalResources(active)).status, 'running')
+    let extracting = false
+    for (let i = 0; i < 100; i++) {
+      const saved = await manager.operate({ operation: 'get', path: `.skill-imports/${active.import_id}/state.json` })
+      const receipt = JSON.parse(Buffer.from(saved.data, 'base64').toString())
+      if (receipt.phase === 'extracting') { extracting = true; break }
+      if (['completed', 'failed', 'cancelled'].includes(receipt.status)) break
+      await new Promise(resolve => setTimeout(resolve, 20))
+    }
+    assert.equal(extracting, true, 'capture an actual extraction before cancelling')
+    const settled = await manager.personalResources({ operation: 'skill_import_cancel', import_id: active.import_id })
+    assert.ok(['cancelled', 'completed'].includes(settled.status), JSON.stringify(settled))
+    const finalVersion = settled.status === 'completed' ? settled.version : second.version
+    console.log(`PASS cancellation during extraction: ${settled.status}; remote process fencing and final receipt confirmed`)
+    const resources = await manager.personalResources({ operation: 'list' })
+    assert.equal(resources.skills.find(skill => skill.id === 'streamed-package').version, finalVersion)
+    await manager.personalResources({ operation: 'skill_uninstall', name: 'streamed-package', version: finalVersion })
+    console.log('PASS skill package: one-upload staged imports, 256 MiB assets in a 128 MiB sandbox, atomic replacement, receipts, cancellation and stale-version rejection')
   } else if (phase === 'mixed') {
     const nativeRequire = createRequire('/opt/workbench/profiles/workbench/package.json')
     const { Context } = nativeRequire('@deepseek-ai/cordis')

@@ -1,5 +1,7 @@
 """Sandbox-local MCP supervisor; confirm descendant exit even after lost IO."""
 import ctypes
+import base64
+import zlib
 import json
 import os
 import re
@@ -18,6 +20,28 @@ except ImportError:  # Importable by the manager's portable unit tests.
     fcntl = None
 
 STATE = Path('/tmp/.gxzs-mcp-workers')
+
+
+def command_source(source):
+    # Linux limits each exec argument independently of the total argv budget.
+    # This is trusted, bundled code; keep the existing supervisor and stdin wire.
+    encoded = base64.b64encode(zlib.compress(source.encode('utf-8'))).decode('ascii')
+    return 'import base64,zlib;exec(zlib.decompress(base64.b64decode(' + repr(encoded) + ')))'
+
+
+def reap_exited(child):
+    """Collect adopted children while preserving Popen's own exit status."""
+    while True:
+        try:
+            event = os.waitid(os.P_ALL, 0, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+            if event is None:
+                return
+            if event.si_pid == child.pid:
+                child.poll()
+            else:
+                os.waitpid(event.si_pid, os.WNOHANG)
+        except ChildProcessError:
+            return
 
 
 class WorkerStopped(Exception):
@@ -126,19 +150,22 @@ def fence_worker(token):
     return False
 
 
-def prune_records():
-    # Completed receipts outlive the 25-second launch deadline. Never discard
+def prune_records(retention=None):
+    # Completed receipts outlive the launch deadline. Never discard
     # unfinished records or infer completion merely from their age.
+    if retention is None:
+        from mcp_policy import get
+        retention = max(get('receipt_retention_seconds'), get('startup_timeout_seconds'))
     if not STATE.exists():
         return
     for path in STATE.glob('*.json'):
         token = path.stem
         try:
-            if path.stat().st_mtime >= time.time() - 3600:
+            if path.stat().st_mtime >= time.time() - retention:
                 continue
             with worker_record(token) as folder:
                 record = read_record(folder, token) or {}
-                if record.get('fenced') is True and record.get('finished_at', time.time()) < time.time() - 3600:
+                if record.get('fenced') is True and record.get('finished_at', time.time()) < time.time() - retention:
                     os.unlink(token + '.json', dir_fd=folder)
         except (OSError, ValueError, TimeoutError):
             pass
@@ -157,7 +184,10 @@ def emit(receipt):
         pass  # The durable receipt also works when stdout has disconnected.
 
 
-def supervise(source, args, token=None, start_deadline=None):
+def supervise(source, args, token=None, start_deadline=None, limits=None):
+    if limits is None:
+        from mcp_policy import current
+        limits = current()
     # MCP stdio servers may detach. Adopt their descendants for scoped fencing.
     if ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0) != 0:
         raise OSError(ctypes.get_errno(), 'Cannot supervise MCP descendants')
@@ -173,13 +203,13 @@ def supervise(source, args, token=None, start_deadline=None):
             previous[signum] = signal.signal(signum, interrupted)
         os.set_blocking(sys.stdout.fileno(), False)
         if token is not None:
-            prune_records()
+            prune_records(max(limits['receipt_retention_seconds'], limits['startup_timeout_seconds']))
             with worker_record(token) as folder:
                 if (read_record(folder, token) or {}).get('fenced') is True or time.time() >= start_deadline:
                     fenced = True
                     return
                 save_record(folder, token, {'pid': os.getpid(), 'started': process_start(os.getpid()), 'fenced': False})
-        child = subprocess.Popen([sys.executable, '-I', '-u', '-c', source, *args],
+        child = subprocess.Popen([sys.executable, '-I', '-u', '-c', command_source(source), *args],
                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                  stderr=subprocess.DEVNULL, start_new_session=True)
         # One event loop forwards both directions. Cleanup never needs a new
@@ -193,10 +223,11 @@ def supervise(source, args, token=None, start_deadline=None):
         with selectors.DefaultSelector() as selector:
             registered = {}
             while source_open or outgoing:
+                reap_exited(child)
                 wanted = {}
-                if len(incoming) < 2 * 1024 * 1024:
+                if len(incoming) < limits['supervisor_input_buffer_bytes']:
                     wanted['input'] = selectors.EVENT_READ
-                if source_open and len(outgoing) < 16 * 1024 * 1024:
+                if source_open and len(outgoing) < limits['supervisor_output_buffer_bytes']:
                     wanted['output'] = selectors.EVENT_READ
                 if incoming and sink_open:
                     wanted['worker'] = selectors.EVENT_WRITE

@@ -40,7 +40,8 @@
     "@gxzs/dsh-workbench-sandbox-skills": "file:../../packages/workbench-sandbox-skills",
     "@gxzs/dsh-workbench-sandbox-runtime": "file:../../packages/workbench-sandbox-runtime",
     "@gxzs/dsh-workbench-mcp-tools": "file:../../packages/workbench-mcp-tools",
-    "@gxzs/dsh-tool-discovery": "file:../../packages/tool-discovery"
+    "@gxzs/dsh-tool-discovery": "file:../../packages/tool-discovery",
+    "@modelcontextprotocol/ext-tasks": "0.2.2"
   },
   "overrides": {
     "@earendil-works/pi-ai": "1.1.0",

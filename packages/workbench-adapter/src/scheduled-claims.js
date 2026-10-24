@@ -12,7 +12,8 @@ export function registerScheduledClaims(ctx, { runtime, database, ownerId }) {
       pending.set(payload.agent, claims)
       return
     }
-    return projectInboxClaim(database, payload, ownerId, needsResources ? { mcpTools: runtime.mcpResources?.() ?? [] } : undefined)
+    return projectInboxClaim(database, payload, ownerId, needsResources
+      ? { mcpTools: runtime.mcpResources?.() ?? [], mcpServers: runtime.mcpPlugins?.() ?? [] } : undefined)
   }, { global: true, prepend: true })
   ctx.on('system-prompt/assemble', async (_assembly, context, next) => {
     const claims = context.scope && pending.get(context.scope)
@@ -22,7 +23,8 @@ export function registerScheduledClaims(ctx, { runtime, database, ownerId }) {
       await delay(100, undefined, { signal: context.signal })
     context.signal?.throwIfAborted()
     for (const payload of claims) projectInboxClaim(database, payload, ownerId,
-      claimNeedsResources(database, payload, ownerId) ? { mcpTools: runtime.mcpResources?.() ?? [] } : undefined)
+      claimNeedsResources(database, payload, ownerId)
+        ? { mcpTools: runtime.mcpResources?.() ?? [], mcpServers: runtime.mcpPlugins?.() ?? [] } : undefined)
     runtime.restrictMcpScope?.(context.scope)
     // Providers ran before this waterfall. Reassemble once after catalog and
     // scoped restrictions are ready; the consumed pending entry prevents recursion.

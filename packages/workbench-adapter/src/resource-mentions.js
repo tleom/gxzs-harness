@@ -1,3 +1,4 @@
+import { mentionProviders } from './mcp-catalog.js'
 import { httpError } from './http.js'
 import { createHash } from 'node:crypto'
 
@@ -15,7 +16,7 @@ export function runResourceContext(run, objective) {
   if (run?.selection?.command !== 'goal' || typeof objective !== 'string'
     || run.selection.resource_position_hash !== resourceTextHash(objective)) return text
   const marked = appendResourceInstructions([{ type: 'text', text: objective }],
-    normalizeResourceMentions(run.selection.resource_mentions), run.mcpTools ?? [], run.selection.mentioned_resources)[0].text
+    normalizeResourceMentions(run.selection.resource_mentions), mentionProviders(run.mcpTools ?? [], run.selection.mcp_servers), run.selection.mentioned_resources)[0].text
   return marked === objective ? text : [text, `当前目标的插件点名位置（用户目标原文保持不变）：\n${marked}`].filter(Boolean).join('\n')
 }
 

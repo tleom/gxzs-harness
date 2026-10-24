@@ -112,7 +112,6 @@ export class WorkbenchWorkspaces {
         if (result.conflict) throw httpError(409,
           typeof result.message === 'string' ? result.message : '目录已发生变化，请刷新后重试', 'RESOURCE_CONFLICT')
         entries.push(...result.entries)
-        if (entries.length > 100_000) throw httpError(413, '目录条目超过 100000，请缩小浏览范围')
         cursor = result.next_cursor
         if (cursor && (typeof cursor !== 'string' || !result.entries.length || cursors.has(cursor)))
           throw httpError(502, '目录分页未向前推进，请刷新后重试')

@@ -42,6 +42,10 @@ async def slow(counter: str) -> str:
     path.write_text(path.read_text() + "1" if path.exists() else "1")
     await asyncio.sleep(20)
     return "done"
+@server.tool()
+def large() -> CallToolResult:
+    return CallToolResult(content=[TextContent(type="text", text="x" * (9 * 1024 * 1024))],
+                          structured_content={"value": "complete structured result"})
 if __name__ == "__main__":
     transport = sys.argv[1]
     server.run(transport=transport, **({"host": "127.0.0.1", "port": int(sys.argv[2])} if transport != "stdio" else {}))
@@ -107,6 +111,37 @@ class Connection:
         assert self.process.returncode == 0, self.process.stderr.read().decode()
 
 
+def test_global_stdio_uses_independent_owner_processes_and_shared_global_configuration(modules, tmp_path):
+    base, _ = modules
+    script = tmp_path / 'global-fixture.py'
+    script.write_text(SERVER)
+    config = {'transport': 'stdio', 'command': sys.executable, 'args': [str(script), 'stdio'],
+              'env': {'OWNER_CONFIG': 'global-fixture-key'}, 'timeout': 5}
+    workers = []
+    try:
+        for owner in ('owner-a', 'owner-b'):
+            root = tmp_path / owner
+            root.mkdir()
+            source = (f'import sys,asyncio,json; sys.path.insert(0,{str(base)!r}); '
+                      f'from mcp_worker import serve; asyncio.run(serve("global:demo","global-v1",{str(root)!r},json.loads(sys.stdin.readline())))')
+            worker = object.__new__(Connection)
+            worker.process = subprocess.Popen([sys.executable, '-I', '-u', '-c', source], stdin=subprocess.PIPE,
+                                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                               env={'PATH': os.environ['PATH'], 'HOME': '/tmp', 'LANG': 'C.UTF-8'})
+            workers.append(worker)
+            worker.process.stdin.write(json.dumps(config).encode() + b'\n')
+            worker.process.stdin.flush()
+            worker.ready = worker.read()
+            assert worker.ready.get('ready'), worker.ready
+            assert not (root / 'mcp').exists()
+        results = [worker.call('add', {'value': 2})['result']['structuredContent'] for worker in workers]
+        assert results[0]['pid'] != results[1]['pid']
+        assert all(item['calls'] == 1 and item['owner_env'] == 'global-fixture-key' for item in results)
+    finally:
+        for worker in workers:
+            worker.close()
+
+
 @pytest.fixture(params=["stdio", "streamable-http", "sse"])
 def connected(request, modules, tmp_path):
     base, ops = modules
@@ -161,6 +196,7 @@ def test_transports_schema_results_persistence_and_clean_exit(connected):
         "add",
         "failure",
         "slow",
+        "large",
     }
     assert connection.call("add", {"value": "wrong"}) == {
         "error": "MCP 工具参数不符合声明"
@@ -225,3 +261,12 @@ def test_direct_config_change_fences_existing_connection(connected):
     path = root / "mcp/demo/mcp.json"
     path.write_text(path.read_text() + "\n")
     assert connection.call("add", {"value": 1}) == {"conflict": True}
+
+
+def test_large_result_reaches_native_host_intact_for_every_transport(connected):
+    connection, _, root, _ = connected
+    result = connection.call('large')['result']
+    assert len(result['content'][0]['text']) == 9 * 1024 * 1024
+    assert result['structuredContent'] == {'value': 'complete structured result'}
+    assert not result.get('isError')
+    assert not (root / '.agent-output').exists()

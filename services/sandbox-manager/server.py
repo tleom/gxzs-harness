@@ -18,6 +18,7 @@ from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, wait
 from urllib.request import ProxyHandler, Request, build_opener
 
+from mcp_policy import get as mcp_limit, current as mcp_policy
 from admission import Admission
 from resource_limits import cgroup_args, owner_cgroup, ResourceUnavailable, storage_status
 from owner_networks import OwnerNetworks
@@ -25,6 +26,7 @@ from owner_auth import authorize as authorize_request
 from office_conversions import OfficeConversions
 from runtime_names import volume_prefix
 from global_skills import mount_arguments as global_skill_mounts, matches_mount
+from skill_imports import MAX_SKILL_JSON_BYTES, SkillImportFailure
 
 
 LOGGER = logging.getLogger(__name__)
@@ -65,11 +67,11 @@ def schedule_mcp_refresh(key, items):
             continue
         identity = key, item["id"]
         with MCP_REFRESH_GUARD:
-            if (len(MCP_REFRESHING) >= 8 or identity in MCP_REFRESHING
-                    or time.monotonic() - MCP_REFRESH_ATTEMPTS.get(identity, -float("inf")) < 30):
+            if (len(MCP_REFRESHING) >= mcp_limit('discovery_parallelism') or identity in MCP_REFRESHING
+                    or time.monotonic() - MCP_REFRESH_ATTEMPTS.get(identity, -float("inf")) < mcp_limit("refresh_retry_seconds")):
                 continue
-            if len(MCP_REFRESH_ATTEMPTS) > 1024:
-                cutoff = time.monotonic() - 60
+            if len(MCP_REFRESH_ATTEMPTS) > mcp_limit('discovery_cache_entries'):
+                cutoff = time.monotonic() - mcp_limit('refresh_retry_seconds')
                 for previous, attempted in list(MCP_REFRESH_ATTEMPTS.items()):
                     if attempted < cutoff and previous not in MCP_REFRESHING:
                         MCP_REFRESH_ATTEMPTS.pop(previous, None)
@@ -82,7 +84,7 @@ def schedule_mcp_refresh(key, items):
                                                       "version": version,
                                                       "maintenance": True,
                                                       "catalog_discovered_at": discovered_at,
-                                                      "deadline_ms": int(time.time() * 1000) + 30_000})
+                                                      "deadline_ms": int(time.time() * 1000 + mcp_limit("catalog_timeout_seconds") * 1000)})
             except Exception:
                 LOGGER.warning("Personal MCP catalog refresh failed for %s", target[1])
             finally:
@@ -393,7 +395,7 @@ def authorize_mcp(payload):
                       data=json.dumps(payload).encode(), method="POST",
                       headers={"Authorization": "Bearer " + TOKEN, "Content-Type": "application/json"})
     try:
-        with build_opener(ProxyHandler({})).open(request, timeout=5) as response:
+        with build_opener(ProxyHandler({})).open(request, timeout=mcp_limit('control_timeout_seconds')) as response:
             return json.loads(response.read(1024)).get("authorized") is True
     except Exception:
         return False
@@ -403,12 +405,20 @@ def upload_operation(key, action, source):
     if action not in {'files', 'personal-resources'}:
         raise ValueError('Unsupported binary upload target')
     from mcp_runtime import module_source
-    script = module_source('file_ops', 'resource_ops', 'binary_upload')
-    script += "\ntry:\n print(json.dumps(binary_upload.run(sys.stdin.buffer, " + repr(action) + ")))\nexcept (ValueError, OSError, zipfile.BadZipFile) as error:\n print(json.dumps({'error': str(error)})); sys.exit(2)"
+    script = module_source('file_ops', 'resource_ops', 'binary_upload', 'skill_imports')
+    script += "\ntry:\n print(json.dumps(binary_upload.run(sys.stdin.buffer, " + repr(action) + ",stage_only=True)))\nexcept (ValueError, OSError, zipfile.BadZipFile) as error:\n print(json.dumps({'error': str(error)})); sys.exit(2)"
     script = script.replace('\ntry:', "import json,zipfile,binary_upload;\ntry:")
-    with lock(key):
-        ensure(key)
-        name, _ = identity(key)
+    source.seek(0)
+    staged_skill = False
+    if action == 'personal-resources':
+        # Buffered readline/seek can leave the raw fd past the header when it
+        # is subsequently inherited by Docker. pread leaves that fd unchanged.
+        metadata = json.loads(os.pread(source.fileno(), 128 * 1024, 0).split(b'\n', 1)[0])
+        if not isinstance(metadata, dict):
+            raise ValueError('文件上传元数据无效')
+        staged_skill = metadata.get('operation') in {'skill_stage', 'skill_import'}
+
+    def dispatch(name):
         source.seek(0)
         result = subprocess.run(['docker', 'exec', '--user', '1000', '-i', name, *MANAGER_PYTHON, '-c', script],
                                 stdin=source, capture_output=True, timeout=600)
@@ -417,9 +427,96 @@ def upload_operation(key, action, source):
             raise ValueError(output.get('error', '文件上传失败'))
         return output
 
+    with lock(key):
+        ensure(key)
+        name, _ = identity(key)
+        if not staged_skill:
+            return dispatch(name)
+    # Only staged imports release preparation before transfer. Ordinary file
+    # mutations keep their existing lifecycle serialization.
+    result = dispatch(name)
+    if action == 'personal-resources' and metadata.get('operation') == 'skill_import':
+        return finish_legacy_import(key, metadata, result['import_id'])
+    return result
+
+
+def finish_legacy_import(key, payload, import_id):
+    """Old clients retain synchronous responses; execution uses the same job."""
+    request = {'import_id': import_id, 'name': payload.get('name'), 'version': payload.get('version')}
+    try:
+        prepared = operation(key, 'personal-resources', {**request, 'operation': 'skill_prepare'})
+    except (ValueError, OSError):
+        operation(key, 'personal-resources', {**request, 'operation': 'skill_import_cancel'})
+        raise
+    if prepared.get('conflict'):
+        operation(key, 'personal-resources', {**request, 'operation': 'skill_import_cancel'})
+        return {'conflict': True}
+    result = operation(key, 'personal-resources', {**request, 'operation': 'skill_import'})
+    deadline = time.monotonic() + 600
+    while result.get('status') in {'ready', 'running', 'pending'} and time.monotonic() < deadline:
+        time.sleep(0.2)
+        result = operation(key, 'personal-resources', {**request, 'operation': 'skill_import_status'})
+    if result.get('status') not in {'completed', 'conflict', 'failed', 'cancelled'}:
+        result = operation(key, 'personal-resources', {**request, 'operation': 'skill_import_cancel'})
+    if result.get('status') not in {'completed', 'conflict'}:
+        raise SkillImportFailure(result)
+    return {field: result[field] for field in ('id', 'version', 'path', 'conflict') if field in result}
+
 
 def operation(key, action, payload):
     name, _ = identity(key)
+    if action == 'personal-resources' and payload.get('operation') == 'skill_import' and not payload.get('import_id'):
+        staged = operation(key, action, {**payload, 'operation': 'skill_stage', 'import_id': uuid.uuid4().hex})
+        return finish_legacy_import(key, payload, staged['import_id'])
+    if action == 'personal-resources' and payload.get('import_id'):
+        from skill_import_runtime import invoke, cancel, status
+        from mcp_runtime import module_source
+        op = payload.get('operation')
+        # Already-authenticated control never provisions or waits behind a
+        # workspace mutation. An unavailable container yields an unknown receipt.
+        if op == 'skill_import_cancel':
+            return cancel(key, name, payload)
+        if op == 'skill_import_status':
+            return status(key, name, payload)
+        with lock(key):
+            ensure(key)
+            name, _ = identity(key)
+        if op == 'skill_import':
+            if getattr(REQUEST_CONTEXT, 'operation_capacity', False):
+                # A legacy synchronous request transfers its existing slot to
+                # the supervised job; no second admission or early release.
+                REQUEST_CONTEXT.operation_capacity = False
+            elif not OPERATION_CAPACITY.acquire(blocking=False):
+                raise CapacityError('Sandbox manager is busy; operation was not started')
+            return invoke(key, name, payload, on_finish=OPERATION_CAPACITY.release)
+        function = {'skill_inspect': 'inspect', 'skill_prepare': 'prepare', 'skill_stage': 'stage_json'}.get(op)
+        if function is None:
+            raise ValueError('技能导入操作无效')
+        source = module_source('file_ops', 'resource_ops', 'binary_upload', 'skill_imports')
+        source += 'import json; print(json.dumps(sys.modules["skill_imports"].' + function + '(json.load(sys.stdin))))'
+        result = docker('exec', '--user', '1000', '-i', name, *MANAGER_PYTHON, '-c', source,
+                        stdin=json.dumps(payload), check=False)
+        if result.returncode:
+            raise ValueError('技能包暂存不可用，请重新导入')
+        return json.loads(result.stdout)
+    if action == "global-mcp":
+        from mcp_runtime import invoke, cancel_task
+        if payload.get("operation") not in {"mcp_test", "mcp_call", "mcp_browse", "mcp_request", "mcp_task"}:
+            raise ValueError("Unsupported global MCP operation")
+        config = payload.get("configuration")
+        server_id = payload.get("name")
+        if payload.get('operation') == 'mcp_task' and payload.get('method') == 'tasks/cancel':
+            if not isinstance(server_id, str) or not re.fullmatch('[a-z][a-z0-9_-]{0,63}', server_id):
+                raise ValueError('Invalid global MCP identity')
+            return cancel_task(key, {**payload, 'name': 'global:' + server_id, 'server_id': server_id, 'scope': 'global'}, authorize=authorize_mcp)
+        if not isinstance(config, dict) or config.get("transport") != "stdio" or not isinstance(server_id, str) or not re.fullmatch('[a-z][a-z0-9_-]{0,63}', server_id):
+            raise ValueError("Invalid global MCP configuration")
+        with lock(key):
+            ensure(key)
+            container, _ = identity(key)
+        request = {**payload, "name": "global:" + server_id, "server_id": server_id, "scope": "global"}
+        state = {"version": payload["version"], "enabled": True, "timeout": config.get("timeout", mcp_limit("call_timeout_seconds")), "configuration": config}
+        return invoke(key, container, request, state, authorize=authorize_mcp)
     if action == "global-memory":
         from global_memory import operate
         return operate(key, payload, docker=docker, ensure=ensure, identity=identity,
@@ -518,11 +615,15 @@ def operation(key, action, payload):
             image=IMAGE, prefix=PREFIX, manager_python=MANAGER_PYTHON, admission=admission,
         )
     if action == "personal-mcp":
-        from mcp_runtime import invalidate, invoke, module_source
+        from mcp_runtime import invalidate, invoke, module_source, cancel_task
 
-        allowed = {"mcp_list", "mcp_read", "mcp_save", "mcp_delete", "mcp_toggle", "mcp_reorder", "mcp_test", "mcp_call"}
+        allowed = {"mcp_list", "mcp_read", "mcp_save", "mcp_delete", "mcp_toggle", "mcp_reorder", "mcp_test", "mcp_call", "mcp_browse", "mcp_request", "mcp_task"}
         if payload.get("operation") not in allowed:
             raise ValueError("Unsupported MCP operation")
+        if any(field in payload for field in ("configuration", "scope", "server_id")):
+            raise ValueError("Personal MCP request contains reserved fields")
+        if payload.get('operation') == 'mcp_task' and payload.get('method') == 'tasks/cancel':
+            return cancel_task(key, payload, authorize=authorize_mcp)
         tracked = payload['operation'] != 'mcp_list' and payload.get('maintenance') is not True
         with lock(key):
             record = HOSTS.root / key / 'host.json'
@@ -531,11 +632,12 @@ def operation(key, action, payload):
             ensure(key, track_activity=tracked, allow_existing_image=payload['operation'] == 'mcp_list')
             name, _ = identity(key)
             request = payload
-            if payload["operation"] in {"mcp_test", "mcp_call"}:
+            if payload["operation"] in {"mcp_test", "mcp_call", "mcp_browse", "mcp_request", "mcp_task"}:
                 request = {"operation": "mcp_probe", "name": payload.get("name")}
                 if payload["operation"] == "mcp_test":
                     request["include_discovery_state"] = True
-            source = module_source("file_ops", "resource_ops", "mcp_ops")
+            source = module_source("mcp_policy", "file_ops", "resource_ops", "mcp_ops")
+            source += "sys.modules['mcp_policy'].configure(" + repr(mcp_policy()) + "); "
             source += "import json; print(json.dumps(sys.modules['mcp_ops'].personal_mcp(json.load(sys.stdin))))"
             result = docker("exec", "--user", "1000", "-i", name, *MANAGER_PYTHON, "-c", source,
                             stdin=json.dumps(request), check=False)
@@ -547,7 +649,7 @@ def operation(key, action, payload):
                 touch(key)
         if payload["operation"] in {"mcp_save", "mcp_delete", "mcp_toggle"} and not output.get("conflict"):
             invalidate(key, payload["name"])
-        if payload["operation"] in {"mcp_test", "mcp_call"}:
+        if payload["operation"] in {"mcp_test", "mcp_call", "mcp_browse", "mcp_request", "mcp_task"}:
             discovered_at = payload.get("catalog_discovered_at", output.get("discovered_at"))
             output = invoke(key, name, payload, output, authorize=authorize_mcp)
             if (payload["operation"] == "mcp_test"
@@ -633,12 +735,10 @@ def operation(key, action, payload):
                 raise ValueError("Global resources are read-only")
             if action == "global-resources" and payload.get("operation") != "global_install":
                 raise ValueError("Unsupported global resource operation")
-            helper = Path(__file__).with_name("file_ops.py").read_text()
-            script = Path(__file__).with_name("resource_ops.py").read_text()
-            source = (
-                "import types,sys; helper=types.ModuleType('file_ops'); exec(" + repr(helper)
-                + ",helper.__dict__); sys.modules['file_ops']=helper; exec(" + repr(script) + ")"
-            )
+            from mcp_runtime import module_source
+            source = module_source('file_ops', 'resource_ops', 'binary_upload', 'skill_imports')
+            source += 'import json; request=json.load(sys.stdin); '
+            source += 'print(json.dumps(sys.modules["resource_ops"].global_install(request) if request.get("operation")=="global_install" else sys.modules["resource_ops"].personal(request)))'
             result = docker("exec", "--user", "0" if action == "global-resources" else "1000", "-i",
                             name, *MANAGER_PYTHON, "-c", source, stdin=json.dumps(payload), check=False)
             output = json.loads(result.stdout or "{}")
@@ -710,7 +810,7 @@ def operation(key, action, payload):
     raise ValueError("Unsupported operation")
 
 
-from hosts import Hosts, IDLE_TIMEOUT_SECONDS
+from hosts import Hosts, HostPlatformError, IDLE_TIMEOUT_SECONDS
 HOSTS = Hosts(STATE, docker, ensure, identity, lock, ADMISSION, ensure_network)
 
 
@@ -719,6 +819,12 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
+        if self.path == '/mcp-policy':
+            if not hmac.compare_digest(self.headers.get('Authorization', ''), 'Bearer ' + TOKEN):
+                self.write_json(403, b'{"error":"Manager policy requires coordinator credentials"}', action='mcp-policy')
+                return
+            self.write_json(200, json.dumps(mcp_policy()).encode(), action='mcp-policy')
+            return
         if self.path != '/healthz':
             self.send_error(404)
             return
@@ -804,6 +910,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         code = 200
         admitted = False
+        REQUEST_CONTEXT.operation_capacity = False
         request_id = uuid.uuid4().hex[:12]
         key = action = role = 'unresolved'
         try:
@@ -818,6 +925,10 @@ class Handler(BaseHTTPRequestHandler):
             # while another operation owns the workspace preparation lock.
             if hmac.compare_digest(self.headers.get('Authorization', ''), 'Bearer ' + TOKEN):
                 role = 'root'
+            elif action == 'personal-resources':
+                # Host records publish atomically. Mutations recheck the owner
+                # under lock(key); cancellation must reach its supervisor first.
+                role = authorize_request(self.headers, TOKEN, HOSTS.root, key, action)
             else:
                 with lock(key):
                     role = authorize_request(self.headers, TOKEN, HOSTS.root, key, parts[2])
@@ -827,7 +938,9 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError('Transfer-Encoding is not supported; send a fixed Content-Length')
             size = int(self.headers.get("Content-Length", "0"))
             binary = self.headers.get('Content-Type', '').split(';', 1)[0].strip().lower() == 'application/octet-stream'
-            limit = 100 * 1024 * 1024 + 128 * 1024 if binary else MAX_BODY
+            limit = (100 * 1024 * 1024 + 128 * 1024 if binary
+                     else mcp_limit('request_bytes') if parts[2] in {'personal-mcp', 'global-mcp', 'global-memory'}
+                     else MAX_SKILL_JSON_BYTES if action in {'personal-resources', 'global-resources'} else MAX_BODY)
             if not 0 <= size <= limit:
                 raise ValueError("Request too large")
             if binary:
@@ -836,6 +949,7 @@ class Handler(BaseHTTPRequestHandler):
                 admitted = OPERATION_CAPACITY.acquire(blocking=False)
                 if not admitted:
                     raise CapacityError('Sandbox manager is busy; operation was not started')
+                REQUEST_CONTEXT.operation_capacity = True
                 with tempfile.TemporaryFile(dir=STATE) as staged:
                     remaining = size
                     deadline = time.monotonic() + 600
@@ -855,22 +969,45 @@ class Handler(BaseHTTPRequestHandler):
                 payload = json.loads(body or "{}")
                 if not isinstance(payload, dict):
                     raise ValueError('Request must be an object')
-                if parts[2] not in CONTROL_ACTIONS and not (parts[2] == 'office-preview' and payload.get('operation') == 'cancel'):
+                if (action == 'personal-resources' and size > MAX_BODY
+                        and payload.get('operation') not in {'skill_stage', 'skill_inspect', 'skill_import'}):
+                    raise ValueError('Request too large')
+                if action == 'global-resources' and size > MAX_BODY and payload.get('operation') != 'global_install':
+                    raise ValueError('Request too large')
+                import_control = parts[2] == 'personal-resources' and payload.get('import_id') and payload.get('operation') in {'skill_import', 'skill_import_cancel', 'skill_import_status'}
+                task_cancel = (action in {'personal-mcp', 'global-mcp'} and payload.get('operation') == 'mcp_task'
+                               and payload.get('method') == 'tasks/cancel')
+                # Runtime validates the signed grant and existing connection,
+                # and admits at most one cancel per worker outside business slots.
+                if parts[2] not in CONTROL_ACTIONS and not import_control and not task_cancel and not (parts[2] == 'office-preview' and payload.get('operation') == 'cancel'):
                     admitted = OPERATION_CAPACITY.acquire(blocking=False)
                     if not admitted:
                         raise CapacityError('Sandbox manager is busy; operation was not started')
+                    REQUEST_CONTEXT.operation_capacity = True
                 if action == 'files' and payload.get('operation') == 'download':
                     self.download(key, payload)
                     return
                 output = operation(key, parts[2], payload)
             if output.get("conflict"):
                 code = 409
+        except SkillImportFailure as error:
+            code, output = error.http_status, {'error': str(error), 'code': error.code}
+            if error.import_id:
+                output['import_id'] = error.import_id
         except CapacityError as error:
             code, output = 503, {'error': str(error), 'code': 'MANAGER_BUSY', 'retry_after': 1}
         except ResourceUnavailable as error:
             code, output = 503, {'error': str(error), 'code': error.code, 'retry_after': error.retry_after}
         except SandboxUpdatePending as error:
             code, output = 503, {'error': str(error), 'code': 'SANDBOX_UPDATING', 'retry_after': 5}
+        except HostPlatformError as error:
+            code, output = error.status, {'error': str(error), 'code': error.code}
+            if error.request_id:
+                output['request_id'] = error.request_id
+            if error.retry_after is not None:
+                output['retry_after'] = error.retry_after
+            LOGGER.warning('Host platform request failed request_id=%s upstream_request_id=%s workspace=%s status=%s code=%s',
+                           request_id, error.request_id, key, code, error.code)
         except PermissionError as error:
             code, output = 403, {"error": str(error), "code": "MANAGER_FORBIDDEN"}
         except (ValueError, OSError) as error:
@@ -884,8 +1021,9 @@ class Handler(BaseHTTPRequestHandler):
                                  "request_id": request_id}
         finally:
             REQUEST_CONTEXT.owner = None
-            if admitted:
+            if admitted and REQUEST_CONTEXT.operation_capacity:
                 OPERATION_CAPACITY.release()
+            REQUEST_CONTEXT.operation_capacity = False
         if getattr(self, '_streaming_response', False):
             self.close_connection = True
             return
@@ -981,6 +1119,8 @@ def reap():
             reap_workers()
             from global_memory import reap_calls
             reap_calls()
+            from skill_import_runtime import reap_calls as reap_skill_imports
+            reap_skill_imports()
             for item in STATE.iterdir():
                 try:
                     key = str(uuid.UUID(item.name))
@@ -994,6 +1134,10 @@ def reap():
                             invalidate(key)
                             name, _ = identity(key)
                             docker("stop", "--time", "10", name, check=False)
+                            stopped = HOSTS._upgrade_inspect(name)
+                            if stopped is None or stopped['State']['Running'] is False:
+                                from skill_import_runtime import fence_workspace as fence_skills
+                                fence_skills(key)
                 except (ValueError, OSError):
                     continue
         except Exception:

@@ -13,6 +13,226 @@ from hosts import Hosts
 from resource_limits import ResourceUnavailable
 
 
+def test_confirmed_host_pair_fence_notifies_skill_runtime(monkeypatch, tmp_path):
+    import global_memory
+    import mcp_runtime
+    import skill_import_runtime
+    fake = type('Fixture', (), {'native_snapshots': {}, 'admission': Mock(), 'root': tmp_path})()
+    monkeypatch.setattr(global_memory, 'fence_workspace', Mock())
+    monkeypatch.setattr(mcp_runtime, 'fence_workspace', Mock(return_value=True))
+    skills = Mock()
+    monkeypatch.setattr(skill_import_runtime, 'fence_workspace', skills)
+    Hosts._fence(fake, 'owner-workspace', 'owner', 'instance')
+    skills.assert_called_once_with('owner-workspace')
+
+
+def test_ready_ensure_reconfirms_without_provisioning_or_restarting(tmp_path, monkeypatch):
+    host, docker, sandbox, payload, _ = setup(tmp_path, monkeypatch)
+    host.ensure('workspace', payload)
+    maintain(host)
+    host.heartbeat.reset_mock()
+    docker.reset_mock()
+    sandbox.reset_mock()
+    host._ssh.reset_mock()
+    assert host.ensure('workspace', payload)['ready'] is True
+    host.heartbeat.assert_not_called()
+    sandbox.assert_not_called()
+    host._ssh.assert_not_called()
+    assert not any(call.args[0] in {'start', 'stop', 'create'} for call in docker.call_args_list)
+
+
+def test_ready_ensure_retains_the_existing_activity_renewal(tmp_path, monkeypatch):
+    host, _, _, payload, _ = setup(tmp_path, monkeypatch)
+    host.ensure('workspace', payload)
+    maintain(host)
+    activity = host.root.parent / 'workspace'
+    activity.touch()
+    os.utime(activity, (1, 1))
+    assert host.ensure('workspace', payload)['ready'] is True
+    assert time.time() - activity.stat().st_mtime < 5
+
+
+def test_scheduled_wakeup_renews_activity_before_its_ready_probe(tmp_path, monkeypatch):
+    host, _, _, payload, _ = setup(tmp_path, monkeypatch)
+    host.ensure('workspace', payload)
+    maintain(host)
+    activity = host.root.parent / 'workspace'
+    activity.touch()
+    os.utime(activity, (1, 1))
+    def probe(_):
+        assert time.time() - activity.stat().st_mtime < 5
+        return True
+    host.healthy.side_effect = probe
+    assert host.ensure('workspace', {**payload, 'scheduled_wakeup': True})['ready'] is True
+
+
+def test_malformed_retry_metadata_cannot_replace_the_platform_conflict(tmp_path, monkeypatch):
+    from io import BytesIO
+    from urllib.error import HTTPError
+    from hosts import HostPlatformError
+    host, _, _, _, _ = setup(tmp_path, monkeypatch)
+    monkeypatch.setenv('GXZS_ORCHESTRATOR_TOKEN', 'test-coordinator')
+    body = BytesIO(json.dumps({'message': '状态正在同步', 'retry_after': '²'}).encode())
+    host.opener.open = Mock(side_effect=HTTPError('http://backend/heartbeat', 409, 'conflict', {}, body))
+    with pytest.raises(HostPlatformError) as failed:
+        Hosts.heartbeat(host, {}, 'ready')
+    assert failed.value.status == 409
+    assert failed.value.retry_after == 2
+    assert body.closed
+
+
+@pytest.mark.parametrize('kind', ['invalid-json', 'truncated-body', 'invalid-retry'])
+def test_heartbeat_keeps_the_retry_header_when_error_body_is_unusable(tmp_path, monkeypatch, kind):
+    from io import BytesIO
+    from http.client import IncompleteRead
+    from urllib.error import HTTPError
+    from hosts import HostPlatformError
+    host, _, _, _, _ = setup(tmp_path, monkeypatch)
+    monkeypatch.setenv('GXZS_ORCHESTRATOR_TOKEN', 'test-coordinator')
+    body = BytesIO(b'invalid-json' if kind != 'invalid-retry' else b'{"retry_after":true}')
+    error = HTTPError('http://backend/heartbeat', 409, 'conflict', {'Retry-After': '7'}, body)
+    if kind == 'truncated-body':
+        error.read = Mock(side_effect=IncompleteRead(b'{'))
+    host.opener.open = Mock(side_effect=error)
+    with pytest.raises(HostPlatformError) as failed:
+        Hosts.heartbeat(host, {}, 'ready')
+    assert failed.value.status == 409
+    assert failed.value.code == 'HOST_STATE_CONFLICT'
+    assert failed.value.retry_after == 7
+    assert body.closed
+
+
+def test_wrong_generation_cannot_renew_a_scheduled_wakeup(tmp_path, monkeypatch):
+    host, _, _, payload, _ = setup(tmp_path, monkeypatch)
+    host.ensure('workspace', payload)
+    maintain(host)
+    activity = host.root.parent / 'workspace'
+    activity.touch()
+    os.utime(activity, (1, 1))
+    with pytest.raises(ValueError):
+        host.ensure('workspace', {**payload, 'scheduled_wakeup': True, 'generation': 2})
+    assert activity.stat().st_mtime == 1
+
+
+def test_failed_ready_proof_preserves_phase_until_maintenance(tmp_path, monkeypatch):
+    host, docker, _, payload, _ = setup(tmp_path, monkeypatch)
+    host.ensure('workspace', payload)
+    maintain(host)
+    host.healthy.return_value = False
+    host.heartbeat.reset_mock()
+    docker.reset_mock()
+    result = host.ensure('workspace', payload)
+    assert result['state'] == 'ready' and result['ready'] is False
+    assert json.loads((host.root / 'workspace' / 'host.json').read_text())['state'] == 'ready'
+    host.heartbeat.assert_not_called()
+    assert not any(call.args[0] in {'start', 'stop', 'create'} for call in docker.call_args_list)
+
+
+def test_ready_proof_cannot_return_a_generation_changed_during_probe(tmp_path, monkeypatch):
+    host, _, _, payload, _ = setup(tmp_path, monkeypatch)
+    host.ensure('workspace', payload)
+    maintain(host)
+    record = host.root / 'workspace' / 'host.json'
+    def changed(_):
+        item = json.loads(record.read_text())
+        item.update(state='fencing', ready=False)
+        host._save(record, item)
+        return True
+    host.healthy.side_effect = changed
+    with pytest.raises(ResourceUnavailable):
+        host.ensure('workspace', payload)
+    assert json.loads(record.read_text())['state'] == 'fencing'
+
+
+def test_ready_proof_does_not_hold_the_lifecycle_lock_during_network_io(tmp_path, monkeypatch):
+    host, _, _, payload, _ = setup(tmp_path, monkeypatch)
+    host.ensure('workspace', payload)
+    maintain(host)
+    entered, release = threading.Event(), threading.Event()
+    def healthy(_):
+        entered.set()
+        assert release.wait(2)
+        return True
+    host.healthy.side_effect = healthy
+    result = []
+    thread = threading.Thread(target=lambda: result.append(host.ensure('workspace', payload)))
+    thread.start()
+    try:
+        assert entered.wait(1)
+        lock = host.lock('workspace')
+        assert lock.acquire(timeout=0.5)
+        lock.release()
+    finally:
+        release.set()
+        thread.join(2)
+    assert result and result[0]['ready'] is True
+
+
+def test_late_ensure_snapshot_does_not_regress_a_newly_ready_host(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+    host, _, _, payload, _ = setup(tmp_path, monkeypatch)
+    host.ensure('workspace', payload)
+    record = host.root / 'workspace' / 'host.json'
+    original = host.lock
+    calls = 0
+    @contextmanager
+    def changing_lock(key):
+        nonlocal calls
+        with original(key):
+            calls += 1
+            if calls == 2:
+                item = json.loads(record.read_text())
+                host._save(record, {**item, 'state': 'ready', 'ready': True})
+            yield
+    host.lock = changing_lock
+    host.heartbeat.reset_mock()
+    with pytest.raises(ResourceUnavailable):
+        host.ensure('workspace', payload)
+    assert json.loads(record.read_text())['state'] == 'ready'
+    host.heartbeat.assert_not_called()
+
+
+@pytest.mark.parametrize('status,payload,expected_status,expected_code', [
+    (409, {'code': 409, 'message': '宿主状态已推进，不能应用过期状态', 'request_id': 'upstream-1', 'retry_after': 3}, 409, 'HOST_STATE_CONFLICT'),
+    (503, {'resource_code': 'MANAGER_BUSY', 'message': '管理服务繁忙', 'retry_after': 5}, 503, 'MANAGER_BUSY'),
+    (429, {'resource_code': 'RATE_LIMITED', 'message': '读取限流', 'retry_after': 7}, 429, 'RATE_LIMITED'),
+    (429, {'code': 429, 'message': '读取限流', 'retry_after': 7}, 429, 'HOST_PLATFORM_UNAVAILABLE'),
+    (403, {'message': 'Forbidden'}, 502, 'HOST_PLATFORM_AUTH_ERROR'),
+    (409, ['unexpected'], 409, 'HOST_STATE_CONFLICT'),
+])
+def test_heartbeat_preserves_reviewed_platform_error_metadata(tmp_path, monkeypatch, status, payload, expected_status, expected_code):
+    from io import BytesIO
+    from urllib.error import HTTPError
+    from hosts import HostPlatformError
+    host, _, _, _, _ = setup(tmp_path, monkeypatch)
+    monkeypatch.setenv('GXZS_ORCHESTRATOR_TOKEN', 'test-coordinator')
+    body = BytesIO(json.dumps(payload).encode())
+    host.opener.open = Mock(side_effect=HTTPError('http://backend/heartbeat', status, 'conflict', {}, body))
+    with pytest.raises(HostPlatformError) as failure:
+        Hosts.heartbeat(host, {}, 'ready')
+    assert (failure.value.status, failure.value.code) == (expected_status, expected_code)
+    assert 'HTTP Error' not in str(failure.value)
+    if isinstance(payload, dict) and status not in {401, 403}:
+        assert failure.value.request_id == payload.get('request_id')
+        assert failure.value.retry_after == payload.get('retry_after')
+        assert str(failure.value) == payload['message']
+    assert body.closed
+
+
+def test_heartbeat_transport_error_does_not_publish_internal_url(tmp_path, monkeypatch):
+    from urllib.error import URLError
+    from hosts import HostPlatformError
+    host, _, _, _, _ = setup(tmp_path, monkeypatch)
+    monkeypatch.setenv('GXZS_ORCHESTRATOR_TOKEN', 'test-coordinator')
+    host.opener.open = Mock(side_effect=URLError('http://internal/private?token=secret'))
+    with pytest.raises(HostPlatformError) as failure:
+        Hosts.heartbeat(host, {}, 'ready')
+    assert failure.value.status == 503
+    assert failure.value.code == 'HOST_PLATFORM_UNAVAILABLE'
+    assert failure.value.retry_after == 2
+    assert 'secret' not in str(failure.value)
+
+
 @pytest.fixture(autouse=True)
 def close_maintenance_workers(monkeypatch):
     instances = []
@@ -126,6 +346,8 @@ def test_ensure_does_not_renew_stale_degraded_state_without_current_liveness(tmp
 
 
 def setup(tmp_path, monkeypatch):
+    import mcp_runtime
+    monkeypatch.setattr(mcp_runtime, 'discover_orphans', Mock(return_value=([], True)))
     for key, value in {
         'GXZS_HOST_IMAGE': 'host:test', 'GXZS_HOST_NETWORK': 'control',
         'WORKBENCH_MANAGER_HOST_STATE': '/srv/manager', 'GXZS_HOST_PLATFORM_URL': 'http://backend/internal/workbench',
@@ -1718,3 +1940,109 @@ def test_predecessor_cleanup_revalidates_after_docker_inspection(tmp_path, monke
     docker.side_effect = operate
     host._cleanup_superseded(item)
     assert not any(call.args[0] == 'rm' for call in docker.call_args_list)
+
+
+def test_pending_mcp_fence_retains_admission_and_survives_manager_retry(tmp_path, monkeypatch):
+    import mcp_runtime
+    host, _, _, payload, _ = setup(tmp_path, monkeypatch)
+    host.ensure('workspace', payload)
+    record = host.root/'workspace/host.json'
+    fence = Mock(return_value=False)
+    monkeypatch.setattr(mcp_runtime, 'fence_workspace', fence)
+    host.admission.fence.reset_mock()
+    with pytest.raises(ResourceUnavailable) as failure:
+        host._fence('workspace', payload['owner_id'], payload['instance_id'], preserve_pending=True)
+    assert failure.value.code == 'MCP_FENCE_PENDING'
+    host.admission.fence.assert_not_called()
+    state = json.loads(record.read_text())
+    assert state['ready'] is False and state['mcp_fence_pending']['preserve_pending'] is True
+    fence.return_value = True
+    # A fresh manager instance resumes the same durable Host receipt.
+    again = Hosts(tmp_path, host.docker, host.ensure_sandbox, host.identity, host.lock, host.admission, host.ensure_network)
+    try:
+        assert again._retry_mcp_fence(record) is True
+        assert 'mcp_fence_pending' not in json.loads(record.read_text())
+        host.admission.fence.assert_called_once_with(payload['owner_id'], payload['instance_id'], preserve_pending=True)
+    finally:
+        again.close()
+
+
+def test_idle_mcp_fence_retry_finishes_stop_without_restarting_or_freeing_early(tmp_path, monkeypatch):
+    import mcp_runtime
+    host, docker, _, payload, _ = setup(tmp_path, monkeypatch)
+    host.ensure('workspace', payload)
+    maintain(host)
+    record = host.root/'workspace/host.json'
+    item = json.loads(record.read_text())
+    host._stop_pair(item)
+    fence = Mock(return_value=False)
+    monkeypatch.setattr(mcp_runtime, 'fence_workspace', fence)
+    host.admission.fence.reset_mock()
+    with pytest.raises(ResourceUnavailable):
+        host._fence('workspace', item['owner_id'], item['instance_id'], stopped=True)
+    assert json.loads(record.read_text())['state'] == 'fencing'
+    host.admission.fence.assert_not_called()
+    docker.reset_mock()
+    host.heartbeat.reset_mock()
+    fence.return_value = True
+    maintain(host)
+    assert json.loads(record.read_text())['state'] == 'stopped'
+    assert not any(call.args[0] in {'start','create','rename'} for call in docker.call_args_list)
+    host.admission.fence.assert_called_once()
+    assert host.heartbeat.call_args.args[1] == 'stopped'
+
+
+def test_pending_mcp_fence_blocks_even_a_preexisting_waiting_ticket(tmp_path, monkeypatch):
+    host, _, _, payload, _ = setup(tmp_path, monkeypatch)
+    host.ensure('workspace', payload)
+    record = host.root/'workspace/host.json'
+    item = json.loads(record.read_text())
+    item.update(state='draining', ready=False, mcp_fence_pending={'preserve_pending':True,'stopped':False})
+    record.write_text(json.dumps(item))
+    host.admission.pending.return_value = True
+    host.admission.request.reset_mock()
+    with pytest.raises(ResourceUnavailable, match='工具回收'):
+        host.schedule('workspace',dict(owner_id=payload['owner_id'],generation=payload['generation'],
+            instance_id=payload['instance_id'],run_id='old-waiting',chat_id='chat',action='acquire'))
+    host.admission.request.assert_not_called()
+
+
+def test_profile_upgrade_waits_for_mcp_proof_and_retries_its_existing_phase(tmp_path, monkeypatch):
+    import mcp_runtime
+    host, docker, _, _, record, begin = upgrade_setup(tmp_path, monkeypatch)
+    fence = Mock(return_value=False)
+    monkeypatch.setattr(mcp_runtime, 'fence_workspace', fence)
+    with pytest.raises(ResourceUnavailable):
+        host.profile_upgrade('workspace', begin)
+    item = json.loads(record.read_text())
+    assert item['state']=='fencing' and item['profile_upgrade']['phase']=='fencing'
+    host.admission.fence.assert_not_called()
+    docker.reset_mock()
+    fence.return_value=True
+    maintain(host)
+    item=json.loads(record.read_text())
+    assert 'mcp_fence_pending' not in item and item['profile_upgrade']['phase']=='fencing'
+    assert not any(call.args[0] in {'start','create'} for call in docker.call_args_list)
+    assert host.profile_upgrade('workspace', begin)['phase']=='preparing'
+
+
+def test_replacement_waits_for_mcp_proof_without_changing_generation(tmp_path, monkeypatch):
+    import mcp_runtime
+    host, _, _, payload, _ = setup(tmp_path, monkeypatch)
+    host.ensure('workspace', payload)
+    maintain(host)
+    record=host.root/'workspace/host.json'
+    replacement=dict(payload,expected_generation=1,expected_instance_id='host-1',generation=2,instance_id='host-2')
+    fence=Mock(return_value=False)
+    monkeypatch.setattr(mcp_runtime,'fence_workspace',fence)
+    host.admission.fence.reset_mock()
+    with pytest.raises(ResourceUnavailable):
+        host.replace('workspace',replacement)
+    assert json.loads(record.read_text())['generation']==1
+    host.admission.fence.assert_not_called()
+    fence.return_value=True
+    maintain(host)
+    assert json.loads(record.read_text())['generation']==1
+    host.ensure=Mock(return_value={'generation':2})
+    assert host.replace('workspace',replacement)=={'generation':2}
+    assert json.loads(record.read_text())['generation']==2
