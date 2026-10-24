@@ -58,7 +58,6 @@ await withCleanup(async()=>{
   }
  })
  await check('abrupt_local_ssh_child_disconnect_reaps_remote_bridge',async()=>{
-  const baseline=await remoteBridges()
   const controller=new AbortController()
   const p=runtime.spawn({argv:['/bin/sh','-c','sleep 30'],cwd:'/workspace',stdio:{stdin:'ignore',stdout:'pipe',stderr:'pipe'},graceMs:200,signal:controller.signal})
   p.stdout.resume();p.stderr.resume()
@@ -79,7 +78,9 @@ await withCleanup(async()=>{
    await p.done.catch(()=>{})
    await drained()
   }
-  assert.equal(await remoteBridges(),baseline)
+  // Remote bridges from the preceding churn may still be exiting at entry.
+  // The cleanup invariant is zero, not that transient pre-check count.
+  assert.equal(await remoteBridges(),0)
  })
  await check('invalid_root_path_rejected_before_bridge',async()=>{
   await assert.rejects(ssh.connectStream({path:hello.root+'/../outside',capability:'a'.repeat(64)}),/invalid stream endpoint/);assert.equal(ssh.bridges.size,0)
