@@ -16,6 +16,7 @@ export class WorkbenchTerminals {
   constructor({ native, service, sessions, connection, gateway }) {
     Object.assign(this, { native, service, sessions, connection, gateway })
     this.creating = new Map(); this.knownSessions = new Set(); this.attachments = new Map()
+    this.disposed = false
   }
   activity() {
     let count = 0
@@ -27,15 +28,18 @@ export class WorkbenchTerminals {
     return count
   }
   dispose() {
+    this.disposed = true
     for (const current of this.attachments.values()) current.abort(httpError(503, '终端连接服务已更新，请重新连接'))
     this.attachments.clear()
     for (const current of this.creating.values()) current.controller.abort()
     this.knownSessions.clear()
   }
   async agent(owner, chatId) {
+    if (this.disposed) throw httpError(503, '终端连接服务已更新，请重新连接')
     const chat = this.service.requireChat(owner, chatId)
     this.knownSessions.add(chat.sessionId)
     const resolved = await this.sessions.resolveAgent(chat.sessionId)
+    if (this.disposed) throw httpError(503, '终端连接服务已更新，请重新连接')
     if ('error' in resolved) throw resolved.error
     return resolved.agent
   }
@@ -62,7 +66,7 @@ export class WorkbenchTerminals {
           return await this.native.create(agent, { id: request.id, cols: request.cols, rows: request.rows,
             ...(request.shellPath ? { shellPath: request.shellPath } : {}) }, current.controller.signal)
         } catch (error) {
-          if (error?.code === 'terminal/limit-reached') throw httpError(409, '终端数量达到配置上限')
+          if (error?.code === 'terminal/limit-reached') throw httpError(409, '每个对话最多打开 3 个终端，请先关闭一个终端', error.code)
           throw error
         }
       })().finally(() => {
@@ -109,6 +113,13 @@ export class WorkbenchTerminals {
           controllerId: frame.writable ? attachment : frame.info.state === 'running' ? 'other-attachment' : undefined } } : frame
         yield { event: 'workbench_terminal', value: frame.type === 'snapshot' ? { ...value, environment } : value }
       }
+    } catch (error) {
+      // A failed close retains its native slot so cleanup can be retried. Do not
+      // present it as a deleted resource and let the UI discard the close action.
+      if (['terminal/not-found', 'terminal/unavailable'].includes(error?.code)
+        && this.native.list(agent.session.id).some(info => info.id === id))
+        throw httpError(409, '终端关闭尚未完成，请重试关闭', 'terminal/closing')
+      throw error
     } finally {
       signal.removeEventListener('abort', stop)
       if (this.attachments.get(key) === current) this.attachments.delete(key)

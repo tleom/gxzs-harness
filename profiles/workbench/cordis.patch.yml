@@ -45,6 +45,16 @@
     - id: gxzs-persistent-terminal-activity
       name: '@gxzs/dsh-workbench-adapter/persistent-terminal-activity'
 
+# Sidebar PTYs are counted per Session, including pending creation/cleanup.
+# Bash supplies a directory prompt, history/editing and native activity tracking.
+- id: terminal-controller
+  config:
+    maxTerminals: 3
+    shell:
+      path: /bin/bash
+      name: bash
+      args: ['-i']
+
 - id: sandbox
   disabled: true
 

@@ -8,8 +8,10 @@ export class SidebarLeases {
     Object.assign(this, { browsers, terminals, service, ttlMs })
     this.windows = new Map()
     this.serial = new Map()
+    this.disposed = false
   }
   async update(owner, request) {
+    if (this.disposed) throw httpError(503, '侧栏连接服务已更新，请重新连接')
     if (!uuid.test(request.window_id) || !Array.isArray(request.resources))
       throw httpError(400, '侧栏窗口参数无效')
     const resources = new Map()
@@ -27,10 +29,11 @@ export class SidebarLeases {
     finally { if (this.serial.get(key) === operation) this.serial.delete(key) }
   }
   async replace(owner, key, resources) {
+    if (this.disposed) throw httpError(503, '侧栏连接服务已更新，请重新连接')
     let window = this.windows.get(key)
     if (!window) {
       if (this.windows.size >= 128) throw httpError(429, '侧栏窗口过多')
-      window = { holds: new Map() }
+      window = { holds: new Map(), lifetime: new AbortController() }
       this.windows.set(key, window)
     }
     clearTimeout(window.timer)
@@ -41,7 +44,11 @@ export class SidebarLeases {
       for (const [id, resource] of resources) {
         if (window.holds.has(id)) continue
         try {
-          const hold = await this.retain(owner, resource)
+          const hold = await this.retain(owner, resource, window.lifetime.signal)
+          if (this.disposed || this.windows.get(key) !== window) {
+            hold.release()
+            throw httpError(503, '侧栏连接服务已更新，请重新连接')
+          }
           window.holds.set(id, hold)
         } catch (error) {
           if (![404, 410].includes(error.status) && !['terminal/not-found', 'terminal/unavailable'].includes(error.code)) throw error
@@ -49,11 +56,13 @@ export class SidebarLeases {
       }
       return { protocol: 1, held: [...window.holds.keys()], ttl_ms: this.ttlMs }
     } finally {
-      window.timer = setTimeout(() => this.remove(key, window), this.ttlMs)
-      window.timer.unref?.()
+      if (this.windows.get(key) === window) {
+        window.timer = setTimeout(() => this.remove(key, window), this.ttlMs)
+        window.timer.unref?.()
+      }
     }
   }
-  async retain(owner, resource) {
+  async retain(owner, resource, signal) {
     const chat = this.service.requireChat(owner, resource.chat_id)
     if (resource.kind === 'browser') {
       const browser = this.browsers.require(owner, resource.id)
@@ -64,18 +73,20 @@ export class SidebarLeases {
     if (!native.list(chat.sessionId).some(item => item.id === resource.id)) throw httpError(404, '终端已经关闭')
     this.terminals.knownSessions.add(chat.sessionId)
     const lifetime = new AbortController()
-    const held = native.retain(chat.sessionId, resource.id, lifetime.signal)[Symbol.asyncIterator]()
+    const retained = AbortSignal.any([signal, lifetime.signal])
+    const held = native.retain(chat.sessionId, resource.id, retained)[Symbol.asyncIterator]()
     let first
     try { first = await held.next() }
     catch (error) { lifetime.abort(); throw error }
     if (first.done || first.value.type !== 'retained') { lifetime.abort(); await held.return?.(); throw httpError(404, '终端已经关闭') }
     // Resume the native lifetime iterator so terminal close/expiry can settle it.
-    void held.next().catch(() => {}).finally(() => { lifetime.abort(); void held.return?.() })
-    return { release: () => lifetime.abort(), live: () => !lifetime.signal.aborted }
+    void held.next().catch(() => {}).finally(async () => { lifetime.abort(); await held.return?.() }).catch(() => {})
+    return { release: () => lifetime.abort(), live: () => !retained.aborted }
   }
   remove(key, expected = this.windows.get(key)) {
     if (!expected || this.windows.get(key) !== expected) return
     this.windows.delete(key)
+    expected.lifetime.abort(httpError(503, '侧栏连接服务已更新，请重新连接'))
     clearTimeout(expected.timer)
     for (const hold of expected.holds.values()) hold.release()
   }
@@ -85,5 +96,8 @@ export class SidebarLeases {
     await this.serial.get(key)?.catch(() => {})
     this.remove(key)
   }
-  dispose() { for (const key of this.windows.keys()) this.remove(key) }
+  dispose() {
+    this.disposed = true
+    for (const key of this.windows.keys()) this.remove(key)
+  }
 }

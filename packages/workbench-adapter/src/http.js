@@ -81,7 +81,7 @@ const REMOTE_ERRORS = {
   'job/not-found': [404, '后台任务不存在或不属于此对话'],
   'terminal/unavailable': [404, '终端已关闭或当前不可用'],
   'terminal/control-unavailable': [409, '当前终端不能接受输入，请重新连接'],
-  'terminal/limit-reached': [409, '当前会话无法继续创建终端'],
+  'terminal/limit-reached': [409, '每个对话最多打开 3 个终端，请先关闭一个终端'],
   'gateway/bad-request': [400, '请求参数无效'],
   'gateway/cancelled': [409, '请求已取消，请刷新当前状态'],
   'session/not-found': [404, '会话不存在或已被删除'],

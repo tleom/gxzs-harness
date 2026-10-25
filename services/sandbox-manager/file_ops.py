@@ -239,9 +239,9 @@ def entry_metadata(fd, name, path, info, *, shallow=False):
     if shallow:
         return {"name": name, "path": path, "kind": kind, "size": info.st_size,
                 "modified": info.st_mtime, "version": None,
-                "downloadable": path != "conversations" and (kind == "directory" or (kind == "file" and info.st_size <= MAX_BYTES))}
+                "downloadable": path != "conversations" and kind in {"directory", "file"}}
     fingerprint = hash_file(fd, name, info.st_size) if kind == "file" and info.st_size <= MAX_BYTES else None
-    downloadable = kind == "file" and fingerprint is not None
+    downloadable = kind == "file"
     if kind == "file" and info.st_size > MAX_BYTES:
         fingerprint = large_file_version(info)
     if kind == "directory":
@@ -250,7 +250,7 @@ def entry_metadata(fd, name, path, info, *, shallow=False):
             entries = tree_entries(child)
             fingerprint = entries_version(entries)
             downloadable = (
-                all(stat.S_ISDIR(mode) or (stat.S_ISREG(mode) and size <= MAX_BYTES)
+                all(stat.S_ISDIR(mode) or stat.S_ISREG(mode)
                     for _, mode, size, _, _ in entries)
                 and sum(size for _, mode, size, _, _ in entries if stat.S_ISREG(mode)) <= MAX_TREE_BYTES
             )

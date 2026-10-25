@@ -3,6 +3,7 @@ const { createInterface } = require('node:readline')
 const { randomUUID } = require('node:crypto')
 const { createScreencast } = require('./browser-screencast.cjs')
 const { startDisplay, displayAvailable } = require('./browser-display.cjs')
+const { createBrowserDownloads } = require('./browser-downloads.cjs')
 const partialNavigationNotice = '页面已打开，但尚未完成加载；请根据当前页面内容继续操作'
 /** Preserve viewport pixels; never fall back to a lossy photograph encoding. */
 function createImageCapture({ budgetMs = 8000 } = {}) {
@@ -79,16 +80,30 @@ function observePage() {
     viewport: { x: scrollX, y: scrollY, width: innerWidth, height: innerHeight }, text: parts.join('\n').slice(0,20000), elements }
 }
 
-function runWorker({ chromium, input = process.stdin, output = process.stdout, exit = code => process.exit(code), displayFactory = displayAvailable() ? startDisplay : undefined, commandTimeoutMs = 30_000, cancelGraceMs = 1_000 }) {
+function runWorker({ chromium, input = process.stdin, output = process.stdout, exit = code => process.exit(code), displayFactory = displayAvailable() ? startDisplay : undefined, commandTimeoutMs = 30_000, cancelGraceMs = 1_000, workspace = process.cwd() }) {
   let browser, context, page, session, watching = false, capturing = false, closed = false
   let display
   let legacyPixels = false
   let adoptNewPage
   let timer, notice = '', navigation = 0, hasFrame = false, navigating = false, lastFrame
   let captureFinished = Promise.resolve(), finishCapture = () => {}
+  let latestDownload, downloadSequence = 0
+  const downloads = createBrowserDownloads({ workspace, report: update => {
+    if (closed) return
+    notice = update.notice
+    if (update.download) latestDownload = update.download
+    void captureFinished.then(() => frame()).catch(() => {})
+  } })
   let shutdownPromise
   let commandDeadline, cancellationDeadline
   const pages = new Map()
+  const errorPageUrl = 'chrome-error://chromewebdata/'
+  const displayUrl = (url, history) => {
+    if (url === 'about:blank') return ''
+    if (url !== errorPageUrl) return url
+    const failed = history.entries[history.currentIndex]?.url || ''
+    try { return validUrl(failed) } catch { return '' }
+  }
   let pageId, pendingPopup, frameSequence = 0, activeCommand, revision = 0
   const streams = new Map(), cancelled = new Set(), pressedButtons = new Set(), pressedModifiers = new Set()
   const observedFrames = new Map()
@@ -104,7 +119,8 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
   }
   async function observeOnce() {
     const baseline = revision
-    const result = { ...await page.evaluate(observePage), page_id: pageId, revision, ...(notice ? { notice } : {}) }
+    const result = { ...await page.evaluate(observePage), page_id: pageId, revision, ...(notice ? { notice } : {}),
+      ...(latestDownload ? { download: latestDownload } : {}) }
     if (typeof page.locator === 'function') {
       try { result.accessibility = (await page.locator('body').ariaSnapshot({ timeout: 1500 })).slice(0, 16000) } catch {}
     }
@@ -113,8 +129,7 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
       if (frame === page.mainFrame() || result.frames.length >= 6) continue
       try {
         const handle = await frame.frameElement()
-        const box = await handle.boundingBox()
-        await handle.dispose()
+        const box = await handle.boundingBox().finally(() => handle.dispose())
         if (!box || box.x >= result.viewport.width || box.y >= result.viewport.height || box.x + box.width < 0 || box.y + box.height < 0) continue
         let ref = [...observedFrames].find(([, value]) => value === frame)?.[0]
         if (!ref) { ref = `frame-${++frameReference}`; observedFrames.set(ref, frame) }
@@ -144,9 +159,9 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
     const history = await cdp.send('Page.getNavigationHistory')
     const title = (await target.title()).slice(0, 1024)
     if (target !== page || target.url() !== url || navigation !== epoch || closed || (extra.frame_id && !watching)) return false
-    const meta = { type: 'frame', page_id: pageId, url: url === 'about:blank' ? '' : url, title,
+    const meta = { type: 'frame', page_id: pageId, url: displayUrl(url, history), title,
       ...viewport, mediaType: extra.mediaType || image.mediaType, back: history.currentIndex > 0,
-      forward: history.currentIndex < history.entries.length - 1, notice, ...extra }
+      forward: history.currentIndex < history.entries.length - 1, notice, ...(latestDownload ? { download: latestDownload } : {}), ...extra }
     const stamp = JSON.stringify(meta)
     if (extra.frame_id || !lastFrame || lastFrame.stamp !== stamp || !lastFrame.image.equals(image)) {
       await send({ ...meta, image: typeof image === 'string' ? image : image.toString('base64') })
@@ -201,20 +216,26 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
     if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || value.length > 4096) throw new Error('invalid_url')
     return url.href
   }
+  const validPageUrl = value => {
+    // A site may open its own generated document. Chromium owns the blob's
+    // origin and lifetime; address-bar/tool navigation still requires HTTP(S).
+    if (value.length <= 4096 && new URL(value).protocol === 'blob:') return value
+    return validUrl(value)
+  }
   async function frame(deadline) {
     if (!page || page.isClosed() || capturing || closed || navigating) return false
     capturing = true
     captureFinished = new Promise(resolve => { finishCapture = resolve })
     const target = page, cdp = session, epoch = navigation, url = target.url()
     try {
-      if (url !== 'about:blank') validUrl(url)
+      if (url !== 'about:blank' && url !== errorPageUrl) validPageUrl(url)
       if (display) {
         // The desktop's RFB stream owns pixels. This stream only carries navigation/control metadata.
         const viewport = await target.evaluate(() => ({ width: innerWidth, height: innerHeight }))
         const history = await cdp.send('Page.getNavigationHistory')
-        const meta = { type: 'frame', page_id: pageId, display: 'kasm', url: url === 'about:blank' ? '' : url,
+        const meta = { type: 'frame', page_id: pageId, display: 'kasm', url: displayUrl(url, history),
           title: (await target.title()).slice(0, 1024), ...viewport, back: history.currentIndex > 0,
-          forward: history.currentIndex < history.entries.length - 1, notice }
+          forward: history.currentIndex < history.entries.length - 1, notice, ...(latestDownload ? { download: latestDownload } : {}) }
         if (target !== page || closed || navigation !== epoch) return false
         const stamp = JSON.stringify(meta)
         if (lastFrame?.stamp !== stamp) { await send(meta); lastFrame = { stamp } }
@@ -290,7 +311,7 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
     target.setDefaultTimeout(5000)
     target.setDefaultNavigationTimeout(20000)
     target.on('dialog', dialog => { notice = '网页弹窗已关闭'; void dialog.dismiss().catch(() => {}) })
-    target.on('download', download => { notice = '请在系统浏览器中下载文件'; void download.cancel().catch(() => {}) })
+    target.on('download', download => { downloadSequence++; void downloads.start(download).catch(() => {}) })
     target.on('domcontentloaded', () => {
       if (target === page && notice === partialNavigationNotice) {
         notice = ''
@@ -302,9 +323,11 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
       if (main !== target.mainFrame() || target !== page) return
       navigation++
       revision++
-      if (main.url() === 'about:blank') return
+      // Chromium's own network/certificate error page remains a usable tab.
+      // It is never accepted as an address-bar or tool navigation target.
+      if (main.url() === 'about:blank' || main.url() === errorPageUrl) return
       try {
-        validUrl(main.url())
+        validPageUrl(main.url())
       } catch { notice = '浏览器仅支持 HTTP 和 HTTPS 页面'; void target.close().catch(() => {}) }
     })
     const adopt = popup => {
@@ -313,8 +336,11 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
       let popupSession
       let adopted = false
       try {
+        // A generated document can emit popup before Chromium exposes its URL.
+        // This only waits for an actual opener popup, never native download UI.
+        if (!popup.url()) await popup.waitForURL(/^(?:https?:|blob:|about:blank)/, { waitUntil: 'commit', timeout: 5000 })
         try {
-          if (popup.url() !== 'about:blank') validUrl(popup.url())
+          if (popup.url() !== 'about:blank' && popup.url() !== errorPageUrl) validPageUrl(popup.url())
         } catch {
           notice = '浏览器仅支持 HTTP 和 HTTPS 页面'
           await popup.close().catch(() => {})
@@ -322,7 +348,7 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
         }
         popupSession = await bind(popup, popupId)
         // The initial blank popup can navigate while its CDP binding is awaited.
-        try { if (popup.url() !== 'about:blank') validUrl(popup.url()) }
+        try { if (popup.url() !== 'about:blank' && popup.url() !== errorPageUrl) validPageUrl(popup.url()) }
         catch {
           notice = '浏览器仅支持 HTTP 和 HTTPS 页面'
           await popupSession.detach().catch(() => {})
@@ -378,13 +404,16 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
     if (action === 'init') {
       if (displayFactory) display = await displayFactory({ width: value.width, height: value.height, emit: send,
         onExit: () => fatal('沙盒浏览器显示服务已退出') })
+      if (closed) { await display?.stop(); throw new Error('browser_closed') }
       browser = await chromium.launch({ executablePath: '/usr/bin/chromium', headless: !display,
         ...(display ? { env: display.env } : {}),
         args: ['--no-sandbox', '--disable-dev-shm-usage', ...(display ? ['--force-device-scale-factor=1', '--no-first-run',
           '--kiosk', '--window-position=0,0', `--window-size=${value.width},${value.height}`] : [])], timeout: 20000 })
+      if (closed) { await browser.close(); throw new Error('browser_closed') }
       browser.on('disconnected', () => fatal('沙盒浏览器已退出，请重新打开浏览器'))
       context = await browser.newContext({ viewport: display ? null : { width: value.width, height: value.height },
-        ...(!display ? { deviceScaleFactor: 1 } : {}), locale: 'zh-CN', acceptDownloads: false, serviceWorkers: 'block' })
+        ...(!display ? { deviceScaleFactor: 1 } : {}), locale: 'zh-CN', acceptDownloads: true, serviceWorkers: 'allow' })
+      if (closed) { await context.close(); throw new Error('browser_closed') }
       if (display) {
         await context.exposeBinding('__workbenchInputChanged', () => { revision++ })
         await context.addInitScript(() => {
@@ -393,16 +422,14 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
         })
       }
       context.on?.('page', target => {
-        if (!page || target === page) return
+        // Chromium variants can expose native download UI as an empty-URL target.
+        // It is not a web tab; adopting/closing it can stall later page commands.
+        if (!page || target === page || !target.url()) return
         // Ctrl+T/Ctrl+N can create a page without a window.open opener.
         void target.opener().then(opener => { if (!opener && !closed) adoptNewPage?.(target) })
       })
-      await context.route('**/*', route => {
-        const request = route.request()
-        if (request.isNavigationRequest() && !/^https?:\/\//i.test(request.url())) return route.abort()
-        return route.continue()
-      })
       page = await context.newPage()
+      if (closed) { await page.close(); throw new Error('browser_closed') }
       pageId = value.browser_id || randomUUID()
       session = await bind(page, pageId)
       pages.set(pageId, { page, session })
@@ -451,10 +478,38 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
     const moves = ['navigate', 'reload', 'back', 'forward'].includes(action)
     if (moves) { navigation++; navigating = true }
     const navigationPage = page, navigationDeadline = Date.now() + 20000
+    const downloadsBeforeNavigation = downloadSequence
     let navigationResponse, navigationCommitted = false, navigationLoaded = false
     const loaded = () => { navigationLoaded = true }
     try { switch (action) {
-      case 'navigate': navigationResponse = await page.goto(validUrl(value.url), { waitUntil: 'commit' }); break
+      case 'navigate': {
+        const target = validUrl(value.url)
+        let redirected = false
+        const trackRedirect = request => {
+          if (request.isNavigationRequest() && request.frame() === navigationPage.mainFrame() && request.redirectedFrom()) redirected = true
+        }
+        if (value.fallback_url) navigationPage.on('request', trackRedirect)
+        try {
+          navigationResponse = await page.goto(target, { waitUntil: 'commit', ...(value.fallback_url ? { timeout: 10000 } : {}) })
+        } catch (failure) {
+          // Only inferred HTTPS gets one HTTP attempt, within the same navigation
+          // deadline and page. Explicit HTTPS, certificate errors and cancellation
+          // never downgrade, and a failed redirect must not replay the original URL.
+          const fallback = value.fallback_url && new URL(validUrl(value.fallback_url))
+          const original = new URL(target)
+          const connectionFailure = /net::ERR_(?:SSL_PROTOCOL_ERROR|CONNECTION_REFUSED|CONNECTION_RESET|CONNECTION_CLOSED|TIMED_OUT)(?:\b|$)/.test(failure.message) || failure.name === 'TimeoutError'
+          if (!fallback || !connectionFailure || redirected || closed || cancelled.has(value.id) || page !== navigationPage ||
+              Date.now() >= navigationDeadline || original.protocol !== 'https:' || fallback.protocol !== 'http:' ||
+              ['hostname', 'pathname', 'search', 'hash'].some(key => original[key] !== fallback[key])) throw failure
+          // A failed goto can reject before Chromium commits its error page.
+          // Wait for that commit instead of racing it with the HTTP attempt.
+          await page.waitForURL(errorPageUrl, { waitUntil: 'commit', timeout: Math.min(1000, Math.max(1, navigationDeadline - Date.now())) }).catch(() => {})
+          assertCurrent(value)
+          if (page !== navigationPage || Date.now() >= navigationDeadline) throw failure
+          navigationResponse = await page.goto(fallback.href, { waitUntil: 'commit', timeout: Math.max(1, navigationDeadline - Date.now()) })
+        } finally { navigationPage.off('request', trackRedirect) }
+        break
+      }
       case 'reload': navigationResponse = await page.reload({ waitUntil: 'commit' }); break
       case 'back': navigationResponse = await page.goBack({ waitUntil: 'commit' }); break
       case 'forward': navigationResponse = await page.goForward({ waitUntil: 'commit' }); break
@@ -524,20 +579,33 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
         await navigationPage.waitForLoadState('domcontentloaded', { timeout: Math.max(1, navigationDeadline - Date.now()) })
       }
     } catch (error) {
+      const attachmentNavigation = moves && /Download is starting|net::ERR_ABORTED/.test(error.message)
+      if (attachmentNavigation && downloadSequence === downloadsBeforeNavigation) {
+        // Chromium can reject goto before emitting the attachment's download event.
+        // Wait only on this error path; ordinary navigation adds no timer or request.
+        await new Promise(resolve => {
+          const done = () => { clearTimeout(timeout); navigationPage.off('download', done); resolve() }
+          const timeout = setTimeout(done, Math.min(1000, Math.max(1, navigationDeadline - Date.now())))
+          navigationPage.once('download', done)
+        })
+      }
       // A slow page may have committed a readable document while its load event
       // still waits on site resources. Preserve that observation without replaying
       // navigation or claiming the page finished loading. Pre-commit failures stay errors.
-      if (!navigationCommitted || error.name !== 'TimeoutError' || page !== navigationPage || page.isClosed()) throw error
-      assertCurrent(value)
-      try { validUrl(page.url()) } catch { throw error }
-      let readDeadline
-      const readableDocument = await Promise.race([
-        page.evaluate(() => ({ url: location.href, hasBody: Boolean(document.body), readyState: document.readyState })).catch(() => undefined),
-        new Promise(resolve => { readDeadline = setTimeout(resolve, 1000) }),
-      ]).finally(() => clearTimeout(readDeadline))
-      assertCurrent(value)
-      if (!readableDocument?.hasBody || page !== navigationPage || page.url() !== readableDocument.url) throw error
-      notice = navigationLoaded || readableDocument.readyState === 'complete' ? '' : partialNavigationNotice
+      // An attachment response starts a download instead of committing a document.
+      if (!attachmentNavigation || downloadSequence === downloadsBeforeNavigation) {
+        if (!navigationCommitted || error.name !== 'TimeoutError' || page !== navigationPage || page.isClosed()) throw error
+        assertCurrent(value)
+        try { validPageUrl(page.url()) } catch { throw error }
+        let readDeadline
+        const readableDocument = await Promise.race([
+          page.evaluate(() => ({ url: location.href, hasBody: Boolean(document.body), readyState: document.readyState })).catch(() => undefined),
+          new Promise(resolve => { readDeadline = setTimeout(resolve, 1000) }),
+        ]).finally(() => clearTimeout(readDeadline))
+        assertCurrent(value)
+        if (!readableDocument?.hasBody || page !== navigationPage || page.url() !== readableDocument.url) throw error
+        notice = navigationLoaded || readableDocument.readyState === 'complete' ? '' : partialNavigationNotice
+      }
     } finally {
       navigationPage.off('domcontentloaded', loaded)
       if (moves) { navigation++; navigating = false }
@@ -565,6 +633,8 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
     clearTimeout(cancellationDeadline)
     shutdownPromise = (async () => {
       await Promise.all([...streams.values()].map(value => value.dispose()))
+      await downloads.close()
+      await context?.close?.().catch(() => {})
       await browser?.close().catch(() => {})
       await display?.stop()
     })()

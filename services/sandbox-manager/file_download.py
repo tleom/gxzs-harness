@@ -6,7 +6,7 @@ import stat
 import tempfile
 import zipfile
 
-from file_ops import MAX_BYTES, parent_fd, file_identity, temporary_parent
+from file_ops import parent_fd, file_identity, temporary_parent
 
 MAX_DIRECTORY_BYTES = 1024 * 1024 * 1024
 
@@ -31,8 +31,8 @@ def stamp(digest, path, info):
 
 
 def copy_file(fd, name, output, expected, digest=None):
-    if not stat.S_ISREG(expected.st_mode) or expected.st_size > MAX_BYTES:
-        raise ValueError('单个文件最大 100 MiB')
+    if not stat.S_ISREG(expected.st_mode):
+        raise ValueError('只能下载普通文件')
     item = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
     with os.fdopen(item, 'rb') as source:
         if file_identity(os.fstat(source.fileno())) != file_identity(expected):

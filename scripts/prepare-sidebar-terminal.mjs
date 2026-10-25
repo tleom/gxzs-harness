@@ -5,13 +5,12 @@ import { fileURLToPath } from 'node:url'
 
 /** Internal Agent operations share the native screen/PTY without replacing its UI attachment. */
 export function sidebarTerminalSource(source) {
-  source = source.replace('maxTerminals: z.number().step(1).min(1).default(3),', 'maxTerminals: z.number().step(1).min(1).default(8),')
+  // Migrate both the upstream default and earlier GXZS unlimited installations.
+  source = source.replace(/maxTerminals: z\.number\(\)\.step\(1\)\.min\([01]\)\.default\((?:0|3|8)\),/,
+    'maxTerminals: z.number().step(1).min(1).max(3).default(3),')
     .replace('if ([...this.owners.values()].reduce((count, item) => count + new Set([...item.terminals.keys(), ...item.pending.keys(), ...item.allocations.keys()]).size, 0) >= this.config.maxTerminals)',
       'if (new Set([\n\t\t\t\t...owner.terminals.keys(),\n\t\t\t\t...owner.pending.keys(),\n\t\t\t\t...owner.allocations.keys()\n\t\t\t]).size >= this.config.maxTerminals)')
   const additions = [
-    ['maxTerminals: z.number().step(1).min(1).default(8),', 'maxTerminals: z.number().step(1).min(0).default(0),'],
-    ['if (new Set([\n\t\t\t\t...owner.terminals.keys(),\n\t\t\t\t...owner.pending.keys(),\n\t\t\t\t...owner.allocations.keys()\n\t\t\t]).size >= this.config.maxTerminals)',
-      'if (this.config.maxTerminals > 0 && new Set([\n\t\t\t\t...owner.terminals.keys(),\n\t\t\t\t...owner.pending.keys(),\n\t\t\t\t...owner.allocations.keys()\n\t\t\t]).size >= this.config.maxTerminals)'],
     ['\trename(title) {', `\t// GXZS internal Agent input; the controller remains owned by the UI follower.
 \twriteFromAgent(data, signal) {
 \t\tthis.retention?.invalidate();
@@ -45,6 +44,10 @@ export function sidebarTerminalSource(source) {
 \t\t}
 \t\trename(agent, id, title) {`],
   ]
+  source = source.replace('if (this.config.maxTerminals > 0 && new Set([', 'if (new Set([')
+  if (!source.includes('maxTerminals: z.number().step(1).min(1).max(3).default(3),') ||
+      !source.includes('if (new Set([\n\t\t\t\t...owner.terminals.keys(),\n\t\t\t\t...owner.pending.keys(),\n\t\t\t\t...owner.allocations.keys()\n\t\t\t]).size >= this.config.maxTerminals)'))
+    throw new Error('DSH terminal contract changed; inspect upstream before upgrading')
   for (const [before, after] of additions) {
     if (source.includes(after)) continue
     if (source.split(before).length !== 2) throw new Error('DSH terminal contract changed; inspect upstream before upgrading')

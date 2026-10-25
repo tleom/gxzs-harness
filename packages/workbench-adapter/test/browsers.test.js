@@ -3,6 +3,12 @@ import { expect, it, vi } from 'vitest'
 import { browserAction, SandboxBrowser, WorkbenchBrowsers } from '../src/browsers.js'
 const id = '12345678-1234-1234-1234-123456789abc'
 const signal = () => new AbortController().signal
+it('accepts an inferred HTTP fallback only for the same HTTPS destination', () => {
+  expect(browserAction({action:'navigate',url:'https://xcmggx.com:8080/app?q=1',fallback_url:'http://xcmggx.com:8080/app?q=1'}))
+    .toEqual({action:'navigate',url:'https://xcmggx.com:8080/app?q=1',fallback_url:'http://xcmggx.com:8080/app?q=1'})
+  for (const fallback_url of ['http://other.test/app?q=1','file:///app','http://u:p@xcmggx.com/app?q=1','http://xcmggx.com/other','https://xcmggx.com/app?q=1'])
+    expect(()=>browserAction({action:'navigate',url:'https://xcmggx.com/app?q=1',fallback_url})).toThrow()
+})
 it('receives a full-resolution PNG above the old line limit without closing the browser', async () => {
   const stdin = new PassThrough(), stdout = new PassThrough()
   const browser = new SandboxBrowser({spawn:spec => ({stdin,stdout,
@@ -94,6 +100,21 @@ it('replaces only the same owner browser across chats, leaving other users isola
   await gateway.close({ownerId:'owner'},root)
   expect(workers[2].dispose).not.toHaveBeenCalled()
   gateway.dispose()
+})
+
+it('removes current-chat references when a worker exits without an explicit close request',async()=>{
+  let finish
+  const worker={closed:false,command:vi.fn(async()=>{}),pageFrames:new Map([[id,{image:'last-frame'}]]),
+    done:new Promise(resolve=>{finish=resolve}),dispose:vi.fn()}
+  const gateway=new WorkbenchBrowsers({create:()=>worker,service:{requireChat:vi.fn()}})
+  await gateway.create({ownerId:'owner'},{id,chat_id:id},signal())
+  worker.closed=true;finish()
+  await worker.done;await Promise.resolve()
+  expect(gateway.items.size).toBe(0)
+  expect(gateway.slots.size).toBe(0)
+  expect(gateway.workers.size).toBe(0)
+  expect(gateway.current.size).toBe(0)
+  expect(worker.pageFrames.size).toBe(0)
 })
 it('never recreates a missing restored browser or replaces the current one while attaching', async()=>{
   const worker={closed:false,command:vi.fn(async()=>{}),dispose:vi.fn(),done:new Promise(()=>{})}
@@ -227,6 +248,62 @@ it('waits for actual process exit before admitting a replacement and serializes 
   await expect(gateway.create({ownerId:'owner'},{id,chat_id:id},cancelled.signal)).rejects.toThrow('cancelled open')
   expect(workers[1].closed).toBe(false)
   gateway.dispose();for(const exit of exits)exit()
+})
+
+it('rejects in-flight and queued replacements when disposed while the old process is exiting',async()=>{
+  let finish
+  const worker={closed:false,command:async()=>{},dispose(){this.closed=true},done:new Promise(resolve=>{finish=resolve})}
+  const create=vi.fn(()=>worker),gateway=new WorkbenchBrowsers({create})
+  const owner={ownerId:'owner'},a='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',b='bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb'
+  await gateway.create(owner,{id,chat_id:id},signal())
+  const first=gateway.create(owner,{id:a,chat_id:a},signal())
+  const queued=gateway.create(owner,{id:b,chat_id:b},signal())
+  const results=[expect(first).rejects.toMatchObject({status:410}),expect(queued).rejects.toMatchObject({status:410})]
+  await vi.waitFor(()=>expect(worker.closed).toBe(true))
+  gateway.dispose();finish()
+  await Promise.all(results)
+  expect(create).toHaveBeenCalledOnce()
+  expect(gateway.slots.size).toBe(0)
+  expect(gateway.workers.size).toBe(0)
+  expect(gateway.allocating.size).toBe(0)
+})
+
+it('waits for the complete native process range after the browser worker reports exit',async()=>{
+  let exit,empty
+  const waitForExit=vi.fn(()=>new Promise(resolve=>{empty=resolve}))
+  const browser=new SandboxBrowser({spawn:()=>({stdin:new PassThrough(),stdout:new PassThrough(),done:new Promise(resolve=>{exit=resolve}),waitForExit})})
+  let settled=false
+  const done=browser.done.then(()=>{settled=true})
+  exit({exitCode:1})
+  await vi.waitFor(()=>expect(waitForExit).toHaveBeenCalledOnce())
+  expect(browser.closed).toBe(true)
+  expect(settled).toBe(false)
+  empty(true);await done
+  expect(settled).toBe(true)
+})
+
+it('keeps an unobserved browser process range reserved until a later close confirms cleanup',async()=>{
+  let exit
+  const waitForExit=vi.fn().mockRejectedValue(new Error('transport lost'))
+  const browser=new SandboxBrowser({spawn:()=>({stdin:new PassThrough(),stdout:new PassThrough(),done:new Promise(resolve=>{exit=resolve}),waitForExit})})
+  browser.command=vi.fn(async()=>{})
+  const create=vi.fn(()=>browser),gateway=new WorkbenchBrowsers({create})
+  const owner={ownerId:'owner'}
+  await gateway.create(owner,{id,chat_id:id},signal())
+  const failed=expect(browser.done).rejects.toMatchObject({status:502})
+  exit({exitCode:1});await failed
+  expect(gateway.slots.size).toBe(1)
+  expect(gateway.workers.size).toBe(1)
+  // Restoring the UI after a failed close must retain its retryable close tab.
+  await expect(gateway.create(owner,{id,chat_id:id,existing:true},signal()))
+    .rejects.toMatchObject({status:409,code:'browser/closing'})
+  await expect(gateway.create(owner,{id:'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'},signal())).rejects.toMatchObject({status:502})
+  expect(create).toHaveBeenCalledOnce()
+  waitForExit.mockResolvedValue(true)
+  await gateway.close(owner,id)
+  expect(gateway.slots.size).toBe(0)
+  expect(gateway.workers.size).toBe(0)
+  await expect(gateway.create(owner,{id,chat_id:id,existing:true},signal())).rejects.toMatchObject({status:404})
 })
 
 it('reconciles watch state after a queued disable overlaps a replacement stream and a full action queue', async () => {

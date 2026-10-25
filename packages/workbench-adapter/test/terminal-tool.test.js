@@ -74,7 +74,7 @@ it('does not leave a tab event after aborted allocation or replay input after ca
   const test=fixture(),abort=new AbortController()
   test.native.list.mockReturnValue([])
   test.native.create.mockImplementation(async (_agent,request)=>{abort.abort();return {id:request.id,title:'bash'}})
-  await expect(test.definition.execute({action:'write',data:'echo no\r',wait_ms:0},{...test.exec,signal:abort.signal})).rejects.toBeTruthy()
+  await expect(test.definition.execute({action:'open',wait_ms:0},{...test.exec,signal:abort.signal})).rejects.toBeTruthy()
   expect(test.native.writeFromAgent).not.toHaveBeenCalled()
   expect(test.database.appendEvent).not.toHaveBeenCalled()
 })
@@ -124,11 +124,11 @@ it('keeps the native UI attachment writable while the Agent observes and writes 
   b.terminals.delete('other')
   await TerminalController.prototype.create.call(controller,{}, {id:'new',cols:80,rows:24},signal)
   expect(controller.spawn).toHaveBeenCalledOnce()
-  controller.config.maxTerminals=0
+  controller.config.maxTerminals=3
   for(let i=0;i<12;i++) b.terminals.set(`existing-${i}`,{})
-  await TerminalController.prototype.create.call(controller,{}, {id:'unlimited',cols:80,rows:24},signal)
-  expect(controller.spawn).toHaveBeenCalledTimes(2)
-  expect(patched).toContain('maxTerminals: z.number().step(1).min(0).default(0)')
+  await expect(TerminalController.prototype.create.call(controller,{}, {id:'fourth',cols:80,rows:24},signal)).rejects.toMatchObject({code:'terminal/limit-reached'})
+  expect(controller.spawn).toHaveBeenCalledOnce()
+  expect(patched).toContain('maxTerminals: z.number().step(1).min(1).max(3).default(3)')
 })
 
 it('reads the terminal selected by a sidebar reference without substituting another PTY', async () => {
@@ -139,5 +139,79 @@ it('reads the terminal selected by a sidebar reference without substituting anot
   expect(test.native.create).not.toHaveBeenCalled()
   test.native.list.mockReturnValue([])
   await expect(test.definition.execute({action:'read',terminal_id:id,wait_ms:0},test.exec)).rejects.toMatchObject({status:404})
+  expect(test.native.create).not.toHaveBeenCalled()
+})
+
+it.each(['read', 'write', 'key', 'close'])('does not allocate a terminal implicitly for %s', async action => {
+  const test = fixture(); test.native.list.mockReturnValue([])
+  await expect(test.definition.execute({action,data:'echo no\r',key:'Enter',wait_ms:0},test.exec)).rejects.toMatchObject({status:404})
+  expect(test.native.create).not.toHaveBeenCalled()
+  expect(test.database.appendEvent).not.toHaveBeenCalled()
+})
+
+it('does not substitute a new shell for an explicitly selected exited terminal', async () => {
+  const test=fixture();test.native.list.mockReturnValue([{id,title:'bash',state:'exited'}])
+  await expect(test.definition.execute({action:'open',terminal_id:id,wait_ms:0},test.exec)).rejects.toMatchObject({status:409})
+  expect(test.native.create).not.toHaveBeenCalled()
+})
+
+it('reuses the latest running terminal at capacity without closing or writing to it', async () => {
+  const test=fixture()
+  const running={id:'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',title:'bash',state:'running'}
+  test.native.list.mockReturnValue([{id,state:'running'},running,{id:'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb',state:'exited'}])
+  const value=await test.definition.execute({action:'open',wait_ms:0},test.exec)
+  expect(value.terminal_id).toBe(running.id)
+  expect(test.native.create).not.toHaveBeenCalled()
+  expect(test.native.close).not.toHaveBeenCalled()
+  expect(test.native.writeFromAgent).not.toHaveBeenCalled()
+  expect(test.native.inspectForAgent).toHaveBeenCalledWith(test.agent,running.id,test.exec.signal)
+})
+
+it('returns an exited screen when all three terminals have exited without discarding them', async () => {
+  const test=fixture()
+  const infos=[{id,state:'exited'},{id:'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',state:'exited'},{id:'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb',state:'exited'}]
+  test.native.list.mockReturnValue(infos)
+  test.native.inspectForAgent.mockResolvedValue({info:infos[2],screen:'saved output',truncated:false})
+  const value=await test.definition.execute({action:'open',wait_ms:0},test.exec)
+  expect(value).toMatchObject({terminal_id:infos[2].id,state:'exited',screen:'saved output'})
+  expect(test.native.create).not.toHaveBeenCalled()
+  expect(test.native.close).not.toHaveBeenCalled()
+})
+
+it('reuses after concurrent allocation fills capacity and preserves other creation failures', async () => {
+  const test=fixture()
+  test.native.list.mockReturnValueOnce([]).mockReturnValue([{id,state:'running'}])
+  test.native.create.mockRejectedValueOnce(Object.assign(new Error('limit'),{code:'terminal/limit-reached'}))
+  await expect(test.definition.execute({action:'open',wait_ms:0},test.exec)).resolves.toMatchObject({terminal_id:id})
+  expect(test.native.close).not.toHaveBeenCalled()
+  test.native.list.mockReturnValue([])
+  test.native.create.mockRejectedValueOnce(new Error('transport failed'))
+  await expect(test.definition.execute({action:'open',wait_ms:0},test.exec)).rejects.toThrow('transport failed')
+})
+
+it('skips a closing terminal at capacity and opens only the successfully observed terminal',async()=>{
+  const test=fixture()
+  const infos=[{id,state:'running'},{id:'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',state:'running'},{id:'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb',state:'running'}]
+  test.native.list.mockReturnValue(infos)
+  test.native.inspectForAgent.mockRejectedValueOnce(Object.assign(new Error('closing'),{code:'terminal/unavailable'}))
+  const value=await test.definition.execute({action:'open',wait_ms:0},test.exec)
+  expect(value.terminal_id).toBe(infos[1].id)
+  expect(test.native.inspectForAgent.mock.calls.map(call=>call[1])).toEqual([infos[2].id,infos[1].id])
+  expect(test.database.appendEvent).toHaveBeenCalledExactlyOnceWith('owner','run',{event:'workbench_terminal_open',chat_id:'chat',terminal_id:infos[1].id})
+  expect(test.native.create).not.toHaveBeenCalled()
+  expect(test.native.close).not.toHaveBeenCalled()
+  expect(test.native.writeFromAgent).not.toHaveBeenCalled()
+})
+
+it('does not open stale tabs or substitute explicit targets when a terminal becomes unavailable',async()=>{
+  const test=fixture()
+  test.native.list.mockReturnValue([{id,state:'running'},{id:'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',state:'running'},{id:'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb',state:'exited'}])
+  test.native.inspectForAgent.mockRejectedValue(Object.assign(new Error('closing'),{code:'terminal/unavailable'}))
+  await expect(test.definition.execute({action:'open',wait_ms:0},test.exec)).rejects.toMatchObject({status:409})
+  expect(test.native.inspectForAgent).toHaveBeenCalledTimes(3)
+  test.native.inspectForAgent.mockClear()
+  await expect(test.definition.execute({action:'open',terminal_id:id,wait_ms:0},test.exec)).rejects.toMatchObject({code:'terminal/unavailable'})
+  expect(test.native.inspectForAgent).toHaveBeenCalledOnce()
+  expect(test.database.appendEvent).not.toHaveBeenCalled()
   expect(test.native.create).not.toHaveBeenCalled()
 })

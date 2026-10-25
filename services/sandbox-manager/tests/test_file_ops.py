@@ -105,16 +105,17 @@ def test_large_file_can_be_deleted_without_reading_its_content(root, monkeypatch
         stream.truncate(1024 * 1024 * 1024)
     monkeypatch.setattr(module, 'read_file', lambda *args: pytest.fail('large deletion must not read file content'))
     metadata = module.operate({'operation': 'stat', 'path': target.name}, root)
-    assert len(metadata['version']) == 64 and metadata['downloadable'] is False
+    assert len(metadata['version']) == 64 and metadata['downloadable'] is True
     assert module.operate({'operation': 'delete', 'path': target.name, 'version': metadata['version']}, root) == {'deleted': True}
     assert not target.exists()
 
 
-def test_large_file_rejects_stale_delete_and_remains_bounded_for_download(root):
+def test_large_file_download_is_available_but_legacy_json_reads_remain_bounded(root):
     target = Path(root) / 'large.bin'
     with target.open('wb') as stream:
         stream.truncate(module.MAX_BYTES + 1)
     metadata = module.operate({'operation': 'stat', 'path': target.name}, root)
+    assert metadata['downloadable'] is True
     with target.open('ab') as stream:
         stream.write(b'changed')
     result = module.operate({'operation': 'delete', 'path': target.name, 'version': metadata['version']}, root)
