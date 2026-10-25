@@ -113,7 +113,9 @@ try {
     const install = async version => {
       const request = await prepare(version)
       let result = await manager.personalResources(request)
-      for (let i = 0; result.status === 'running' && i < 600; i++) {
+      // An uncertain observation is not a terminal receipt and must not replay
+      // the import. Keep querying the same durable import within this bound.
+      for (let i = 0; ['running', 'unknown'].includes(result.status) && i < 600; i++) {
         await new Promise(resolve => setTimeout(resolve, 100))
         result = await manager.personalResources({ operation: 'skill_import_status', import_id: request.import_id })
       }
@@ -149,7 +151,7 @@ try {
     const resources = await manager.personalResources({ operation: 'list' })
     assert.equal(resources.skills.find(skill => skill.id === 'streamed-package').version, finalVersion)
     await manager.personalResources({ operation: 'skill_uninstall', name: 'streamed-package', version: finalVersion })
-    console.log('PASS skill package: one-upload staged imports, 256 MiB assets in a 128 MiB sandbox, atomic replacement, receipts, cancellation and stale-version rejection')
+    console.log('PASS skill package: one-upload staged imports, 256 MiB assets, atomic replacement, receipts, cancellation and stale-version rejection')
   } else if (phase === 'mixed') {
     const nativeRequire = createRequire('/opt/workbench/profiles/workbench/package.json')
     const { Context } = nativeRequire('@deepseek-ai/cordis')

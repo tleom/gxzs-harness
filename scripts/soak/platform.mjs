@@ -65,6 +65,11 @@ const simulation = await createSimulator({ ...config, extraHandler: async ({ req
   if (route === 'workbench/config') {
     json(res, 200, { data: { enabled: true, system_prompt: '这是隔离的合成稳定性测试。模型响应由可控服务生成。', global_skills: config.globalSkills, models: { default: 'simulator/gxzs-simulator', providers: { simulator: { api: 'openai-completions', baseURL: config.publicURL + '/v1', apiKeyEnv: 'GXZS_SIM_MODEL_KEY', compat: { supportsDeveloperRole: false }, models: [{ id: 'gxzs-simulator', name: '零费用模拟模型', input: ['text', 'image'], contextWindow: 1050000, maxTokens: 128000 }] } } } } }); return true
   }
+  if (route === 'mcp/policy') {
+    const reply = await fetch(config.managerURL + '/mcp-policy', { headers: { authorization: `Bearer ${config.token}` }, signal: AbortSignal.timeout(10000) })
+    if (!reply.ok) throw new Error('Fixture policy authority returned ' + reply.status)
+    json(res, 200, { data: { policy: await reply.json() } }); return true
+  }
   if (route === 'mcp/catalog' || route === 'mcp/plugins') {
     const personal = await manager(binding, 'personal-mcp', { operation: 'mcp_list' })
     const tools = [fixtureTool], plugins = [fixturePlugin]
@@ -89,6 +94,13 @@ const simulation = await createSimulator({ ...config, extraHandler: async ({ req
   if (route === 'scheduling') {
     const reply = await fetch(`${config.managerURL}/sandboxes/${binding.workspace_id}/schedule`, { method: 'POST', headers: { authorization: `Bearer ${config.token}`, 'content-type': 'application/json' }, body: JSON.stringify({ ...body, owner_id: owner, generation: binding.generation, instance_id: binding.instance_id }), signal: AbortSignal.timeout(5000) })
     const result = await reply.json(); json(res, reply.status, reply.ok ? { data: result } : result); return true
+  }
+  if (route === 'schedule-wakeups' && Number.isSafeInteger(body.sequence) && body.sequence > 0 && Array.isArray(body.tasks)) {
+    // An empty native catalog needs no durable wakeup. Positive scheduling is
+    // verified against the real Java/SnailJob stack, never simulated here.
+    if (body.tasks.length) { json(res, 503, { error: 'Use the Java fixture for durable schedule wakeups' }); return true }
+    await simulation.record({ event: 'empty_schedule_wakeups', owner, sequence: body.sequence })
+    json(res, 200, { data: { sequence: body.sequence, tasks: [], complete: true } }); return true
   }
   json(res, 404, { error: 'Unimplemented synthetic platform route', route }); return true
 } })

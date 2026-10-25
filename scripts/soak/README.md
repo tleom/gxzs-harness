@@ -7,6 +7,7 @@
 
 `platform.mjs` 模拟 Java 平台边界。此套测试不能替代生产 Java HTTP、登录权限、
 真实模型供应商或真实外部插件验证；这些边界需要单独测试。
+空定时目录仅确认没有待登记计划；非空预唤醒登记返回拒绝，由真实 Java/SnailJob 测试栈验证持久化登记与到期执行。
 
 ## 创建独立测试栈
 
@@ -51,7 +52,8 @@ python3 terminal_check.py --root /home/jrgx/gxzs-simulated-soak-example
 `run.py pilot --case-file scenario.json --root ...` 支持完整场景对象。
 `kind` 包括 `chain`、`mixed`、`schedule-delivery`、`goal`、`browser-recovery`。
 `largeArguments` 和 `argumentChunkSize` 验证大参数、Unicode 和分片；`fault` 可配置
-`mode=http503|http403|disconnect`、`step`、`count`，验证重试和部分流断开。
+`mode=http429|http503|http403|disconnect`、`step`、`count`，验证重试和部分流断开。
+429 响应携带 `Retry-After: 1`；夹具不会转发到真实模型。
 `/__test/fault` 可注入有界的平台目录/配置/准入 503，接口要求本栈凭据。
 
 报告包含任务及事件清单、工具执行记录、资源和准入采样。验收时核对文件落盘、

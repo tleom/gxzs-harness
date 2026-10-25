@@ -168,6 +168,27 @@ try:
                         host_image, '/smoke-streaming-files.mjs', workspaces[0], phase, check=False)
         if output.returncode:
             print((output.stdout + output.stderr).replace(token, '[fixture-redacted]')[-6000:], file=sys.stderr)
+            sandbox = prefix + '-' + workspaces[0]
+            # Capture the failing cgroup before its low-memory limit is restored
+            # and disposable cleanup removes the process and durable receipts.
+            diagnostics = [
+                ('inspect', '--format', '{{json .State}}', sandbox),
+                ('exec', sandbox, 'cat', '/sys/fs/cgroup/memory.events'),
+                ('exec', sandbox, 'cat', '/sys/fs/cgroup/memory.current'),
+                ('logs', '--tail', '80', manager),
+                ('exec', '--user', '1000', sandbox, 'python3', '-c',
+                 "from pathlib import Path;import json;"
+                 "print(json.dumps([json.loads(p.read_text()) for p in "
+                 "Path('/workspace/.skill-imports').glob('*/state.json')]));"
+                 "print(json.dumps([json.loads(p.read_text()) for p in "
+                 "Path('/tmp/.gxzs-mcp-workers').glob('*.json')]))"),
+            ]
+            for arguments in diagnostics:
+                try:
+                    diagnostic = docker(*arguments, check=False)
+                    print((diagnostic.stdout + diagnostic.stderr).replace(token, '[fixture-redacted]')[-12000:], file=sys.stderr)
+                except subprocess.TimeoutExpired:
+                    print('Streaming failure diagnostic timed out: ' + arguments[0], file=sys.stderr)
             raise RuntimeError('Streaming file smoke failed: ' + phase)
         print(output.stdout.strip(), flush=True)
     streaming_probe('file')
@@ -207,10 +228,13 @@ with zipfile.ZipFile('/workspace/probe/skill-package.zip', 'w', compression=zipf
 """)
     memory = mixed_after['HostConfig']['Memory']
     memory_swap = mixed_after['HostConfig']['MemorySwap']
-    docker('update', '--memory', '128m', '--memory-swap', '128m', sandbox)
+    # The import process is separately tested with a 128 MiB RLIMIT_AS. This
+    # cgroup also contains SSH, supervision and charged filesystem pages.
+    docker('update', '--memory', '256m', '--memory-swap', '256m', sandbox)
     try:
         streaming_probe('skill-package')
         assert not json.loads(docker('inspect', sandbox).stdout)[0]['State']['OOMKilled']
+        print('PASS streaming skill package in a 256 MiB sandbox, including SSH and supervision', flush=True)
     finally:
         docker('update', '--memory', str(memory), '--memory-swap', str(memory_swap), sandbox)
     # Freeze a real importer during extraction, then restart only its manager.

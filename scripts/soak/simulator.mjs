@@ -47,7 +47,7 @@ export function scenarioFrom(messages) {
   if (!Number.isFinite(value.durationMs ?? 0) || (value.durationMs ?? 0) < 0 || (value.durationMs ?? 0) > 86400000) throw new Error('Invalid duration')
   if (!Number.isInteger(value.stepDelayMs ?? 100) || (value.stepDelayMs ?? 100) < 0 || (value.stepDelayMs ?? 100) > 30000) throw new Error('Invalid step delay')
   if (!Number.isInteger(value.argumentChunkSize ?? 256) || (value.argumentChunkSize ?? 256) < 64 || (value.argumentChunkSize ?? 256) > 65536) throw new Error('Invalid chunk size')
-  if (value.fault && (!['http503', 'http403', 'disconnect'].includes(value.fault.mode)
+  if (value.fault && (!['http429', 'http503', 'http403', 'disconnect'].includes(value.fault.mode)
       || !Number.isInteger(value.fault.step) || value.fault.step < 0
       || !Number.isInteger(value.fault.count) || value.fault.count < 1 || value.fault.count > 3)) throw new Error('Invalid synthetic model fault')
   return { ...value, kind: value.kind ?? 'chain', rounds: value.rounds ?? 10,
@@ -172,7 +172,10 @@ export async function createSimulator({ token, output, host = '127.0.0.1', port 
       if (scenario.fault?.step === step && (state.injectedFaults ?? 0) < scenario.fault.count) {
         state.injectedFaults = (state.injectedFaults ?? 0) + 1
         await persist(); await record({ case: scenario.id, event: 'injected_model_failure', mode: scenario.fault.mode, step })
-        if (scenario.fault.mode !== 'disconnect') return json(res, scenario.fault.mode === 'http403' ? 403 : 503, { error: { message: 'Synthetic provider fault', type: 'fixture_injected' } })
+        if (scenario.fault.mode !== 'disconnect') {
+          if (scenario.fault.mode === 'http429') res.setHeader('retry-after', '1')
+          return json(res, Number(scenario.fault.mode.slice(4)), { error: { message: 'Synthetic provider fault', type: 'fixture_injected' } })
+        }
         res.writeHead(200, { 'content-type': body.stream === true ? 'text/event-stream' : 'application/json' })
         if (body.stream === true) res.write(`data: ${JSON.stringify({ id: `chatcmpl-${id}`, object: 'chat.completion.chunk', created, model: body.model, choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: `sim_${scenario.id}_${step}`, type: 'function', function: { name: 'bash', arguments: '{"command":' } }] }, finish_reason: null }] })}\n\n`)
         else res.write('{"id":')

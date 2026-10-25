@@ -1,5 +1,9 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { spawn } from 'node:child_process'
+import { once } from 'node:events'
+import { createServer } from 'node:http'
+import { fileURLToPath } from 'node:url'
 import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
@@ -33,13 +37,62 @@ test('special scenarios cannot finish before their defining verification step', 
 
 const token = 'synthetic-test-token-with-no-upstream-credentials'
 const tools = [{ type: 'function', function: { name: 'bash', parameters: { type: 'object' } } }]
+
+test('synthetic platform forwards the manager-owned MCP policy after authenticating the binding', async t => {
+  const policy = { request_bytes: 123456, response_bytes: 234567, max_call_seconds: 45, catalog_timeout_seconds: 90 }
+  let requests = 0
+  const manager = createServer((req, res) => {
+    requests++
+    assert.equal(req.url, '/mcp-policy')
+    assert.equal(req.headers.authorization, `Bearer ${token}`)
+    res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify(policy))
+  })
+  await new Promise(resolve => manager.listen(0, '127.0.0.1', resolve))
+  t.after(async () => { manager.closeAllConnections(); await new Promise(resolve => manager.close(resolve)) })
+  const output = await mkdtemp(path.join(os.tmpdir(), 'gxzs-sim-platform-'))
+  t.after(() => rm(output, { recursive: true }))
+  const owner = 'soak1017:910001', instance = 'fixture-instance'
+  await writeFile(path.join(output, 'bindings.json'), JSON.stringify([{ owner_id: owner, generation: 1, instance_id: instance }]))
+  const config = path.join(output, 'config.json')
+  await writeFile(config, JSON.stringify({ token, output, host: '127.0.0.1', port: 0,
+    managerURL: `http://127.0.0.1:${manager.address().port}`, globalSkills: [] }))
+  const child = spawn(process.execPath, [fileURLToPath(new URL('./platform.mjs', import.meta.url)), config], { stdio: ['ignore', 'pipe', 'pipe'] })
+  const exited = once(child, 'exit')
+  t.after(async () => { child.kill(); await exited })
+  const ready = await new Promise((resolve, reject) => {
+    let text = ''
+    const timer = setTimeout(() => reject(new Error('Synthetic platform did not start')), 5000)
+    child.once('error', error => { clearTimeout(timer); reject(error) })
+    child.stdout.on('data', chunk => {
+      text += chunk
+      if (text.includes('\n')) { clearTimeout(timer); resolve(JSON.parse(text.split('\n')[0])) }
+    })
+  })
+  const url = `http://127.0.0.1:${ready.port}/internal/workbench/mcp/policy`
+  assert.equal((await fetch(url)).status, 401)
+  assert.equal(requests, 0)
+  const response = await fetch(url, { headers: { authorization: `Bearer ${token}`,
+    'x-gxzs-owner': owner, 'x-gxzs-host-generation': '1', 'x-gxzs-host-instance': instance } })
+  assert.equal(response.status, 200)
+  assert.deepEqual(await response.json(), { data: { policy } })
+  assert.equal(requests, 1)
+  const wakeupURL = `http://127.0.0.1:${ready.port}/internal/workbench/schedule-wakeups`
+  const headers = { authorization: `Bearer ${token}`, 'content-type': 'application/json',
+    'x-gxzs-owner': owner, 'x-gxzs-host-generation': '1', 'x-gxzs-host-instance': instance }
+  const empty = await fetch(wakeupURL, { method: 'POST', headers, body: JSON.stringify({ sequence: 3, tasks: [] }) })
+  assert.equal(empty.status, 200)
+  assert.deepEqual(await empty.json(), { data: { sequence: 3, tasks: [], complete: true } })
+  const active = await fetch(wakeupURL, { method: 'POST', headers, body: JSON.stringify({ sequence: 4, tasks: [{ id: 'future' }] }) })
+  assert.equal(active.status, 503)
+})
+
 async function fixture(t) {
   const output = await mkdtemp(path.join(os.tmpdir(), 'gxzs-sim-test-'))
   const simulator = await createSimulator({ token, output })
   t.after(async () => { simulator.server.closeAllConnections(); await new Promise(resolve => simulator.server.close(resolve)); await simulator.drain(); await rm(output, { recursive: true }) })
   return { ...simulator, call: async body => {
     const response = await fetch(`http://127.0.0.1:${simulator.port}/v1/chat/completions`, { method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' }, body: JSON.stringify(body) })
-    return { status: response.status, text: await response.text() }
+    return { status: response.status, headers: Object.fromEntries(response.headers), text: await response.text() }
   } }
 }
 const request = (id, extra = []) => ({ model: 'gxzs-simulator', stream: true, tools, messages: [{ role: 'user', content: `GXZS_SIM_CASE ${JSON.stringify({ id, rounds: 1, stepDelayMs: 0 })}` }, ...extra] })
@@ -128,6 +181,17 @@ test('partial response disconnect is not reported as a successful completion', a
   await assert.rejects(server.call(body))
   assert.equal(server.stats.completed, 0)
   assert.equal(toolCall((await server.call(body)).text).id, 'sim_disconnect_0')
+})
+
+test('rate-limit injection returns 429 once and preserves the undispatched tool step', async t => {
+  const server = await fixture(t), body = request('rate_limited')
+  body.messages[0].content = 'GXZS_SIM_CASE {"id":"rate_limited","rounds":1,"stepDelayMs":0,"fault":{"mode":"http429","step":0,"count":1}}'
+  const limited = await server.call(body)
+  assert.equal(limited.status, 429)
+  assert.equal(limited.headers['retry-after'], '1')
+  assert.equal(server.stats.toolResponses, 0)
+  assert.equal(toolCall((await server.call(body)).text).id, 'sim_rate_limited_0')
+  assert.equal(server.stats.upstreamCalls, 0)
 })
 test('scenario marker uses the latest child scope and rejects unsafe identifiers', () => {
   assert.equal(scenarioFrom([{ role: 'user', content: 'GXZS_SIM_CASE {"id":"parent"}\nGXZS_SIM_CASE {"id":"child"}' }]).id, 'child')
