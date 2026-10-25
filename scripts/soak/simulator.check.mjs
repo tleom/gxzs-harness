@@ -84,7 +84,7 @@ async function fixture(t) {
   t.after(async () => { simulator.server.closeAllConnections(); await new Promise(resolve => simulator.server.close(resolve)); await simulator.drain(); await rm(output, { recursive: true }) })
   return { ...simulator, call: async body => {
     const response = await fetch(`http://127.0.0.1:${simulator.port}/v1/chat/completions`, { method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' }, body: JSON.stringify(body) })
-    return { status: response.status, text: await response.text() }
+    return { status: response.status, headers: Object.fromEntries(response.headers), text: await response.text() }
   } }
 }
 const request = (id, extra = []) => ({ model: 'gxzs-simulator', stream: true, tools, messages: [{ role: 'user', content: `GXZS_SIM_CASE ${JSON.stringify({ id, rounds: 1, stepDelayMs: 0 })}` }, ...extra] })
@@ -173,6 +173,17 @@ test('partial response disconnect is not reported as a successful completion', a
   await assert.rejects(server.call(body))
   assert.equal(server.stats.completed, 0)
   assert.equal(toolCall((await server.call(body)).text).id, 'sim_disconnect_0')
+})
+
+test('rate-limit injection returns 429 once and preserves the undispatched tool step', async t => {
+  const server = await fixture(t), body = request('rate_limited')
+  body.messages[0].content = 'GXZS_SIM_CASE {"id":"rate_limited","rounds":1,"stepDelayMs":0,"fault":{"mode":"http429","step":0,"count":1}}'
+  const limited = await server.call(body)
+  assert.equal(limited.status, 429)
+  assert.equal(limited.headers['retry-after'], '1')
+  assert.equal(server.stats.toolResponses, 0)
+  assert.equal(toolCall((await server.call(body)).text).id, 'sim_rate_limited_0')
+  assert.equal(server.stats.upstreamCalls, 0)
 })
 test('scenario marker uses the latest child scope and rejects unsafe identifiers', () => {
   assert.equal(scenarioFrom([{ role: 'user', content: 'GXZS_SIM_CASE {"id":"parent"}\nGXZS_SIM_CASE {"id":"child"}' }]).id, 'child')
