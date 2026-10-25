@@ -18,18 +18,21 @@ def test_limits_and_fifo(tmp_path):
     queue = Admission(str(tmp_path / 'queue.db'))
     def call(owner, run, action='acquire'):
         return queue.request(owner, 1, 'host-' + owner, run, run, action)['state']
-    assert queue.request('0', 1, 'host-0', 'one', 'one', 'acquire')['limits'] == {'per_user': 3, 'users': 15, 'tasks': 30}
+    assert queue.request('0', 1, 'host-0', 'one', 'one', 'acquire')['limits'] == {'per_user': 3, 'users': 15}
     for user in range(15):
-        for run in ('one', 'two'):
+        for run in ('one', 'two', 'three'):
             assert call(str(user), run) == 'running'
-    assert call('0', 'three') == 'waiting'
+    assert queue.db.execute("SELECT COUNT(*) FROM task_admission WHERE state='running'").fetchone()[0] == 45
+    assert call('0', 'four') == 'waiting'
     assert call('15', 'one') == 'waiting'
     call('0', 'one', 'release')
     assert call('15', 'one') == 'waiting'
-    assert call('0', 'three') == 'running'
+    assert call('0', 'four') == 'running'
     call('1', 'one', 'release')
     assert call('15', 'one') == 'waiting'
     call('1', 'two', 'release')
+    assert call('15', 'one') == 'waiting'
+    call('1', 'three', 'release')
     assert call('15', 'one') == 'running'
     queue.close()
 
@@ -139,7 +142,7 @@ def test_concurrent_owners_never_exceed_capacity(tmp_path):
         list(pool.map(acquire, range(90)))
     rows = queue.db.execute("SELECT owner,COUNT(*) n FROM task_admission WHERE state='running' GROUP BY owner").fetchall()
     assert len(rows) <= 15
-    assert sum(row['n'] for row in rows) <= 30
+    assert sum(row['n'] for row in rows) <= 45
     assert all(row['n'] <= 3 for row in rows)
     queue.close()
 
@@ -153,7 +156,7 @@ def test_independent_connections_serialize_admission(tmp_path):
         list(pool.map(acquire, range(90)))
     rows = queues[0].db.execute("SELECT owner,COUNT(*) n FROM task_admission WHERE state='running' GROUP BY owner").fetchall()
     assert len(rows) <= 15
-    assert sum(row['n'] for row in rows) <= 30
+    assert sum(row['n'] for row in rows) <= 45
     assert all(row['n'] <= 3 for row in rows)
     for queue in queues:
         queue.close()
