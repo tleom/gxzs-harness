@@ -125,7 +125,7 @@ try {
     const first = await install(null)
     const asset = await manager.operate({ operation: 'stat', path: 'skills/streamed-package/asset.bin' })
     assert.equal(asset.size, 256 * mib)
-    assert.equal(asset.downloadable, false)
+    assert.equal(asset.downloadable, true)
     const second = await install(first.version)
     assert.notEqual(second.version, first.version)
     await assert.rejects(install(first.version), error => error.status === 409)

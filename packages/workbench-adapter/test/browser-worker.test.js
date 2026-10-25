@@ -29,12 +29,12 @@ function worker(displayFactory, options = {}) {
   const page = Object.assign(new EventEmitter(), {
     url: () => 'https://example.com', viewportSize: () => ({width:1000,height:700}), isClosed: () => false,
     screenshot: vi.fn(async () => Buffer.from('jpeg')), title: async () => 'Example',
-    setDefaultTimeout: vi.fn(), setDefaultNavigationTimeout: vi.fn(),
+    setDefaultTimeout: vi.fn(), setDefaultNavigationTimeout: vi.fn(), waitForURL:vi.fn(async()=>{}),
     keyboard: {insertText:vi.fn(async()=>{}),press:vi.fn(async()=>{})},
     mouse: {wheel:vi.fn(async()=>{}),move:vi.fn(async()=>{})},
   })
-  const context = {route:async()=>{},newPage:async()=>page,newCDPSession:async()=>({send:async()=>({currentIndex:0,entries:[{}]})})}
-  const browser = Object.assign(new EventEmitter(), {newContext:async()=>context,close:vi.fn(async()=>{})})
+  const context = Object.assign(new EventEmitter(), {route:vi.fn(async()=>{}),close:vi.fn(async()=>{}),newPage:async()=>page,newCDPSession:async()=>({send:async()=>({currentIndex:0,entries:[{}]})})})
+  const browser = Object.assign(new EventEmitter(), {newContext:vi.fn(async()=>context),close:vi.fn(async()=>{})})
   const input = new PassThrough(), output = new PassThrough(), frames = [], exit = vi.fn()
   output.on('data',chunk=>frames.push(JSON.parse(String(chunk))))
   const launch=vi.fn(async()=>browser)
@@ -45,6 +45,82 @@ function worker(displayFactory, options = {}) {
   }
   return {page,browser,runtime,frames,exit,command,input,context,launch}
 }
+
+it('allows native downloads and service workers without disabling the HTTP cache, then closes the context',async()=>{
+  const value=worker()
+  await value.command(1,'init',{width:1000,height:700})
+  expect(value.browser.newContext).toHaveBeenCalledWith(expect.objectContaining({acceptDownloads:true,serviceWorkers:'allow'}))
+  expect(value.context.route).not.toHaveBeenCalled()
+  await value.runtime.shutdown()
+  expect(value.context.close).toHaveBeenCalledOnce()
+  expect(value.browser.close).toHaveBeenCalledOnce()
+})
+
+it.each(['display', 'launch', 'context', 'page'])('closes resources that finish %s after shutdown',async stage=>{
+  let complete
+  const display={stop:vi.fn(async()=>{})}
+  const value=worker(stage==='display' ? ()=>new Promise(resolve=>{complete=()=>resolve(display)}) : undefined)
+  value.page.close=vi.fn(async()=>{})
+  if(stage==='launch') value.launch.mockImplementation(()=>new Promise(resolve=>{complete=()=>resolve(value.browser)}))
+  if(stage==='context') value.browser.newContext.mockImplementation(()=>new Promise(resolve=>{complete=()=>resolve(value.context)}))
+  if(stage==='page') value.context.newPage=()=>new Promise(resolve=>{complete=()=>resolve(value.page)})
+  try {
+    value.input.write(JSON.stringify({id:1,action:'init',width:1000,height:700})+'\n')
+    await vi.waitFor(()=>expect(complete).toBeTypeOf('function'))
+    await value.runtime.shutdown()
+    complete()
+    await new Promise(resolve=>setImmediate(resolve))
+    if(stage==='display') {expect(display.stop).toHaveBeenCalled();expect(value.launch).not.toHaveBeenCalled()}
+    else expect(value.browser.close).toHaveBeenCalled()
+    if(stage==='context') expect(value.context.close).toHaveBeenCalled()
+    if(stage==='page') expect(value.page.close).toHaveBeenCalled()
+    expect(value.frames.some(frame=>frame.type==='frame')).toBe(false)
+  } finally {await value.runtime.shutdown()}
+})
+
+it('disposes iframe handles when their bounds fail during navigation',async()=>{
+  const value=worker(),dispose=vi.fn(async()=>{})
+  const frame={frameElement:async()=>({boundingBox:async()=>{throw new Error('detached')},dispose}),isDetached:()=>true}
+  value.page.frames=()=>[frame];value.page.mainFrame=()=>value.page
+  value.page.evaluate=async()=>({url:'https://example.com',title:'Example',viewport:{width:1000,height:700},elements:[],text:''})
+  try {
+    await value.command(1,'init',{width:1000,height:700})
+    await value.command(2,'snapshot')
+    expect(dispose).toHaveBeenCalledOnce()
+  } finally {await value.runtime.shutdown()}
+})
+
+it('does not adopt native download UI as a web tab or wait for it to close',async()=>{
+  const value=worker()
+  try {
+    await value.command(1,'init',{width:1000,height:700})
+    const native={url:()=>'',opener:vi.fn(async()=>null),close:vi.fn(()=>new Promise(()=>{}))}
+    value.context.emit('page',native)
+    await value.command(2,'text',{text:'still usable'})
+    expect(value.page.keyboard.insertText).toHaveBeenCalledWith('still usable')
+    expect(native.opener).not.toHaveBeenCalled()
+    expect(native.close).not.toHaveBeenCalled()
+  } finally {await value.runtime.shutdown()}
+})
+
+it('accepts an attachment navigation whose download event follows the goto rejection',async()=>{
+  const value=worker()
+  value.page.goto=vi.fn(async()=>{
+    setImmediate(()=>value.page.emit('download',{
+      suggestedFilename:()=> 'file.txt',path:async()=>{throw new Error('download interrupted')},
+      delete:async()=>{},cancel:async()=>{},
+    }))
+    throw new Error('page.goto: net::ERR_ABORTED')
+  })
+  try {
+    await value.command(1,'init',{width:1000,height:700})
+    await value.command(2,'navigate',{url:'https://example.com/file'})
+    expect(value.frames.find(frame=>frame.id===2).error).toBeUndefined()
+    await value.command(3,'text',{text:'still usable'})
+    expect(value.page.keyboard.insertText).toHaveBeenCalledWith('still usable')
+    expect(value.page.listenerCount('download')).toBe(1)
+  } finally {await value.runtime.shutdown()}
+})
 
 it.each(['element-click', 'element-text'])('returns lookup counts without mutating the page for %s', async action => {
   const value = worker()
@@ -163,6 +239,51 @@ function navigationFixture({ commit = true, readable = true, errorName = 'Timeou
   value.page.goto = value.page.reload = value.page.goBack = value.page.goForward = navigate
   return { ...value, navigate, frame, url }
 }
+
+it('falls back once inside one navigation and releases its request listener', async () => {
+  const value = navigationFixture(), target = 'https://example.com/loaded', fallback = 'http://example.com/loaded'
+  value.page.goto = vi.fn().mockRejectedValueOnce(new Error('net::ERR_SSL_PROTOCOL_ERROR')).mockResolvedValue({})
+  value.page.waitForLoadState.mockResolvedValue()
+  try {
+    await value.command(1, 'init', {width:1000,height:700})
+    const listeners = value.page.listenerCount('request')
+    await value.command(2, 'navigate', {url:target,fallback_url:fallback})
+    expect(value.page.goto.mock.calls.map(([url])=>url)).toEqual([target,fallback])
+    expect(value.frames.find(frame=>frame.id===2).error).toBeUndefined()
+    expect(value.page.listenerCount('request')).toBe(listeners)
+  } finally { await value.runtime.shutdown() }
+})
+
+it('shares the existing navigation deadline with HTTP fallback after a timeout', async () => {
+  const value = navigationFixture(), clock = vi.spyOn(Date, 'now').mockReturnValue(100000)
+  value.page.goto = vi.fn().mockImplementationOnce(async () => {
+    clock.mockReturnValue(115000)
+    throw Object.assign(new Error('navigation timeout'), {name:'TimeoutError'})
+  }).mockResolvedValue({})
+  value.page.waitForLoadState.mockResolvedValue()
+  try {
+    await value.command(1, 'init', {width:1000,height:700})
+    await value.command(2, 'navigate', {url:'https://example.com/',fallback_url:'http://example.com/'})
+    expect(value.page.goto.mock.calls[1][1].timeout).toBe(5000)
+    expect(value.page.waitForLoadState.mock.calls[0][1].timeout).toBe(5000)
+  } finally { clock.mockRestore(); await value.runtime.shutdown() }
+})
+
+it.each(['explicit', 'certificate', 'redirect', 'cancel', 'unrelated'])('does not downgrade a %s navigation failure', async mode => {
+  const value = navigationFixture(), target = 'https://example.com/loaded'
+  value.page.goto = vi.fn(async () => {
+    if (mode === 'redirect') value.page.emit('request',{isNavigationRequest:()=>true,frame:()=>value.frame,redirectedFrom:()=>({})})
+    if (mode === 'cancel') value.input.write(JSON.stringify({action:'cancel',cancel_id:2})+'\n')
+    throw new Error(mode === 'certificate' ? 'net::ERR_CERT_AUTHORITY_INVALID' : 'net::ERR_CONNECTION_REFUSED')
+  })
+  try {
+    await value.command(1, 'init', {width:1000,height:700})
+    await value.command(2, 'navigate', {url:target,...(mode==='explicit'?{}:{fallback_url:mode==='unrelated'?'http://other.example/loaded':'http://example.com/loaded'})})
+    expect(value.page.goto).toHaveBeenCalledOnce()
+    expect(value.frames.find(frame=>frame.id===2).error).toBeTruthy()
+    expect(value.page.listenerCount('request')).toBe(0)
+  } finally { await value.runtime.shutdown() }
+})
 
 it.each(['navigate', 'reload', 'back', 'forward'])('keeps the committed page observable after a %s load timeout', async action => {
   const value = navigationFixture()
@@ -328,10 +449,10 @@ it.each([false, true])('waits for visible renderer resize before acknowledgement
   } finally {await value.runtime.shutdown()}
 })
 
-it('replaces the displayed page with a native popup, preserving the browser identity', async () => {
+it.each(['https://example.com/child','chrome-error://chromewebdata/'])('replaces the displayed page with a native popup %s, preserving the browser identity', async url => {
   const value=worker()
   value.page.close=vi.fn(async()=>value.page.emit('close'))
-  const popup=Object.assign(new EventEmitter(),{url:()=> 'https://example.com/child',viewportSize:()=>({width:1000,height:700}),isClosed:()=>false,
+  const popup=Object.assign(new EventEmitter(),{url:()=>url,viewportSize:()=>({width:1000,height:700}),isClosed:()=>false,
     screenshot:vi.fn(async()=>Buffer.from('popup')),title:async()=> 'Child',setDefaultTimeout:vi.fn(),setDefaultNavigationTimeout:vi.fn(),
     close:vi.fn(async()=>{}),keyboard:{insertText:vi.fn(async()=>{})}})
   try {
@@ -424,13 +545,34 @@ it('rejects an already-navigated non-HTTP popup without replacing the current pa
   const value=worker()
   try {
     await value.command(1,'init',{width:1000,height:700})
-    const popup={url:()=> 'blob:https://example.com/document',close:vi.fn(async()=>{})}
+    const popup={url:()=> 'file:///workspace/document',close:vi.fn(async()=>{})}
     value.page.emit('popup',popup)
     await vi.waitFor(()=>expect(popup.close).toHaveBeenCalledOnce())
     await value.command(2,'watch',{enabled:true})
     expect(value.frames.filter(frame=>frame.type==='frame').at(-1).url).toBe('https://example.com')
     expect(value.browser.close).not.toHaveBeenCalled()
   } finally { await value.runtime.shutdown() }
+})
+
+it('adopts a generated blob document after its initially empty popup URL commits',async()=>{
+  const value=worker()
+  let url=''
+  const popup=Object.assign(new EventEmitter(), {
+    url:()=>url,isClosed:()=>false,viewportSize:()=>({width:1000,height:700}),
+    screenshot:async()=>Buffer.from('preview'),title:async()=> 'Generated preview',
+    setDefaultTimeout:vi.fn(),setDefaultNavigationTimeout:vi.fn(),close:vi.fn(async()=>{}),
+    waitForURL:vi.fn(async()=>{url='blob:https://example.com/document'}),
+  })
+  value.page.close=vi.fn(async()=>value.page.emit('close'))
+  try {
+    await value.command(1,'init',{width:1000,height:700})
+    value.page.emit('popup',popup)
+    await vi.waitFor(()=>expect(value.frames.some(frame=>frame.url===url && url.startsWith('blob:'))).toBe(true))
+    expect(popup.waitForURL).toHaveBeenCalledOnce()
+    expect(popup.close).not.toHaveBeenCalled()
+    expect(value.page.close).toHaveBeenCalledOnce()
+    expect(value.exit).not.toHaveBeenCalled()
+  } finally {await value.runtime.shutdown()}
 })
 
 it('revalidates a popup after async binding and retains the original CDP session when rejecting it', async () => {
@@ -443,7 +585,7 @@ it('revalidates a popup after async binding and retains the original CDP session
   try {
     await value.command(1,'init',{width:1000,height:700})
     value.page.emit('popup',popup)
-    url='blob:https://example.com/redirect'
+    url='file:///workspace/document'
     finishBind({send:popupHistory,detach})
     await vi.waitFor(()=>expect(popup.close).toHaveBeenCalledOnce())
     expect(detach).toHaveBeenCalledOnce()

@@ -15,7 +15,14 @@ export function browserAction(request) {
       try { url = new URL(request.url) } catch { throw httpError(400, '网页地址无效') }
       if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.href.length > 4096)
         throw httpError(400, '请输入有效的 HTTP 或 HTTPS 地址')
-      return { action, url: url.href }
+      let fallback
+      if (request.fallback_url !== undefined) {
+        try { fallback = new URL(request.fallback_url) } catch { throw httpError(400, '网页地址无效') }
+        if (url.protocol !== 'https:' || fallback.protocol !== 'http:' || fallback.username || fallback.password ||
+            fallback.href.length > 4096 || ['hostname', 'pathname', 'search', 'hash'].some(key => url[key] !== fallback[key]))
+          throw httpError(400, '网页地址无效')
+      }
+      return { action, url: url.href, ...(fallback ? { fallback_url: fallback.href } : {}) }
     }
     case 'back': case 'forward': case 'reload': case 'release-input': case 'selection': return { action }
     case 'modifiers': return { action, modifiers: modifiers || [] }
@@ -70,17 +77,31 @@ export class SandboxBrowser {
     this.handle = subprocess.spawn({ argv: ['/usr/local/bin/node', worker], cwd: '/workspace',
       signal: this.lifetime.signal, graceMs: 1500,
       stdio: { stdin: 'pipe', stdout: 'pipe', stderr: { maxBytes: 4096 } } })
-    this.done = this.handle.done.then(
+    this.exited = this.handle.done.then(
       outcome => this.dispose(outcome.exitCode === 0 && !outcome.signal
         ? httpError(410, '浏览器已经关闭，请重新打开') : httpError(502, '沙盒浏览器连接中断')),
       () => this.dispose(httpError(502, '沙盒浏览器连接中断')),
     )
+    this.done = this.waitForExit()
+    this.done.catch(() => {})
     if (!this.handle.stdin || !this.handle.stdout) { this.dispose(); throw httpError(502, '沙盒浏览器连接不可用') }
     this.handle.stdout.setEncoding('utf8')
     this.handle.stdout.on('data', chunk => this.receive(chunk))
     this.handle.stdout.on('error', () => this.dispose(httpError(502, '沙盒浏览器连接中断')))
     this.handle.stdin.on('error', () => this.dispose(httpError(502, '沙盒浏览器连接中断')))
     this.armIdle()
+  }
+  waitForExit() {
+    if (!this.cleanup) this.cleanup = (async () => {
+      await this.exited
+      // The command outcome can precede Chromium descendant cleanup. Keep the
+      // owner slot until the native provider confirms the entire range is empty.
+      if (await this.handle.waitForExit?.() === false) throw new Error('Process range is still active')
+    })().catch(() => {
+      this.cleanup = undefined
+      throw httpError(502, '浏览器进程清理未完成，请重试关闭')
+    })
+    return this.cleanup
   }
   armIdle() {
     clearTimeout(this.idleTimer)
@@ -291,7 +312,10 @@ export class WorkbenchBrowsers {
     if (browser && request.chat_id && browser.chatId !== request.chat_id) throw httpError(403, '浏览器不属于当前对话')
     if (browser?.closed) browser = undefined
     if (!browser) {
-      if (request.existing === true) throw httpError(404, '浏览器已经关闭')
+      if (request.existing === true) {
+        if (this.slots.has(key)) throw httpError(409, '浏览器关闭尚未完成，请重试关闭', 'browser/closing')
+        throw httpError(404, '浏览器已经关闭')
+      }
       browser = await this.allocate(owner, request, signal)
     }
     let abort
@@ -335,11 +359,15 @@ export class WorkbenchBrowsers {
       const settled = () => {
         this.workers.delete(worker)
         if (worker.closed) {
-          for (const [key, slot] of this.slots) if (slot.worker === worker) { this.slots.delete(key); this.items.delete(key) }
+          for (const [key, slot] of this.slots) if (slot.worker === worker) {
+            this.slots.delete(key); this.items.delete(key)
+            const currentKey = `${slot.ownerId}/${slot.chatId}`
+            if (this.current.get(currentKey) === worker.id) this.current.delete(currentKey)
+          }
           worker.pageFrames?.clear()
         }
       }
-      Promise.resolve(worker.done).then(settled, settled)
+      Promise.resolve(worker.done).then(settled, () => {})
       this.items.set(key, browser)
       this.current.set(`${owner.ownerId}/${request.chat_id}`, request.id)
       browser.ready = browser.command({ action: 'init', browser_id: request.id, width: 1000, height: 700 },
@@ -399,7 +427,10 @@ export class WorkbenchBrowsers {
   async close(owner, id) {
     const key = `${owner.ownerId}/${id}`, browser = this.items.get(key) || this.slots.get(key)?.worker
     if (!browser) return
-    browser.dispose(); await browser.done
+    browser.dispose()
+    await (browser.waitForExit ? browser.waitForExit() : browser.done)
+    this.workers.delete(browser)
+    browser.pageFrames?.clear()
     if (this.items.get(key) === browser) this.items.delete(key)
     if (this.slots.get(key)?.worker === browser) this.slots.delete(key)
     const currentKey = `${owner.ownerId}/${browser.chatId}`

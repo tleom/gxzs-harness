@@ -1,6 +1,14 @@
 import { expect, it, vi } from 'vitest'
 import { WorkbenchTerminals } from '../src/terminals.js'
 import { WorkbenchSubagents } from '../src/subagents.js'
+
+it('preserves the native capacity code so the UI and Agent can reuse an existing terminal', async () => {
+  const native={list:()=>[],create:vi.fn(async()=>{throw Object.assign(new Error('limit'),{code:'terminal/limit-reached'})})}
+  const gateway=new WorkbenchTerminals({native,service:{requireChat:()=>({sessionId:'root'})},sessions:{resolveAgent:async()=>({agent:{session:{id:'root'}}})}})
+  await expect(gateway.create({ownerId:'owner'},'chat',{id:'12345678-1234-1234-1234-123456789abc',cols:80,rows:24},new AbortController().signal))
+    .rejects.toMatchObject({status:409,code:'terminal/limit-reached'})
+  expect(gateway.creating.size).toBe(0)
+})
 import { sendError } from '../src/http.js'
 const owner = { ownerId: 'signed-owner' }
 const chat = { id: 'chat', sessionId: 'root' }
@@ -150,6 +158,41 @@ it('rejects invalid terminal inputs before the native stream and detaches on ada
   gateway.dispose()
   expect(abort).toHaveBeenCalledOnce()
   expect(pending.signal.aborted).toBe(true)
+  expect(gateway.attachments.size).toBe(0)
+})
+it.each(['create','follow','control'])('does not start %s after disposal during Session resolution',async action=>{
+  let resolve
+  const native={create:vi.fn(),list:vi.fn(()=>[]),close:vi.fn(),retain:vi.fn()}
+  const connection={createPeer:vi.fn()}
+  const sessions={resolveAgent:vi.fn(()=>new Promise(done=>{resolve=done}))}
+  const gateway=new WorkbenchTerminals({native,service,sessions,connection})
+  const signal=new AbortController().signal
+  const pending=action==='create'?gateway.create(owner,chat.id,{id:attachment},signal)
+    :action==='follow'?gateway.follow(owner,chat.id,attachment,attachment,signal).next()
+    :gateway.control(owner,chat.id,attachment,'close',{})
+  const result=expect(pending).rejects.toMatchObject({status:503})
+  gateway.dispose()
+  resolve({agent:{session:{id:chat.sessionId}}})
+  await result
+  expect(native.create).not.toHaveBeenCalled()
+  expect(native.close).not.toHaveBeenCalled()
+  expect(connection.createPeer).not.toHaveBeenCalled()
+  expect(gateway.knownSessions.size).toBe(0)
+  await expect(gateway.create(owner,chat.id,{id:attachment},signal)).rejects.toMatchObject({status:503})
+  expect(sessions.resolveAgent).toHaveBeenCalledOnce()
+})
+it.each([false,true])('distinguishes deleted terminals from retained closing slots: retained %s',async retained=>{
+  const failure={isDSHRemoteError:true,code:'terminal/unavailable'}
+  const native={environment:()=>({maxBufferedBytes:1024}),list:()=>retained?[{id:attachment}]:[],retain:()=>{throw failure}}
+  const peer={dispose:vi.fn(async()=>{})}
+  const gateway=new WorkbenchTerminals({native,service,sessions:{resolveAgent:async()=>({agent:{session:{id:chat.sessionId}}})},connection:{createPeer:()=>peer}})
+  const stream=gateway.follow(owner,chat.id,attachment,attachment,new AbortController().signal)
+  let error
+  try{await stream.next()}catch(reason){error=reason}
+  const res={writeHead:vi.fn(),end:vi.fn()}
+  sendError(res,error)
+  expect(res.writeHead.mock.calls[0][0]).toBe(retained?409:404)
+  expect(peer.dispose).toHaveBeenCalledOnce()
   expect(gateway.attachments.size).toBe(0)
 })
 it('authorizes native child history only through its parent catalog and rejects external local addresses', async () => {

@@ -28,6 +28,7 @@ if (Number(process.versions.node.split('.')[0]) < 24) throw new Error('Node 24 i
 for (const file of [helper, ptc, '/usr/bin/rg', '/usr/sbin/sshd', '/opt/office/uno_worker.py', '/usr/bin/Xvnc', '/usr/bin/xrandr',
   '/opt/office/node/node_modules/ws/package.json']) accessSync(file, constants.R_OK)
 for (const [command, args] of [
+  ['/bin/bash', ['--version']],
   ['/usr/bin/git', ['--version']],
   ['/usr/bin/rg', ['--version']],
   ['/usr/bin/python3', ['-I', '-c', 'import uno']],

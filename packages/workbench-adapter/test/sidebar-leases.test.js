@@ -60,3 +60,40 @@ it('retains more than 128 existing terminals without a terminal quantity cap',as
   leases.dispose()
   await vi.waitFor(()=>expect(retained).toBe(0))
 })
+
+it('releases a late retain and rejects queued renewals after disposal',async()=>{
+  const f=fixture(), release=vi.fn()
+  let finish
+  f.leases.retain=vi.fn(()=>new Promise(resolve=>{finish=()=>resolve({release,live:()=>true})}))
+  const request={window_id,resources:[{kind:'terminal',id,chat_id:chat}]}
+  const first=f.leases.update(owner,request)
+  const firstResult=expect(first).rejects.toMatchObject({status:503})
+  const queued=f.leases.update(owner,request)
+  const queuedResult=expect(queued).rejects.toMatchObject({status:503})
+  await vi.waitFor(()=>expect(f.leases.retain).toHaveBeenCalledOnce())
+  f.leases.dispose()
+  finish()
+  await Promise.all([firstResult,queuedResult])
+  expect(release).toHaveBeenCalledOnce()
+  expect(f.leases.windows.size).toBe(0)
+  expect(f.leases.serial.size).toBe(0)
+  expect(f.leases.retain).toHaveBeenCalledOnce()
+  await expect(f.leases.update(owner,request)).rejects.toMatchObject({status:503})
+})
+
+it('cancels a pending native retain when the service is disposed',async()=>{
+  const f=fixture()
+  let signal
+  f.leases.terminals.native.retain=async function*(_session,_id,lifetime){
+    signal=lifetime
+    await new Promise(resolve=>{lifetime.addEventListener('abort',resolve,{once:true});if(lifetime.aborted)resolve()})
+    lifetime.throwIfAborted()
+  }
+  const updating=f.leases.update(owner,{window_id,resources:[{kind:'terminal',id,chat_id:chat}]})
+  const result=expect(updating).rejects.toMatchObject({status:503})
+  await vi.waitFor(()=>expect(signal).toBeDefined())
+  f.leases.dispose()
+  expect(signal.aborted).toBe(true)
+  await result
+  expect(f.leases.windows.size).toBe(0)
+})

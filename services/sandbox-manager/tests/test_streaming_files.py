@@ -73,6 +73,30 @@ def test_directory_budget_uses_uncompressed_bytes_and_has_no_entry_cap(tmp_path,
         file_download.write_download({'path': 'files'}, io.BytesIO(), str(tmp_path))
 
 
+def test_large_file_download_bypasses_json_read_limit_and_leaves_no_staging_files(tmp_path):
+    target = tmp_path / 'large.bin'
+    size = 101 * 1024 * 1024 + 1
+    with target.open('wb') as stream:
+        stream.truncate(size)
+    metadata = file_ops.operate({'operation': 'stat', 'path': target.name}, str(tmp_path))
+    assert metadata['downloadable'] is True
+    class Sink:
+        total = 0
+        header = None
+        def write(self, chunk):
+            if self.header is None:
+                self.header = json.loads(chunk)
+            else:
+                assert len(chunk) <= 64 * 1024
+                self.total += len(chunk)
+        def flush(self):
+            pass
+    sink = Sink()
+    file_download.write_download({'path': target.name}, sink, str(tmp_path))
+    assert sink.total == sink.header['size'] == size
+    assert list(tmp_path.iterdir()) == [target]
+
+
 def test_download_rejects_symlink_and_traversal(tmp_path):
     (tmp_path / 'target').write_bytes(b'private')
     (tmp_path / 'link').symlink_to(tmp_path / 'target')
