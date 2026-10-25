@@ -305,6 +305,16 @@ describe('DSH session event projection', () => {
     })
   })
 
+  it('preserves the native string error from a failed compaction', () => {
+    const { database, chat } = setup()
+    projectSessionEvent(database, chat.sessionId, {
+      type: 'compaction/end', data: { compactionId: 'failed', turn: null, error: 'summarization produced no text summary content' },
+    })
+    expect(database.getControl(chat.ownerId, chat.id).compaction).toMatchObject({
+      id: 'failed', phase: 'failed', message: 'summarization produced no text summary content',
+    })
+  })
+
   it('persists explicit DSH deliveries for replay', () => {
     const { database, chat, run } = setup()
     bind(database, chat, run)

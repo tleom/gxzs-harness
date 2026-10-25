@@ -419,7 +419,7 @@ function projectControlEvent(database, chat, sessionId, event) {
     const current = database.getControl(chat.ownerId, chat.id).compaction
     update = { compaction: {
       id: event.data?.compactionId ?? current?.id ?? '', phase,
-      message: event.data?.error?.message ?? current?.message ?? null,
+      message: event.data?.error ?? current?.message ?? null,
       before_tokens: current?.before_tokens ?? null, after_tokens: current?.after_tokens ?? null,
     } }
   }
