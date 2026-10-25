@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { DatabaseSync } from 'node:sqlite'
 import { platformToolName, platformToolNames, publicToolName } from '../src/names.js'
 import { apply } from '../src/index.js'
+import * as schemas from '../src/schema.js'
 import { buildCatalog, renderCatalog } from '../../tool-discovery/src/catalog.js'
 
 const catalogTool = {
@@ -30,6 +31,34 @@ function setup({ authorized = true } = {}) {
 }
 
 describe('platform MCP proxy tools', () => {
+  it('reuses unchanged schema validation while applying current versions, definitions and removals', async () => {
+    const { ctx, platform, definitions } = setup()
+    const schema = { type: 'object', properties: { query: { type: 'string', minLength: 2 } } }
+    const current = { ...catalogTool, inputSchema: schema }
+    const adapt = vi.spyOn(schemas, 'adaptInputSchema')
+    try {
+      platform.json.mockImplementation(async ({ route }) => route === 'mcp/catalog'
+        ? { tools: [JSON.parse(JSON.stringify(current))] }
+        : { data: { result: { content: [{ type: 'text', text: 'found' }] } } })
+      await apply(ctx)
+      expect(adapt).toHaveBeenCalledTimes(1)
+      for (let i = 0; i < 10; i++) await ctx.workbenchRuntime.refreshMcpCatalog()
+      expect(adapt).toHaveBeenCalledTimes(1)
+      current.version = 'v2'
+      current.description = 'Changed description'
+      const snapshot = await ctx.workbenchRuntime.refreshMcpCatalog()
+      expect(snapshot.tools[0]).toMatchObject({ version: 'v2', description: 'Changed description' })
+      expect(adapt).toHaveBeenCalledTimes(1)
+      current.inputSchema.properties.query.minLength = 5
+      await ctx.workbenchRuntime.refreshMcpCatalog()
+      expect(adapt).toHaveBeenCalledTimes(2)
+      await expect(definitions.get('search').execute({ query: 'abc' },
+        { callId: 'changed-bounds', agent: { id: 's' }, signal: new AbortController().signal })).rejects.toThrow('schema')
+      platform.json.mockResolvedValueOnce({ tools: [] })
+      expect((await ctx.workbenchRuntime.refreshMcpCatalog()).tools).toEqual([])
+      expect(definitions.has('search')).toBe(false)
+    } finally { adapt.mockRestore() }
+  })
   it('registers an implicit 2020-12 tool and validates concurrent requests before platform IO', async () => {
     const { ctx, definitions, platform } = setup()
     const inputSchema = { type: 'object', properties: { query: { type: 'string' }, account: { type: 'string' } },

@@ -10,11 +10,12 @@ export function taskRecoveryScopes(ctx, journal, resume) {
   const sync = agent => {
     dispose(agent)
     const runtime = ctx.workbenchRuntime
+    const pending = journal?.pending(runtime.ownerId)
+    if (!pending?.length) return
     const run = runtime.executionRun?.(agent?.session?.id ?? agent?.id)
     const tools = agent?.ctx?.get?.('tools')
     if (!journal || !run || !tools || run.ownerId !== runtime.ownerId
       || run.status !== 'running' || run.stopConfirmation?.fenced) return
-    const pending = journal.pending(run.ownerId)
     const disposers = []
     try {
       for (const tool of run.mcpTools ?? []) {

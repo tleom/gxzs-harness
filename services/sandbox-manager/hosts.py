@@ -361,8 +361,9 @@ class Hosts:
                     '-v', str(host_state / 'hosts' / item['workspace_id']) + ':/run/gxzs:ro',
                     '-v', str(host_state / 'hosts' / item['workspace_id'] / 'ssh') + ':/home/gxzs/.ssh:ro', image)
 
-    def _container_identity(self, item, advertise):
-        info = json.loads(self.docker('inspect', host_name(item)).stdout)[0]
+    def _container_identity(self, item, advertise, *, info=None):
+        if info is None:
+            info = json.loads(self.docker('inspect', host_name(item)).stdout)[0]
         self._verify_named_container(item, info)
         ports = (info.get('NetworkSettings', {}).get('Ports') or {}).get('3081/tcp')
         if not ports or not isinstance(ports[0], dict) or not str(ports[0].get('HostPort', '')).isdecimal():
@@ -1076,22 +1077,29 @@ class Hosts:
                     self.failures.pop(current['instance_id'], None)
                     self.recoveries.pop(current['instance_id'], None)
                 return
-            healthy = bool(host_running and sandbox_healthy and item.get('endpoint') and self.healthy(item['endpoint']))
-            alive = bool(healthy or (host_running and item.get('endpoint') and self.alive(item['endpoint'])))
+            # Docker can allocate a different published port after an external
+            # restart. Probe the inspected container before retaining its endpoint.
+            endpoint = (self._container_identity(item, os.environ['GXZS_HOST_ADVERTISE_IP'], info=info)['endpoint']
+                        if host_running else item.get('endpoint'))
+            healthy = bool(host_running and sandbox_healthy and endpoint and self.healthy(endpoint))
+            alive = bool(healthy or (host_running and endpoint and self.alive(endpoint)))
             dependency_degraded = bool(not healthy and alive and sandbox_healthy
-                                       and self.dependency_degraded(item['endpoint']))
+                                       and self.dependency_degraded(endpoint))
             process_pressure = bool(host_running and sandbox_running and
                                     (pid_pressure(info) or pid_pressure(sandbox_info)))
-            native_activity = self.native_activity(item['endpoint']) if healthy or alive else None
+            native_activity = self.native_activity(endpoint) if healthy or alive else None
             # A later complete readiness/activity response supersedes an earlier
             # timed-out probe. Do not recover a Host that has already caught up.
             healthy = healthy or (sandbox_healthy and native_activity is not None)
-            failed_transport_activity = (self.failed_transport_activity(item['endpoint'])
+            failed_transport_activity = (self.failed_transport_activity(endpoint)
                                          if not healthy and alive else None)
             with self.lock(record.parent.name):
                 item = json.loads(record.read_text())
                 if item != observed:
                     return
+                if alive and endpoint != item.get('endpoint'):
+                    item['endpoint'] = endpoint
+                    self._save(record, item)
                 activity = self.root.parent / item['workspace_id']
                 if native_activity is not None:
                     previous = self.native_snapshots.get(item['instance_id'])

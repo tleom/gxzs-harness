@@ -1,6 +1,15 @@
 import { expect, it, vi } from 'vitest'
 import { taskRecoveryScopes } from '../src/task-recovery.js'
 
+it('does not hydrate frozen run catalogs when the owner has no retained tasks', () => {
+  const executionRun = vi.fn(() => { throw new Error('unneeded catalog hydration') })
+  const pending = vi.fn(() => [])
+  const scopes = taskRecoveryScopes({ workbenchRuntime: { ownerId: 'owner', executionRun } }, { pending }, vi.fn())
+  scopes.sync({ id: 'agent' })
+  expect(pending).toHaveBeenCalledWith('owner')
+  expect(executionRun).not.toHaveBeenCalled()
+})
+
 it('offers retained tasks only in an authorized run and uses their exact saved receipt', async () => {
   const record = { ref: 'old-run:old-call', runId: 'old-run', callId: 'old-call', resourceId: 'global:mcp:reports:make', version: '1', manifestVersion: 'm', args: {} }
   const journal = { pending: vi.fn(() => [record]) }
