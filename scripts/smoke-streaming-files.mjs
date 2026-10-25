@@ -151,7 +151,7 @@ try {
     const resources = await manager.personalResources({ operation: 'list' })
     assert.equal(resources.skills.find(skill => skill.id === 'streamed-package').version, finalVersion)
     await manager.personalResources({ operation: 'skill_uninstall', name: 'streamed-package', version: finalVersion })
-    console.log('PASS skill package: one-upload staged imports, 256 MiB assets in a 128 MiB sandbox, atomic replacement, receipts, cancellation and stale-version rejection')
+    console.log('PASS skill package: one-upload staged imports, 256 MiB assets, atomic replacement, receipts, cancellation and stale-version rejection')
   } else if (phase === 'mixed') {
     const nativeRequire = createRequire('/opt/workbench/profiles/workbench/package.json')
     const { Context } = nativeRequire('@deepseek-ai/cordis')

@@ -228,10 +228,13 @@ with zipfile.ZipFile('/workspace/probe/skill-package.zip', 'w', compression=zipf
 """)
     memory = mixed_after['HostConfig']['Memory']
     memory_swap = mixed_after['HostConfig']['MemorySwap']
-    docker('update', '--memory', '128m', '--memory-swap', '128m', sandbox)
+    # The import process is separately tested with a 128 MiB RLIMIT_AS. This
+    # cgroup also contains SSH, supervision and charged filesystem pages.
+    docker('update', '--memory', '256m', '--memory-swap', '256m', sandbox)
     try:
         streaming_probe('skill-package')
         assert not json.loads(docker('inspect', sandbox).stdout)[0]['State']['OOMKilled']
+        print('PASS streaming skill package in a 256 MiB sandbox, including SSH and supervision', flush=True)
     finally:
         docker('update', '--memory', str(memory), '--memory-swap', str(memory_swap), sandbox)
     # Freeze a real importer during extraction, then restart only its manager.
