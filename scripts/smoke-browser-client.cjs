@@ -47,6 +47,14 @@ async function main() {
       await receive([1, 1])
       await receive([0, 0, 0, 0])
       await receive([3, 32, 2, 88, 32, 24, 0, 1, 0, 255, 0, 255, 0, 255, 16, 8, 0, 0, 0, 0, 0, 0, 0, 4, 116, 101, 115, 116])
+      const encodings = writes.find(bytes => bytes[0] === 2)
+      const encodingBytes = Uint8Array.from(encodings)
+      const view = new DataView(encodingBytes.buffer)
+      const negotiated = Array.from({ length: view.getUint16(2) }, (_, index) => view.getInt32(4 + index * 4))
+      const requestPacing = !negotiated.includes(-313)
+      const updateRequests = writes.filter(bytes => bytes[0] === 3).length
+      await receive([0, 0, 0, 0])
+      const requestsNextFrame = writes.filter(bytes => bytes[0] === 3).length === updateRequests + 1
       const start = writes.length
       // No following network packet is allowed to rescue this parse. The real
       // server can wait forever for the fence reply in this single message.
@@ -129,13 +137,15 @@ async function main() {
       await tick()
       const enabledWebRtcClosed = peer?.connectionState === 'closed' && dataChannel?.readyState === 'closed'
       const upgradeCancelled = rtc._udpPeer === null && rtc._udpChannel === null
-      return { connected, disconnected: initialDisconnected, coalescedFenceReplied, incompleteDidNotReply, fragmentedFenceReplied,
+      return { connected, disconnected: initialDisconnected, requestPacing, requestsNextFrame, coalescedFenceReplied, incompleteDidNotReply, fragmentedFenceReplied,
         initialPixelsTransparent, resetPixelsTransparent, websiteBlackPixelPreserved, whiteBackdrop,
         disabledWebRtcAllocatedNoPeers, reconnectsAllocatedNoPeers, reconnectsRemovedCanvases, enabledWebRtcClosed, upgradeCancelled,
         paintedBitmapsReleased, evictedBitmapReleased, supersededFrameReleased, lateFrameReleased, clearedBitmapsReleased, disposedBitmapsReleased, channelClosed }
     })
     assert.equal(result.connected, true)
     assert.equal(result.disconnected, false)
+    assert.equal(result.requestPacing, true, 'Lossless updates must use upstream request/reply pacing')
+    assert.equal(result.requestsNextFrame, true, 'Completing an update must request the next frame')
     assert.equal(result.coalescedFenceReplied, true, 'Coalesced encoder capabilities must not strand the ServerFence')
     assert.equal(result.incompleteDidNotReply, true)
     assert.equal(result.fragmentedFenceReplied, true)
