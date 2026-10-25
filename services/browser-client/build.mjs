@@ -48,6 +48,8 @@ try {
         if (text.split(encoders).length !== 2) throw new Error('Kasm video-encoder dispatch contract changed')
         const jpegCapability = 'encs.push(encodings.pseudoEncodingQualityLevel0 + this._qualityLevel);'
         if (text.split(jpegCapability).length !== 2) throw new Error('Kasm JPEG capability contract changed')
+        const continuousUpdates = 'encs.push(encodings.pseudoEncodingContinuousUpdates);'
+        if (text.split(continuousUpdates).length !== 2) throw new Error('Kasm update pacing contract changed')
         const frameHook = 'this._display.onflush = this._onFlush.bind(this);'
         if (text.split(frameHook).length !== 2) throw new Error('Kasm frame observer contract changed')
         const udpInit = "if (typeof RTCPeerConnection !== 'undefined' && this._isPrimaryDisplay) {"
@@ -59,6 +61,9 @@ try {
         return { contents: text.replace(declaration, 'this._supportsMultiMonitor = false;')
           // With no JPEG capability or WebP negotiation, Tight uses lossless zlib pixels.
           .replace(jpegCapability, '')
+          // Use upstream request/reply pacing across the authenticated relay.
+          // Continuous lossless animation can otherwise overrun its bounded queue.
+          .replace(continuousUpdates, '')
           .replace(udpInit, "if (this._useUdp && typeof RTCPeerConnection !== 'undefined' && this._isPrimaryDisplay) {")
           .replace(udpUpgrade, 'this._udpUpgradeTimeout = ' + udpUpgrade)
           .replace(disconnect, disconnect + `

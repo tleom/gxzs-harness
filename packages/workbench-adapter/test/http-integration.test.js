@@ -722,9 +722,9 @@ describe('authenticated workbench HTTP handler', () => {
     const created = await call(handler, key, 'POST', '/chats', {})
     const chatId = created.body.data.id
     const directory = context.workbenchFileManager.operate.mock.calls.at(-1)[0].path
-    expect(directory).toMatch(new RegExp(`^conversations/\\d{4}-\\d{2}-\\d{2}/${chatId}$`))
+    expect(directory).toMatch(/^conversations\/\d{4}-\d{2}-\d{2}\/new-chat(?:-\d+)?$/)
     expect(context.workbenchFileManager.operate).toHaveBeenCalledWith({
-      operation: 'mkdir', path: directory,
+      operation: 'mkdir', path: directory, unique: true,
     })
     context.workbenchFileManager.operate.mockClear()
     await call(handler, key, 'GET', `/chats/${chatId}`)

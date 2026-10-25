@@ -80,7 +80,7 @@ function observePage() {
     viewport: { x: scrollX, y: scrollY, width: innerWidth, height: innerHeight }, text: parts.join('\n').slice(0,20000), elements }
 }
 
-function runWorker({ chromium, input = process.stdin, output = process.stdout, exit = code => process.exit(code), displayFactory = displayAvailable() ? startDisplay : undefined, commandTimeoutMs = 30_000, cancelGraceMs = 1_000, workspace = process.cwd() }) {
+function runWorker({ chromium, input = process.stdin, output = process.stdout, exit = code => process.exit(code), displayFactory = displayAvailable() ? startDisplay : undefined, commandTimeoutMs = 30_000, cancelGraceMs = 1_000, workspace = '/workspace', directory = process.cwd() }) {
   let browser, context, page, session, watching = false, capturing = false, closed = false
   let display
   let legacyPixels = false
@@ -88,7 +88,7 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
   let timer, notice = '', navigation = 0, hasFrame = false, navigating = false, lastFrame
   let captureFinished = Promise.resolve(), finishCapture = () => {}
   let latestDownload, downloadSequence = 0
-  const downloads = createBrowserDownloads({ workspace, report: update => {
+  const downloads = createBrowserDownloads({ workspace, directory, report: update => {
     if (closed) return
     notice = update.notice
     if (update.download) latestDownload = update.download

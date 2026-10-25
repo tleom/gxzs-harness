@@ -73,9 +73,10 @@ export class WorkbenchService {
         directory: target.path === '.' ? 'conversations' : `conversations/${target.path}` })
     }
     const date = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date())
-    const directory = `conversations/${date}/${id}`
     await this.fileManager.operate({ operation: 'mkdir', path: `conversations/${date}` })
-    await this.fileManager.operate({ operation: 'mkdir', path: directory })
+    // A new chat may start from a terminal before it has a title or first prompt.
+    // Reserve the short directory atomically; retain its mapping when the chat is renamed.
+    const { path: directory } = await this.fileManager.operate({ operation: 'mkdir', path: `conversations/${date}/new-chat`, unique: true })
     const created = await this.sessions.create({ cwd: this.chatDirectory(id, directory) })
     const chat = this.database.createChat({ id, ownerId: owner.ownerId, sessionId: created.sessionId, selection, directory })
     return chat

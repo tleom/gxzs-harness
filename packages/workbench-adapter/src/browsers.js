@@ -56,7 +56,7 @@ export function browserAction(request) {
 
 /** One ephemeral Chromium process/context in this owner's SSH sandbox. */
 export class SandboxBrowser {
-  constructor(subprocess, { idleMs = 300000, worker = '/opt/workbench/packages/workbench-adapter/src/browser-worker.cjs' } = {}) {
+  constructor(subprocess, { cwd = '/workspace', idleMs = 300000, worker = '/opt/workbench/packages/workbench-adapter/src/browser-worker.cjs' } = {}) {
     this.pending = new Map()
     this.listeners = new Set()
     this.viewers = new Map()
@@ -74,7 +74,7 @@ export class SandboxBrowser {
     this.watchBusy = false
     this.idleMs = idleMs
     this.lifetime = new AbortController()
-    this.handle = subprocess.spawn({ argv: ['/usr/local/bin/node', worker], cwd: '/workspace',
+    this.handle = subprocess.spawn({ argv: ['/usr/local/bin/node', worker], cwd,
       signal: this.lifetime.signal, graceMs: 1500,
       stdio: { stdin: 'pipe', stdout: 'pipe', stderr: { maxBytes: 4096 } } })
     this.exited = this.handle.done.then(
@@ -297,7 +297,7 @@ export class SandboxBrowser {
 }
 
 export class WorkbenchBrowsers {
-  constructor({ subprocess, service, create = () => new SandboxBrowser(subprocess) }) { this.items = new Map(); this.workers = new Set(); this.current = new Map(); this.slots = new Map(); this.allocating = new Map(); this.createBrowser = create; this.service = service }
+  constructor({ subprocess, service, create = cwd => new SandboxBrowser(subprocess, { cwd }) }) { this.items = new Map(); this.workers = new Set(); this.current = new Map(); this.slots = new Map(); this.allocating = new Map(); this.createBrowser = create; this.service = service }
   count(ownerId, chatId) { return [...this.slots.values()].filter(slot => slot.ownerId === ownerId && slot.chatId === chatId).length }
   activity() { return [...this.workers].filter(worker => !worker.closed && (worker.listeners?.size || worker.pending?.size || worker.windowHolds?.size)).length }
   async create(owner, request, signal) {
@@ -349,7 +349,9 @@ export class WorkbenchBrowsers {
         await this.close(owner, key.slice(owner.ownerId.length + 1))
       signal.throwIfAborted()
       if (this.disposed) throw httpError(410, '浏览器服务已经关闭')
-      const browser = this.createBrowser()
+      const chat = request.chat_id && this.service?.requireChat(owner, request.chat_id)
+      const cwd = chat ? this.service.chatDirectory(chat.id, chat.directory) : '/workspace'
+      const browser = this.createBrowser(cwd)
       browser.rootPageId = request.id
       browser.id = request.id
       browser.chatId = request.chat_id
