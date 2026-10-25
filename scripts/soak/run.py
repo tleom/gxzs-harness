@@ -94,7 +94,7 @@ else:
         cases = [(rows[0], case)]
     elif args.action == 'soak':
         # Thirty independent owners; four simultaneously submitted root chats each.
-        # Native global limits remain 15 owners / 30 root tasks, 2 per owner.
+        # Native admission allows 15 active owners and 3 root tasks per owner.
         for lane in range(4):
             for index, row in enumerate(rows):
                 duration = args.minutes * 60000 if index == 0 and lane == 0 else 20 * 60000

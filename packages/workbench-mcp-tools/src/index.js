@@ -133,7 +133,7 @@ export async function apply(ctx, config = {}) {
       if (isTaskRecoveryName(name) || ['list_mcp_resources', 'list_mcp_resource_templates', 'read_mcp_resource'].includes(name)) return true
       const existing = ctx.tools.get?.(name)
       return Boolean(existing && ![...registrations.values()].some(item => item.definition === existing))
-    })
+    }, registrations)
     catalogIssues = catalog.issues ?? []
     const plugins = payload.data?.plugins ?? payload.plugins ?? []
     if (!Array.isArray(plugins) || plugins.some(plugin => !plugin || typeof plugin.id !== 'string' || typeof plugin.name !== 'string'
@@ -330,7 +330,7 @@ async function callProxy(ctx, tool, args, exec, { task = false, recovery, journa
   throw new Error('Platform MCP response is missing CallToolResult.content')
 }
 
-function normalizeCatalog(value, reserved) {
+function normalizeCatalog(value, reserved, registrations) {
   if (!Array.isArray(value)) throw new Error('platform MCP catalog must be an array')
   const runtimeNames = new Set()
   const ids = new Set()
@@ -344,7 +344,13 @@ function normalizeCatalog(value, reserved) {
     if (!/^[A-Za-z][A-Za-z0-9_-]{0,127}$/.test(tool.runtime_name) || runtimeNames.has(tool.runtime_name)) throw new Error('MCP runtime names must be valid and unique')
     if (!['global', 'personal'].includes(tool.scope) || typeof tool.version !== 'string' || !tool.version) throw new Error('invalid MCP scope or version')
     if (!tool.inputSchema || typeof tool.inputSchema !== 'object' || Array.isArray(tool.inputSchema)) throw new Error('invalid MCP input schema')
-    const adapted = adaptInputSchema(tool.inputSchema)
+    // Reuse the registered validator only for the identical source schema.
+    // Still rebuild the current catalog, aliases and authorization on every read.
+    const previous = registrations.get(tool.runtime_name)?.tool
+    const adapted = previous?.id === tool.id
+      && definitionStamp(previous.sourceInputSchema) === definitionStamp(tool.inputSchema)
+      ? { schema: previous.inputSchema, validate: previous.validateArguments }
+      : adaptInputSchema(tool.inputSchema)
     runtimeNames.add(tool.runtime_name)
     ids.add(tool.id)
     return [{ ...tool, definitionStamp: definitionStamp(tool), sourceInputSchema: tool.inputSchema, inputSchema: adapted.schema, validateArguments: adapted.validate, manifest_version: tool.manifest_version ?? '' }]

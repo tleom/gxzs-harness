@@ -16,7 +16,8 @@ from hosts import Hosts
 
 
 @pytest.fixture
-def host(tmp_path):
+def host(tmp_path, monkeypatch):
+    monkeypatch.setenv('GXZS_HOST_ADVERTISE_IP', '10.16.9.237')
     locks = {}
     def docker(*args, **_kwargs):
         assert args[0] == 'inspect'
@@ -26,6 +27,9 @@ def host(tmp_path):
                    lambda workspace: locks.setdefault(workspace, threading.RLock()),
                    SimpleNamespace(busy=lambda _owner: False), None)
     result.healthy = Mock(return_value=True)
+    # These tests isolate maintenance dispatch; Docker endpoint reconciliation
+    # is exercised with real inspection payloads in test_hosts.py.
+    result._container_identity = Mock(side_effect=lambda item, _advertise, **_kwargs: {'endpoint': item['endpoint']})
     result.native_activity = Mock(return_value=dict(
         runningAgents=0, pendingMessages=0, runningJobs=0,
         activeSchedules=0, activeSidebarResources=0, activeSettingsWrites=0))

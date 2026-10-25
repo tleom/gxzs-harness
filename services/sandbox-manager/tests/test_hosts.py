@@ -41,6 +41,31 @@ def test_ready_ensure_reconfirms_without_provisioning_or_restarting(tmp_path, mo
     assert not any(call.args[0] in {'start', 'stop', 'create'} for call in docker.call_args_list)
 
 
+@pytest.mark.parametrize('reachable', [True, False])
+def test_maintenance_reconciles_a_restarted_hosts_published_port_without_restarting_work(tmp_path, monkeypatch, reachable):
+    host, docker, _, payload, created = setup(tmp_path, monkeypatch)
+    host.ensure('workspace', payload)
+    maintain(host)
+    record = host.root / 'workspace' / 'host.json'
+    before = json.loads(record.read_text())
+    created['NetworkSettings']['Ports']['3081/tcp'][0]['HostPort'] = '32002'
+    endpoint = 'http://10.16.9.237:32002'
+    host.healthy.side_effect = lambda current: reachable and current == endpoint
+    host.alive = Mock(return_value=False)
+    if not reachable:
+        host.native_activity.return_value = None
+    host.heartbeat.reset_mock()
+    docker.reset_mock()
+    maintain(host)
+    after = json.loads(record.read_text())
+    assert after['endpoint'] == (endpoint if reachable else before['endpoint'])
+    assert (after['generation'], after['instance_id']) == (before['generation'], before['instance_id'])
+    assert not any(call.args[0] in {'start', 'stop', 'rename', 'create'} for call in docker.call_args_list)
+    if reachable:
+        assert host.heartbeat.call_args.args[0]['endpoint'] == endpoint
+        assert host.ensure('workspace', payload)['ready'] is True
+
+
 def test_ready_ensure_retains_the_existing_activity_renewal(tmp_path, monkeypatch):
     host, _, _, payload, _ = setup(tmp_path, monkeypatch)
     host.ensure('workspace', payload)
