@@ -47,7 +47,8 @@ with tempfile.TemporaryDirectory(prefix='gxzs-ssh-smoke-') as directory:
     key.chmod(0o600)
     known = Path(directory) / 'known_hosts'
     known.write_text(fixture['known_hosts'])
-    command = ['ssh', '-p', '2222', '-i', str(key),
+    # DSH's SSH transport does not forward the local client's locale settings.
+    command = ['ssh', '-F', '/dev/null', '-p', '2222', '-i', str(key),
         '-o', 'IdentitiesOnly=yes', '-o', 'StrictHostKeyChecking=yes',
         '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=5',
         '-o', 'UserKnownHostsFile=' + str(known), 'gxzs@127.0.0.1', 'id -u']
@@ -58,6 +59,11 @@ with tempfile.TemporaryDirectory(prefix='gxzs-ssh-smoke-') as directory:
     assert subprocess.check_output(command, timeout=10).strip() == b'ssh-office-python-ok'
     command[-1] = 'node -e ' + shlex.quote("require('pptxgenjs'); require('sharp'); console.log('ssh-office-node-ok')")
     assert subprocess.check_output(command, timeout=10).strip() == b'ssh-office-node-ok'
+    command[-1] = 'node'
+    result = subprocess.run(command, input=fixture['download_probe'], text=True,
+                            capture_output=True, timeout=25)
+    assert result.returncode == 0, result.stderr
+    print(result.stdout, end='')
     command[-1] = 'id -u'
     wrong = Path(directory) / 'wrong_id'
     subprocess.run(['ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', str(wrong)], check=True)
@@ -108,9 +114,11 @@ def verify(container, host_image=None):
         # The fixture's loopback connection uses the host key read by the real
         # manager. Only the address changes inside this network-isolated test.
         known = known.replace(f'[{container}]:2222 ', '[127.0.0.1]:2222 ', 1)
-        docker('exec', '-i', container, '/usr/local/bin/python', '-I', '-S', '-c', AUTH_CHECK,
+        result = docker('exec', '-i', container, '/usr/local/bin/python', '-I', '-S', '-c', AUTH_CHECK,
                stdin=json.dumps({'private': key.read_text(), 'public': key.with_suffix('.pub').read_text(),
-                                 'known_hosts': known}))
+                                 'known_hosts': known,
+                                 'download_probe': (Path(__file__).parent / 'smoke-browser-downloads.cjs').read_text(encoding='utf-8')}))
+        print(result.stdout, end='')
         if host_image:
             # The host shares the disposable sandbox's network namespace and
             # fixture SSH keys; attachment checks also mount its dedicated home.
