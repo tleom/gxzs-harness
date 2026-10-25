@@ -5,6 +5,22 @@ const uuid = /^[a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12}$/i
 const keys = /^(?:(?:Control|Alt|Shift|Meta)\+){0,3}(?:[a-zA-Z0-9]|Enter|Tab|Escape|Backspace|Delete|ArrowLeft|ArrowRight|ArrowUp|ArrowDown|Home|End|PageUp|PageDown|Space|F(?:[1-9]|1[0-2]))$/
 const integer = (value, min, max) => Number.isInteger(value) && value >= min && value <= max
 export function browserAction(request) {
+  const value = parseBrowserAction(request)
+  if (request.before_unload !== undefined) {
+    if (!['leave', 'stay'].includes(request.before_unload) ||
+        !['navigate', 'reload', 'back', 'forward', 'click', 'text', 'key'].includes(value.action))
+      throw httpError(400, '离页确认参数无效')
+    value.before_unload = request.before_unload
+  }
+  if (request.expected_revision !== undefined && value.action !== 'cut-selection') {
+    if (!['navigate', 'reload', 'back', 'forward'].includes(value.action) ||
+        !Number.isSafeInteger(request.expected_revision) || request.expected_revision < 0)
+      throw httpError(400, '网页观察版本无效')
+    value.expected_revision = request.expected_revision
+  }
+  return value
+}
+function parseBrowserAction(request) {
   const { action } = request
   const modifiers = request.modifiers
   if (modifiers !== undefined && (!Array.isArray(modifiers) || modifiers.length > 4 || modifiers.some(value => !['Control','Alt','Shift','Meta'].includes(value))))

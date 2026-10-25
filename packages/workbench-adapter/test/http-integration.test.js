@@ -358,11 +358,12 @@ describe('authenticated workbench HTTP handler', () => {
     const runtime = context.reflect.provide.mock.calls.find(([name]) => name === 'workbenchRuntime')[1]
     const sessionId = runtime.database.getChat('t:42', chat.id).sessionId
     runtime.hasOwnedWork = vi.fn(id => id === sessionId)
-    const response = await call(handler, key, 'DELETE', '/files', { path: 'case/a.txt' })
+    const response = await call(handler, key, 'DELETE', '/files', { path: `${chat.file_directory}/a.txt` })
     expect(response.status).toBe(409)
     expect(context.workbenchFileManager.operate.mock.calls.some(([request]) => request.operation === 'delete')).toBe(false)
-    runtime.hasOwnedWork = () => false
     expect((await call(handler, key, 'DELETE', '/files', { path: 'case/a.txt' })).status).toBe(200)
+    runtime.hasOwnedWork = () => false
+    expect((await call(handler, key, 'DELETE', '/files', { path: `${chat.file_directory}/a.txt` })).status).toBe(200)
   })
   it('returns the directory warning before any file operation for a live conversation or its parent', async () => {
     const { handler, key, context } = setup()
@@ -370,7 +371,7 @@ describe('authenticated workbench HTTP handler', () => {
     context.workbenchFileManager.operate.mockClear()
     for (const path of [chat.file_directory, chat.file_directory.split('/').slice(0, -1).join('/')]) {
       const response = await call(handler, key, 'DELETE', '/files', { path, version: 'v1' })
-      expect(response).toMatchObject({ status: 409, body: { code: 'DIRECTORY_IN_USE', message: '请先删除对应对话或工作区' } })
+      expect(response).toMatchObject({ status: 409, body: { code: 'DIRECTORY_IN_USE', message: '文件已绑定会话，暂不可删除' } })
     }
     expect(context.workbenchFileManager.operate).not.toHaveBeenCalled()
   })
@@ -671,6 +672,14 @@ describe('authenticated workbench HTTP handler', () => {
     expect(context.workbenchFileManager.operate).toHaveBeenCalledWith({ operation: 'upload', path: 'case/a.bin', version: null, data: 'AP8=' })
     await expect(call(handler, key, 'POST', '/files', { path: '/workspace', data: 'AA==' })).resolves.toMatchObject({ status: 403 })
     await expect(call(handler, key, 'POST', '/files/directories', { path: '../escape' })).resolves.toMatchObject({ status: 403 })
+    for (const operation of ['copy', 'move']) {
+      const body = { operation, path: '/workspace/case/a.bin', destination: '/workspace/case/b.bin' }
+      expect((await call(handler, key, 'POST', '/files', body)).status).toBe(200)
+      expect(context.workbenchFileManager.operate).toHaveBeenLastCalledWith({ operation, path: 'case/a.bin', destination: 'case/b.bin' })
+      expect((await call(handler, key, 'POST', '/files', { ...body, destination: '../escape' })).status).toBe(403)
+      expect((await call(handler, key, 'POST', '/files', body, false)).status).toBe(401)
+      expect((await call(handler, key, 'POST', '/files', body, true, '99')).status).toBe(403)
+    }
   })
 
   it('uses sandbox-manager metadata as the file version authority', async () => {
@@ -707,12 +716,12 @@ describe('authenticated workbench HTTP handler', () => {
     expect(context.workbenchFileManager.operate).not.toHaveBeenCalled()
   })
 
-  it('blocks file deletion while any owner run is active', async () => {
+  it('blocks deleting an active conversation file', async () => {
     const { handler, key, context } = setup()
     const chat = await call(handler, key, 'POST', '/chats', {})
     await call(handler, key, 'POST', `/chats/${chat.body.data.id}/runs`, { query: 'work', request_key: 'run-1', version: 1 })
     context.workbenchFileManager.operate.mockClear()
-    const deleted = await call(handler, key, 'DELETE', '/files', { path: 'case/a.bin', version: 'v1' })
+    const deleted = await call(handler, key, 'DELETE', '/files', { path: `${chat.body.data.file_directory}/a.bin`, version: 'v1' })
     expect(deleted).toMatchObject({ status: 409 })
     expect(context.workbenchFileManager.operate).not.toHaveBeenCalled()
   })

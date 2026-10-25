@@ -14,6 +14,13 @@ function create(fetchImpl) {
 }
 
 describe('restricted sandbox-manager file client', () => {
+  it.each(['copy', 'move'])('forwards %s through the existing owner-bound file channel', async operation => {
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({path:'b'})))
+    await create(fetchImpl).operate({operation,path:'a',destination:'b'})
+    expect(fetchImpl).toHaveBeenCalledOnce()
+    expect(JSON.parse(fetchImpl.mock.calls[0][1].body)).toEqual({operation,path:'a',destination:'b'})
+    expect(fetchImpl.mock.calls[0][1].headers['x-gxzs-owner']).toBe('t:1')
+  })
   it('applies published MCP policy and cancellation through the registered service', async () => {
     const timeout = vi.spyOn(AbortSignal, 'timeout')
     const client = create(async () => new Response(JSON.stringify({ value: 'x'.repeat(2048) })))

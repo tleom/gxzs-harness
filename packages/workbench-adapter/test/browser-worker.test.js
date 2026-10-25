@@ -33,6 +33,9 @@ function worker(displayFactory, options = {}) {
     keyboard: {insertText:vi.fn(async()=>{}),press:vi.fn(async()=>{})},
     mouse: {wheel:vi.fn(async()=>{}),move:vi.fn(async()=>{})},
   })
+  page.locator = vi.fn(() => ({ ariaSnapshot: async () => '', first() { return this } }))
+  page.addLocatorHandler = vi.fn(async (_locator, handler) => { page.inputGuard = handler })
+  page.removeLocatorHandler = vi.fn(async () => { page.inputGuard = undefined })
   const context = Object.assign(new EventEmitter(), {route:vi.fn(async()=>{}),close:vi.fn(async()=>{}),newPage:async()=>page,newCDPSession:async()=>({send:async()=>({currentIndex:0,entries:[{}]})})})
   const browser = Object.assign(new EventEmitter(), {newContext:vi.fn(async()=>context),close:vi.fn(async()=>{})})
   const input = new PassThrough(), output = new PassThrough(), frames = [], exit = vi.fn()
@@ -125,9 +128,9 @@ it('accepts an attachment navigation whose download event follows the goto rejec
 it.each(['element-click', 'element-text'])('returns lookup counts without mutating the page for %s', async action => {
   const value = worker()
   let count = 0
-  const locator = { count: vi.fn(async () => count), ariaSnapshot: async () => '',
-    scrollIntoViewIfNeeded: vi.fn(async () => {}), boundingBox: async () => ({ x: 0, y: 0, width: 20, height: 20 }),
-    isEditable: async () => true, focus: vi.fn(async () => {}) }
+  const locator = { count: vi.fn(async () => count), elementHandles: async () => Array(count).fill(locator), dispose: vi.fn(async () => {}), first() { return this }, ariaSnapshot: async () => '',
+    click: vi.fn(async ({ signal }) => { await value.page.inputGuard(); signal.throwIfAborted() }),
+    isEditable: async () => true, focus: vi.fn(async () => {}), evaluate: async () => true }
   value.page.locator = () => locator
   value.page.getByRole = vi.fn(() => locator)
   value.page.frames = () => []
@@ -151,7 +154,8 @@ it.each(['element-click', 'element-text'])('returns lookup counts without mutati
     count = 1
     await value.command(6, action, { role: 'img', name: 'arrows-alt', text: 'value', expected_revision: revision })
     expect(value.frames.find(frame => frame.id === 6).error).toBeUndefined()
-    expect(action === 'element-click' ? value.page.mouse.click : value.page.keyboard.insertText).toHaveBeenCalledOnce()
+    expect(action === 'element-click' ? locator.click : value.page.keyboard.insertText).toHaveBeenCalledOnce()
+    expect(value.page.mouse.click).not.toHaveBeenCalled()
   } finally { await value.runtime.shutdown() }
 })
 
@@ -171,8 +175,8 @@ it.each(['element-click', 'element-text'])('does not deliver %s after navigation
   const value = worker(), main = { url: () => 'https://example.com/next' }
   value.page.mainFrame = () => main
   const navigate = async () => value.page.emit('framenavigated', main)
-  const locator = { count: async () => 1, isEditable: async () => true, focus: navigate,
-    scrollIntoViewIfNeeded: navigate, boundingBox: async () => ({ x: 0, y: 0, width: 10, height: 10 }) }
+  const locator = { count: async () => 1, elementHandles: async () => [locator], dispose: vi.fn(async () => {}), isEditable: async () => true, focus: navigate, evaluate: async () => true,
+    click: async ({ signal }) => { await navigate(); await value.page.inputGuard(); signal.throwIfAborted(); await value.page.mouse.click() } }
   value.page.getByRole = () => locator
   value.page.mouse.click = vi.fn(async () => {})
   try {
@@ -185,16 +189,161 @@ it.each(['element-click', 'element-text'])('does not deliver %s after navigation
   } finally { await value.runtime.shutdown() }
 })
 
+it('reports an unclickable element and removes its native action guard without coordinate fallback', async () => {
+  const value = worker()
+  value.page.mouse.click = vi.fn()
+  const element = { dispose: vi.fn(async () => {}), click: async () => {
+    const error = new Error('element is covered'); error.name = 'TimeoutError'; throw error
+  } }
+  value.page.getByRole = () => ({ elementHandles: async () => [element] })
+  try {
+    await value.command(1, 'init', { width: 1000, height: 700 })
+    await value.command(2, 'element-click', { role: 'button', name: 'Covered', expected_revision: 0 })
+    expect(value.frames.find(frame => frame.id === 2)).toMatchObject({ value: { outcome: { kind: 'not_actionable' } } })
+    expect(value.page.mouse.click).not.toHaveBeenCalled()
+    expect(value.page.removeLocatorHandler).toHaveBeenCalledOnce()
+    expect(element.dispose).toHaveBeenCalledOnce()
+  } finally { await value.runtime.shutdown() }
+})
+
+it('aborts native click waiting immediately on cancellation and leaves the browser usable', async () => {
+  const value = worker(), delivered = vi.fn()
+  let waiting = false
+  const element = { dispose: vi.fn(async () => {}), click: async ({ signal }) => {
+    waiting = true
+    await new Promise((resolve, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }))
+    delivered()
+  } }
+  value.page.getByRole = () => ({ elementHandles: async () => [element] })
+  try {
+    await value.command(1, 'init', { width: 1000, height: 700 })
+    value.input.write(JSON.stringify({ id: 2, action: 'element-click', role: 'button', name: 'Covered', expected_revision: 0 }) + '\n')
+    await vi.waitFor(() => expect(waiting).toBe(true))
+    value.input.write(JSON.stringify({ action: 'cancel', cancel_id: 2 }) + '\n')
+    await vi.waitFor(() => expect(value.frames.find(frame => frame.id === 2)?.error).toBe('浏览器操作已取消'))
+    await value.command(3, 'text', { text: 'still usable' })
+    expect(value.page.keyboard.insertText).toHaveBeenCalledWith('still usable')
+    expect(delivered).not.toHaveBeenCalled()
+    expect(value.page.removeLocatorHandler).toHaveBeenCalledOnce()
+    expect(element.dispose).toHaveBeenCalledOnce()
+    expect(value.exit).not.toHaveBeenCalled()
+  } finally { await value.runtime.shutdown() }
+})
+
+it('does not resolve a replacement node after the pinned iframe element detaches', async () => {
+  const value = worker(), replacementClick = vi.fn()
+  const element = { dispose: vi.fn(async () => {}), click: async () => { throw new Error('Element is not attached to the DOM') } }
+  const locator = { elementHandles: vi.fn(async () => [element]), click: replacementClick }
+  value.page.getByRole = () => locator
+  try {
+    await value.command(1, 'init', { width: 1000, height: 700 })
+    await value.command(2, 'element-click', { role: 'button', name: 'Old frame target' })
+    expect(value.frames.find(frame => frame.id === 2)).toMatchObject({ value: { outcome: { kind: 'stale' } } })
+    expect(locator.elementHandles).toHaveBeenCalledOnce()
+    expect(replacementClick).not.toHaveBeenCalled()
+    expect(element.dispose).toHaveBeenCalledOnce()
+  } finally { await value.runtime.shutdown() }
+})
+
+it.each(['navigate', 'reload', 'back', 'forward'])('returns an observed cancellation for beforeunload during %s and allows an explicit leave', async action => {
+  const value = worker(), dismiss = vi.fn(async () => {}), accept = vi.fn(async () => {})
+  const navigate = vi.fn(async () => {
+    const accepted = accept.mock.calls.length
+    value.page.emit('dialog', { type: () => 'beforeunload', dismiss, accept })
+    if (accept.mock.calls.length === accepted) throw new Error('net::ERR_ABORTED')
+  })
+  for (const method of ['goto', 'reload', 'goBack', 'goForward']) value.page[method] = navigate
+  value.page.evaluate = async () => ({ text: 'Current page', elements: [], viewport: {} })
+  try {
+    await value.command(1, 'init', { width: 1000, height: 700 })
+    await value.command(2, action, { url: 'https://example.com/new' })
+    expect(value.frames.find(frame => frame.id === 2)).toMatchObject({ value: { outcome: { kind: 'navigation_cancelled' } } })
+    expect(value.frames.find(frame => frame.id === 2).value.revision).toEqual(expect.any(Number))
+    expect(value.frames.find(frame => frame.id === 2).error).toBeUndefined()
+    await value.command(3, 'snapshot')
+    const snapshot = value.frames.find(frame => frame.id === 3).value
+    expect(snapshot.notice).toBe('已取消离开当前页面')
+    expect(snapshot.revision).toBe(value.frames.find(frame => frame.id === 2).value.revision)
+    await value.command(4, action, { url: 'https://example.com/new', before_unload: 'leave', expected_revision: snapshot.revision })
+    expect(value.frames.find(frame => frame.id === 4).error).toBeUndefined()
+    expect(value.frames.find(frame => frame.id === 4).value.outcome).toBeUndefined()
+    expect(dismiss).toHaveBeenCalledOnce()
+    expect(accept).toHaveBeenCalledOnce()
+  } finally { await value.runtime.shutdown() }
+})
+
+it('keeps ordinary confirm and prompt dismissals separate from explicit beforeunload leave', async () => {
+  const value = worker(), dismiss = vi.fn(async () => {}), accept = vi.fn(async () => {})
+  value.page.goto = async () => {
+    for (const type of ['confirm', 'prompt']) value.page.emit('dialog', { type: () => type, dismiss, accept })
+  }
+  try {
+    await value.command(1, 'init', { width: 1000, height: 700 })
+    await value.command(2, 'navigate', { url: 'https://example.com/new', before_unload: 'leave' })
+    expect(dismiss).toHaveBeenCalledTimes(2)
+    expect(accept).not.toHaveBeenCalled()
+  } finally { await value.runtime.shutdown() }
+})
+
+it('finishes a dismissed history navigation through the native abort signal', async () => {
+  const value = worker(), dismiss = vi.fn(async () => {})
+  value.page.goBack = ({ signal }) => new Promise((resolve, reject) => {
+    signal.addEventListener('abort', () => reject(signal.reason), { once: true })
+    value.page.emit('dialog', { type: () => 'beforeunload', dismiss })
+  })
+  try {
+    await value.command(1, 'init', { width: 1000, height: 700 })
+    await value.command(2, 'back')
+    expect(value.frames.find(frame => frame.id === 2)).toMatchObject({ value: { outcome: { kind: 'navigation_cancelled' } } })
+    expect(dismiss).toHaveBeenCalledOnce()
+  } finally { await value.runtime.shutdown() }
+})
+
+it('does not accept beforeunload on behalf of a cancelled leave operation', async () => {
+  const value = worker(), dismiss = vi.fn(async () => {}), accept = vi.fn(async () => {})
+  value.page.goto = async () => {
+    value.input.write(JSON.stringify({ action: 'cancel', cancel_id: 2 }) + '\n')
+    value.page.emit('dialog', { type: () => 'beforeunload', dismiss, accept })
+    throw new Error('cancelled navigation')
+  }
+  try {
+    await value.command(1, 'init', { width: 1000, height: 700 })
+    await value.command(2, 'navigate', { url: 'https://example.com/new', before_unload: 'leave' })
+    expect(value.frames.find(frame => frame.id === 2)?.error).toBe('浏览器操作已取消')
+    expect(dismiss).toHaveBeenCalledOnce()
+    expect(accept).not.toHaveBeenCalled()
+  } finally { await value.runtime.shutdown() }
+})
+
 it('does not insert text into a document that navigated during field selection', async () => {
   const value = worker(), main = { url: () => 'https://example.com/next' }
   value.page.mainFrame = () => main
-  value.page.getByRole = () => ({ count: async () => 1, isEditable: async () => true, focus: async () => {} })
+  const element = { isEditable: async () => true, focus: async () => {}, evaluate: async () => true, dispose: async () => {} }
+  value.page.getByRole = () => ({ elementHandles: async () => [element] })
   value.page.keyboard.press.mockImplementation(async () => value.page.emit('framenavigated', main))
   try {
     await value.command(1, 'init', { width: 1000, height: 700 })
     await value.command(2, 'element-text', { role: 'textbox', name: 'Query', text: 'fixture', expected_revision: 0 })
     expect(value.page.keyboard.insertText).not.toHaveBeenCalled()
     expect(value.frames.find(frame => frame.id === 2)).toMatchObject({ value: { outcome: { kind: 'stale' } } })
+  } finally { await value.runtime.shutdown() }
+})
+
+it.each(['focus', 'select'])('does not type into a field that stole focus during %s', async phase => {
+  const value = worker()
+  let focused = true
+  const element = { isEditable: async () => true, dispose: vi.fn(async () => {}),
+    focus: async () => { if (phase === 'focus') focused = false },
+    evaluate: async () => focused }
+  value.page.getByRole = () => ({count:async()=>1,elementHandles:async()=>[element],...element})
+  value.page.keyboard.press.mockImplementation(async () => { focused = false })
+  try {
+    await value.command(1, 'init', {width:1000,height:700})
+    await value.command(2, 'element-text', {role:'textbox',name:'Target',text:'private',expected_revision:0})
+    expect(value.frames.find(frame=>frame.id===2)).toMatchObject({value:{outcome:{kind:'stale'}}})
+    expect(value.page.keyboard.insertText).not.toHaveBeenCalled()
+    expect(value.page.keyboard.press).toHaveBeenCalledTimes(phase==='focus'?0:1)
+    expect(element.dispose).toHaveBeenCalledOnce()
   } finally { await value.runtime.shutdown() }
 })
 
@@ -374,8 +523,8 @@ it('shares the existing navigation deadline between document commit and load', a
   try {
     await value.command(1, 'init', { width: 1000, height: 700 })
     await value.command(2, 'navigate', { url: value.url })
-    expect(value.navigate).toHaveBeenCalledWith(value.url, { waitUntil: 'commit' })
-    expect(value.page.waitForLoadState).toHaveBeenCalledWith('domcontentloaded', { timeout: 5000 })
+    expect(value.navigate).toHaveBeenCalledWith(value.url, { waitUntil: 'commit', signal: expect.any(AbortSignal) })
+    expect(value.page.waitForLoadState).toHaveBeenCalledWith('domcontentloaded', { timeout: 5000, signal: expect.any(AbortSignal) })
   } finally { await value.runtime.shutdown(); clock.mockRestore() }
 })
 

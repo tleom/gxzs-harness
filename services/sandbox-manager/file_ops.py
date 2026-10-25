@@ -1,14 +1,16 @@
 """Executed as the sandbox user. All traversal uses directory descriptors, never symlinks."""
 import base64
 import bisect
+import ctypes
+import errno
 import hashlib
 import io
 import json
 import os
+import shutil
 import stat
 import sys
 import uuid
-import zipfile
 
 MAX_BYTES = 100 * 1024 * 1024
 MAX_TREE_BYTES = 1024 * 1024 * 1024
@@ -16,6 +18,31 @@ MAX_MANIFEST_FILE_BYTES = 2 * 1024 * 1024 * 1024
 MAX_MANIFEST_TREE_BYTES = 10 * 1024 * 1024 * 1024
 TEMP_PATH = '/tmp'
 TEMP_STORAGE_ROOT = '/var/lib/gxzs-tmp'
+SHARE_IDENTITY_ATTRIBUTE = 'user.gxzs.share-identity'
+
+
+def share_identity(fd):
+    """An inode-bound marker cannot be inherited by copying file attributes."""
+    try:
+        marker = os.getxattr(fd, SHARE_IDENTITY_ATTRIBUTE).decode().split(':')
+    except OSError as error:
+        if error.errno == errno.ENODATA:
+            return None
+        raise
+    except UnicodeDecodeError:
+        return None
+    info = os.fstat(fd)
+    if (len(marker) == 3 and len(marker[0]) == 32
+            and all(char in '0123456789abcdef' for char in marker[0])
+            and marker[1:] == [str(info.st_dev), str(info.st_ino)]):
+        return marker[0]
+    return None
+
+
+def set_share_identity(fd, identity):
+    info = os.fstat(fd)
+    os.setxattr(fd, SHARE_IDENTITY_ATTRIBUTE,
+                f'{identity}:{info.st_dev}:{info.st_ino}'.encode())
 
 
 def temporary_parent(path, *, missing_ok=False):
@@ -236,12 +263,15 @@ def entries_version(entries):
 
 def entry_metadata(fd, name, path, info, *, shallow=False):
     kind = "directory" if stat.S_ISDIR(info.st_mode) else "file" if stat.S_ISREG(info.st_mode) else "blocked"
+    # Stable across atomic renames, unlike the content/deletion version's ctime.
+    identity = version(json.dumps((info.st_dev, info.st_ino, stat.S_IFMT(info.st_mode))).encode())
     if shallow:
         return {"name": name, "path": path, "kind": kind, "size": info.st_size,
-                "modified": info.st_mtime, "version": None,
+                "modified": info.st_mtime, "version": None, "identity": identity,
                 "downloadable": path != "conversations" and kind in {"directory", "file"}}
     fingerprint = hash_file(fd, name, info.st_size) if kind == "file" and info.st_size <= MAX_BYTES else None
     downloadable = kind == "file"
+    details = {}
     if kind == "file" and info.st_size > MAX_BYTES:
         fingerprint = large_file_version(info)
     if kind == "directory":
@@ -249,6 +279,11 @@ def entry_metadata(fd, name, path, info, *, shallow=False):
         try:
             entries = tree_entries(child)
             fingerprint = entries_version(entries)
+            details = {
+                'content_size': sum(size for _, mode, size, _, _ in entries if stat.S_ISREG(mode)),
+                'file_count': sum(stat.S_ISREG(mode) for _, mode, _, _, _ in entries),
+                'directory_count': sum(stat.S_ISDIR(mode) for _, mode, _, _, _ in entries),
+            }
             downloadable = (
                 all(stat.S_ISDIR(mode) or stat.S_ISREG(mode)
                     for _, mode, size, _, _ in entries)
@@ -257,28 +292,8 @@ def entry_metadata(fd, name, path, info, *, shallow=False):
         finally:
             os.close(child)
     return {"name": name, "path": path, "kind": kind, "size": info.st_size,
-            "modified": info.st_mtime, "version": fingerprint, "downloadable": downloadable}
-
-
-def legacy_archive(fd):
-    """Keep pre-streaming Hosts working during Manager-first rolling upgrades."""
-    entries = tree_entries(fd)
-    if sum(size for _, mode, size, _, _ in entries if stat.S_ISREG(mode)) > 50 * 1024 * 1024:
-        raise ValueError('Legacy directory download exceeds 50 MiB; use streaming download')
-    output = io.BytesIO()
-    with zipfile.ZipFile(output, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
-        for path, mode, _, _, _ in entries:
-            if stat.S_ISDIR(mode):
-                archive.writestr(path + '/', b'')
-            elif stat.S_ISREG(mode):
-                parent, name = parent_fd(fd, path)
-                try:
-                    archive.writestr(path, read_file(parent, name, 50 * 1024 * 1024))
-                finally:
-                    os.close(parent)
-            else:
-                raise ValueError('Folder contains an unsupported link or special file')
-    return output.getvalue()
+            "modified": info.st_mtime, "version": fingerprint, "identity": identity,
+            "downloadable": path != 'conversations' and downloadable, **details}
 
 
 def remove_contents(fd):
@@ -295,15 +310,120 @@ def remove_contents(fd):
             os.unlink(name, dir_fd=fd)
 
 
+def rename_new(source_fd, source, target_fd, target):
+    """Linux atomic rename without replacing an existing file or directory."""
+    rename = ctypes.CDLL(None, use_errno=True).renameat2
+    rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    rename.restype = ctypes.c_int
+    if rename(source_fd, os.fsencode(source), target_fd, os.fsencode(target), 1):
+        code = ctypes.get_errno()
+        if code == errno.EEXIST:
+            raise FileExistsError('目标目录已存在同名文件或文件夹')
+        raise OSError(code, os.strerror(code))
+
+
+def copy_entry(source_fd, source, target_fd, target):
+    info = os.stat(source, dir_fd=source_fd, follow_symlinks=False)
+    if stat.S_ISDIR(info.st_mode):
+        original = os.open(source, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=source_fd)
+        try:
+            os.mkdir(target, mode=0o700, dir_fd=target_fd)
+            copied = os.open(target, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=target_fd)
+            try:
+                for name in os.listdir(original):
+                    copy_entry(original, name, copied, name)
+                os.fsync(copied)
+            finally:
+                os.close(copied)
+        finally:
+            os.close(original)
+    elif stat.S_ISREG(info.st_mode):
+        source_file = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=source_fd)
+        with os.fdopen(source_file, 'rb') as original:
+            before = os.fstat(original.fileno())
+            if not stat.S_ISREG(before.st_mode):
+                raise ValueError('只支持普通文件和文件夹')
+            target_file = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=target_fd)
+            with os.fdopen(target_file, 'wb') as copied:
+                shutil.copyfileobj(original, copied, 1024 * 1024)
+                copied.flush()
+                os.fchmod(copied.fileno(), stat.S_IMODE(before.st_mode))
+                os.fsync(copied.fileno())
+            if file_identity(before) != file_identity(os.fstat(original.fileno())):
+                raise ValueError('文件在复制期间发生变化，请重试')
+    else:
+        raise ValueError('只支持普通文件和文件夹')
+
+
+def transfer(payload, root):
+    source, destination = payload.get('path'), payload.get('destination')
+    operation = payload['operation']
+    if not isinstance(source, str) or not isinstance(destination, str):
+        raise ValueError('文件路径无效')
+    if source in {'.', 'conversations', 'skills', 'mcp'} or destination in {'.', 'conversations', 'skills', 'mcp'}:
+        raise ValueError('不能复制、移动或替换工作区的固定目录')
+    source_fd, source_name = parent_fd(root, source)
+    try:
+        target_fd, target_name = parent_fd(root, destination)
+        try:
+            if destination == source or destination.startswith(source + '/'):
+                raise ValueError('目标不能是原位置或源文件夹的子目录')
+            info = os.stat(source_name, dir_fd=source_fd, follow_symlinks=False)
+            if not (stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode)):
+                raise ValueError('只支持普通文件和文件夹')
+            try:
+                os.stat(target_name, dir_fd=target_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise FileExistsError('目标目录已存在同名文件或文件夹')
+            if operation == 'move':
+                rename_new(source_fd, source_name, target_fd, target_name)
+                os.fsync(source_fd)
+            else:
+                # Publish the completed copy once; an interrupted copy never appears as the destination.
+                temporary = '.copy-' + uuid.uuid4().hex
+                try:
+                    copy_entry(source_fd, source_name, target_fd, temporary)
+                    rename_new(target_fd, temporary, target_fd, target_name)
+                finally:
+                    try:
+                        staged = os.stat(temporary, dir_fd=target_fd, follow_symlinks=False)
+                    except FileNotFoundError:
+                        staged = None
+                    if staged is not None:
+                        if stat.S_ISDIR(staged.st_mode):
+                            child = os.open(temporary, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=target_fd)
+                            try:
+                                remove_contents(child)
+                            finally:
+                                os.close(child)
+                            os.rmdir(temporary, dir_fd=target_fd)
+                        else:
+                            os.unlink(temporary, dir_fd=target_fd)
+            os.fsync(target_fd)
+            current = os.stat(target_name, dir_fd=target_fd, follow_symlinks=False)
+            return entry_metadata(target_fd, target_name, destination, current, shallow=True)
+        finally:
+            os.close(target_fd)
+    finally:
+        os.close(source_fd)
+
+
 def operate(payload, root="/workspace"):
     operation = payload["operation"]
     path = payload.get("path", ".")
+    if operation in {'copy', 'move'}:
+        return transfer(payload, root)
     if isinstance(path, str) and path.startswith('/tmp/'):
         return temporary_file(payload)
     if operation == "delete" and path in {"mcp", "skills"}:
         raise ValueError("Resource directories cannot be deleted from file management")
-    if path in {".", "conversations"} and operation not in {"list", "manifest"}:
+    if path in {".", "conversations"} and operation not in {"list", "manifest", "stat"}:
         raise ValueError("The workspace root can only be listed")
+    if operation == 'upload':
+        data = base64.b64decode(payload['data'], validate=True)
+        return upload_stream({**payload, 'size': len(data)}, io.BytesIO(data), root)
     if path == ".":
         fd, name = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW), "."
     else:
@@ -318,6 +438,8 @@ def operate(payload, root="/workspace"):
                     os.mkdir(name, mode=0o700, dir_fd=fd)
                     break
                 except FileExistsError:
+                    if payload.get('exclusive') is True:
+                        raise ValueError('目标目录已存在同名文件或文件夹')
                     if payload.get('unique') is not True:
                         break
                     suffix += 1
@@ -368,17 +490,26 @@ def operate(payload, root="/workspace"):
         if operation == "stat":
             if info is None:
                 return {"path": path, "kind": "missing"}
-            return entry_metadata(fd, name, path, info)
+            result = entry_metadata(fd, name, path, info)
+            if 'bind_share' in payload and stat.S_ISREG(info.st_mode):
+                item = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+                try:
+                    if file_identity(os.fstat(item)) != file_identity(info):
+                        return conflict()
+                    identity = share_identity(item)
+                    if identity is None and payload['bind_share']:
+                        identity = uuid.uuid4().hex
+                        set_share_identity(item, identity)
+                    result['share_identity'] = identity
+                finally:
+                    os.close(item)
+            return result
         if info is not None and stat.S_ISDIR(info.st_mode):
+            if operation == "get":
+                raise ValueError("Only regular files can be read; use streaming download for folders")
             child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
             try:
                 fingerprint = tree_version(child)
-                if operation == "get":
-                    data = legacy_archive(child)
-                    if fingerprint != tree_version(child):
-                        return conflict()
-                    return {"data": base64.b64encode(data).decode(), "version": fingerprint,
-                            "kind": "directory", "name": name + ".zip"}
                 if operation != "delete":
                     raise ValueError("A folder cannot be overwritten by an uploaded file")
                 if payload.get("version") != fingerprint:
@@ -390,36 +521,15 @@ def operate(payload, root="/workspace"):
             return {"deleted": True}
         if operation == "delete":
             return delete_file(fd, name, payload)
-        max_bytes = payload.get("max_bytes", MAX_BYTES) if operation == "get" else MAX_BYTES
+        if operation != 'get':
+            raise ValueError("Unknown operation")
+        max_bytes = payload.get("max_bytes", MAX_BYTES)
         if type(max_bytes) is not int or not 0 < max_bytes <= MAX_BYTES:
             raise ValueError("Invalid file read limit")
         old = read_file(fd, name, max_bytes)
-        if operation == "get":
-            if old is None:
-                raise FileNotFoundError(path)
-            return {"data": base64.b64encode(old).decode(), "version": version(old), "name": name}
-        if operation != "upload":
-            raise ValueError("Unknown operation")
-        if "version" not in payload or payload["version"] != version(old):
-            return conflict()
-        data = base64.b64decode(payload["data"], validate=True)
-        if len(data) > MAX_BYTES:
-            raise ValueError("Upload exceeds 100 MiB")
-        temporary = ".upload-" + uuid.uuid4().hex
-        try:
-            target = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=fd)
-            with os.fdopen(target, "wb") as stream:
-                stream.write(data)
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.rename(temporary, name, src_dir_fd=fd, dst_dir_fd=fd)
-            os.fsync(fd)
-        finally:
-            try:
-                os.unlink(temporary, dir_fd=fd)
-            except FileNotFoundError:
-                pass
-        return {"path": path, "version": version(data)}
+        if old is None:
+            raise FileNotFoundError(path)
+        return {"data": base64.b64encode(old).decode(), "version": version(old), "name": name}
     finally:
         os.close(fd)
 
@@ -458,6 +568,15 @@ def upload_stream(payload, source, root="/workspace"):
             if source.read(1):
                 raise ValueError('文件大小与声明不一致')
             output.flush()
+            if old is not None:
+                os.fchmod(output.fileno(), stat.S_IMODE(old.st_mode) & 0o777)
+                original = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+                try:
+                    identity = share_identity(original)
+                    if identity is not None:
+                        set_share_identity(output.fileno(), identity)
+                finally:
+                    os.close(original)
             os.fsync(output.fileno())
         # Recheck after receiving bytes; a user process may have edited the file.
         try:

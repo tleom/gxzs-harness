@@ -101,6 +101,10 @@ it('keeps the native UI attachment writable while the Agent observes and writes 
   const before=await terminal.inspectForAgent(abort.signal)
   expect(before.info.state).toBe('running')
   expect(before.screen).toContain('ready')
+  terminal.screen.resize(80, 120)
+  const tall=await terminal.inspectForAgent(abort.signal)
+  expect(tall.screen).toContain('ready')
+  expect(tall.truncated).toBe(false)
   await terminal.writeFromAgent('echo ai\r',abort.signal)
   const writing=uplink.send({type:'write',data:'echo user\r'})
   const ack=(await ui.next()).value
@@ -129,6 +133,15 @@ it('keeps the native UI attachment writable while the Agent observes and writes 
   await expect(TerminalController.prototype.create.call(controller,{}, {id:'fourth',cols:80,rows:24},signal)).rejects.toMatchObject({code:'terminal/limit-reached'})
   expect(controller.spawn).toHaveBeenCalledOnce()
   expect(patched).toContain('maxTerminals: z.number().step(1).min(1).max(3).default(3)')
+})
+
+it('preserves native exit and failure information when observing a retained terminal', async () => {
+  const test=fixture()
+  for (const info of [{id,title:'bash',state:'exited',exitCode:7}, {id,title:'bash',state:'failed',error:'PTY disconnected'}]) {
+    test.native.inspectForAgent.mockResolvedValue({info,screen:'last screen',truncated:true})
+    const value=await test.definition.execute({action:'read',terminal_id:id,wait_ms:0},test.exec)
+    expect(value).toMatchObject({state:info.state,truncated:true,...(info.error?{error:info.error}:{exitCode:7})})
+  }
 })
 
 it('reads the terminal selected by a sidebar reference without substituting another PTY', async () => {

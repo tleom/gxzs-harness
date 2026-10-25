@@ -19,7 +19,7 @@ export const Config = z.object({
 })
 
 const ACTIONS = {
-  files: new Set(['list', 'stat', 'manifest', 'get', 'upload', 'delete', 'mkdir']),
+  files: new Set(['list', 'stat', 'manifest', 'get', 'upload', 'delete', 'mkdir', 'copy', 'move']),
   'personal-resources': new Set(['list', 'skill_stage', 'skill_inspect', 'skill_prepare', 'skill_import', 'skill_import_cancel', 'skill_import_status', 'skill_update', 'skill_uninstall', 'skill_toggle', 'skill_reorder']),
   'personal-mcp': new Set(['mcp_list', 'mcp_read', 'mcp_save', 'mcp_delete', 'mcp_toggle', 'mcp_reorder', 'mcp_test']),
   'host-settings': new Set(['check']),

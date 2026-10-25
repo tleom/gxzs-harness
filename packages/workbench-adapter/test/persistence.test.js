@@ -22,6 +22,37 @@ function seed(database, ownerId = 'user-a') {
 }
 
 describe('workbench durable projection', () => {
+  it('resolves consumed steering through native turn bindings with owner and chat isolation', () => {
+    const database = open(), { chat, ownerId } = seed(database)
+    const create = (id, target = chat, owner = ownerId) => database.createRun({ id, ownerId: owner,
+      chatId: target.id, sessionId: target.sessionId, query: id, attachments: [{ name: id }], selection: {}, now: 1 }).run
+    const original = create('original'), resumed = create('resumed'), first = create('first'), later = create('later')
+    database.bindRunMessage(chat.sessionId, original.id, 1, 'original-message')
+    database.bindRunMessage(chat.sessionId, resumed.id, 2, 'resume-message')
+    database.bindNativeTurn(resumed, 3)
+    for (const [message, turn] of [[first, 2], [later, 3]]) {
+      database.transitionRun(ownerId, message.id, 'steered')
+      database.bindRunMessage(chat.sessionId, message.id, turn, message.id)
+    }
+    const pending = create('pending')
+    database.transitionRun(ownerId, pending.id, 'steered')
+    const otherChat = database.createChat({ ownerId, sessionId: 'other-session', selection: {} })
+    const other = create('other', otherChat)
+    database.transitionRun(ownerId, other.id, 'steered')
+    database.bindRunMessage(otherChat.sessionId, other.id, 2, 'other-message')
+    const prepare = database.db.prepare.bind(database.db)
+    let query
+    database.db.prepare = sql => { if (sql.startsWith('SELECT m.* FROM runs r')) query = sql; return prepare(sql) }
+    expect(database.consumedSteeringRuns(ownerId, original.id)).toEqual([])
+    expect(database.consumedSteeringRuns(ownerId, resumed.id).map(run => [run.id, run.turnNumber, run.attachments]))
+      .toEqual([['first', 2, [{ name: 'first' }]], ['later', 3, [{ name: 'later' }]]])
+    expect(prepare('EXPLAIN QUERY PLAN ' + query).all(resumed.id, ownerId).map(row => row.detail).join('\n'))
+      .toContain('runs_session_turn (session_id=? AND turn_number=?)')
+    expect(() => database.consumedSteeringRuns('foreign', resumed.id)).toThrow('任务不存在')
+    database.db.prepare('UPDATE chats SET deleted_at=1 WHERE id=?').run(chat.id)
+    expect(() => database.consumedSteeringRuns(ownerId, resumed.id)).toThrow('任务不存在')
+  })
+
   it('uses active and chronological indexes for chat summaries without sorting frozen catalogs', () => {
     const database = open()
     const { chat, ownerId } = seed(database)

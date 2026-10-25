@@ -6,7 +6,105 @@ import { WorkbenchService } from '../src/service.js'
 import { WorkbenchWorkspaces } from '../src/workspaces.js'
 
 const cleanups = []
+it('moves ordinary files but preserves registered conversation directories and their ancestors', async () => {
+  const f = fixture(); f.chat('owner')
+  await f.service.directories.transferFile(f.owner, 'move', 'conversations/2026-10-22/original/nested/delivery.docx', 'delivery.docx')
+  expect(f.fileManager.operate).toHaveBeenLastCalledWith({operation:'move',path:'conversations/2026-10-22/original/nested/delivery.docx',destination:'delivery.docx'})
+  for (const source of ['conversations/2026-10-22/original','conversations/2026-10-22'])
+    await expect(f.service.directories.transferFile(f.owner,'move',source,'renamed')).rejects.toMatchObject({code:'DIRECTORY_IN_USE'})
+  await f.service.directories.transferFile(f.owner,'copy','conversations/2026-10-22/original','copied')
+  expect(f.fileManager.operate).toHaveBeenLastCalledWith({operation:'copy',path:'conversations/2026-10-22/original',destination:'copied'})
+})
 afterEach(() => cleanups.splice(0).reverse().forEach(close => close()))
+
+it('limits an active task lock to its descendants while keeping sibling workspaces editable', async () => {
+  const f = fixture(), root = 'conversations/2026-10-25/active'
+  const chat = f.chat('active', root)
+  f.chat('idle', `${root}-other`)
+  const { run } = f.db.createRun({ ownerId: 'owner', chatId: chat.id, sessionId: chat.sessionId, query: 'work', selection: {} })
+  f.db.transitionRun('owner', run.id, 'running')
+  for (const source of [`${root}-other/nested/file.txt`, `${root}-other/nested`, 'unrelated/file.txt']) {
+    await f.service.directories.transferFile(f.owner, 'move', source, `${source}-renamed`)
+    await f.service.directories.transferFile(f.owner, 'move', source, 'archive/moved')
+    await f.service.directories.deleteFile(f.owner, source, 'v1')
+  }
+  expect(f.fileManager.operate).toHaveBeenCalledTimes(9)
+  for (const source of [root, 'conversations/2026-10-25']) {
+    await expect(f.service.directories.deleteFile(f.owner, source, 'v1')).rejects.toMatchObject({ code: 'DIRECTORY_IN_USE', message: '文件已绑定会话，暂不可删除' })
+    await expect(f.service.directories.transferFile(f.owner, 'move', source, 'archive/moved')).rejects.toMatchObject({ code: 'DIRECTORY_IN_USE', message: '文件已绑定会话，暂不可移动' })
+  }
+  await expect(f.service.directories.deleteFile(f.owner, `${root}/nested`, 'v1')).rejects.toMatchObject({ code: 'FILE_IN_USE' })
+})
+
+it.each(['queued', 'running', 'waiting_input', 'stopping'])('protects active conversation files for %s without blocking copy', async status => {
+  const f = fixture(); const chat = f.chat('active')
+  const { run } = f.db.createRun({ ownerId: 'owner', chatId: chat.id, sessionId: chat.sessionId, query: 'work', selection: {} })
+  f.db.transitionRun('owner', run.id, status)
+  const source = `${chat.directory}/nested/delivery.docx`
+  for (const [destination, label] of [[`${chat.directory}/nested/renamed.docx`, '重命名'], ['archive/delivery.docx', '移动']]) {
+    await expect(f.service.directories.transferFile(f.owner, 'move', source, destination)).rejects.toMatchObject({ status: 409, code: 'FILE_IN_USE', message: `任务正在执行中，暂不可${label}` })
+  }
+  await expect(f.service.directories.deleteFile(f.owner, source, 'v1')).rejects.toMatchObject({ code: 'FILE_IN_USE', message: '任务正在执行中，暂不可删除' })
+  expect(f.fileManager.operate).not.toHaveBeenCalled()
+  await f.service.directories.transferFile(f.owner, 'copy', source, 'archive/copied.docx')
+  expect(f.fileManager.operate).toHaveBeenLastCalledWith({ operation: 'copy', path: source, destination: 'archive/copied.docx' })
+  await f.service.directories.transferFile(f.owner, 'move', 'outside.txt', `${chat.directory}/incoming.txt`)
+  expect(f.fileManager.operate).toHaveBeenLastCalledWith({ operation: 'move', path: 'outside.txt', destination: `${chat.directory}/incoming.txt` })
+  await f.service.directories.deleteFile(f.owner, 'unrelated/file.txt', 'v1')
+  expect(f.fileManager.operate).toHaveBeenLastCalledWith({ operation: 'delete', path: 'unrelated/file.txt', version: 'v1' })
+  f.db.transitionRun('owner', run.id, 'completed')
+  await f.service.directories.transferFile(f.owner, 'move', source, 'archive/delivery.docx')
+})
+
+it.each(['native-root', 'native-child'])('keeps files protected while %s is still executing', async mode => {
+  const f = fixture(); const chat = f.chat('active')
+  if (mode === 'native-root') f.agent.status = 'running'
+  else f.service.hasOwnedWork = sessionId => sessionId === chat.sessionId
+  await expect(f.service.directories.transferFile(f.owner, 'move', `${chat.directory}/a.txt`, `${chat.directory}/b.txt`)).rejects.toMatchObject({ code: 'FILE_IN_USE', message: '任务正在执行中，暂不可重命名' })
+  await expect(f.service.directories.deleteFile(f.owner, `${chat.directory}/a.txt`, 'v1')).rejects.toMatchObject({ code: 'FILE_IN_USE' })
+  expect(f.fileManager.operate).not.toHaveBeenCalled()
+})
+
+it('protects a registered empty workspace and its ancestors from rename, move and deletion', async () => {
+  const f = fixture(); f.workspace('nested', 'cases/nested')
+  for (const source of ['conversations/cases/nested', 'conversations/cases']) {
+    const parent = source.slice(0, source.lastIndexOf('/'))
+    for (const [destination, label] of [[`${parent}/renamed`, '重命名'], ['archive/moved', '移动']])
+      await expect(f.service.directories.transferFile(f.owner, 'move', source, destination)).rejects.toMatchObject({ code: 'DIRECTORY_IN_USE', message: `文件已绑定会话，暂不可${label}` })
+    await expect(f.service.directories.deleteFile(f.owner, source, 'v1')).rejects.toMatchObject({ code: 'DIRECTORY_IN_USE', message: '文件已绑定会话，暂不可删除' })
+  }
+  expect(f.fileManager.operate).not.toHaveBeenCalled()
+  await f.service.directories.transferFile(f.owner, 'copy', 'conversations/cases/nested', 'archive/copied')
+  expect(f.fileManager.operate).toHaveBeenCalledOnce()
+})
+
+it.each(['conversation', 'workspace'])('allows ordinary descendants of an inactive %s to be renamed, moved and deleted', async binding => {
+  for (const child of ['nested', 'nested/file.txt']) {
+    for (const operation of ['rename', 'move', 'delete']) {
+      const f = fixture(), root = 'conversations/cases'
+      if (binding === 'workspace') f.workspace()
+      else {
+        const chat = f.chat('inactive', root)
+        const { run } = f.db.createRun({ ownerId: 'owner', chatId: chat.id, sessionId: chat.sessionId, query: 'finished', selection: {} })
+        f.db.transitionRun('owner', run.id, 'completed')
+      }
+      const source = `${root}/${child}`
+      if (operation === 'delete') {
+        await f.service.directories.deleteFile(f.owner, source, 'v1')
+        expect(f.fileManager.operate).toHaveBeenLastCalledWith({ operation: 'delete', path: source, version: 'v1' })
+      } else {
+        const destination = operation === 'rename' ? `${source}-renamed` : `archive/${child.split('/').at(-1)}`
+        await f.service.directories.transferFile(f.owner, 'move', source, destination)
+        expect(f.fileManager.operate).toHaveBeenLastCalledWith({ operation: 'move', path: source, destination })
+      }
+      expect(f.files.has(root)).toBe(true)
+      f.fileManager.operate.mockClear()
+      await expect(f.service.directories.deleteFile(f.owner, root, 'v1')).rejects.toMatchObject({ code: 'DIRECTORY_IN_USE' })
+      expect(f.fileManager.operate).not.toHaveBeenCalled()
+    }
+  }
+})
+
 function fixture(database) {
   const db = database ?? new WorkbenchDatabase(':memory:')
   if (!database) cleanups.push(() => db.close())
@@ -79,7 +177,7 @@ it('keeps an empty registered workspace when its last conversation is deleted', 
 
 it.each(['conversations/2026-10-22/original', '/workspace/conversations/2026-10-22/original', 'conversations/2026-10-22', 'conversations/2026-10-22/x/../original'])('protects live fork roots and ancestors: %s', async candidate => {
   const f = fixture(); f.chat('fork')
-  await expect(f.service.directories.deleteFile(f.owner, candidate, 'v1')).rejects.toMatchObject({ status: 409, code: 'DIRECTORY_IN_USE', message: '请先删除对应对话或工作区' })
+  await expect(f.service.directories.deleteFile(f.owner, candidate, 'v1')).rejects.toMatchObject({ status: 409, code: 'DIRECTORY_IN_USE', message: '文件已绑定会话，暂不可删除' })
   expect(f.fileManager.operate).not.toHaveBeenCalled()
 })
 

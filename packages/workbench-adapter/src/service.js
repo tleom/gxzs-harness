@@ -1446,6 +1446,14 @@ export class WorkbenchService {
     const context = this.database.latestContextEvent(owner.ownerId, run.id)
     const steering = steeringSnapshot ?? (events.length ? events.filter(event => event.event === 'workbench_steering' || event.event === 'workbench_steered')
       : this.database.steeringEvents(owner.ownerId, run.id))
+    const messages = new Map(steering.filter(event => event.event === 'workbench_steering').map(event => [event.steering_id,
+      { id: event.steering_id, query: event.query, attachments: event.attachments ?? [], created_at: event.created_at,
+        message: this.database.getRun(owner.ownerId, event.steering_id) }]))
+    // A pending steer can be consumed by a later run after pause/resume. Native
+    // turn bindings retain its full input even when the admission page is absent.
+    if (steeringSnapshot === undefined) for (const message of this.database.consumedSteeringRuns(owner.ownerId, run.id)) {
+      messages.set(message.id, { id: message.id, query: message.query, attachments: message.attachments, message })
+    }
     if (run.error && !run.errorCode) run.errorCode = this.database.runErrorCode(owner.ownerId, run.id)
     return {
       ...runDto(run, events,
@@ -1454,13 +1462,12 @@ export class WorkbenchService {
       input_supplement: this.inputSupplement(run),
       ...this.database.runTiming(owner.ownerId, run.id),
       steer_target_run_id: steering.find((event) => event.event === 'workbench_steered')?.steer_target_run_id,
-      steering_messages: steering.filter((event) => event.event === 'workbench_steering').map((event) => {
-        const message = this.database.getRun(owner.ownerId, event.steering_id)
+      steering_messages: [...messages.values()].map(({ id, query, attachments, created_at, message }) => {
         const mentions = message ? runDto(message).mentioned_resources : []
-        return { id: event.steering_id, query: event.query, attachments: event.attachments ?? [],
-          ...(message ? { input_supplement: this.inputSupplement(message) } : {}),
+        return { id, query, attachments,
+          ...(message ? { input_supplement: this.inputSupplement(message), turn: message.turnNumber } : {}),
           ...(mentions.length ? { mentioned_resources: mentions } : {}),
-          created_at: (message?.createdAt / 1000) || event.created_at }
+          created_at: message ? message.createdAt / 1000 : created_at }
       }),
       human_input_history: inputs.filter((input) => ['skipped', 'timeout', 'aborted', 'submitted'].includes(input.status)).map((input) => {
         const answers = input.answer?.answers ?? []

@@ -3,6 +3,18 @@ import { expect, it, vi } from 'vitest'
 import { browserAction, SandboxBrowser, WorkbenchBrowsers } from '../src/browsers.js'
 const id = '12345678-1234-1234-1234-123456789abc'
 const signal = () => new AbortController().signal
+it.each(['navigate','back','forward','reload'])('preserves a validated manual leave decision and observation revision for %s', action => {
+  const request={action,...(action==='navigate'?{url:'https://example.com/next'}:{}),before_unload:'leave',expected_revision:12}
+  expect(browserAction(request)).toEqual(request)
+  expect(()=>browserAction({...request,before_unload:'accept'})).toThrow('离页确认参数无效')
+  for(const expected_revision of [-1,1.2,'12',Number.MAX_SAFE_INTEGER+1])
+    expect(()=>browserAction({...request,expected_revision})).toThrow('网页观察版本无效')
+})
+it('does not extend leave confirmation or navigation revisions to unrelated controls',()=>{
+  expect(()=>browserAction({action:'resize',width:1000,height:700,before_unload:'leave'})).toThrow()
+  expect(()=>browserAction({action:'key',key:'Enter',expected_revision:1})).toThrow()
+  expect(browserAction({action:'key',key:'Enter',before_unload:'stay'})).toEqual({action:'key',key:'Enter',before_unload:'stay'})
+})
 it('accepts an inferred HTTP fallback only for the same HTTPS destination', () => {
   expect(browserAction({action:'navigate',url:'https://xcmggx.com:8080/app?q=1',fallback_url:'http://xcmggx.com:8080/app?q=1'}))
     .toEqual({action:'navigate',url:'https://xcmggx.com:8080/app?q=1',fallback_url:'http://xcmggx.com:8080/app?q=1'})

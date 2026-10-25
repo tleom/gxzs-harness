@@ -2,8 +2,6 @@ import base64
 import importlib.util
 from pathlib import Path
 import os
-import io
-import zipfile
 import pytest
 
 spec=importlib.util.spec_from_file_location('file_ops',Path(__file__).parents[1]/'file_ops.py')
@@ -50,14 +48,13 @@ def test_large_directory_pages_without_omission_and_rejects_changed_directory(ro
 
 
 @pytest.mark.parametrize('name', ['mcp', 'skills'])
-def test_resource_roots_allow_browsing_and_zip_download_but_reject_deletion(root, name):
+def test_resource_roots_allow_browsing_but_reject_deletion_and_text_reads(root, name):
     directory = Path(root) / name
     directory.mkdir()
     (directory / 'demo.txt').write_text('content')
     assert module.operate({'operation': 'list', 'path': name}, root)['entries'][0]['name'] == 'demo.txt'
-    result = module.operate({'operation': 'get', 'path': name}, root)
-    with zipfile.ZipFile(io.BytesIO(base64.b64decode(result['data']))) as archive:
-        assert archive.read('demo.txt') == b'content'
+    with pytest.raises(ValueError, match='use streaming download'):
+        module.operate({'operation': 'get', 'path': name}, root)
     current = module.operate({'operation': 'stat', 'path': name}, root)
     with pytest.raises(ValueError, match='cannot be deleted'):
         module.operate({'operation': 'delete', 'path': name, 'version': current['version']}, root)
@@ -177,14 +174,18 @@ def test_symlink_directory_leaf_and_fifo_are_blocked(root,tmp_path):
     assert (outside/'secret').read_bytes()==b'private'
 
 
-def test_legacy_directory_download_keeps_its_original_memory_budget(root):
+def test_directory_text_reads_reject_before_scanning_or_reading_contents(root, monkeypatch):
     directory = Path(root) / 'legacy'
     directory.mkdir()
     with (directory / 'large.bin').open('wb') as stream:
         stream.truncate(50 * 1024 * 1024 + 1)
     assert module.operate({'operation': 'stat', 'path': 'legacy'}, root)['downloadable']
-    with pytest.raises(ValueError, match='Legacy directory download'):
-        module.operate({'operation': 'get', 'path': 'legacy'}, root)
+    def unexpected(*args, **kwargs):
+        pytest.fail('A directory text read must not scan or read its contents')
+    monkeypatch.setattr(module, 'tree_version', unexpected)
+    monkeypatch.setattr(module, 'read_file', unexpected)
+    with pytest.raises(ValueError, match='use streaming download'):
+        module.operate({'operation': 'get', 'path': 'legacy', 'max_bytes': 2 * 1024 * 1024}, root)
 
 
 @pytest.mark.parametrize('layout', ['flat', 'nested'])
