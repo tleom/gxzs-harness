@@ -998,6 +998,16 @@ export class WorkbenchDatabase {
     }
   }
 
+  consumedSteeringRuns(ownerId, runId) {
+    if (!this.getRunState(ownerId, runId)) throw notFound('任务不存在')
+    return this.db.prepare(`SELECT m.* FROM runs r JOIN runs m INDEXED BY runs_session_turn
+      ON m.session_id=r.session_id AND m.turn_number IN (
+        SELECT turn_number FROM run_turns WHERE session_id=r.session_id AND run_id=r.id)
+      WHERE r.id=? AND r.owner_id=? AND m.owner_id=r.owner_id AND m.chat_id=r.chat_id
+      AND m.id<>r.id AND m.status='steered' ORDER BY m.created_at,m.id`)
+      .all(runId, ownerId).map(decodeRun)
+  }
+
   steeringEvents(ownerId, runId, through = Number.MAX_SAFE_INTEGER) {
     if (!this.getRunState(ownerId, runId)) throw notFound('任务不存在')
     const rows = this.db.prepare(`SELECT CASE WHEN length(CAST(payload_json AS BLOB)) <= 8388608

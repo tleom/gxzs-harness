@@ -670,8 +670,14 @@ export function apply(ctx, config) {
       if (result.kind === 'missing') throw httpError(404, '路径不存在')
       sendJson(res, 200, { data: result })
     })],
-    ['POST', /^\/files$/, async ({ json }, res) => {
+    ['POST', /^\/files$/, async ({ owner, json }, res) => {
       const requested = managerPath(json.path)
+      if (['copy', 'move'].includes(json.operation)) {
+        const result = await service.directories.transferFile(owner, json.operation, requested, managerPath(json.destination))
+        sendJson(res, 200, { data: result })
+        return
+      }
+      if (json.operation !== undefined) throw httpError(400, '文件操作无效')
       if (typeof json.data !== 'string') throw httpError(400, '缺少 data')
       const bytes = Buffer.from(json.data, 'base64')
       if (bytes.length > 100 * 1024 * 1024) throw httpError(413, '文件超过 100 MiB')
@@ -684,7 +690,7 @@ export function apply(ctx, config) {
       sendJson(res, 200, { data: result })
     }],
     ['POST', /^\/files\/directories$/, async ({ json }, res) => {
-      const result = await ctx.workbenchFileManager.operate({ operation: 'mkdir', path: managerPath(json.path) })
+      const result = await ctx.workbenchFileManager.operate({ operation: 'mkdir', path: managerPath(json.path), exclusive: true })
       sendJson(res, 200, { data: result })
     }],
     ['GET', /^\/files\/download$/, async ({ url }, res) => withResponseSignal(res, async signal => {

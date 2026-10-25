@@ -17,6 +17,37 @@ function referenceResolver(test, candidates) {
 }
 
 const opened = []
+it('includes full consumed input on an isolated native page while retaining admission retry identity', () => {
+  const { service, owner, chat, database } = setup()
+  const make = (query, attachments = [], selection = {}) => database.createRun({ ownerId: owner.ownerId,
+    chatId: chat.id, sessionId: chat.sessionId, query, selection, attachments }).run
+  const original = make('old'), file = { name: '材料.pdf', path: '材料.pdf' }
+  const supplement = [{ question: '范围', answer: '全部' }]
+  const message = make('supplement', [file], { input_supplement: supplement, mentioned_resources: [{ kind: 'skills', id: 'pdf' }] })
+  const resumed = make('resumed')
+  database.bindRunMessage(chat.sessionId, original.id, 1, 'old-message')
+  database.transitionRun(owner.ownerId, message.id, 'steered')
+  database.appendEvent(owner.ownerId, original.id, { event: 'workbench_steering', steering_id: message.id, query: message.query, attachments: [file] })
+  database.appendEvent(owner.ownerId, message.id, { event: 'workbench_steered', steer_target_run_id: original.id })
+  expect(service.inputRunDto(owner, original).steering_messages[0].turn).toBeUndefined()
+  database.bindRunMessage(chat.sessionId, message.id, 2, 'steering-message')
+  database.bindRunMessage(chat.sessionId, resumed.id, 2, 'resume-message')
+  const page = service.historyPageView(owner, chat, { through_seq: 100, records: [
+    { event: { seq: 50, type: 'turn/start', time: 50000, data: { turn: 2 } } },
+    { event: { seq: 51, type: 'user/message', time: 51000, data: { id: 'steering-message', source: { kind: 'user', rpcId: message.id }, content: [{ type: 'text', text: message.query }] } } },
+  ] }, false, true)
+  expect(page.runs.map(run => run.id)).toEqual([resumed.id])
+  expect(page.runs[0].steering_messages).toMatchObject([{ id: message.id, query: message.query, attachments: [file],
+    input_supplement: supplement, mentioned_resources: [{ kind: 'skills', id: 'pdf' }], turn: 2 }])
+  expect(service.inputRunDto(owner, original).steering_messages[0].turn).toBe(2)
+  expect(service.getRun(owner, message.id).steer_target_run_id).toBe(original.id)
+  // A bounded journal snapshot must not gain future inputs from native bindings.
+  expect(service.inputRunDto(owner, resumed, [], []).steering_messages).toEqual([])
+  database.appendEvent(owner.ownerId, resumed.id, { event: 'workbench_steering', steering_id: message.id, query: message.query })
+  expect(service.inputRunDto(owner, resumed).steering_messages).toHaveLength(1)
+  expect(service.inputRunDto(owner, resumed).steering_messages[0].attachments).toEqual([file])
+})
+
 it('presents history metadata without materializing an unmentioned frozen tool catalog', () => {
   const { service, database, owner, chat } = setup()
   const run = database.createRun({ ownerId: owner.ownerId, chatId: chat.id, sessionId: chat.sessionId,

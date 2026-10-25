@@ -76,8 +76,16 @@ function observePage() {
     const text = node.textContent.slice(start, Math.min(end,start+20000-length)).trim()
     if (text) { parts.push(text); length += text.length+1 }
   }
+  const busyRegions = []
+  for (const element of document.querySelectorAll('[aria-busy="true"]')) {
+    if (!visible(element.getBoundingClientRect()) || !element.checkVisibility({ visibilityProperty: true })) continue
+    busyRegions.push({ label: (element.getAttribute('aria-label') || element.getAttribute('title') || '').slice(0,200),
+      text: (element.innerText || '').slice(0,200) })
+    if (busyRegions.length >= 120) break
+  }
   return { url: location.href.slice(0,4096), title: document.title.slice(0,1024),
-    viewport: { x: scrollX, y: scrollY, width: innerWidth, height: innerHeight }, text: parts.join('\n').slice(0,20000), elements }
+    viewport: { x: scrollX, y: scrollY, width: innerWidth, height: innerHeight }, text: parts.join('\n').slice(0,20000), elements,
+    loading: { document_state: document.readyState, busy_regions: busyRegions } }
 }
 
 function runWorker({ chromium, input = process.stdin, output = process.stdout, exit = code => process.exit(code), displayFactory = displayAvailable() ? startDisplay : undefined, commandTimeoutMs = 30_000, cancelGraceMs = 1_000, workspace = '/workspace', directory = process.cwd() }) {
@@ -104,7 +112,7 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
     const failed = history.entries[history.currentIndex]?.url || ''
     try { return validUrl(failed) } catch { return '' }
   }
-  let pageId, pendingPopup, frameSequence = 0, activeCommand, revision = 0
+  let pageId, pendingPopup, frameSequence = 0, activeCommand, activeClick, revision = 0
   const streams = new Map(), cancelled = new Set(), pressedButtons = new Set(), pressedModifiers = new Set()
   const observedFrames = new Map()
   let frameReference = 0
@@ -182,9 +190,13 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
     const owner = value.frame_ref ? observedFrames.get(value.frame_ref) : page
     if (!owner || owner.isDetached?.()) throw new Error('stale_observation')
     const locator = value.role ? owner.getByRole(value.role, { name: value.name, exact: true }) : owner.locator(value.selector)
-    const count = await locator.count()
-    if (count !== 1) throw Object.assign(new Error(count === 0 ? 'element_not_found' : 'ambiguous_element'), { matchCount: count })
-    return locator
+    const handles = await locator.elementHandles()
+    const count = handles.length
+    if (count !== 1) {
+      await Promise.all(handles.map(handle => handle.dispose()))
+      throw Object.assign(new Error(count === 0 ? 'element_not_found' : 'ambiguous_element'), { matchCount: count })
+    }
+    return handles[0]
   }
   async function releaseInput() {
     for (const button of pressedButtons) await page.mouse.up({ button }).catch(() => {})
@@ -310,7 +322,23 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
     })
     target.setDefaultTimeout(5000)
     target.setDefaultNavigationTimeout(20000)
-    target.on('dialog', dialog => { notice = '网页弹窗已关闭'; void dialog.dismiss().catch(() => {}) })
+    target.on('dialog', dialog => {
+      if (dialog.type() !== 'beforeunload') {
+        notice = '网页弹窗已关闭'
+        void dialog.dismiss().catch(() => {})
+        return
+      }
+      const command = target === page ? activeCommand : undefined
+      const leave = command?.before_unload === 'leave' && !cancelled.has(command.id) && !closed
+      notice = leave ? '已确认离开当前页面' : '已取消离开当前页面'
+      if (command) command.beforeUnloadCancelled = !leave
+      const handled = (leave ? dialog.accept() : dialog.dismiss()).then(() => {
+        // goBack/goForward can otherwise wait for their full navigation timeout after dismissal.
+        if (!leave) command?.navigationController?.abort(new Error('navigation_cancelled'))
+      })
+      if (command) command.beforeUnloadHandled = handled
+      void handled.catch(() => {})
+    })
     target.on('download', download => { downloadSequence++; void downloads.start(download).catch(() => {}) })
     target.on('domcontentloaded', () => {
       if (target === page && notice === partialNavigationNotice) {
@@ -476,7 +504,8 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
     // Element lookup is observational. Advance only after its preconditions pass.
     if (!['element-click', 'element-text'].includes(action)) revision++
     const moves = ['navigate', 'reload', 'back', 'forward'].includes(action)
-    if (moves) { navigation++; navigating = true }
+    if (moves) { navigation++; navigating = true; value.navigationController = new AbortController() }
+    const navigationOptions = { waitUntil: 'commit', signal: value.navigationController?.signal }
     const navigationPage = page, navigationDeadline = Date.now() + 20000
     const downloadsBeforeNavigation = downloadSequence
     let navigationResponse, navigationCommitted = false, navigationLoaded = false
@@ -490,7 +519,7 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
         }
         if (value.fallback_url) navigationPage.on('request', trackRedirect)
         try {
-          navigationResponse = await page.goto(target, { waitUntil: 'commit', ...(value.fallback_url ? { timeout: 10000 } : {}) })
+          navigationResponse = await page.goto(target, { ...navigationOptions, ...(value.fallback_url ? { timeout: 10000 } : {}) })
         } catch (failure) {
           // Only inferred HTTPS gets one HTTP attempt, within the same navigation
           // deadline and page. Explicit HTTPS, certificate errors and cancellation
@@ -506,13 +535,13 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
           await page.waitForURL(errorPageUrl, { waitUntil: 'commit', timeout: Math.min(1000, Math.max(1, navigationDeadline - Date.now())) }).catch(() => {})
           assertCurrent(value)
           if (page !== navigationPage || Date.now() >= navigationDeadline) throw failure
-          navigationResponse = await page.goto(fallback.href, { waitUntil: 'commit', timeout: Math.max(1, navigationDeadline - Date.now()) })
+            navigationResponse = await page.goto(fallback.href, { ...navigationOptions, timeout: Math.max(1, navigationDeadline - Date.now()) })
         } finally { navigationPage.off('request', trackRedirect) }
         break
       }
-      case 'reload': navigationResponse = await page.reload({ waitUntil: 'commit' }); break
-      case 'back': navigationResponse = await page.goBack({ waitUntil: 'commit' }); break
-      case 'forward': navigationResponse = await page.goForward({ waitUntil: 'commit' }); break
+      case 'reload': navigationResponse = await page.reload(navigationOptions); break
+      case 'back': navigationResponse = await page.goBack(navigationOptions); break
+      case 'forward': navigationResponse = await page.goForward(navigationOptions); break
       case 'resize':
         navigation++
         if (display) {
@@ -545,24 +574,57 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
         await page.mouse.move(value.x, value.y); assertCurrent(value)
         await page.mouse.up({ button: value.button, clickCount: value.count }); pressedButtons.delete(value.button); break
       case 'element-click': {
-        const locator = await resolveElement(value)
-        assertObservation(value)
-        const preparedRevision = ++revision
-        await locator.scrollIntoViewIfNeeded(); assertObservation(value, preparedRevision)
-        const box = await locator.boundingBox(); assertObservation(value, preparedRevision)
-        if (!box) throw new Error('element_not_visible')
-        await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2)
+        // Pin this document's element: Locator retries could otherwise cross iframe navigation.
+        const element = await resolveElement(value)
+        const target = page, guard = target.locator(':visible').first(), controller = new AbortController()
+        activeClick = controller
+        try {
+          assertObservation(value)
+          const preparedRevision = ++revision
+          // Native retries must not retarget a new document or outlive cancellation.
+          await target.addLocatorHandler(guard, () => {
+            try { assertObservation(value, preparedRevision) }
+            catch (error) { controller.abort(error) }
+          }, { noWaitAfter: true })
+          assertObservation(value, preparedRevision)
+          await element.click({ signal: controller.signal, timeout: 5000, noWaitAfter: true })
+        } catch (error) {
+          if (controller.signal.aborted) throw controller.signal.reason
+          if (error.message.includes('Element is not attached to the DOM')) throw new Error('stale_observation')
+          if (error.name === 'TimeoutError') throw new Error('element_not_actionable')
+          throw error
+        } finally {
+          activeClick = undefined
+          await target.removeLocatorHandler(guard).catch(() => {})
+          await element.dispose().catch(() => {})
+        }
         break
       }
       case 'element-text': {
-        const locator = await resolveElement(value)
-        if (!await locator.isEditable()) throw new Error('element_not_editable')
-        assertObservation(value)
-        const preparedRevision = ++revision, target = page, epoch = navigation
-        await locator.focus(); assertObservation(value, preparedRevision)
-        await page.keyboard.press('ControlOrMeta+A'); assertCurrent(value)
-        if (page !== target || navigation !== epoch) throw new Error('stale_observation')
-        await page.keyboard.insertText(value.text)
+        const element = await resolveElement(value)
+        try {
+          if (!await element.isEditable()) throw new Error('element_not_editable')
+          assertObservation(value)
+          const preparedRevision = ++revision, target = page, epoch = navigation
+          const assertFocused = async (beforeInput = true) => {
+            const focused = await element.evaluate(node => {
+              const active = node.getRootNode().activeElement
+              return node.isConnected && node.ownerDocument.hasFocus() && (active === node || (node.isContentEditable && node.contains(active)))
+            })
+            if (beforeInput) assertObservation(value, preparedRevision)
+            else assertCurrent(value) // Native Ctrl+A also advances the headed input revision.
+            if (page !== target || navigation !== epoch) throw new Error('stale_observation')
+            if (!focused) throw new Error('stale_observation')
+          }
+          await element.focus()
+          await assertFocused()
+          await page.keyboard.press('ControlOrMeta+A')
+          await assertFocused(false)
+          await page.keyboard.insertText(value.text)
+        } catch (error) {
+          if (error.message.includes('Element is not attached to the DOM')) throw new Error('stale_observation')
+          throw error
+        } finally { await element.dispose().catch(() => {}) }
         break
       }
       case 'move': await setModifiers(value.modifiers || []); await page.mouse.move(value.x, value.y); break
@@ -576,9 +638,13 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
         // Hash/history changes emit framenavigated too, but do not prove that commit.
         navigationCommitted = true
         navigationPage.on('domcontentloaded', loaded)
-        await navigationPage.waitForLoadState('domcontentloaded', { timeout: Math.max(1, navigationDeadline - Date.now()) })
+        await navigationPage.waitForLoadState('domcontentloaded', { timeout: Math.max(1, navigationDeadline - Date.now()), signal: value.navigationController.signal })
       }
     } catch (error) {
+      await value.beforeUnloadHandled
+      assertCurrent(value)
+      if (value.beforeUnloadCancelled && moves)
+        return { page_id: pageId, revision, outcome: { kind: 'navigation_cancelled', message: '已取消离开当前页面' } }
       const attachmentNavigation = moves && /Download is starting|net::ERR_ABORTED/.test(error.message)
       if (attachmentNavigation && downloadSequence === downloadsBeforeNavigation) {
         // Chromium can reject goto before emitting the attachment's download event.
@@ -613,11 +679,13 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
     if (moves && streams.get(page)?.active) await streams.get(page).resize()
     if (pendingPopup) { const pending = pendingPopup; await pending; if (pendingPopup === pending) pendingPopup = undefined }
     if (moves && capturing) await captureFinished
+    await value.beforeUnloadHandled
     assertCurrent(value)
     // Observed frames stream independently; a click never waits for image encoding.
     if (display) await frame()
     else if (!streams.get(page)?.active && (!watching || !['move', 'wheel', 'text', 'key'].includes(action))) await freshFrame()
-    return { page_id: pageId }
+    return { page_id: pageId, ...(value.beforeUnloadCancelled
+      ? { revision, outcome: { kind: 'navigation_cancelled', message: '已取消离开当前页面' } } : {}) }
   }
   function fatal(error) {
     if (closed) return
@@ -650,6 +718,8 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
     if (request.action === 'cancel') {
       cancelled.add(request.cancel_id)
       if (cancelled.size > 512) cancelled.delete(cancelled.values().next().value)
+      if (activeCommand?.id === request.cancel_id) activeClick?.abort(new Error('operation_cancelled'))
+      if (activeCommand?.id === request.cancel_id) activeCommand.navigationController?.abort(new Error('operation_cancelled'))
       if (activeCommand?.id === request.cancel_id && ['navigate', 'reload', 'back', 'forward'].includes(activeCommand.action))
         void session?.send('Page.stopLoading').catch(() => {})
       if (activeCommand?.id === request.cancel_id && !cancellationDeadline) {
@@ -685,7 +755,9 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
           : failure.message === 'ambiguous_element'
           ? { kind: 'ambiguous', message: `匹配到 ${failure.matchCount} 个网页元素`, match_count: failure.matchCount }
           : failure.message === 'stale_observation' && !['snapshot', 'screenshot', 'cut-selection'].includes(value?.action)
-          ? { kind: 'stale', message: '页面已更新，请根据最新页面继续操作' } : undefined
+          ? { kind: 'stale', message: '页面已更新，请根据最新页面继续操作' }
+          : failure.message === 'element_not_actionable'
+          ? { kind: 'not_actionable', message: '网页元素暂时无法点击，请查看是否被遮挡或禁用' } : undefined
         if (outcome) {
           await send({ type: 'result', id: value.id, value: { page_id: pageId, outcome } })
           return

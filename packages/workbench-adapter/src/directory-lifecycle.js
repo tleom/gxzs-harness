@@ -2,7 +2,7 @@ import path from 'node:path'
 import { containsWorkspacePath, resolveWorkspacePath } from './paths.js'
 import { httpError } from './http.js'
 
-const protectedDirectory = () => httpError(409, '请先删除对应对话或工作区', 'DIRECTORY_IN_USE')
+const protectedDirectory = (operation = '删除') => httpError(409, `文件已绑定会话，暂不可${operation}`, 'DIRECTORY_IN_USE')
 const overlaps = (a, b) => containsWorkspacePath(a, b) || containsWorkspacePath(b, a)
 
 /** Serialize ownership changes, so the final fork cannot race directory cleanup. */
@@ -33,6 +33,17 @@ export class DirectoryLifecycle {
       throw httpError(409, '工作区正在删除，请稍后重试', 'WORKSPACE_DELETING')
   }
 
+  assertInactive(owner, paths, chats, operation) {
+    if (chats.some(chat => {
+      const directory = this.chatPath(chat)
+      return paths.some(candidate => candidate !== directory && containsWorkspacePath(directory, candidate))
+        && (this.service.database.activeRun(owner.ownerId, chat.id)
+        || this.service.agents?.get(chat.sessionId)?.status === 'running'
+        || this.service.hasOwnedWork?.(chat.sessionId))
+    }))
+      throw httpError(409, `任务正在执行中，暂不可${operation}`, 'FILE_IN_USE')
+  }
+
   async canCleanChat(owner, chat, directory = this.chatPath(chat)) {
     // The shared volume and its conversation root are never deletion targets.
     if (!directory.startsWith('conversations/')) return false
@@ -45,14 +56,30 @@ export class DirectoryLifecycle {
     return this.run(owner, async () => {
       const directory = this.relative(requested)
       const chats = this.service.database.directoryChats(owner.ownerId)
+      this.assertInactive(owner, [directory], chats, '删除')
       // Check ancestors too: deleting a date folder must not bypass protection.
       if (chats.some(chat => containsWorkspacePath(directory, this.chatPath(chat)))
         || (await this.workspaces(owner)).some(item => containsWorkspacePath(directory, this.workspacePath(item)))
         || this.service.database.pendingWorkspaceDeletions(owner.ownerId).some(item => overlaps(directory, item.path)))
         throw protectedDirectory()
-      if (this.service.database.hasActiveRuns(owner.ownerId) || chats.some(chat => this.service.hasOwnedWork?.(chat.sessionId)))
-        throw httpError(409, '工作台正在执行任务，请停止后再删除文件')
       return this.service.fileManager.operate({ operation: 'delete', path: directory, version })
+    })
+  }
+
+  async transferFile(owner, operation, requested, destination) {
+    return this.run(owner, async () => {
+      const source = this.relative(requested), target = this.relative(destination)
+      this.assertAvailable(owner, source)
+      this.assertAvailable(owner, target)
+      if (operation === 'move') {
+        const chats = this.service.database.directoryChats(owner.ownerId)
+        const label = path.posix.dirname(source) === path.posix.dirname(target) ? '重命名' : '移动'
+        this.assertInactive(owner, [source], chats, label)
+        if (chats.some(chat => containsWorkspacePath(source, this.chatPath(chat)))
+          || (await this.workspaces(owner)).some(item => containsWorkspacePath(source, this.workspacePath(item))))
+          throw protectedDirectory(label)
+      }
+      return this.service.fileManager.operate({ operation, path: source, destination: target })
     })
   }
 

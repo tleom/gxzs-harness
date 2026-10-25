@@ -27,9 +27,11 @@ export function sidebarTerminalSource(source) {
 \t\treturn this.enqueue(() => {
 \t\t\tsignal.throwIfAborted();
 \t\t\tconst buffer = this.screen.buffer.active;
-\t\t\tconst start = Math.max(0, buffer.length - 80);
+\t\t\tlet end = buffer.length;
+\t\t\twhile (end > 0 && !buffer.getLine(end - 1)?.translateToString(true).trimEnd()) end--;
+\t\t\tconst start = Math.max(0, end - 80);
 \t\t\tconst lines = [];
-\t\t\tfor (let i = start; i < buffer.length; i++) lines.push(buffer.getLine(i)?.translateToString(true) ?? "");
+\t\t\tfor (let i = start; i < end; i++) lines.push(buffer.getLine(i)?.translateToString(true) ?? "");
 \t\t\tconst text = lines.join("\\n").trimEnd();
 \t\t\treturn { info: this.info, screen: text.slice(-24576), truncated: start > 0 || text.length > 24576 };
 \t\t});
@@ -48,6 +50,11 @@ export function sidebarTerminalSource(source) {
 \t\trename(agent, id, title) {`],
   ]
   source = source.replace('if (this.config.maxTerminals > 0 && new Set([', 'if (new Set([')
+  // Re-running preparation on an already prepared package updates the reader in place.
+  source = source.replace('\t\t\tconst start = Math.max(0, buffer.length - 80);',
+    '\t\t\tlet end = buffer.length;\n\t\t\twhile (end > 0 && !buffer.getLine(end - 1)?.translateToString(true).trimEnd()) end--;\n\t\t\tconst start = Math.max(0, end - 80);')
+    .replace('for (let i = start; i < buffer.length; i++) lines.push(buffer.getLine(i)?.translateToString(true) ?? "");',
+      'for (let i = start; i < end; i++) lines.push(buffer.getLine(i)?.translateToString(true) ?? "");')
   if (!source.includes('maxTerminals: z.number().step(1).min(1).max(3).default(3),') ||
       !source.includes('if (new Set([\n\t\t\t\t...owner.terminals.keys(),\n\t\t\t\t...owner.pending.keys(),\n\t\t\t\t...owner.allocations.keys()\n\t\t\t]).size >= this.config.maxTerminals)'))
     throw new Error('DSH terminal contract changed; inspect upstream before upgrading')

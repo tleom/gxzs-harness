@@ -1,4 +1,5 @@
 """Linux sandbox regression tests for binary framing, CAS and disk-backed downloads."""
+import base64
 import hashlib
 import io
 import json
@@ -18,6 +19,52 @@ if os.name == 'posix':
 
 def frame(metadata, data):
     return io.BytesIO(json.dumps(metadata).encode() + b'\n' + data)
+
+
+def save_file(root, transport, data, version):
+    metadata = {'operation': 'upload', 'path': 'script.sh', 'size': len(data), 'version': version}
+    if transport == 'json':
+        return file_ops.operate({**metadata, 'data': base64.b64encode(data).decode()}, str(root))
+    return binary_upload.run(frame(metadata, data), 'files', str(root))
+
+
+@pytest.mark.parametrize('transport', ['json', 'binary'])
+@pytest.mark.parametrize('mutation', ['edit', 'replace', 'create'])
+def test_save_preserves_concurrent_native_changes(tmp_path, monkeypatch, transport, mutation):
+    path = tmp_path / 'script.sh'
+    old = b'old content'
+    if mutation != 'create':
+        path.write_bytes(old)
+    expected = file_ops.version(old) if path.exists() else None
+    native_fsync = os.fsync
+    changed = False
+    def concurrent_write(fd):
+        nonlocal changed
+        native_fsync(fd)
+        if not changed:
+            changed = True
+            if mutation == 'replace':
+                path.unlink()
+            path.write_bytes(b'agent content')
+    monkeypatch.setattr(file_ops.os, 'fsync', concurrent_write)
+    result = save_file(tmp_path, transport, b'editor content', expected)
+    assert result['code'] == 'FILE_VERSION_CONFLICT'
+    assert path.read_bytes() == b'agent content'
+    assert [item.name for item in tmp_path.iterdir()] == ['script.sh']
+
+
+@pytest.mark.parametrize('transport', ['json', 'binary'])
+@pytest.mark.parametrize('mode', [0o755, 0o640, None])
+def test_save_keeps_existing_permissions_and_private_new_file_default(tmp_path, transport, mode):
+    path = tmp_path / 'script.sh'
+    if mode is not None:
+        path.write_bytes(b'old')
+        path.chmod(mode)
+    expected = file_ops.version(b'old') if mode is not None else None
+    result = save_file(tmp_path, transport, b'new', expected)
+    assert result['version'] == file_ops.version(b'new')
+    assert path.read_bytes() == b'new'
+    assert path.stat().st_mode & 0o7777 == (mode if mode is not None else 0o600)
 
 
 def test_binary_upload_exact_bytes_conflict_and_incomplete_cleanup(tmp_path):

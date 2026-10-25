@@ -160,7 +160,12 @@ def test_directory_stat_uses_same_fingerprint_without_bulk_json_or_rewalk(module
             walks.append(1)
             return original(*args, **kwargs)
         monkeypatch.setattr(files, 'tree_entries', entries)
-        monkeypatch.setattr(files.json, 'dumps', lambda *_a, **_k: pytest.fail('whole tree JSON copy'))
+        serialize = files.json.dumps
+        def no_bulk_json(value, *args, **kwargs):
+            if isinstance(value, list):
+                pytest.fail('whole tree JSON copy')
+            return serialize(value, *args, **kwargs)
+        monkeypatch.setattr(files.json, 'dumps', no_bulk_json)
         actual = files.entry_metadata(fd, '中文', '中文', os.stat(folder))
         assert actual['version'] == expected and len(walks) == 1
     finally:

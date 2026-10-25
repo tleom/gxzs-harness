@@ -6,7 +6,7 @@ import stat
 import tempfile
 import zipfile
 
-from file_ops import parent_fd, file_identity, temporary_parent
+from file_ops import parent_fd, file_identity, temporary_parent, share_identity
 
 MAX_DIRECTORY_BYTES = 1024 * 1024 * 1024
 
@@ -30,13 +30,15 @@ def stamp(digest, path, info):
     digest.update(json.dumps([path, file_identity(info)], ensure_ascii=True).encode() + b'\n')
 
 
-def copy_file(fd, name, output, expected, digest=None):
+def copy_file(fd, name, output, expected, digest=None, expected_share=None):
     if not stat.S_ISREG(expected.st_mode):
         raise ValueError('只能下载普通文件')
     item = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
     with os.fdopen(item, 'rb') as source:
         if file_identity(os.fstat(source.fileno())) != file_identity(expected):
             raise ValueError('文件已改变，请重试下载')
+        if expected_share is not None and share_identity(source.fileno()) != expected_share:
+            raise FileNotFoundError('分享文件已改变')
         count = 0
         while chunk := source.read(64 * 1024):
             count += len(chunk)
@@ -62,9 +64,11 @@ def write_download(payload, output, root='/workspace'):
         digest = hashlib.sha256()
         with tempfile.TemporaryFile(dir=root) as staged:
             if stat.S_ISREG(info.st_mode):
-                copy_file(parent, name, staged, info, digest)
+                copy_file(parent, name, staged, info, digest, payload.get('share_identity'))
                 kind = 'file'
             elif stat.S_ISDIR(info.st_mode):
+                if payload.get('share_identity') is not None:
+                    raise FileNotFoundError('分享文件已改变')
                 kind = 'directory'
                 child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
                 try:
@@ -96,6 +100,8 @@ def write_download(payload, output, root='/workspace'):
                 raise ValueError('不支持下载链接或特殊文件')
             size = staged.tell()
             header = {'name': name, 'kind': kind, 'size': size, 'version': digest.hexdigest()}
+            if payload.get('share_identity') is not None:
+                header['share_identity'] = payload['share_identity']
             output.write(json.dumps(header).encode() + b'\n')
             output.flush()
             staged.seek(0)

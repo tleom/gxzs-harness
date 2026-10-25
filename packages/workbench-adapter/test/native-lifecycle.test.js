@@ -1429,6 +1429,117 @@ function goalServiceFixture(test) {
     workingDirectory: test.ctx.workingDirectory, onGoalChanged: listener => test.ctx.on('goal/changed', listener, { prepend: true }),
     platformClient: { json: async () => ({ data: { tools: [] } }) }, skills: { list: async () => [] }, fileManager: { operate: async () => ({}) } })
 }
+it.each(['slash', 'button'])('pauses through the native model tool after steering and resumes once through %s', async method => {
+  const t = await fixture([]), s = goalServiceFixture(t)
+  const GoalTool = await native('dsh-tool-goal')
+  await t.ctx.plugin(GoalTool, {})
+  let release
+  const first = new Promise(resolve => { release = resolve })
+  t.model.stream = async function* (options) {
+    this.requests.push(options)
+    const step = this.requests.length
+    if (step === 1) await first
+    if (step === 2 || step === 3) {
+      const goal = t.ctx.goals.get(t.agent)
+      yield { type: 'tool-call-delta', index: 0, id: `goal-control-${step}`,
+        name: step === 2 ? 'get_goal' : 'update_goal',
+        argumentsDelta: JSON.stringify(step === 2 ? {} : { goal_id: goal.id, revision: goal.revision, action: 'pause' }) }
+      yield { type: 'finish', reason: { kind: 'tool-calls' } }
+    } else {
+      yield { type: 'text-delta', index: 0, text: step === 1 ? '处理中' : '本轮完成' }
+      yield { type: 'finish', reason: { kind: 'stop' } }
+    }
+  }
+  const started = await s.issueCommand(t.owner, t.chat.id, { command: '/goal 核验材料', request_key: 'goal-tool-pause' })
+  await vi.waitFor(() => expect(t.model.requests).toHaveLength(1))
+  const pause = t.create('先暂停，待会儿继续')
+  t.db.saveSubmission(t.owner.ownerId, pause.id, [{ type: 'text', text: pause.query }])
+  await t.scheduler.tick()
+  await s.steer(t.owner, pause.id, started.run.id)
+  await s.steer(t.owner, pause.id, started.run.id)
+  release()
+  await t.agent.whenIdle()
+  expect(t.ctx.goals.get(t.agent)).toMatchObject({ phase: 'paused', activation: 'disarmed', roundsStarted: 1 })
+  const history = () => t.agent.session.snapshotEvents()
+  expect(history().filter(event => event.type === 'user/message' && event.data.source.rpcId === pause.id)).toHaveLength(1)
+  expect(history().filter(event => event.type === 'goal/change' && event.data.operation === 'pause')).toHaveLength(1)
+  expect(t.db.getRun(t.owner.ownerId, pause.id).status).toBe('steered')
+  const requests = t.model.requests.length
+  await t.scheduler.tick()
+  await t.agent.whenIdle()
+  expect(t.model.requests).toHaveLength(requests)
+  // Bound the resumed fake model while checking real native activation and receipt ownership.
+  t.model.script = ['hang']
+  t.model.stream = FakeModel.prototype.stream
+  const resumed = method === 'slash'
+    ? await s.issueCommand(t.owner, t.chat.id, { command: '/goal resume', request_key: 'resume-tool-paused' })
+    : await s.mutateGoal(t.owner, t.chat.id, 'resume', { ref: t.ctx.goals.get(t.agent) })
+  await vi.waitFor(() => expect(t.model.requests).toHaveLength(requests + 1))
+  expect(t.ctx.goals.get(t.agent)).toMatchObject({ phase: 'active', activation: 'armed', roundsStarted: 2 })
+  expect(resumed.run.is_continuation).toBe(true)
+  await s.mutateGoal(t.owner, t.chat.id, 'pause', { ref: t.ctx.goals.get(t.agent) })
+  await t.agent.whenIdle()
+  expect(t.model.requests).toHaveLength(requests + 1)
+  expect(history().filter(event => event.type === 'user/message' && event.data.source.rpcId === pause.id)).toHaveLength(1)
+})
+
+it.each(['slash', 'button', 'message'])('consumes pending steering once after native pause and %s resume', async method => {
+  const t = await fixture(['hang', 'hang']), s = goalServiceFixture(t)
+  const started = await s.issueCommand(t.owner, t.chat.id, { command: '/goal 核验材料', request_key: 'pause-pending' })
+  await vi.waitFor(() => expect(t.model.requests).toHaveLength(1))
+  const attachment = { name: '材料.pdf', path: '材料.pdf' }
+  const pending = t.db.createRun({ ownerId: t.owner.ownerId, chatId: t.chat.id, sessionId: t.agent.id,
+    query: '补充材料', selection: {}, attachments: [attachment] }).run
+  t.db.saveSubmission(t.owner.ownerId, pending.id, [{ type: 'text', text: pending.query }])
+  await t.scheduler.tick()
+  await s.steer(t.owner, pending.id, started.run.id)
+  await s.mutateGoal(t.owner, t.chat.id, 'pause', { ref: t.ctx.goals.get(t.agent) })
+  await t.agent.whenIdle()
+  const consumed = () => t.agent.session.snapshotEvents().filter(event => event.type === 'user/message' && event.data.source.rpcId === pending.id)
+  expect(consumed()).toHaveLength(0)
+  expect(t.agent.inbox.nextStep.map(message => message.source.rpcId)).toContain(pending.id)
+  await t.scheduler.tick()
+  await t.agent.whenIdle()
+  expect(t.model.requests).toHaveLength(1)
+  let resumed
+  if (method === 'message') {
+    const next = t.create('继续核验另一个材料')
+    await dispatchRunPrompt(t.scheduler, next, [{ type: 'text', text: next.query }])
+    resumed = { run: s.inputRunDto(t.owner, t.db.getRun(t.owner.ownerId, next.id)) }
+  } else {
+    resumed = method === 'slash'
+      ? await s.issueCommand(t.owner, t.chat.id, { command: '/goal resume', request_key: 'resume-pending' })
+      : await s.mutateGoal(t.owner, t.chat.id, 'resume', { ref: t.ctx.goals.get(t.agent) })
+  }
+  await vi.waitFor(() => expect(t.model.requests).toHaveLength(2))
+  if (method === 'message') t.sessions.cancel({ sessionId: t.agent.id })
+  else await s.mutateGoal(t.owner, t.chat.id, 'pause', { ref: t.ctx.goals.get(t.agent) })
+  await t.agent.whenIdle()
+  expect(consumed()).toHaveLength(1)
+  expect(s.getRun(t.owner, pending.id).steer_target_run_id).toBe(started.run.id)
+  await expect(s.steer(t.owner, pending.id, started.run.id)).resolves.toMatchObject({ status: 'steered' })
+  const records = t.agent.session.snapshotEvents()
+  const consumingTurn = t.db.getRun(t.owner.ownerId, resumed.run.id).turnNumber
+  const start = records.findIndex(event => event.type === 'turn/start' && event.data.turn === consumingTurn)
+  const page = () => s.historyPageView(t.owner, t.db.getChat(t.owner.ownerId, t.chat.id), {
+    through_seq: records.at(-1).seq, records: records.slice(start).map(event => ({ event })),
+  }, false, true)
+  expect(page().runs).toHaveLength(1)
+  expect(page().runs[0].steering_messages).toMatchObject([{ id: pending.id, query: pending.query, attachments: [attachment] }])
+  const before = t.db.steeringEvents(t.owner.ownerId, resumed.run.id)
+  await reconcileNativeSessions(t.db, { observeSession: async () => ({ events: records }) }, t.owner.ownerId)
+  expect(t.db.steeringEvents(t.owner.ownerId, resumed.run.id)).toEqual(before)
+  if (method !== 'message') expect(resumed.run).toMatchObject({ is_continuation: true, parent_run_id: started.run.id })
+  const { HistoryPresentation } = await import('../src/history-presentation.js')
+  const projection = new HistoryPresentation(t.agent.id,
+    turn => Number.isInteger(turn) ? t.db.runForTurn(t.agent.id, turn) : undefined,
+    undefined, id => t.db.runForMessage(t.agent.id, id))
+  const display = projection.accept({ type: 'snapshot', records: t.agent.session.snapshotEvents().map(event => ({ event })) })
+  expect(display.events.filter(item => item.event.event === 'workbench_steering')).toMatchObject([
+    { run_id: resumed.run.id, event: { steering_id: pending.id, query: pending.query } },
+  ])
+})
+
 it.each(['slash', 'button'])('keeps native Goal text clean and preserves model-visible plugin binding across %s resume', async method => {
   const t = await fixture(['hang', 'hang', 'hang']), s = goalServiceFixture(t)
   const tool = { id: 'personal:mcp:douyin:lookup', runtime_name: 'douyin_lookup', version: 'v1', manifest_version: 'm1',

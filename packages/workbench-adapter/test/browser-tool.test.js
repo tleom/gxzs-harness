@@ -42,9 +42,9 @@ it('carries its last observation revision to the next operation', async () => {
   expect(test.browser.command).toHaveBeenCalledWith({action:'element-click',selector:'#submit',expected_revision:7},test.exec.signal)
 })
 
-it.each(['not_found', 'ambiguous', 'stale'])('returns a new snapshot for %s without replaying the operation', async kind => {
+it.each(['not_found', 'ambiguous', 'stale', 'not_actionable', 'navigation_cancelled'])('returns a new snapshot for %s without replaying the operation', async kind => {
   const test = fixture()
-  const outcome = { kind, message: 'Lookup result', ...(kind === 'stale' ? {} : { match_count: kind === 'not_found' ? 0 : 2 }) }
+  const outcome = { kind, message: 'Lookup result', ...(['not_found', 'ambiguous'].includes(kind) ? { match_count: kind === 'not_found' ? 0 : 2 } : {}) }
   let revision = 7
   test.browser.command.mockImplementation(async value => value.action === 'snapshot'
     ? { url: 'https://example.com/', title: 'Current page', text: 'Current content', elements: [], revision: revision++ }
@@ -56,6 +56,33 @@ it.each(['not_found', 'ambiguous', 'stale'])('returns a new snapshot for %s with
   expect(test.browser.command.mock.calls.filter(([value]) => value.action === 'element-click')).toHaveLength(1)
   await test.definition.execute({ action: 'key', key: 'Tab' }, test.exec)
   expect(test.browser.command).toHaveBeenCalledWith({ action: 'key', key: 'Tab', expected_revision: 8 }, test.exec.signal)
+})
+
+it.each([
+  { action: 'navigate', url: 'https://example.com/new' },
+  { action: 'new_tab', url: 'https://example.com/new' },
+  { action: 'reload' }, { action: 'back' }, { action: 'forward' },
+  { action: 'click', selector: '#leave' }, { action: 'key', key: 'Enter' },
+])('carries an explicit beforeunload decision with $action', async args => {
+  const test = fixture()
+  await test.definition.execute({ ...args, before_unload: 'leave' }, test.exec)
+  expect(test.browser.command.mock.calls[0][0]).toMatchObject({ before_unload: 'leave' })
+  expect(test.browser.command.mock.calls[1][0]).toEqual({ action: 'snapshot' })
+})
+
+it('reports a missing accessible name and invalid leave options before browser admission', async () => {
+  for (const [args, message] of [
+    [{ action: 'click', role: 'checkbox' }, '使用 role 时需同时提供 name'],
+    [{ action: 'text', role: 'textbox', text: 'x' }, '使用 role 时需同时提供 name'],
+    [{ action: 'snapshot', before_unload: 'leave' }, '离页确认参数无效'],
+  ]) {
+    const test = fixture()
+    await expect(test.definition.execute(args, test.exec)).rejects.toMatchObject({ status: 400, message })
+    expect(test.browsers.create).not.toHaveBeenCalled()
+  }
+  const test = fixture()
+  await expect(test.definition.execute({ action: 'reload', before_unload: 'yes' }, test.exec)).rejects.toMatchObject({ code: 'INVALID_ARGS' })
+  expect(test.browsers.create).not.toHaveBeenCalled()
 })
 
 it('does not carry an old observation into a browser reopened with the same chat id', async () => {
