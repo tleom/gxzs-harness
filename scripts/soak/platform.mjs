@@ -65,6 +65,11 @@ const simulation = await createSimulator({ ...config, extraHandler: async ({ req
   if (route === 'workbench/config') {
     json(res, 200, { data: { enabled: true, system_prompt: '这是隔离的合成稳定性测试。模型响应由可控服务生成。', global_skills: config.globalSkills, models: { default: 'simulator/gxzs-simulator', providers: { simulator: { api: 'openai-completions', baseURL: config.publicURL + '/v1', apiKeyEnv: 'GXZS_SIM_MODEL_KEY', compat: { supportsDeveloperRole: false }, models: [{ id: 'gxzs-simulator', name: '零费用模拟模型', input: ['text', 'image'], contextWindow: 1050000, maxTokens: 128000 }] } } } } }); return true
   }
+  if (route === 'mcp/policy') {
+    const reply = await fetch(config.managerURL + '/mcp-policy', { headers: { authorization: `Bearer ${config.token}` }, signal: AbortSignal.timeout(10000) })
+    if (!reply.ok) throw new Error('Fixture policy authority returned ' + reply.status)
+    json(res, 200, { data: { policy: await reply.json() } }); return true
+  }
   if (route === 'mcp/catalog' || route === 'mcp/plugins') {
     const personal = await manager(binding, 'personal-mcp', { operation: 'mcp_list' })
     const tools = [fixtureTool], plugins = [fixturePlugin]
