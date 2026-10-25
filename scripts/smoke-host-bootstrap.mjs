@@ -691,6 +691,8 @@ try {
   const sandboxWorkspace = '/workspace'
   await mkdir(home)
   if (sessionCreate) {
+    // Production Manager provisions this protected root before any file operation.
+    if (realSsh) remote('mkdir -p -- /workspace/conversations')
     assert.equal(process.getuid(), 1000, 'Run the host smoke as its production non-root user')
     assert.equal((await stat('/')).uid, 0, 'The parent remains owned by root')
     await assert.rejects(access('/', constants.W_OK), { code: 'EACCES' })
