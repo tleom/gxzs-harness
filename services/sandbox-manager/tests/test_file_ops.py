@@ -18,6 +18,23 @@ def root(tmp_path):
     return str(tmp_path)
 
 
+def test_mkdir_reports_atomic_reservation_without_changing_an_existing_directory(root):
+    payload = {'operation': 'mkdir', 'path': 'conversations/new-chat'}
+    assert module.operate(payload, root) == {'path': payload['path']}
+    assert module.operate(payload, root) == {'path': payload['path']}
+    assert module.operate({**payload, 'unique': True}, root) == {'path': payload['path'] + '-2'}
+    assert module.operate({**payload, 'unique': True}, root) == {'path': payload['path'] + '-3'}
+
+
+def test_unique_chat_directories_do_not_collide_under_concurrent_creation(root):
+    from concurrent.futures import ThreadPoolExecutor
+    payload = {'operation': 'mkdir', 'path': 'conversations/new-chat', 'unique': True}
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        paths = list(pool.map(lambda _: module.operate(payload, root)['path'], range(24)))
+    assert len(set(paths)) == 24
+    assert all((Path(root) / path).is_dir() for path in paths)
+
+
 def test_large_directory_pages_without_omission_and_rejects_changed_directory(root):
     directory = Path(root) / 'large'
     directory.mkdir()

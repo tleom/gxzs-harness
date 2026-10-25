@@ -5,6 +5,9 @@ import { fileURLToPath } from 'node:url'
 
 /** Internal Agent operations share the native screen/PTY without replacing its UI attachment. */
 export function sidebarTerminalSource(source) {
+  // Keep the native Bash activity integration; set only its default visible prompt.
+  source = source.replace('env: { DSH_SESSION_ID: agent.id },',
+    'env: { DSH_SESSION_ID: agent.id, PROMPT_COMMAND: "PS1=\'\\\\w\\\\$ \'" },')
   // Migrate both the upstream default and earlier GXZS unlimited installations.
   source = source.replace(/maxTerminals: z\.number\(\)\.step\(1\)\.min\([01]\)\.default\((?:0|3|8)\),/,
     'maxTerminals: z.number().step(1).min(1).max(3).default(3),')

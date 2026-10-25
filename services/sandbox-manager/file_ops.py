@@ -312,13 +312,19 @@ def operate(payload, root="/workspace"):
             return {"path": path, "kind": "missing"}
     try:
         if operation == "mkdir":
-            try:
-                os.mkdir(name, mode=0o700, dir_fd=fd)
-            except FileExistsError:
-                pass
+            original, suffix = name, 1
+            while True:
+                try:
+                    os.mkdir(name, mode=0o700, dir_fd=fd)
+                    break
+                except FileExistsError:
+                    if payload.get('unique') is not True:
+                        break
+                    suffix += 1
+                    name = f'{original}-{suffix}'
             child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
             os.close(child)
-            return {"path": path}
+            return {"path": os.path.join(os.path.dirname(path), name)}
         if operation == "manifest":
             if path != ".":
                 raise ValueError("Migration manifest is available only for the workspace root")

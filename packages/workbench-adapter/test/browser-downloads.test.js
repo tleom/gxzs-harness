@@ -7,7 +7,7 @@ const base = resolve('.tmp/browser-downloads-tests'), roots = []
 async function workspace() { await mkdir(base,{recursive:true}); const root=await mkdtemp(join(base,'case-')); roots.push(root); return root }
 afterEach(async()=> { for(const root of roots.splice(0)) { if(!resolve(root).startsWith(base+sep)) throw new Error('Unsafe test path'); await rm(root,{recursive:true,force:true}) } })
 function download(name, bytes='content') {
-  return {suggestedFilename:()=>name,path:vi.fn(async()=>'/browser/temp'),saveAs:vi.fn(path=>writeFile(path,bytes)),
+  return {suggestedFilename:()=>name,path:vi.fn(async()=>{const root=await workspace(),path=join(root,'browser-temp');await writeFile(path,bytes);return path}),saveAs:vi.fn(),
     delete:vi.fn(async()=>{}),cancel:vi.fn(async()=>{})}
 }
 it('saves completed downloads without overwriting names and removes the browser temporary copy',async()=> {
@@ -18,17 +18,18 @@ it('saves completed downloads without overwriting names and removes the browser 
   expect(files).toHaveLength(2)
   expect(new Set(files.map(file=>file.path)).size).toBe(2)
   expect(await Promise.all(files.map(file=>readFile(join(root,file.path),'utf8')))).toEqual(expect.arrayContaining(['one','two']))
-  expect(files.every(file=>file.path.startsWith('downloads/')&&file.size===3)).toBe(true)
+  expect(files.map(file=>file.path).sort()).toEqual(['Download/报告 (1).pdf','Download/报告.pdf'])
+  expect(files.every(file=>file.size===3)).toBe(true)
   expect(first.delete).toHaveBeenCalledOnce();expect(second.delete).toHaveBeenCalledOnce()
   await manager.close()
   expect(first.cancel).not.toHaveBeenCalled()
   expect(await readFile(join(root,files[0].path),'utf8')).toBeTruthy()
 })
-it('removes only its incomplete destination when saving fails',async()=> {
+it('does not leave a destination when the source cannot be copied',async()=> {
   const root=await workspace(),report=vi.fn(),manager=createBrowserDownloads({workspace:root,report}),file=download('file.txt')
-  file.saveAs.mockImplementation(async path=>{await writeFile(path,'partial');throw new Error('disk full')})
+  file.path.mockImplementation(workspace)
   await manager.start(file)
-  expect(await readdir(join(root,'downloads'))).toEqual([])
+  expect(await readdir(join(root,'Download'))).toEqual([])
   expect(report).toHaveBeenLastCalledWith({notice:'下载失败：file.txt'})
   expect(file.delete).toHaveBeenCalledOnce()
   await manager.close()
@@ -47,4 +48,15 @@ it('cancels active downloads on shutdown without creating files or reporting a f
 it.each(['../../x.txt','..\\..\\x.txt','/etc/passwd','NUL','a:b?.txt','文件'.repeat(200)+'.txt'])('keeps suggested filename %s inside one bounded file component',name=>{
   const value=downloadName(name)
   expect(value).not.toMatch(/[\\/:?*<>|]/);expect(value).not.toBe('..');expect(Buffer.byteLength(value)).toBeLessThanOrEqual(200)
+})
+it('places downloads directly in the current conversation and preserves long Unicode extensions',async()=>{
+  const root=await workspace(),directory=join(root,'conversations','new-chat'),report=vi.fn()
+  await mkdir(directory,{recursive:true})
+  const manager=createBrowserDownloads({workspace:root,directory,report})
+  await manager.start(download('文件'.repeat(100)+'.docx','word'))
+  const file=report.mock.calls.find(([event])=>event.download)[0].download
+  expect(file.path).toBe(`conversations/new-chat/Download/${file.name}`)
+  expect(file.name.endsWith('.docx')).toBe(true)
+  expect(await readFile(join(root,file.path),'utf8')).toBe('word')
+  await manager.close()
 })

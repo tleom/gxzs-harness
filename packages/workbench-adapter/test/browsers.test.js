@@ -9,6 +9,15 @@ it('accepts an inferred HTTP fallback only for the same HTTPS destination', () =
   for (const fallback_url of ['http://other.test/app?q=1','file:///app','http://u:p@xcmggx.com/app?q=1','http://xcmggx.com/other','https://xcmggx.com/app?q=1'])
     expect(()=>browserAction({action:'navigate',url:'https://xcmggx.com/app?q=1',fallback_url})).toThrow()
 })
+it('starts the browser in the authenticated conversation directory',async()=>{
+  const create=vi.fn(()=>({command:vi.fn(async()=>{}),done:new Promise(()=>{}),dispose:vi.fn()}))
+  const chat={id:'chat',directory:'conversations/2026-10-25/new-chat'}
+  const service={requireChat:vi.fn(()=>chat),chatDirectory:vi.fn((id,directory)=>'/workspace/'+directory)}
+  const gateway=new WorkbenchBrowsers({service,create})
+  await gateway.create({ownerId:'owner'},{id,chat_id:'chat'},signal())
+  expect(create).toHaveBeenCalledWith('/workspace/conversations/2026-10-25/new-chat')
+  expect(service.requireChat).toHaveBeenCalledWith({ownerId:'owner'},'chat')
+})
 it('receives a full-resolution PNG above the old line limit without closing the browser', async () => {
   const stdin = new PassThrough(), stdout = new PassThrough()
   const browser = new SandboxBrowser({spawn:spec => ({stdin,stdout,

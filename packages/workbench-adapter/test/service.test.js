@@ -55,11 +55,13 @@ function setup() {
   const agent = { id: chat.sessionId, cancel: vi.fn(), whenIdle: vi.fn(async () => {}) }
   const agents = { get: vi.fn(() => agent) }
   const commands = { execute: vi.fn(async () => ({ result: { text: 'ok' }, commandId: 'c1' })) }
+  const directories = new Set()
   const fileManager = {
-    operate: vi.fn(async ({ operation }) => {
+    operate: vi.fn(async ({ operation, path, unique }) => {
       if (operation === 'stat') return { kind: 'directory', version: 'tree-v1' }
       if (operation === 'list') return { entries: [] }
-      if (operation === 'delete' || operation === 'mkdir') return { deleted: true }
+      if (operation === 'mkdir') { const base=path;let suffix=1;while(unique && directories.has(path))path=base+'-'+(++suffix);directories.add(path);return {path} }
+      if (operation === 'delete') return { deleted: true }
       throw new Error('unexpected file operation')
     }),
     personalResources: vi.fn(async () => ({ memory: { content: '', version: null }, skills: [], warnings: [] })),
@@ -867,10 +869,11 @@ describe('followup and control service', () => {
     const second = await service.createChat(owner, '/workspace', {})
     expect(first.id).not.toBe(second.id)
     for (const chat of [first, second]) {
-      expect(chat.directory).toMatch(new RegExp(`^conversations/\\d{4}-\\d{2}-\\d{2}/${chat.id}$`))
-      expect(fileManager.operate).toHaveBeenCalledWith({ operation: 'mkdir', path: chat.directory })
+      expect(chat.directory).toMatch(/^conversations\/\d{4}-\d{2}-\d{2}\/new-chat(?:-\d+)?$/)
+      expect(fileManager.operate).toHaveBeenCalledWith({ operation: 'mkdir', path: first.directory, unique: true })
       expect(sessionController.create).toHaveBeenCalledWith({ cwd: `/workspace/${chat.directory}` })
     }
+    expect(second.directory).toBe(first.directory+'-2')
     expect(fileManager.operate.mock.invocationCallOrder[0]).toBeLessThan(sessionController.create.mock.invocationCallOrder[0])
   })
 
