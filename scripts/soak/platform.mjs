@@ -95,6 +95,13 @@ const simulation = await createSimulator({ ...config, extraHandler: async ({ req
     const reply = await fetch(`${config.managerURL}/sandboxes/${binding.workspace_id}/schedule`, { method: 'POST', headers: { authorization: `Bearer ${config.token}`, 'content-type': 'application/json' }, body: JSON.stringify({ ...body, owner_id: owner, generation: binding.generation, instance_id: binding.instance_id }), signal: AbortSignal.timeout(5000) })
     const result = await reply.json(); json(res, reply.status, reply.ok ? { data: result } : result); return true
   }
+  if (route === 'schedule-wakeups' && Number.isSafeInteger(body.sequence) && body.sequence > 0 && Array.isArray(body.tasks)) {
+    // An empty native catalog needs no durable wakeup. Positive scheduling is
+    // verified against the real Java/SnailJob stack, never simulated here.
+    if (body.tasks.length) { json(res, 503, { error: 'Use the Java fixture for durable schedule wakeups' }); return true }
+    await simulation.record({ event: 'empty_schedule_wakeups', owner, sequence: body.sequence })
+    json(res, 200, { data: { sequence: body.sequence, tasks: [], complete: true } }); return true
+  }
   json(res, 404, { error: 'Unimplemented synthetic platform route', route }); return true
 } })
 console.log(JSON.stringify({ ready: true, port: simulation.port, synthetic: true, upstreamCalls: 0 }))

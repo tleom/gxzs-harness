@@ -76,6 +76,14 @@ test('synthetic platform forwards the manager-owned MCP policy after authenticat
   assert.equal(response.status, 200)
   assert.deepEqual(await response.json(), { data: { policy } })
   assert.equal(requests, 1)
+  const wakeupURL = `http://127.0.0.1:${ready.port}/internal/workbench/schedule-wakeups`
+  const headers = { authorization: `Bearer ${token}`, 'content-type': 'application/json',
+    'x-gxzs-owner': owner, 'x-gxzs-host-generation': '1', 'x-gxzs-host-instance': instance }
+  const empty = await fetch(wakeupURL, { method: 'POST', headers, body: JSON.stringify({ sequence: 3, tasks: [] }) })
+  assert.equal(empty.status, 200)
+  assert.deepEqual(await empty.json(), { data: { sequence: 3, tasks: [], complete: true } })
+  const active = await fetch(wakeupURL, { method: 'POST', headers, body: JSON.stringify({ sequence: 4, tasks: [{ id: 'future' }] }) })
+  assert.equal(active.status, 503)
 })
 
 async function fixture(t) {
