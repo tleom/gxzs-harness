@@ -41,7 +41,7 @@ RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.l
     && apt-get -o Acquire::Retries=3 -o Acquire::https::Timeout=30 update \
     && apt-get -o Acquire::Retries=3 -o Acquire::https::Timeout=30 install -y --no-install-recommends \
       openssh-server tini bubblewrap ca-certificates curl unzip zip jq ripgrep git file \
-      xauth x11-utils x11-xserver-utils \
+      xauth x11-utils x11-xserver-utils xsettingsd \
       libreoffice-writer libreoffice-calc libreoffice-impress libreoffice-draw libreoffice-math python3-uno \
       poppler-utils fontconfig fonts-noto-cjk fonts-noto-color-emoji fonts-dejavu-core fonts-liberation \
       fonts-crosextra-carlito fonts-crosextra-caladea pandoc ghostscript qpdf \

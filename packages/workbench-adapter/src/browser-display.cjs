@@ -1,6 +1,6 @@
 // A private X display per chat browser. Only the signed adapter can carry its pixels.
 const { spawn, execFile } = require('node:child_process')
-const { existsSync, mkdtempSync, rmSync } = require('node:fs')
+const { existsSync, mkdtempSync, rmSync, writeFileSync } = require('node:fs')
 const { tmpdir } = require('node:os')
 const { join } = require('node:path')
 const { createServer, connect } = require('node:net')
@@ -22,6 +22,8 @@ async function startDisplay({ width, height, emit, onExit }) {
   let display
   do { display = 100 + Math.floor(Math.random() * 50000) }
   while (existsSync(`/tmp/.X${display}-lock`) || existsSync(`/tmp/.X11-unix/X${display}`))
+  const env = { ...process.env, DISPLAY: `:${display}`, HOME: home, XDG_CONFIG_HOME: join(home, '.config'), XDG_CACHE_HOME: join(home, '.cache') }
+  const settingsPath = join(home, 'xsettings.conf')
   const port = await availablePort()
   const child = spawn('/usr/bin/Xvnc', [`:${display}`, '-geometry', `${width}x${height}`, '-depth', '24',
     '-websocketPort', String(port), '-interface', '127.0.0.1', '-UseIPv6', '0', '-publicIP', '127.0.0.1',
@@ -32,7 +34,8 @@ async function startDisplay({ width, height, emit, onExit }) {
     '-FrameRate', '30', '-AcceptSetDesktopSize', '0', '-MaxVideoResolution', '1920x1080',
     '-DLP_ClipAcceptMax', '32768', '-DLP_ClipSendMax', '32768', '-DLP_ClipTypes', 'text/plain',
     '-httpd', '/usr/share/kasmvnc/www'], { env: { ...process.env, HOME: home }, stdio: ['ignore', 'ignore', 'pipe'] })
-  let stopping = false, failure, log = '', relay
+  let stopping = false, failure, log = '', relay, settings
+  let settingsDone = Promise.resolve(), density = 1
   let currentMode
   const size = { width, height }
   child.stderr.on('data', bytes => { log = (log + bytes).slice(-4096) })
@@ -49,9 +52,10 @@ async function startDisplay({ width, height, emit, onExit }) {
     if (stopping) return done
     stopping = true
     closeRelay()
+    settings?.kill('SIGTERM')
     child.kill('SIGTERM')
-    const force = setTimeout(() => child.kill('SIGKILL'), 1000)
-    await done
+    const force = setTimeout(() => { settings?.kill('SIGKILL'); child.kill('SIGKILL') }, 1000)
+    await Promise.all([done, settingsDone])
     clearTimeout(force)
     rmSync(home, { recursive: true, force: true })
   }
@@ -69,12 +73,32 @@ async function startDisplay({ width, height, emit, onExit }) {
       if (count === 99) throw new Error('display_start_timeout')
       await delay(100)
     }
+    // Chromium follows the private desktop's native DPI. This keeps compositor
+    // hit testing and CDP input in one coordinate system without a viewport crop.
+    writeFileSync(settingsPath, 'Xft/DPI 98304\n')
+    settings = spawn('/usr/bin/xsettingsd', ['-c', settingsPath], { env, stdio: ['ignore', 'ignore', 'ignore'] })
+    settingsDone = new Promise(resolve => {
+      settings.once('error', error => { failure = error; resolve() })
+      settings.once('exit', () => { failure ||= new Error('display_settings_exited'); if (!stopping) onExit(); resolve() })
+    })
+    for (let count = 0; ; count++) {
+      if (failure) throw failure
+      const ready = await run('/usr/bin/dump_xsettings', [], { env, timeout: 1000 }).catch(() => null)
+      if (ready?.stdout.includes('Xft/DPI 98304')) break
+      if (count === 99) throw new Error('display_settings_timeout')
+      await delay(10)
+    }
   } catch (error) { await stop(); throw error }
   return {
-    env: { ...process.env, DISPLAY: `:${display}`, HOME: home, XDG_CONFIG_HOME: join(home, '.config'), XDG_CACHE_HOME: join(home, '.cache') },
+    env,
     size,
     stop,
-    async resize(width, height) {
+    async resize(width, height, scale = 1) {
+      if (density !== scale) {
+        writeFileSync(settingsPath, `Xft/DPI ${Math.round(96 * 1024 * scale)}\n`)
+        if (!settings.kill('SIGHUP')) throw new Error('display_settings_exited')
+        density = scale
+      }
       const w = width, h = height, mode = `workbench-${w}x${h}`
       if (currentMode === mode) return
       const randr = args => run('/usr/bin/xrandr', ['--display', `:${display}`, ...args], { timeout: 5000 })

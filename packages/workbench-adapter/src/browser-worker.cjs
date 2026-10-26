@@ -294,7 +294,7 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
     if (!closed) notice = '网页画面暂时获取失败，正在重试'
     throw new Error('frame_unavailable')
   }
-  async function fitDisplayWindow(cdp, target) {
+  async function fitDisplayWindow(cdp) {
     const window = await cdp.send('Browser.getWindowForTarget')
     await cdp.send('Browser.setWindowBounds', { windowId: window.windowId, bounds: { windowState: 'normal' } })
     await cdp.send('Browser.setWindowBounds', { windowId: window.windowId,
@@ -302,16 +302,12 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
     await cdp.send('Browser.setWindowBounds', { windowId: window.windowId, bounds: { windowState: 'fullscreen' } })
     // Chromium enforces a minimum outer-window width even in kiosk mode. Keep
     // layout and input coordinates aligned with the visible X display below it.
-    const position = deviceScaleFactor === 1 ? undefined : await target.evaluate(() => ({ x: scrollX, y: scrollY }))
-    await cdp.send('Emulation.setDeviceMetricsOverride', {
-      ...viewport, deviceScaleFactor, mobile: false,
-      ...(position ? { viewport: { x: position.x, y: position.y, ...viewport, scale: 1 } } : {}),
-    })
+    await cdp.send('Emulation.setDeviceMetricsOverride', { ...viewport, deviceScaleFactor, mobile: false })
   }
   async function bind(target, id) {
     const cdp = await context.newCDPSession(target)
     if (display) {
-      await fitDisplayWindow(cdp, target)
+      await fitDisplayWindow(cdp)
       await target.bringToFront()
     } else streams.set(target, createScreencast({ page: target, session: cdp, nextId: () => ++frameSequence,
       getDeviceScaleFactor: () => deviceScaleFactor,
@@ -448,7 +444,7 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
       if (closed) { await display?.stop(); throw new Error('browser_closed') }
       browser = await chromium.launch({ executablePath: '/usr/bin/chromium', headless: !display,
         ...(display ? { env: display.env } : {}),
-        args: ['--no-sandbox', '--disable-dev-shm-usage', ...(display ? ['--force-device-scale-factor=1', '--no-first-run',
+        args: ['--no-sandbox', '--disable-dev-shm-usage', ...(display ? ['--no-first-run',
           '--kiosk', '--window-position=0,0', `--window-size=${value.width},${value.height}`] : [])], timeout: 20000 })
       if (closed) { await browser.close(); throw new Error('browser_closed') }
       browser.on('disconnected', () => fatal('沙盒浏览器已退出，请重新打开浏览器'))
@@ -457,36 +453,9 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
       if (closed) { await context.close(); throw new Error('browser_closed') }
       if (display) {
         await context.exposeBinding('__workbenchInputChanged', () => { revision++ })
-        await context.exposeBinding('__workbenchViewportChanged', async ({ page: target, frame: source }, x, y) => {
-          if (closed || deviceScaleFactor === 1 || target !== page || source !== target.mainFrame() || !Number.isFinite(x) || !Number.isFinite(y)) return
-          // CDP's viewport is a document-coordinate crop, so it must follow root
-          // scrolling. Keep the native input coordinate system unchanged.
-          await session.send('Emulation.setDeviceMetricsOverride', {
-            ...viewport, deviceScaleFactor, mobile: false,
-            viewport: { x, y, ...viewport, scale: 1 },
-          }).catch(() => {})
-        })
         await context.addInitScript(() => {
           for (const name of ['pointerdown', 'keydown', 'input', 'wheel'])
             addEventListener(name, event => { if (event.isTrusted) void window.__workbenchInputChanged() }, { capture: true, passive: true })
-          if (window !== window.top) return
-          let pending = false, last = 0
-          const followViewport = () => {
-            if (pending) return
-            pending = true
-            setTimeout(async () => {
-              const x = scrollX, y = scrollY
-              last = performance.now()
-              try { await window.__workbenchViewportChanged(x, y) }
-              catch { /* The document may navigate while its update is pending. */ }
-              finally {
-                pending = false
-                if (x !== scrollX || y !== scrollY) followViewport()
-              }
-            }, Math.max(0, 34 - (performance.now() - last)))
-          }
-          addEventListener('scroll', event => { if (event.target === document) followViewport() }, { passive: true })
-          addEventListener('pageshow', followViewport)
         })
       }
       context.on?.('page', target => {
@@ -582,13 +551,22 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
       case 'reload': navigationResponse = await page.reload(navigationOptions); break
       case 'back': navigationResponse = await page.goBack(navigationOptions); break
       case 'forward': navigationResponse = await page.goForward(navigationOptions); break
-      case 'resize':
+      case 'resize': {
+        const previousScale = deviceScaleFactor
         navigation++
         viewport = { width: value.width, height: value.height }
         deviceScaleFactor = value.device_scale_factor ?? 1
         if (display) {
-          await display.resize(Math.round(value.width * deviceScaleFactor), Math.round(value.height * deviceScaleFactor))
-          await fitDisplayWindow(session, page)
+          if (previousScale !== deviceScaleFactor) await session.send('Emulation.clearDeviceMetricsOverride')
+          await display.resize(Math.round(value.width * deviceScaleFactor), Math.round(value.height * deviceScaleFactor), deviceScaleFactor)
+          if (previousScale !== deviceScaleFactor) {
+            // Blink can round the exposed ratio to 1/64. Wait for the native DPI
+            // update before applying the logical viewport and accepting input.
+            const ready = await page.waitForFunction(scale => Math.abs(window.devicePixelRatio - scale) < 1 / 64,
+              deviceScaleFactor, { timeout: 5000, polling: 50 })
+            await ready.dispose()
+          }
+          await fitDisplayWindow(session)
           // XRandR and CDP acknowledge before Chromium applies the resize.
           // Observe the renderer before accepting another input or snapshot.
           const resized = await page.waitForFunction(({ width, height }) =>
@@ -600,6 +578,7 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
         if (capturing) await captureFinished
         await streams.get(page)?.resize()
         break
+      }
       case 'modifiers': await setModifiers(value.modifiers); break
       case 'cut-selection':
         if (!value.text || await selectedText() !== value.text) throw new Error('stale_observation')

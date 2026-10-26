@@ -57,6 +57,7 @@ python3 "$script_dir/smoke-planning-resources.py" "$manager_image" "$sandbox_ima
 docker exec -i "$container_id" node < "$script_dir/smoke-browser-observation.cjs"
 docker exec -i "$container_id" node < "$script_dir/smoke-browser-navigation.cjs"
 docker exec -i "$container_id" node < "$script_dir/smoke-browser-display.cjs"
+docker exec -i "$container_id" node < "$script_dir/smoke-browser-wheel.cjs"
 docker run --rm --network none --entrypoint node "$host_image" -e \
   "process.stdout.write(require('node:fs').readFileSync('/opt/workbench/services/browser-client/dist/client.js'))" \
   | docker exec -i "$container_id" sh -c 'cat > /tmp/workbench-browser-client.js'

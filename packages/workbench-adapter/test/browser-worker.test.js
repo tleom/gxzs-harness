@@ -585,7 +585,7 @@ it('uses a private visible display without starting CDP pixel encoding, and rele
   expect(value.browser.close).toHaveBeenCalledOnce()
 })
 
-it('preserves the scrolled viewport on density changes and only follows the active main frame', async () => {
+it('waits for native density before applying the logical viewport', async () => {
   const display={env:{DISPLAY:':100'},size:{width:1000,height:700},resize:vi.fn(),stop:vi.fn(async()=>{})}
   const value=worker(async()=>display),main={}
   const send=vi.fn(async()=>({currentIndex:0,entries:[{}]}))
@@ -598,29 +598,19 @@ it('preserves the scrolled viewport on density changes and only follows the acti
   value.page.waitForFunction=vi.fn(async()=>({dispose:async()=>{}}))
   try {
     await value.command(1,'init',{width:1000,height:700})
-    const follow=value.context.exposeBinding.mock.calls.find(([name])=>name==='__workbenchViewportChanged')[1]
     send.mockClear()
-    await follow({page:value.page,frame:main},40,2100)
-    expect(send).not.toHaveBeenCalled()
     await value.command(2,'resize',{width:1174,height:681,device_scale_factor:2.2})
+    expect(display.resize).toHaveBeenCalledWith(2583,1498,2.2)
+    expect(send).toHaveBeenCalledWith('Emulation.clearDeviceMetricsOverride')
+    expect(value.page.waitForFunction).toHaveBeenCalledWith(expect.any(Function),2.2,{timeout:5000,polling:50})
     expect(send).toHaveBeenCalledWith('Emulation.setDeviceMetricsOverride',{
       width:1174,height:681,deviceScaleFactor:2.2,mobile:false,
-      viewport:{x:37,y:2000,width:1174,height:681,scale:1},
     })
     send.mockClear()
-    await follow({page:value.page,frame:{}},40,2100)
-    await follow({page:{},frame:main},40,2100)
-    await follow({page:value.page,frame:main},NaN,2100)
-    expect(send).not.toHaveBeenCalled()
-    await follow({page:value.page,frame:main},40,2100)
-    expect(send).toHaveBeenCalledExactlyOnceWith('Emulation.setDeviceMetricsOverride',{
-      width:1174,height:681,deviceScaleFactor:2.2,mobile:false,
-      viewport:{x:40,y:2100,width:1174,height:681,scale:1},
-    })
-    await value.runtime.shutdown()
-    send.mockClear()
-    await follow({page:value.page,frame:main},40,2200)
-    expect(send).not.toHaveBeenCalled()
+    value.page.waitForFunction.mockClear()
+    await value.command(3,'resize',{width:1200,height:700,device_scale_factor:2.2})
+    expect(send).not.toHaveBeenCalledWith('Emulation.clearDeviceMetricsOverride')
+    expect(value.page.waitForFunction).toHaveBeenCalledTimes(1)
   } finally {await value.runtime.shutdown()}
 })
 
