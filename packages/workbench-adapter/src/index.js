@@ -576,7 +576,7 @@ export function apply(ctx, config) {
       const defaultModel = catalog.default ? `${catalog.default.provider}/${catalog.default.model}` : ''
       const chat = await service.createChat(owner, config.workspace, {
         model: defaultModel, tools: [], skills: [], knowledge: [], model_parameters: {}, tool_parameters: {},
-      }, json.workspaceId)
+      }, json.workspaceId, json.directoryName)
       sendJson(res, 201, { data: service.getChat(owner, chat.id) })
     }],
     ['GET', /^\/chats\/([\w-]+)$/, async ({ owner }, res, match) => {

@@ -742,6 +742,20 @@ describe('authenticated workbench HTTP handler', () => {
     })
   })
 
+  it('accepts a short prompt-derived name for an ungrouped conversation', async () => {
+    const { handler, key, context } = setup()
+    const created = await call(handler, key, 'POST', '/chats', { directoryName: 'review-report-v2' })
+    expect(created.status).toBe(201)
+    expect(created.body.data.file_directory).toMatch(/^conversations\/\d{4}-\d{2}-\d{2}\/review-report-v2$/)
+    expect(context.workbenchFileManager.operate).toHaveBeenCalledWith({ operation: 'mkdir', path: created.body.data.file_directory, unique: true })
+  })
+
+  it.each(['../escape', '/absolute', 'a'.repeat(81), ''])('rejects invalid directory names before allocating a folder: %s', async directoryName => {
+    const { handler, key, context } = setup()
+    expect((await call(handler, key, 'POST', '/chats', { directoryName })).status).toBe(400)
+    expect(context.workbenchFileManager.operate).not.toHaveBeenCalled()
+  })
+
   it('creates and lists owner-scoped chats with the expected envelope', async () => {
     const { handler, key } = setup()
     const created = await call(handler, key, 'POST', '/chats', {})

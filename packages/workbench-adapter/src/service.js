@@ -61,11 +61,11 @@ export class WorkbenchService {
     this.directories = new DirectoryLifecycle(this)
   }
 
-  async createChat(owner, workspace, selection, workspaceId) {
-    return this.directories.run(owner, () => this.createChatLocked(owner, workspace, selection, workspaceId))
+  async createChat(owner, workspace, selection, workspaceId, directoryName) {
+    return this.directories.run(owner, () => this.createChatLocked(owner, workspace, selection, workspaceId, directoryName))
   }
 
-  async createChatLocked(owner, workspace, selection, workspaceId) {
+  async createChatLocked(owner, workspace, selection, workspaceId, directoryName) {
     const id = randomUUID()
     if (workspaceId !== undefined) {
       if (!this.workspaces) throw httpError(503, '工作区服务尚未就绪')
@@ -75,11 +75,13 @@ export class WorkbenchService {
       return this.database.createChat({ id, ownerId: owner.ownerId, sessionId: created.sessionId, selection,
         directory: target.path === '.' ? 'conversations' : `conversations/${target.path}` })
     }
+    if (directoryName !== undefined && (typeof directoryName !== 'string' || directoryName.length > 80 || !/^[a-z0-9]+(?:-[a-z0-9]+)*-?$/.test(directoryName)))
+      throw httpError(400, '对话目录名称无效')
     const date = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date())
     await this.fileManager.operate({ operation: 'mkdir', path: `conversations/${date}` })
     // A new chat may start from a terminal before it has a title or first prompt.
     // Reserve the short directory atomically; retain its mapping when the chat is renamed.
-    const name = `${directoryAdjectives[randomInt(directoryAdjectives.length)]}-${directoryNouns[randomInt(directoryNouns.length)]}`
+    const name = directoryName ?? `${directoryAdjectives[randomInt(directoryAdjectives.length)]}-${directoryNouns[randomInt(directoryNouns.length)]}`
     const { path: directory } = await this.fileManager.operate({ operation: 'mkdir', path: `conversations/${date}/${name}`, unique: true })
     const created = await this.sessions.create({ cwd: this.chatDirectory(id, directory) })
     const chat = this.database.createChat({ id, ownerId: owner.ownerId, sessionId: created.sessionId, selection, directory })

@@ -664,7 +664,7 @@ describe('followup and control service', () => {
   it('creates a native workspace session and persists its directory without deleting workspace files', async () => {
     const { service, owner, database, sessionController, fileManager } = setup()
     service.workspaces = { baseline: async () => ({ items: [{ workspaceId: 'ws-cases', path: 'cases' }] }), requireWorkspace: vi.fn(async () => ({ workspaceId: 'ws-cases', path: 'cases' })) }
-    const chat = await service.createChat(owner, '/workspace', {}, 'ws-cases')
+    const chat = await service.createChat(owner, '/workspace', {}, 'ws-cases', 'ignore-this-name')
     expect(service.workspaces.requireWorkspace).toHaveBeenCalledWith(owner, 'ws-cases', true)
     expect(sessionController.create).toHaveBeenCalledWith({ workspaceId: 'ws-cases' })
     expect(database.getChat(owner.ownerId, chat.id).directory).toBe('conversations/cases')
