@@ -49,16 +49,22 @@ function parseBrowserAction(request) {
     case 'ack':
       if (integer(request.frame_id, 1, Number.MAX_SAFE_INTEGER)) return { action, frame_id: request.frame_id }
       break
-    case 'resize':
-      if (integer(request.width, 320, 1920) && integer(request.height, 240, 1080)) return { action, width: request.width, height: request.height }
+    case 'resize': {
+      const scale = request.device_scale_factor ?? 1
+      if (integer(request.width, 320, 3840) && integer(request.height, 240, 2160)
+        && typeof scale === 'number' && Number.isFinite(scale) && scale >= 0.5 && scale <= 4
+        && Math.round(request.width * scale) <= 3840 && Math.round(request.height * scale) <= 2160)
+        return { action, width: request.width, height: request.height,
+          ...(request.device_scale_factor === undefined ? {} : { device_scale_factor: scale }) }
       break
+    }
     case 'click': case 'move': case 'pointer-down': case 'pointer-up':
-      if (!integer(request.x, 0, 1919) || !integer(request.y, 0, 1079)) break
+      if (!integer(request.x, 0, 3839) || !integer(request.y, 0, 2159)) break
       if (action === 'move') return { action, x: request.x, y: request.y, ...(modifiers ? { modifiers } : {}) }
       if (!['left', 'middle', 'right'].includes(request.button === undefined ? 'left' : request.button) || !integer(request.count === undefined ? 1 : request.count, 1, 2)) break
       return { action, x: request.x, y: request.y, button: request.button === undefined ? 'left' : request.button, count: request.count === undefined ? 1 : request.count, ...(modifiers ? { modifiers } : {}) }
     case 'wheel':
-      if (integer(request.x, -3000, 3000) && integer(request.y, -3000, 3000)) return { action, x: request.x, y: request.y }
+      if (integer(request.x, -3000, 3000) && integer(request.y, -3000, 3000)) return { action, x: request.x, y: request.y, ...(modifiers ? { modifiers } : {}) }
       break
     case 'text':
       if (typeof request.text === 'string' && request.text.length <= 32 * 1024) return { action, text: request.text }
@@ -157,7 +163,7 @@ export class SandboxBrowser {
         } else if (frame.type === 'display') {
           // Messages from a replaced attachment belong to its old RFB handshake.
         } else if (frame.type === 'frame' && (frame.display === 'kasm' || typeof frame.image === 'string' && frame.image.length <= Math.ceil(8 * 1024 * 1024 / 3) * 4)
-          && integer(frame.width, 320, 1920) && integer(frame.height, 240, 1080)) {
+          && integer(frame.width, 320, 3840) && integer(frame.height, 240, 2160)) {
           if (frame.legacy) this.legacyFrame = frame
           else {
             this.frame = frame

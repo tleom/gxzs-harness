@@ -2,6 +2,26 @@ import { EventEmitter } from 'node:events'
 import { createRequire } from 'node:module'
 import { expect, it, vi } from 'vitest'
 const { createScreencast } = createRequire(import.meta.url)('../src/browser-screencast.cjs')
+it('keeps CSS input coordinates while streaming native high-density pixels', async () => {
+  const session=Object.assign(new EventEmitter(), {send:vi.fn(async()=>({}))})
+  const stream=createScreencast({session,page:{viewportSize:()=>({width:1174,height:681})},getDeviceScaleFactor:()=>2.2,emit:async()=>true,nextId:()=>1})
+  try {
+    expect(await stream.start()).toBe(true)
+    expect(session.send).toHaveBeenCalledWith('Emulation.setDeviceMetricsOverride',expect.objectContaining({width:1174,height:681,deviceScaleFactor:2.2}))
+    expect(session.send).toHaveBeenCalledWith('Page.startScreencast',expect.objectContaining({format:'png',maxWidth:2583,maxHeight:1498}))
+  } finally {await stream.dispose()}
+})
+
+it('keeps hidden high-density screenshots sharp without starting a stream', async () => {
+  const session=Object.assign(new EventEmitter(),{send:vi.fn(async()=>({}))})
+  const stream=createScreencast({session,page:{viewportSize:()=>({width:1000,height:650})},getDeviceScaleFactor:()=>2.2,emit:async()=>true,nextId:()=>1})
+  try {
+    await stream.resize()
+    expect(session.send).toHaveBeenCalledWith('Emulation.setDeviceMetricsOverride',expect.objectContaining({width:1000,height:650,deviceScaleFactor:2.2}))
+    expect(session.send.mock.calls.some(([name])=>name==='Page.startScreencast')).toBe(false)
+    expect(stream.active).toBe(false)
+  } finally {await stream.dispose()}
+})
 
 it('streams bounded CSS-resolution frames without changing the viewport and waits for viewer receipts', async () => {
   const session = Object.assign(new EventEmitter(), {send:vi.fn(async()=>({}))})

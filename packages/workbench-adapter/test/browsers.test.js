@@ -3,6 +3,14 @@ import { expect, it, vi } from 'vitest'
 import { browserAction, SandboxBrowser, WorkbenchBrowsers } from '../src/browsers.js'
 const id = '12345678-1234-1234-1234-123456789abc'
 const signal = () => new AbortController().signal
+it('accepts native display density with a bounded 4K framebuffer and keeps legacy resize compatible', () => {
+  expect(browserAction({action:'resize',width:1174,height:681,device_scale_factor:2.2}))
+    .toEqual({action:'resize',width:1174,height:681,device_scale_factor:2.2})
+  expect(browserAction({action:'resize',width:3840,height:2160})).toEqual({action:'resize',width:3840,height:2160})
+  for (const device_scale_factor of [0, NaN, Infinity, '2', 4.1, 3])
+    expect(()=>browserAction({action:'resize',width:1920,height:1080,device_scale_factor})).toThrow()
+  expect(browserAction({action:'click',x:3839,y:2159})).toMatchObject({x:3839,y:2159})
+})
 it.each(['navigate','back','forward','reload'])('preserves a validated manual leave decision and observation revision for %s', action => {
   const request={action,...(action==='navigate'?{url:'https://example.com/next'}:{}),before_unload:'leave',expected_revision:12}
   expect(browserAction(request)).toEqual(request)

@@ -25,5 +25,6 @@ during motion, with an 8 MiB encoded-frame limit and matching transport bounds.
 
 The single-display adaptation releases decoded ImageBitmap/VideoFrame images
 after painting, on dropped frames, and on disconnect, including late decodes.
-It also closes the display BroadcastChannel. Desktop pixels use CSS resolution
-(at most 1920x1080) and the viewer requests 15 fps to bound animation work.
+It also closes the display BroadcastChannel. Desktop pixels follow the viewer's
+device pixel ratio (at most 3840x2160), while layout and AI input retain CSS
+coordinates. The viewer requests 15 fps to bound animation work.

@@ -7,10 +7,18 @@ const { createBrowserDownloads } = require('./browser-downloads.cjs')
 const partialNavigationNotice = '页面已打开，但尚未完成加载；请根据当前页面内容继续操作'
 /** Preserve viewport pixels; never fall back to a lossy photograph encoding. */
 function createImageCapture({ budgetMs = 8000 } = {}) {
-  return async (page, captureBudgetMs = budgetMs) => {
+  return async (page, captureBudgetMs = budgetMs, cdp) => {
     const timeout = Math.min(budgetMs, captureBudgetMs)
     if (timeout <= 0) throw new Error('capture_timeout')
-    const image = await page.screenshot({ type: 'png', caret: 'initial', timeout })
+    let image, timer
+    try {
+      // Playwright's null-viewport screenshot temporarily resets device metrics.
+      // Capture the existing compositor directly so AI screenshots leave the viewer sharp.
+      image = cdp ? Buffer.from((await Promise.race([
+        cdp.send('Page.captureScreenshot', { format: 'png', fromSurface: true }),
+        new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('capture_timeout')), timeout) }),
+      ])).data, 'base64') : await page.screenshot({ type: 'png', caret: 'initial', timeout })
+    } finally { clearTimeout(timer) }
     if (image.length > 8 * 1024 * 1024) throw new Error('frame_too_large')
     image.mediaType = 'image/png'
     return image
@@ -113,6 +121,7 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
     try { return validUrl(failed) } catch { return '' }
   }
   let pageId, pendingPopup, frameSequence = 0, activeCommand, activeClick, revision = 0
+  let viewport, deviceScaleFactor = 1
   const streams = new Map(), cancelled = new Set(), pressedButtons = new Set(), pressedModifiers = new Set()
   const observedFrames = new Map()
   let frameReference = 0
@@ -168,7 +177,7 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
     const title = (await target.title()).slice(0, 1024)
     if (target !== page || target.url() !== url || navigation !== epoch || closed || (extra.frame_id && !watching)) return false
     const meta = { type: 'frame', page_id: pageId, url: displayUrl(url, history), title,
-      ...viewport, mediaType: extra.mediaType || image.mediaType, back: history.currentIndex > 0,
+      ...viewport, device_scale_factor: deviceScaleFactor, mediaType: extra.mediaType || image.mediaType, back: history.currentIndex > 0,
       forward: history.currentIndex < history.entries.length - 1, notice, ...(latestDownload ? { download: latestDownload } : {}), ...extra }
     const stamp = JSON.stringify(meta)
     if (extra.frame_id || !lastFrame || lastFrame.stamp !== stamp || !lastFrame.image.equals(image)) {
@@ -246,13 +255,13 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
         const viewport = await target.evaluate(() => ({ width: innerWidth, height: innerHeight }))
         const history = await cdp.send('Page.getNavigationHistory')
         const meta = { type: 'frame', page_id: pageId, display: 'kasm', url: displayUrl(url, history),
-          title: (await target.title()).slice(0, 1024), ...viewport, back: history.currentIndex > 0,
+          title: (await target.title()).slice(0, 1024), ...viewport, device_scale_factor: deviceScaleFactor, back: history.currentIndex > 0,
           forward: history.currentIndex < history.entries.length - 1, notice, ...(latestDownload ? { download: latestDownload } : {}) }
         if (target !== page || closed || navigation !== epoch) return false
         const stamp = JSON.stringify(meta)
         if (lastFrame?.stamp !== stamp) { await send(meta); lastFrame = { stamp } }
         if (legacyPixels) {
-          const image = await capture(target)
+          const image = await capture(target, undefined, cdp)
           if (!closed && target === page && navigation === epoch) {
             const { display: _display, ...legacy } = meta
             await send({ ...legacy, legacy: true, mediaType: image.mediaType, image: image.toString('base64') })
@@ -261,7 +270,7 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
         hasFrame = true
         return true
       }
-      const image = await capture(target, deadline === undefined ? undefined : deadline - Date.now())
+      const image = await capture(target, deadline === undefined ? undefined : deadline - Date.now(), deviceScaleFactor !== 1 ? cdp : undefined)
       return await publishImage(target, cdp, epoch, url, image)
     } catch (error) {
       // A navigation invalidates old-page captures; it is not a stable-page timeout.
@@ -294,7 +303,8 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
     // Chromium enforces a minimum outer-window width even in kiosk mode. Keep
     // layout and input coordinates aligned with the visible X display below it.
     await cdp.send('Emulation.setDeviceMetricsOverride', {
-      ...display.size, deviceScaleFactor: 1, mobile: false,
+      ...viewport, deviceScaleFactor, mobile: false,
+      viewport: { x: 0, y: 0, ...viewport, scale: 1 },
     })
   }
   async function bind(target, id) {
@@ -303,6 +313,7 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
       await fitDisplayWindow(cdp)
       await target.bringToFront()
     } else streams.set(target, createScreencast({ page: target, session: cdp, nextId: () => ++frameSequence,
+      getDeviceScaleFactor: () => deviceScaleFactor,
       onUnavailable: () => startFallback(target),
       emit: value => {
         if (target !== page || closed || navigating || !watching || target.isClosed()) return false
@@ -430,6 +441,7 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
   async function operation(value) {
     const action = value.action
     if (action === 'init') {
+      viewport = { width: value.width, height: value.height }
       if (displayFactory) display = await displayFactory({ width: value.width, height: value.height, emit: send,
         onExit: () => fatal('沙盒浏览器显示服务已退出') })
       if (closed) { await display?.stop(); throw new Error('browser_closed') }
@@ -495,7 +507,7 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
     if (action === 'snapshot') return observe()
     if (action === 'screenshot') {
       const target = page, epoch = navigation
-      const image = await capture(page)
+      const image = await capture(page, undefined, display || deviceScaleFactor !== 1 ? session : undefined)
       if (target !== page || epoch !== navigation) throw new Error('stale_observation')
       return { image: image.toString('base64'), mediaType: image.mediaType }
     }
@@ -544,8 +556,10 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
       case 'forward': navigationResponse = await page.goForward(navigationOptions); break
       case 'resize':
         navigation++
+        viewport = { width: value.width, height: value.height }
+        deviceScaleFactor = value.device_scale_factor ?? 1
         if (display) {
-          await display.resize(value.width, value.height)
+          await display.resize(Math.round(value.width * deviceScaleFactor), Math.round(value.height * deviceScaleFactor))
           await fitDisplayWindow(session)
           // XRandR and CDP acknowledge before Chromium applies the resize.
           // Observe the renderer before accepting another input or snapshot.
@@ -628,7 +642,10 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
         break
       }
       case 'move': await setModifiers(value.modifiers || []); await page.mouse.move(value.x, value.y); break
-      case 'wheel': await page.mouse.wheel(value.x, value.y); break
+      case 'wheel':
+        await setModifiers(value.modifiers || [])
+        try { await page.mouse.wheel(value.x, value.y) } finally { await setModifiers([]) }
+        break
       case 'text': await page.keyboard.insertText(value.text); break
       case 'key': await page.keyboard.press(value.key); break
       default: throw new Error('invalid_action')

@@ -3,6 +3,15 @@ import { createRequire } from 'node:module'
 import { PassThrough } from 'node:stream'
 import { expect, it, vi } from 'vitest'
 const { createImageCapture, runWorker } = createRequire(import.meta.url)('../src/browser-worker.cjs')
+it('captures the existing compositor without resetting display density and bounds its deadline', async () => {
+  const page={screenshot:vi.fn()},cdp={send:vi.fn(async()=>({data:Buffer.from('sharp-png').toString('base64')}))}
+  const capture=createImageCapture()
+  expect((await capture(page,100,cdp)).toString()).toBe('sharp-png')
+  expect(page.screenshot).not.toHaveBeenCalled()
+  expect(cdp.send).toHaveBeenCalledWith('Page.captureScreenshot',{format:'png',fromSurface:true})
+  cdp.send.mockImplementation(()=>new Promise(()=>{}))
+  await expect(capture(page,5,cdp)).rejects.toThrow('capture_timeout')
+})
 
 it('preserves large lossless frames without retrying JPEG at reduced quality', async () => {
   const bytes = Buffer.alloc(4500000)
