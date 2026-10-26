@@ -664,7 +664,7 @@ describe('followup and control service', () => {
   it('creates a native workspace session and persists its directory without deleting workspace files', async () => {
     const { service, owner, database, sessionController, fileManager } = setup()
     service.workspaces = { baseline: async () => ({ items: [{ workspaceId: 'ws-cases', path: 'cases' }] }), requireWorkspace: vi.fn(async () => ({ workspaceId: 'ws-cases', path: 'cases' })) }
-    const chat = await service.createChat(owner, '/workspace', {}, 'ws-cases')
+    const chat = await service.createChat(owner, '/workspace', {}, 'ws-cases', 'ignore-this-name')
     expect(service.workspaces.requireWorkspace).toHaveBeenCalledWith(owner, 'ws-cases', true)
     expect(sessionController.create).toHaveBeenCalledWith({ workspaceId: 'ws-cases' })
     expect(database.getChat(owner.ownerId, chat.id).directory).toBe('conversations/cases')
@@ -900,12 +900,21 @@ describe('followup and control service', () => {
     const second = await service.createChat(owner, '/workspace', {})
     expect(first.id).not.toBe(second.id)
     for (const chat of [first, second]) {
-      expect(chat.directory).toMatch(/^conversations\/\d{4}-\d{2}-\d{2}\/new-chat(?:-\d+)?$/)
-      expect(fileManager.operate).toHaveBeenCalledWith({ operation: 'mkdir', path: first.directory, unique: true })
+      expect(chat.directory).toMatch(/^conversations\/\d{4}-\d{2}-\d{2}\/[a-z]+-[a-z]+(?:-\d+)?$/)
+      expect(fileManager.operate).toHaveBeenCalledWith({ operation: 'mkdir', path: chat.directory.replace(/-\d+$/, ''), unique: true })
       expect(sessionController.create).toHaveBeenCalledWith({ cwd: `/workspace/${chat.directory}` })
     }
-    expect(second.directory).toBe(first.directory+'-2')
+    expect(second.directory).not.toBe(first.directory)
     expect(fileManager.operate.mock.invocationCallOrder[0]).toBeLessThan(sessionController.create.mock.invocationCallOrder[0])
+  })
+
+  it('binds the native session to the unique path returned after a name collision', async () => {
+    const { service, owner, fileManager, sessionController } = setup()
+    fileManager.operate.mockImplementation(async ({ path, unique }) => ({ path: unique ? `${path}-2` : path }))
+    sessionController.create.mockResolvedValue({ sessionId: 'collision' })
+    const chat = await service.createChat(owner, '/workspace', {})
+    expect(chat.directory).toMatch(/\/[a-z]+-[a-z]+-2$/)
+    expect(sessionController.create).toHaveBeenCalledWith({ cwd: `/workspace/${chat.directory}` })
   })
 
   it('groups default task directories by the Shanghai calendar date at midnight', async () => {

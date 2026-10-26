@@ -1,6 +1,6 @@
 // Chromium produces frames only when its compositor changes. One unsent frame
 // and three outstanding receipts bound memory, even while SSH or a viewer stalls.
-function createScreencast({ page, session, emit, nextId, onUnavailable = () => {}, ackTimeoutMs = 1500 }) {
+function createScreencast({ page, session, emit, nextId, onUnavailable = () => {}, ackTimeoutMs = 1500, getDeviceScaleFactor = () => 1 }) {
   let enabled = false, pumping = false, latest, disposed = false, generation = 0
   const pending = new Map()
   async function acknowledge(id) {
@@ -29,11 +29,12 @@ function createScreencast({ page, session, emit, nextId, onUnavailable = () => {
   async function configure() {
     const epoch = generation
     const { width, height } = page.viewportSize()
-    await session.send('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 1, mobile: false,
+    const deviceScaleFactor = getDeviceScaleFactor()
+    await session.send('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor, mobile: false,
       screenWidth: width, screenHeight: height, viewport: { x: 0, y: 0, width, height, scale: 1 } })
     if (epoch !== generation || !enabled || disposed) return false
     await session.send('Page.startScreencast', { format: 'png',
-      maxWidth: width, maxHeight: height, everyNthFrame: 4 })
+      maxWidth: Math.round(width * deviceScaleFactor), maxHeight: Math.round(height * deviceScaleFactor), everyNthFrame: 4 })
     if (epoch !== generation || !enabled || disposed) { await session.send('Page.stopScreencast').catch(() => {}); return false }
     return true
   }
@@ -76,10 +77,10 @@ function createScreencast({ page, session, emit, nextId, onUnavailable = () => {
       if (wasEnabled) await session.send('Page.stopScreencast').catch(() => {})
     },
     async resize() {
-      if (!enabled) return
+      if (disposed) return
       generation++
       try {
-        await session.send('Page.stopScreencast')
+        if (enabled) await session.send('Page.stopScreencast')
         await configure()
       } catch (error) { enabled = false; onUnavailable(); throw error }
     },

@@ -80,25 +80,41 @@ async function main() {
     assert.equal(snapshot.viewport.height, 617)
     assert.equal(snapshot.elements.find(element => element.selector === '#value').value, '可见浏览器中文验收')
     let clicks = 0
-    for (const [width, height] of [[320, 240], [361, 521], [499, 544], [500, 521], [1920, 1080], [320, 240], [823, 617]]) {
-      await call('resize', { width, height })
+    for (const [width, height, scale = 1] of [[320, 240], [361, 521], [499, 544], [500, 521], [1920, 1080], [1174, 681, 2.2], [1740, 810, 2.2], [1280, 720, 3], [320, 240], [823, 617]]) {
+      await call('resize', { width, height, device_scale_factor: scale })
       // A transient matching size must not hide a later minimum-window clamp.
       await new Promise(resolve => setTimeout(resolve, 250))
       const resized = await call('snapshot')
       assert.equal(resized.viewport.width, width)
       assert.equal(resized.viewport.height, height)
       assert.equal(resized.notice, undefined)
+      if (scale !== 1) {
+        const shot = Buffer.from((await call('screenshot')).image, 'base64')
+        assert.equal(shot.readUInt32BE(16), Math.round(width * scale))
+        assert.equal(shot.readUInt32BE(20), Math.round(height * scale))
+      }
       await call('element-click', { selector: '#edge', expected_revision: resized.revision })
       clicks++
       assert.equal((await call('snapshot')).elements.find(element => element.selector === '#edge').label, String(clicks))
       const expected = clicks % 2 ? 0x22cc44 : 0xcc2244
       let actual
       for (let attempt = 0; attempt < 30; attempt++) {
-        actual = pixels(display, width, height, 8)
+        actual = pixels(display, Math.round(width * scale), Math.round(height * scale), 8)
         if (actual[1] === expected) break
         await new Promise(resolve => setTimeout(resolve, 50))
       }
       assert.deepEqual(actual, [0xffffff, expected], 'Layout and edge clicks must match actual desktop pixels')
+      // The viewer reuses the CSS-coordinate pointer actions, in the same queue as keyboard input.
+      await call('pointer-down', { x: width - 8, y: height - 8, button: 'left', count: 1 })
+      await call('pointer-up', { x: width - 8, y: height - 8, button: 'left', count: 1 })
+      clicks++
+      let nativeSnapshot
+      for (let attempt = 0; attempt < 30; attempt++) {
+        nativeSnapshot = await call('snapshot')
+        if (nativeSnapshot.elements.find(element => element.selector === '#edge').label === String(clicks)) break
+        await new Promise(resolve => setTimeout(resolve, 50))
+      }
+      assert.equal(nativeSnapshot.elements.find(element => element.selector === '#edge').label, String(clicks), 'Viewer pointer coordinates must match adaptive desktop pixels')
     }
     await call('resize', { width: 361, height: 521 })
     await call('navigate', { url: `http://127.0.0.1:${server.address().port}/next` })
@@ -125,7 +141,7 @@ async function main() {
     assert.match(greeting, /^RFB /)
     await call('display-close', { connection })
     assert.equal((await call('snapshot')).elements[0].value, '可见浏览器中文验收')
-    console.log('PASS private Kasm display: narrow/wide resize, desktop pixels and edge clicks, AI Unicode edit, RFB handshake and view-only disconnect')
+    console.log('PASS private Kasm display: narrow/wide and native-density 4K resize, desktop pixels and edge clicks after AI screenshots, AI Unicode edit, RFB handshake and view-only disconnect')
   } finally {
     await worker.shutdown()
     server.closeAllConnections()
