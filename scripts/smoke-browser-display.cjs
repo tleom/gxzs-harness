@@ -86,15 +86,18 @@ async function main() {
     await call('wheel', { x: 0, y: 2000, modifiers: [] })
     await new Promise(resolve => setTimeout(resolve, 150))
     let clicks = 0
-    for (const [width, height, scale = 1] of [[320, 240], [361, 521], [499, 544], [500, 521], [1920, 1080], [1174, 681, 2.2], [1740, 810, 2.2], [1280, 720, 3], [320, 240], [823, 617]]) {
+    for (const [width, height, scale = 1] of [[573, 522, 1.25], [573, 521, 1.5], [320, 240], [361, 521], [499, 544], [500, 521], [1920, 1080], [1174, 681, 2.2], [1740, 810, 2.2], [1280, 720, 3], [320, 240], [823, 617]]) {
       await call('resize', { width, height, device_scale_factor: scale })
       // A transient matching size must not hide a later minimum-window clamp.
       await new Promise(resolve => setTimeout(resolve, 250))
       await call('wheel', { x: 0, y: 200, modifiers: [] })
       await new Promise(resolve => setTimeout(resolve, 100))
       const resized = await call('snapshot')
-      assert.equal(resized.viewport.width, width)
-      assert.equal(resized.viewport.height, height)
+      // Blink rounds some odd CSS sizes at fractional native DPI. The physical
+      // screenshot, visible edge pixels and clicks below must still be exact.
+      const tolerance = Number.isInteger(scale) ? 0 : 1
+      assert.ok(Math.abs(resized.viewport.width - width) <= tolerance)
+      assert.ok(Math.abs(resized.viewport.height - height) <= tolerance)
       assert.equal(resized.notice, undefined)
       if (scale !== 1) {
         const shot = Buffer.from((await call('screenshot')).image, 'base64')

@@ -45,9 +45,9 @@ async function main() {
   })
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
   try {
-    await call('init', {width:660,height:546})
-    for (const scale of [1,1.25,1.5,2,2.2,1]) {
-      await call('resize', {width:660,height:546,device_scale_factor:scale})
+    await call('init', {width:1000,height:700})
+    for (const [width,height,scale] of [[573,522,1.25],[573,521,1.5],...[1,1.25,1.5,2,2.2,1].map(scale=>[660,546,scale])]) {
+      await call('resize', {width,height,device_scale_factor:scale})
       for (const [x, expected] of [[140,[200,0,0]],[390,[0,200,0]],[543,[0,0,200]]]) {
         await call('navigate', {url:`http://127.0.0.1:${server.address().port}/`})
         await call('wheel', {x:0,y:200,position:{x,y:180}})
