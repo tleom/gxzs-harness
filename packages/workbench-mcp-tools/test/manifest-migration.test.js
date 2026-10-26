@@ -25,6 +25,61 @@ it('rebinds an identical complete global catalog across a hash/order upgrade wit
   expect(migrateEquivalentManifests(migrated, current, plugins)).toBe(migrated)
 })
 
+function personalFixture() {
+  const { run, current, plugins } = fixture()
+  for (const tool of [...run.mcpTools, ...current]) {
+    tool.id = tool.id.replace('global:', 'personal:'); tool.scope = 'personal'
+  }
+  for (const plugin of [...run.selection.mcp_servers, ...plugins]) {
+    plugin.id = plugin.id.replace('global:', 'personal:'); plugin.scope = 'personal'
+  }
+  const legacy = 'a'.repeat(64), runtime = 'b'.repeat(64)
+  run.selection.mcp_servers[0].version = legacy
+  for (const tool of run.mcpTools) tool.version = legacy
+  plugins[0].version = runtime; plugins[0].legacy_version = legacy
+  for (const tool of current) tool.version = runtime
+  return { run, current, plugins, runtime }
+}
+
+it('migrates an unchanged personal configuration from its frozen file hash to the connection version', () => {
+  const { run, current, plugins, runtime } = personalFixture()
+  const migrated = migrateEquivalentManifests(run, current, plugins)
+  expect(migrated).not.toBe(run)
+  expect(migrated.mcpTools.every(tool => tool.version === runtime && tool.manifest_version === 'new')).toBe(true)
+  expect(migrated.selection.mcp_servers[0]).toMatchObject({ version: runtime, manifest_version: 'new' })
+  expect(run.mcpTools[0].version).toBe('a'.repeat(64))
+})
+
+it.each(['same-manifest', 'resources-only'])('preserves personal %s authorization during the version upgrade', mode => {
+  const { run, current, plugins, runtime } = personalFixture()
+  if (mode === 'same-manifest') {
+    plugins[0].manifest_version = 'old'
+    for (const tool of current) tool.manifest_version = 'old'
+  } else {
+    run.mcpTools = []; current.length = 0
+    run.selection.mcp_servers[0].capabilities = { resources: {} }
+    plugins[0].capabilities = { resources: {} }
+  }
+  const migrated = migrateEquivalentManifests(run, current, plugins)
+  expect(migrated).not.toBe(run)
+  expect(migrated.selection.mcp_servers[0].version).toBe(runtime)
+  expect(migrated.mcpTools).toHaveLength(current.length)
+})
+
+it.each(['changed-file', 'missing-proof', 'tool-version', 'schema', 'capabilities', 'removed', 'fenced', 'stopped'])(
+  'does not migrate a personal binding with %s', change => {
+    const { run, current, plugins } = personalFixture()
+    if (change === 'changed-file') plugins[0].legacy_version = 'c'.repeat(64)
+    if (change === 'missing-proof') delete plugins[0].legacy_version
+    if (change === 'tool-version') run.mcpTools[0].version = 'c'.repeat(64)
+    if (change === 'schema') current[0].inputSchema.required = ['name']
+    if (change === 'capabilities') plugins[0].capabilities.resources = {}
+    if (change === 'removed') current.pop()
+    if (change === 'fenced') run.stopConfirmation = { fenced: true }
+    if (change === 'stopped') run.status = 'stopped'
+    expect(migrateEquivalentManifests(run, current, plugins)).toBe(run)
+  })
+
 it.each(['input', 'output', 'annotations', 'execution', 'version', 'added', 'removed', 'capabilities', 'unavailable', 'incomplete', 'fenced', 'personal'])(
   'retains frozen authorization when %s differs', change => {
     const { run, current, plugins } = fixture()
