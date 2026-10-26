@@ -5,6 +5,7 @@ import hmac
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import logging
+import math
 import os
 import re
 import sqlite3
@@ -624,12 +625,30 @@ def operation(key, action, payload):
             raise ValueError("Personal MCP request contains reserved fields")
         if payload.get('operation') == 'mcp_task' and payload.get('method') == 'tasks/cancel':
             return cancel_task(key, payload, authorize=authorize_mcp)
+        if payload['operation'] in {'mcp_call', 'mcp_request', 'mcp_task'}:
+            from mcp_authorization import validate_grant
+            resource = 'personal:mcp:' + payload['name']
+            if payload['operation'] in {'mcp_call', 'mcp_task'}:
+                resource += ':' + payload['tool']
+            validate_grant(key, payload, resource)
+        deadline = payload.get('deadline_ms') if payload['operation'] in {'mcp_test', 'mcp_call', 'mcp_browse', 'mcp_request', 'mcp_task'} else None
+        if deadline is not None and (type(deadline) not in (int, float) or not math.isfinite(deadline)):
+            raise ValueError('Invalid MCP deadline')
+        def remaining():
+            return 90 if deadline is None else max(0, deadline / 1000 - time.time())
+        expired = {'error': 'MCP 调用截止时间已过期，本次操作未执行', 'code': 'DEADLINE_EXCEEDED'}
+        if not remaining():
+            return expired
         tracked = payload['operation'] != 'mcp_list' and payload.get('maintenance') is not True
         with lock(key):
+            if not remaining():
+                return expired
             record = HOSTS.root / key / 'host.json'
             if payload.get('maintenance') is True and record.exists() and json.loads(record.read_text(encoding='utf-8')).get('state') == 'stopped':
                 raise ResourceUnavailable('个人工作环境已休眠，维护请求稍后重试', 'HOST_IDLE', 30)
             ensure(key, track_activity=tracked, allow_existing_image=payload['operation'] == 'mcp_list')
+            if not remaining():
+                return expired
             name, _ = identity(key)
             request = payload
             if payload["operation"] in {"mcp_test", "mcp_call", "mcp_browse", "mcp_request", "mcp_task"}:
@@ -639,8 +658,15 @@ def operation(key, action, payload):
             source = module_source("mcp_policy", "file_ops", "resource_ops", "mcp_ops")
             source += "sys.modules['mcp_policy'].configure(" + repr(mcp_policy()) + "); "
             source += "import json; print(json.dumps(sys.modules['mcp_ops'].personal_mcp(json.load(sys.stdin))))"
-            result = docker("exec", "--user", "1000", "-i", name, *MANAGER_PYTHON, "-c", source,
-                            stdin=json.dumps(request), check=False)
+            try:
+                result = docker("exec", "--user", "1000", "-i", name, *MANAGER_PYTHON, "-c", source,
+                                stdin=json.dumps(request), timeout=min(90, remaining()), check=False)
+            except subprocess.TimeoutExpired:
+                if not remaining():
+                    return expired
+                raise
+            if not remaining():
+                return expired
             if result.returncode:
                 # Parse errors and tracebacks may include user-supplied secrets.
                 raise ValueError("MCP 配置操作失败，请检查 JSON、路径和版本")

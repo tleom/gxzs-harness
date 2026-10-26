@@ -111,7 +111,9 @@ def test_management_cas_is_translated_but_signed_calls_must_use_runtime_version(
     module.operation(key, 'personal-mcp', {'operation': 'mcp_test', 'name': 'demo', 'version': 'cas'})
     assert observed == [('binding', 'binding')]
     monkeypatch.setattr(runtime, 'invoke', original)
-    assert module.operation(key, 'personal-mcp', {**payload(key, binding), 'version': 'cas'}) == {'conflict': True}
+    request = payload(key, binding)
+    request['version'] = request['authorization']['version'] = 'cas'
+    assert module.operation(key, 'personal-mcp', request) == {'conflict': True}
     assert (key, 'demo') not in runtime.WORKERS
 
 
@@ -128,6 +130,32 @@ def payload(key, binding, *, tool="slow", request="call-1"):
                           "request_key": request, "resource_id": 'personal:mcp:demo:' + tool,
                           "version": "v1", "manifest_version": "m1", "arguments": {}},
     }
+
+
+@pytest.mark.parametrize('stage', ['entry', 'lock', 'ensure'])
+def test_expired_calls_do_not_probe_or_dispatch_after_preparation(manager, monkeypatch, stage):
+    from contextlib import contextmanager
+    module, _, calls, _ = manager
+    now = [time.time()]
+    monkeypatch.setattr(module, 'time', SimpleNamespace(time=lambda: now[0]))
+    @contextmanager
+    def controlled_lock(_key):
+        if stage == 'lock': now[0] += 2
+        yield
+    prepared, probed = [], []
+    def ensure(*args, **kwargs):
+        prepared.append(True)
+        if stage == 'ensure': now[0] += 2
+    monkeypatch.setattr(module, 'lock', controlled_lock)
+    monkeypatch.setattr(module, 'ensure', ensure)
+    monkeypatch.setattr(module, 'docker', lambda *args, **kwargs: probed.append(True))
+    key, binding = str(uuid4()), str(uuid4())
+    request = payload(key, binding, tool='fast')
+    request['deadline_ms'] = int((now[0] + (-1 if stage == 'entry' else 1)) * 1000)
+    request['authorization']['deadline_ms'] = request['deadline_ms']
+    assert module.operation(key, 'personal-mcp', request)['code'] == 'DEADLINE_EXCEEDED'
+    assert prepared == ([True] if stage == 'ensure' else [])
+    assert probed == [] and calls == []
 
 
 def test_background_catalog_refresh_keeps_each_observed_version(manager, monkeypatch):
