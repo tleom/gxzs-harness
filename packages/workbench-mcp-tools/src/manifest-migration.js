@@ -6,7 +6,15 @@ const stamp = value => JSON.stringify(value, (_key, item) => item && typeof item
 
 function definition(tool, legacy = false) {
   const { manifest_version, version, public_name, definitionStamp, discoveryStamp, sourceInputSchema, validateArguments, ...value } = tool
-  return { ...value, ...(!legacy ? { version } : {}), inputSchema: sourceInputSchema ?? value.inputSchema, runtime_name: public_name ?? value.runtime_name }
+  // Admission fills these presentation defaults before freezing authorization.
+  // Compare the registration in that same form, retaining all definition fields.
+  return { ...value, ...(!legacy ? { version } : {}),
+    name: value.tool_name, display_name: value.tool_name,
+    group: value.group ?? 'mcp', provider: value.provider ?? 'mcp',
+    provider_name: value.provider_name ?? value.server_id,
+    provider_call_name: value.provider_call_name ?? value.server_id,
+    provider_description: value.provider_description ?? '',
+    inputSchema: sourceInputSchema ?? value.inputSchema, runtime_name: public_name ?? value.runtime_name }
 }
 const provider = tool => `${tool.scope}:mcp:${tool.server_id}`
 const capability = ({ manifest_version, legacy_version, version, ...value }, legacy = false) => ({ ...value, ...(!legacy ? { version } : {}) })

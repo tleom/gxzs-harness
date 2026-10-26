@@ -1,4 +1,5 @@
 import { expect, it } from 'vitest'
+import { WorkbenchService } from '../../workbench-adapter/src/service.js'
 import { migrateEquivalentManifests } from '../src/manifest-migration.js'
 
 function fixture() {
@@ -40,6 +41,20 @@ function personalFixture() {
   for (const tool of current) tool.version = runtime
   return { run, current, plugins, runtime }
 }
+
+it.each([fixture, personalFixture])('migrates definitions frozen by the actual admission path', async makeFixture => {
+  const { run, current, plugins } = makeFixture()
+  const admitted = await WorkbenchService.prototype.freezeMcpCatalog.call({
+    refreshMcpCatalog: async () => ({ tools: run.mcpTools, plugins: run.selection.mcp_servers }),
+  }, {}, [])
+  run.mcpTools = admitted.tools
+  const migrated = migrateEquivalentManifests(run, current, plugins)
+  expect(migrated).not.toBe(run)
+  expect(migrated.mcpTools.every(tool => tool.manifest_version === 'new')).toBe(true)
+  expect(migrated.selection.mcp_servers[0].version).toBe(plugins[0].version)
+  current[0].inputSchema.required = ['name']
+  expect(migrateEquivalentManifests(run, current, plugins)).toBe(run)
+})
 
 it('migrates an unchanged personal configuration from its frozen file hash to the connection version', () => {
   const { run, current, plugins, runtime } = personalFixture()
