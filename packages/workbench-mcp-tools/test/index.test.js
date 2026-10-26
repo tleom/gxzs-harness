@@ -475,14 +475,14 @@ describe('platform MCP proxy tools', () => {
     bridge.notify()
     expect(listener).toHaveBeenCalledTimes(calls)
   })
-  it('retains registered tools on transient catalog failure and removes them only after a successful empty catalog', async () => {
+  it.each([500, 502, 503, 504])('retains registered tools on transient %s catalog failure and removes them only after a successful empty catalog', async status => {
     const { ctx, definitions, platform } = setup()
     await apply(ctx)
     const refresh = ctx.on.mock.calls.find(([event]) => event === 'workbench/resources-changed')[1]
-    platform.json.mockRejectedValueOnce(Object.assign(new Error('unavailable'), { status: 503 }))
+    platform.json.mockRejectedValueOnce(Object.assign(new Error('unavailable'), { status }))
     await refresh()
     expect(definitions.has(platformToolName(catalogTool))).toBe(true)
-    expect(ctx.workbenchRuntime.mcpCatalogState).toMatchObject({ ready: true, status: 'degraded', errorCode: 'HTTP_503' })
+    expect(ctx.workbenchRuntime.mcpCatalogState).toMatchObject({ ready: true, status: 'degraded', errorCode: `HTTP_${status}` })
     platform.json.mockResolvedValueOnce({ tools: [] })
     await refresh()
     expect(definitions.size).toBe(0)

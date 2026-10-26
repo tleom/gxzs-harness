@@ -6,6 +6,14 @@ import { WorkbenchService } from '../src/service.js'
 import { WorkbenchWorkspaces } from '../src/workspaces.js'
 
 const cleanups = []
+it('rejects unsupported entries without leaving a directory deletion lock', async () => {
+  const f = fixture(), source = 'conversations/2026-10-26/link'
+  f.fileManager.operate.mockResolvedValue({ kind: 'blocked', version: null })
+  await expect(f.service.directories.deleteFile(f.owner, source, null)).rejects.toMatchObject({ code: 'FILE_TYPE_UNSUPPORTED' })
+  expect(f.db.pendingWorkspaceDeletions(f.owner.ownerId)).toEqual([])
+  expect(() => f.service.directories.assertAvailable(f.owner, 'conversations/2026-10-26')).not.toThrow()
+  expect(f.fileManager.operate).toHaveBeenCalledTimes(1)
+})
 it('retains the caller file version across native writes and retries', async () => {
   const f = fixture(), source = 'conversations/2026-10-26/note.txt'
   let currentVersion = 'v2'

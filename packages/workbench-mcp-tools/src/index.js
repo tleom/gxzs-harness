@@ -112,7 +112,7 @@ export async function apply(ctx, config = {}) {
       })
 
     } catch (error) {
-      const transient = [502, 503, 504].includes(error?.status) || ['TypeError', 'TimeoutError'].includes(error?.name)
+      const transient = [500, 502, 503, 504].includes(error?.status) || ['TypeError', 'TimeoutError'].includes(error?.name)
       state(transient && catalogLoaded, error)
       // Bootstrap can precede platform host registration. Keep the plugin alive
       // to recover after registration, but never retain tools on denied access.

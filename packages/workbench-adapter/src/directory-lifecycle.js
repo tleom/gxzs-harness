@@ -81,6 +81,7 @@ export class DirectoryLifecycle {
       // stop resources before discovering that such a target is forbidden.
       if (['.', 'conversations', 'mcp', 'skills'].includes(directory)) throw httpError(400, '系统目录不能删除')
       const requestedEntry = await service.fileManager.operate({ operation: 'stat', path: directory })
+      if (requestedEntry.kind === 'blocked') throw httpError(400, '不支持此文件类型', 'FILE_TYPE_UNSUPPORTED')
       // Ordinary files do not own resources or registrations. Keep the caller's
       // CAS version even if a native process writes between this read and delete.
       if (requestedEntry.kind === 'file')
