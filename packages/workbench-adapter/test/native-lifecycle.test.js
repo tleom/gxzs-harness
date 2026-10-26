@@ -1209,7 +1209,7 @@ it.each(['button', 'command'])('preserves native goal state and resource context
   expect((await service.getControl(test.owner, test.chat.id)).goal).toBeNull()
 })
 
-it('exposes the published DSH projected occupancy immediately after a compacted surface replacement', async () => {
+it('uses the native retained estimate immediately after compaction, on reload, then fresh provider usage', async () => {
   const test = await fixture([])
   const { default: TokenMeter } = await native('dsh-token-meter')
   const { createMessage } = await native('dsh-llm')
@@ -1244,7 +1244,17 @@ it('exposes the published DSH projected occupancy immediately after a compacted 
   expect(afterControl.contextBreakdown.messageTokens).toBeLessThan(beforeControl.contextBreakdown.messageTokens)
   expect(after.pressureTokens).toBe(before.pressureTokens)
   expect(after.projectedTokens).toBeLessThan(before.projectedTokens)
+  expect(after.projectedTokens).toBe(Object.values(afterControl.contextBreakdown).reduce((sum, tokens) => sum + tokens, 0))
+  expect(test.ctx.sessionProjections.snapshot(session).values.contextPressure.projectedTokens).toBeGreaterThan(after.projectedTokens)
   expect(after.contextWindow).toBe(100000)
+  const restored = new WorkbenchService({ database: test.db, agents: { get: () => undefined }, sessionQuery: service.sessionQuery })
+  expect((await restored.getControl(test.owner, test.chat.id)).contextPressure).toEqual(after)
+  const freshUsage = { inputTokens: 500, outputTokens: 20 }
+  session.append('assistant/message', {
+    turn: 2, step: 1, usage: freshUsage, stream: [{ type: 'chunk', time: 0, chunk: { type: 'usage', usage: freshUsage } }],
+    message: createMessage({ role: 'assistant', content: [{ type: 'text', text: 'new answer' }], source: { kind: 'model', provider: 'mock', model: 'mock' } }),
+  }, { surfaceOp: 'append' })
+  expect((await service.getControl(test.owner, test.chat.id)).contextPressure).toEqual(test.ctx.sessionProjections.snapshot(session).values.contextPressure)
   expect(test.model.requests).toHaveLength(0)
 })
 
