@@ -708,7 +708,7 @@ async function draftDirectoryRoundtrip(home) {
     path: directory, version: sandboxFileOperation({ operation: 'stat', path: directory }).version,
   }, status)
   const openDraft = async () => {
-    const id = randomUUID()
+    const id = randomUUID().replaceAll('-', '')
     const context = await request('POST', `/drafts/${id}/resources`, {})
     assert.equal(context.directory, date)
     const terminal = await request('POST', `/chats/draft:${id}/terminals`, { id: randomUUID(), cols: 80, rows: 24 }, 201)

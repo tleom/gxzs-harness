@@ -46,8 +46,9 @@ it.each([
   ['你好', 'new-chat'], ['融资租赁合同纠纷', 'new-chat'], ['Review The 2026 Report please now more', 'review-the-2026-report-please-now'],
 ])('names %s without an asynchronous naming request', (prompt, expected) => expect(directoryName(prompt)).toBe(expected))
 
-it('opens tools in the date directory without a business chat or child directory', async () => {
+it.each(['hyphenated', 'compact'])('opens %s draft tools in the date directory without a business chat or child directory', async format => {
   const f = fixture()
+  if (format === 'compact') f.id = f.id.replaceAll('-', '')
   const first = await f.service.drafts.resources(f.owner, f.id)
   expect(first.directory).toMatch(/^conversations\/\d{4}-\d{2}-\d{2}$/)
   expect([...f.files.keys()]).toEqual([first.directory])

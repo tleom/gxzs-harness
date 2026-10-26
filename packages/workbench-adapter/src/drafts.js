@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { containsWorkspacePath } from './paths.js'
 import { httpError } from './http.js'
 
-const uuid = /^[a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12}$/i
+const uuid = /^(?:[a-f\d]{32}|[a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12})$/i
 export const isDraftId = id => typeof id === 'string' && id.startsWith('draft:') && uuid.test(id.slice(6))
 export const dateDirectory = () => `conversations/${new Intl.DateTimeFormat('sv-SE', {
   timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit',
