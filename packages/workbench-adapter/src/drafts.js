@@ -24,6 +24,7 @@ export class WorkbenchDrafts {
     if (draft?.closing) throw httpError(409, '草稿资源正在关闭，请稍后重试')
     if (draft) {
       if (draft.workspaceId !== workspaceId) throw httpError(409, '草稿所属项目已改变，请重新打开会话')
+      if (workspaceId !== undefined) await this.service.workspaces.requireWorkspace(owner, workspaceId, true)
       return draft
     }
     const workspace = workspaceId === undefined ? undefined : await this.service.workspaces?.requireWorkspace(owner, workspaceId, true)
@@ -148,7 +149,7 @@ export class WorkbenchDrafts {
   async closeForPath(owner, directory) {
     for (const draft of this.db.drafts(owner.ownerId)) {
       if (draft.closed || draft.bound) continue
-      if ([draft.base, draft.directory].filter(Boolean).some(root => containsWorkspacePath(directory, root) || containsWorkspacePath(root, directory)))
+      if ([draft.base, draft.directory].filter(Boolean).some(root => containsWorkspacePath(directory, root)))
         await this.close(owner, draft.id)
     }
   }

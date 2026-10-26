@@ -177,7 +177,7 @@ const manager = fixture(async (req, res) => {
   if (req.url === `${base}files`) {
     const value = req.fixtureBody
     if (['stat', 'delete'].includes(value?.operation)) {
-      assert.match(value.path, /^(?:conversations\/\d{4}-\d{2}-\d{2}\/[a-z]+-[a-z]+(?:-\d+)?|\.agent-output\/[a-f0-9]{32})$/)
+      assert.match(value.path, /^(?:conversations\/\d{4}-\d{2}-\d{2}(?:\/[a-z0-9]+(?:-[a-z0-9]+)*)?|\.agent-output\/[a-f0-9]{32})$/)
       respond(res, 200, sandboxFileOperation(value)); return
     }
     if (nativeAttachments && ['upload', 'get', 'download'].includes(value?.operation)) {
@@ -203,7 +203,7 @@ const manager = fixture(async (req, res) => {
     }
     if (sessionCreate) {
       assert.ok(['mkdir', 'list'].includes(req.fixtureBody?.operation))
-      assert.match(req.fixtureBody.path, /^conversations\/\d{4}-\d{2}-\d{2}(?:\/[a-z]+-[a-z]+(?:-\d+)?)?$/)
+      assert.match(req.fixtureBody.path, /^conversations\/\d{4}-\d{2}-\d{2}(?:\/[a-z0-9]+(?:-[a-z0-9]+)*)?$/)
       if (req.fixtureBody.operation === 'mkdir') {
         let result
         if (realSsh) result = sandboxFileOperation(value)
@@ -683,6 +683,78 @@ async function terminalRoundtrip(chat) {
   console.log('PASS native TerminalController: signed create/follow/write/close; current session cwd; directory-only Bash prompt; owner Sandbox UID=1000; no model call')
 }
 
+async function draftDirectoryRoundtrip(home) {
+  const request = async (method, route, body, status = 200) => {
+    const response = await signedRequest(method, route, body)
+    const text = await response.text()
+    if (fixtureFailure) throw fixtureFailure
+    assert.equal(response.status, status, `${method} ${route}: ${sanitize(text)}`)
+    return text ? JSON.parse(text).data : undefined
+  }
+  const counts = () => {
+    const db = new DatabaseSync(path.join(home, 'workbench.sqlite3'), { readOnly: true })
+    try { return ['chats', 'chat_drafts'].map(table => db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get().n) }
+    finally { db.close() }
+  }
+  const catalog = await request('GET', '/catalog')
+  assert.equal(catalog.draft_resource_protocol, 1)
+  const date = catalog.draft_directory
+  const before = counts()
+  assert.equal(sandboxFileOperation({ operation: 'stat', path: date }).kind, 'missing')
+  await request('GET', '/chats/draft/references?query=hello')
+  assert.deepEqual(counts(), before, 'Reference search must not allocate chats or draft records')
+  assert.equal(sandboxFileOperation({ operation: 'stat', path: date }).kind, 'missing')
+  const remove = async (directory, status = 200) => request('DELETE', '/files', {
+    path: directory, version: sandboxFileOperation({ operation: 'stat', path: directory }).version,
+  }, status)
+  const openDraft = async () => {
+    const id = randomUUID()
+    const context = await request('POST', `/drafts/${id}/resources`, {})
+    assert.equal(context.directory, date)
+    const terminal = await request('POST', `/chats/draft:${id}/terminals`, { id: randomUUID(), cols: 80, rows: 24 }, 201)
+    assert.equal(terminal.cwd, `/workspace/${date}`)
+    return { id, terminal }
+  }
+  const discarded = await openDraft()
+  assert.equal(counts()[0], before[0], 'A real draft terminal must not create a business chat')
+  await remove(date)
+  assert.equal(sandboxFileOperation({ operation: 'stat', path: date }).kind, 'missing')
+  await request('GET', `/drafts/${discarded.id}`, undefined, 404)
+  const draft = await openDraft()
+  const submission = { draft_id: `draft:${draft.id}`, submission: { kind: 'message', prompt: 'Review the current draft directory behavior' } }
+  const chat = await request('POST', '/chats', submission, 201)
+  assert.equal(chat.file_directory, `${date}/review-the-current-draft-directory-behavior`)
+  assert.equal((await request('POST', '/chats', submission, 201)).id, chat.id, 'Task creation retry must retain its chat and directory')
+  const terminals = await request('GET', `/chats/${chat.id}/terminals`)
+  assert.equal(terminals.find(item => item.id === draft.terminal.id)?.cwd, `/workspace/${date}`)
+  const nextTerminal = await request('POST', `/chats/${chat.id}/terminals`, { id: randomUUID(), cols: 80, rows: 24 }, 201)
+  assert.equal(nextTerminal.cwd, `/workspace/${chat.file_directory}`)
+  await request('PATCH', `/chats/${chat.id}`, { title: 'Protected directory fixture' })
+  const protectedResponse = await signedRequest('DELETE', '/files', { path: date,
+    version: sandboxFileOperation({ operation: 'stat', path: date }).version })
+  assert.equal(protectedResponse.status, 409)
+  assert.ok((await protectedResponse.text()).includes('Protected directory fixture'))
+  const chinese = []
+  for (const suffix of ['', '-2']) {
+    const created = await request('POST', '/chats', { draft_id: `draft:${randomUUID()}`,
+      submission: { kind: 'message', prompt: '融资租赁合同纠纷' } }, 201)
+    assert.equal(created.file_directory, `${date}/new-chat${suffix}`)
+    chinese.push(created)
+  }
+  for (const item of [chat, ...chinese]) await request('DELETE', `/chats/${item.id}`, undefined, 204)
+  const projectDirectory = `${date}/project-only`
+  sandboxFileOperation({ operation: 'mkdir', path: projectDirectory })
+  await mkdir(`/workspace/${projectDirectory}`, { recursive: true })
+  const registered = await request('POST', '/workspaces', { operation: 'create', path: projectDirectory.slice('conversations/'.length) })
+  assert.ok(registered.items.some(item => item.path.endsWith('/project-only')))
+  await remove(projectDirectory)
+  assert.ok(!(await request('GET', '/workspaces')).items.some(item => item.path.endsWith('/project-only')))
+  await remove(date)
+  assert.equal(counts()[0], before[0])
+  assert.equal(modelCalls, 0)
+  console.log('PASS native draft directories: read-only search; terminal-only folder deletion; fixed old/new terminal cwd; semantic names and collisions; parent protection; unbound project deletion; no model call')
+}
+
 try {
   if (runningRestart) modelPort = await listen(model)
   const platformPort = await listen(platform)
@@ -749,6 +821,7 @@ try {
   const nativeSettingsProof = await nativeSettingsRoundtrip()
   if (!sessionCreate) await restoreNativeSettings(nativeSettingsProof)
   if (sessionCreate) {
+    await draftDirectoryRoundtrip(env.DSH_HOME)
     const response = await signedRequest('POST', '/chats')
     if (fixtureFailure) throw fixtureFailure
     assert.equal(response.status, 201, 'Actual Workbench -> native sessionController.create must succeed')
@@ -1027,6 +1100,7 @@ try {
           ['png', 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII='],
         ]) {
           const response = await signedRequest('POST', '/files', { path: `${target.file_directory}/native-evidence.${extension}`, data, version: null })
+          if (fixtureFailure) throw fixtureFailure
           assert.equal(response.status, 200, 'Actual file upload route must accept the fixture')
           uploads.push((await response.json()).data)
         }

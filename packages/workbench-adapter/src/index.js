@@ -162,7 +162,7 @@ export function apply(ctx, config) {
     for (const [key, slot] of browsers.slots) {
       if (slot.ownerId !== owner.ownerId || (slot.chatId && database.getChat(owner.ownerId, slot.chatId))) continue
       const root = service.directories.relative(slot.worker.directory || '/workspace')
-      if (containsWorkspacePath(directory, root) || containsWorkspacePath(root, directory))
+      if (containsWorkspacePath(directory, root))
         await browsers.close(owner, key.slice(owner.ownerId.length + 1))
     }
   }

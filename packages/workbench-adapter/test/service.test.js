@@ -2287,6 +2287,23 @@ describe('forked conversations', () => {
     expect(service.getChat(owner, child.id).file_directory).toBe(`conversations/${chat.id}`)
   })
 
+  it('keeps task directory and original native header through repeated draft-backed forks', async () => {
+    const { service, owner, chat, database, agents, second, sessionController } = history()
+    const base = 'conversations/2026-10-26', directory = `${base}/new-chat`
+    database.db.prepare('UPDATE chats SET directory=? WHERE id=?').run(directory, chat.id)
+    database.saveDraft(owner.ownerId, { id: 'draft:fixture', chatId: chat.id, bound: true, originalDirectory: base })
+    service.sessionQuery = { observeSession: vi.fn(async () => ({ header: { cwd: `/workspace/${base}` }, [Symbol.dispose]() {} })) }
+    sessionController.fork.mockResolvedValueOnce({ sessionId: 'fork-a' }).mockResolvedValueOnce({ sessionId: 'fork-b' })
+    const first = await service.fork(owner, second.id, { request_key: 'first-draft' })
+    const next = await service.fork(owner, first.runs[1].id, { request_key: 'second-draft' })
+    expect(first.file_directory).toBe(directory)
+    expect(next.file_directory).toBe(directory)
+    expect(database.getChat(owner.ownerId, next.id).originalDirectory).toBe(base)
+    agents.get.mockReturnValue({ session: { header: { cwd: `/workspace/${base}` } } })
+    await service.ensureChatSession(owner, database.getChat(owner.ownerId, next.id))
+    expect(service.fileManager.operate).toHaveBeenCalledWith({ operation: 'list', path: directory })
+  })
+
   it.each(['conversations/2026-10-18/original', 'conversations/案件材料'])('keeps %s for every fork and its following prompt', async directory => {
     const { service, owner, chat, database, agents, second, sessionController } = history()
     database.updateChat(owner.ownerId, chat.id, { directory })

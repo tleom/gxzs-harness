@@ -170,7 +170,7 @@ export class WorkbenchService {
   async prepareChatSession(owner, chat) {
     await this.ensureChatDirectory(owner, chat.id)
     const cwd = this.chatDirectory(chat.id, chat.directory)
-    const original = this.drafts.originalDirectory(owner, chat)
+    const original = chat.originalDirectory ?? this.drafts.originalDirectory(owner, chat)
     const headerCwd = original ? this.chatDirectory(chat.id, original) : cwd
     const live = this.agents.get(chat.sessionId)
     let header = live?.session?.header

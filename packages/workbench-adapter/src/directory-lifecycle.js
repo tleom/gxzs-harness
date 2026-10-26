@@ -161,8 +161,11 @@ export class DirectoryLifecycle {
       })
     }
     if (plan.completedAt) return
+    await this.service.drafts?.closeForPath(owner, plan.path)
+    await this.service.closeUnboundPathResources?.(owner, plan.path)
     for (const id of plan.chatIds) this.service.scheduler?.deletingChats.add(id)
     for (const id of plan.chatIds) await this.service.deleteChatLocked(owner, id)
+    await this.service.closeUnboundWorkspaceSessions?.(owner, plan.workspaceIds)
     // Recheck before recursive removal; stale/corrupt plans must fail closed.
     if (db.directoryChats(owner.ownerId).some(chat => containsWorkspacePath(plan.path, this.chatPath(chat)))) throw protectedDirectory()
     if ((await this.workspaces(owner)).some(item => containsWorkspacePath(plan.path, this.workspacePath(item)) && !plan.workspaceIds.includes(item.workspaceId))) throw protectedDirectory()

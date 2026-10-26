@@ -67,9 +67,16 @@ export async function forkChat(service, owner, sourceRunId, body) {
     // The native fork owns turn boundaries, IDs, presets and history. Its cwd is inherited.
     if (!prepared) {
       let cwd = service.chatDirectory(chat.id, chat.directory)
+      let originalDirectory = chat.originalDirectory ?? service.drafts.originalDirectory(owner, chat)
       if (service.sessionQuery) {
         const observed = await service.sessionQuery.observeSession(origin.sessionId)
-        try { cwd = observed.header.cwd ?? cwd } finally { observed[Symbol.dispose]?.() }
+        try {
+          // A draft-backed session keeps its initial header while its native
+          // working-directory event and business binding point to the task.
+          if (!originalDirectory) cwd = observed.header.cwd ?? cwd
+          if (observed.header.cwd) originalDirectory = path.posix.relative(service.workspace,
+            resolveWorkspacePath(service.workspace, observed.header.cwd)) || '.'
+        } finally { observed[Symbol.dispose]?.() }
       }
       const absolute = resolveWorkspacePath(service.workspace, cwd)
       const directory = path.posix.relative(service.workspace, absolute) || '.'
@@ -77,10 +84,10 @@ export async function forkChat(service, owner, sourceRunId, body) {
       // Retain the native result before rename/import, so retrying those stages
       // cannot create another native child, including after a host restart.
       prepared = db.saveCommandReceipt(owner.ownerId, chat.id, nativeKey, {
-        sessionId: child.sessionId, origin, directory, title: increasedForkTitle(chat.title),
+        sessionId: child.sessionId, origin, directory, originalDirectory, title: increasedForkTitle(chat.title),
       })
     }
-    const { sessionId, title, directory } = prepared
+    const { sessionId, title, directory, originalDirectory } = prepared
     await service.sessions.rename({ sessionId, title })
     const ids = new Map(chain.map((run) => [run.id, randomUUID()]))
     ids.set(chat.id, id)
@@ -103,7 +110,7 @@ export async function forkChat(service, owner, sourceRunId, body) {
       // markers and explicit resource mentions belong to its historical row.
       const selection = Object.fromEntries(['model', 'tools', 'skills', 'knowledge', 'model_parameters', 'tool_parameters']
         .filter(key => source.selection[key] !== undefined).map(key => [key, source.selection[key]]))
-      db.importChat({ id, ownerId: owner.ownerId, sessionId, title, selection, directory, createdAt: now, updatedAt: now })
+      db.importChat({ id, ownerId: owner.ownerId, sessionId, title, selection, directory, originalDirectory, createdAt: now, updatedAt: now })
       for (const run of chain) {
         const row = db.db.prepare('SELECT * FROM runs WHERE id = ? AND owner_id = ?').get(run.id, owner.ownerId)
         const selection = JSON.parse(row.selection_json)

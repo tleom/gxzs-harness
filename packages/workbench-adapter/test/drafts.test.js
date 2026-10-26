@@ -167,6 +167,35 @@ it('retains files and a retryable deletion when native cleanup fails', async () 
   expect(f.database.pendingWorkspaceDeletions('owner')).toEqual([])
 })
 
+it('keeps a draft usable after deleting a file or child folder below its tool directory', async () => {
+  const f = fixture(), resource = await f.service.drafts.resources(f.owner, f.id)
+  for (const name of ['manual.txt', 'unbound-child']) {
+    f.files.set(`${resource.directory}/${name}`, 'fixture')
+    await f.service.directories.deleteFile(f.owner, `${resource.directory}/${name}`, 'v1')
+  }
+  expect(f.service.closeDraftResources).not.toHaveBeenCalled()
+  expect(f.service.permanentDeletion.erase).not.toHaveBeenCalled()
+  expect((await f.submit()).sessionId).toBe(resource.sessionId)
+})
+
+it('closes project drafts during workspace deletion and rejects stale project drafts before publishing a chat', async () => {
+  const f = fixture(), items = [{ workspaceId: 'cases', path: 'cases', sessionIds: [] }]
+  f.service.workspaces = { baseline: async () => ({ items }), requireWorkspace: vi.fn(async () => {
+    if (!items.length) throw Object.assign(new Error('工作区不存在'), { status: 404 })
+    return items[0]
+  }), controller: { delete: async () => { items.length = 0 }, insertSessionBefore: vi.fn() } }
+  const resource = await f.service.drafts.resources(f.owner, f.id, 'cases')
+  await f.service.directories.deleteWorkspace(f.owner, 'cases')
+  expect(f.service.permanentDeletion.erase).toHaveBeenCalledWith({ sessionIds: [resource.sessionId] })
+  await expect(f.submit('task', f.id, 'cases')).rejects.toMatchObject({ status: 410 })
+  expect(f.database.listChats('owner')).toEqual([])
+  const stale = `draft:${randomUUID()}`
+  f.database.saveDraft('owner', { id: stale, workspaceId: 'cases', base: 'conversations/cases' })
+  await expect(f.submit('task', stale, 'cases')).rejects.toMatchObject({ status: 404 })
+  expect(f.database.listChats('owner')).toEqual([])
+  expect(f.files.has('conversations/cases')).toBe(false)
+})
+
 it('protects a date containing a valid chat before stopping any other draft resources', async () => {
   const f = fixture(), resource = await f.service.drafts.resources(f.owner, f.id)
   await f.submit('Task', `draft:${randomUUID()}`)
