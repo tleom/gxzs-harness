@@ -63,9 +63,13 @@ function parseBrowserAction(request) {
       if (action === 'move') return { action, x: request.x, y: request.y, ...(modifiers ? { modifiers } : {}) }
       if (!['left', 'middle', 'right'].includes(request.button === undefined ? 'left' : request.button) || !integer(request.count === undefined ? 1 : request.count, 1, 2)) break
       return { action, x: request.x, y: request.y, button: request.button === undefined ? 'left' : request.button, count: request.count === undefined ? 1 : request.count, ...(modifiers ? { modifiers } : {}) }
-    case 'wheel':
-      if (integer(request.x, -3000, 3000) && integer(request.y, -3000, 3000)) return { action, x: request.x, y: request.y, ...(modifiers ? { modifiers } : {}) }
+    case 'wheel': {
+      const position = request.position
+      if (position !== undefined && (!integer(position?.x, 0, 3839) || !integer(position?.y, 0, 2159))) break
+      if (integer(request.x, -3000, 3000) && integer(request.y, -3000, 3000)) return { action, x: request.x, y: request.y,
+        ...(position ? { position: { x: position.x, y: position.y } } : {}), ...(modifiers ? { modifiers } : {}) }
       break
+    }
     case 'text':
       if (typeof request.text === 'string' && request.text.length <= 32 * 1024) return { action, text: request.text }
       break

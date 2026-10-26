@@ -68,6 +68,18 @@ it('allows native downloads and service workers without disabling the HTTP cache
   expect(value.browser.close).toHaveBeenCalledOnce()
 })
 
+it('scrolls at the wheel position even when the preceding pointer location is stale', async () => {
+  const value = worker(), actions = []
+  value.page.mouse.move.mockImplementation(async (x, y) => { actions.push(['move', x, y]) })
+  value.page.mouse.wheel.mockImplementation(async (x, y) => { actions.push(['wheel', x, y]) })
+  try {
+    await value.command(1, 'init', { width: 1000, height: 700 })
+    await value.command(2, 'wheel', { x: 0, y: 200, position: { x: 600, y: 200 } })
+    await value.command(3, 'wheel', { x: 0, y: 100 })
+    expect(actions).toEqual([['move', 600, 200], ['wheel', 0, 200], ['wheel', 0, 100]])
+  } finally { await value.runtime.shutdown() }
+})
+
 it.each(['display', 'launch', 'context', 'page'])('closes resources that finish %s after shutdown',async stage=>{
   let complete
   const display={stop:vi.fn(async()=>{})}
@@ -571,6 +583,104 @@ it('uses a private visible display without starting CDP pixel encoding, and rele
   } finally {await value.runtime.shutdown()}
   expect(display.stop).toHaveBeenCalledOnce()
   expect(value.browser.close).toHaveBeenCalledOnce()
+})
+
+it('preserves the scrolled viewport on density changes and only follows the active main frame', async () => {
+  const display={env:{DISPLAY:':100'},size:{width:1000,height:700},resize:vi.fn(),stop:vi.fn(async()=>{})}
+  const value=worker(async()=>display),main={}
+  const send=vi.fn(async()=>({currentIndex:0,entries:[{}]}))
+  value.context.newCDPSession=async()=>({send})
+  value.context.exposeBinding=vi.fn(async()=>{})
+  value.context.addInitScript=vi.fn(async()=>{})
+  value.page.mainFrame=()=>main
+  value.page.bringToFront=vi.fn(async()=>{})
+  value.page.evaluate=vi.fn(async()=>({x:37,y:2000,width:1174,height:681}))
+  value.page.waitForFunction=vi.fn(async()=>({dispose:async()=>{}}))
+  try {
+    await value.command(1,'init',{width:1000,height:700})
+    const follow=value.context.exposeBinding.mock.calls.find(([name])=>name==='__workbenchViewportChanged')[1]
+    send.mockClear()
+    await follow({page:value.page,frame:main},40,2100)
+    expect(send).not.toHaveBeenCalled()
+    await value.command(2,'resize',{width:1174,height:681,device_scale_factor:2.2})
+    expect(send).toHaveBeenCalledWith('Emulation.setDeviceMetricsOverride',{
+      width:1174,height:681,deviceScaleFactor:2.2,mobile:false,
+      viewport:{x:37,y:2000,width:1174,height:681,scale:1},
+    })
+    send.mockClear()
+    await follow({page:value.page,frame:{}},40,2100)
+    await follow({page:{},frame:main},40,2100)
+    await follow({page:value.page,frame:main},NaN,2100)
+    expect(send).not.toHaveBeenCalled()
+    await follow({page:value.page,frame:main},40,2100)
+    expect(send).toHaveBeenCalledExactlyOnceWith('Emulation.setDeviceMetricsOverride',{
+      width:1174,height:681,deviceScaleFactor:2.2,mobile:false,
+      viewport:{x:40,y:2100,width:1174,height:681,scale:1},
+    })
+    await value.runtime.shutdown()
+    send.mockClear()
+    await follow({page:value.page,frame:main},40,2200)
+    expect(send).not.toHaveBeenCalled()
+  } finally {await value.runtime.shutdown()}
+})
+
+it('keeps watched Kasm input independent of metadata reads and refreshes clicks immediately', async () => {
+  let refresh
+  const interval=vi.spyOn(globalThis,'setInterval').mockImplementation(callback=>{refresh=callback;return 0})
+  const display={env:{DISPLAY:':100'},size:{width:1000,height:700},stop:vi.fn(async()=>{})}
+  const value=worker(async()=>display)
+  value.context.exposeBinding=vi.fn(async()=>{})
+  value.context.addInitScript=vi.fn(async()=>{})
+  value.page.bringToFront=vi.fn(async()=>{})
+  value.page.evaluate=vi.fn(async()=>({width:1000,height:700}))
+  value.page.title=vi.fn(async()=> 'Initial')
+  value.page.mouse.down=vi.fn(async()=>{})
+  value.page.mouse.up=vi.fn(async()=>{})
+  try {
+    await value.command(1,'init',{width:1000,height:700})
+    await value.command(2,'watch',{enabled:true})
+    value.page.evaluate.mockClear();value.page.title.mockClear()
+    const actions=[['text',{text:'中文'}],['key',{key:'ArrowLeft'}],['move',{x:20,y:30}],
+      ['wheel',{x:0,y:40}],['modifiers',{modifiers:[]}],['pointer-down',{x:20,y:30,button:'left'}]]
+    for(const [index,[action,args]] of actions.entries()) {
+      await value.command(3+index,action,args)
+      expect(value.frames.find(frame=>frame.id===3+index).error).toBeUndefined()
+    }
+    expect(value.page.evaluate).not.toHaveBeenCalled()
+    expect(value.page.title).not.toHaveBeenCalled()
+    expect(value.page.keyboard.insertText).toHaveBeenCalledWith('中文')
+    expect(value.page.mouse.down).toHaveBeenCalledOnce()
+    value.page.title.mockResolvedValue('Changed by typing')
+    expect(interval).toHaveBeenCalledWith(expect.any(Function),500)
+    refresh()
+    await vi.waitFor(()=>expect(value.frames.filter(frame=>frame.type==='frame').at(-1).title).toBe('Changed by typing'))
+    expect(value.frames.filter(frame=>frame.type==='frame').at(-1).title).toBe('Changed by typing')
+    value.page.title.mockResolvedValue('Changed by clicking')
+    await value.command(10,'pointer-up',{x:20,y:30,button:'left'})
+    expect(value.page.mouse.up).toHaveBeenCalledOnce()
+    expect(value.frames.filter(frame=>frame.type==='frame').at(-1).title).toBe('Changed by clicking')
+  } finally {await value.runtime.shutdown();interval.mockRestore()}
+})
+
+it.each(['unwatched','legacy','unwatched-after-close'])('retains immediate Kasm input observations for %s clients', async mode => {
+  const value=worker(async()=>({env:{DISPLAY:':100'},size:{width:1000,height:700},stop:vi.fn(async()=>{})}))
+  value.context.exposeBinding=vi.fn(async()=>{})
+  value.context.addInitScript=vi.fn(async()=>{})
+  value.context.newCDPSession=async()=>({send:async method=>method==='Page.captureScreenshot'
+    ? {data:Buffer.from('png').toString('base64')} : {currentIndex:0,entries:[{}]}})
+  value.page.bringToFront=vi.fn(async()=>{})
+  value.page.evaluate=vi.fn(async()=>({width:1000,height:700}))
+  value.page.title=vi.fn(async()=> 'Initial')
+  try {
+    await value.command(1,'init',{width:1000,height:700})
+    if(mode!=='unwatched') await value.command(2,'watch',{enabled:true,legacy_pixels:mode==='legacy'})
+    if(mode==='unwatched-after-close') await value.command(3,'watch',{enabled:false})
+    value.page.title.mockResolvedValue('Updated')
+    await value.command(4,'text',{text:'字'})
+    expect(value.frames.find(frame=>frame.id===4).error).toBeUndefined()
+    expect(value.frames.filter(frame=>frame.type==='frame').at(-1).title).toBe('Updated')
+    if(mode==='legacy') expect(value.frames.filter(frame=>frame.type==='frame').at(-1).legacy).toBe(true)
+  } finally {await value.runtime.shutdown()}
 })
 
 it.each([false, true])('waits for visible renderer resize before acknowledgement; timeout=%s', async timeout => {

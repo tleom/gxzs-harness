@@ -1,6 +1,15 @@
 import { PassThrough } from 'node:stream'
 import { expect, it, vi } from 'vitest'
 import { browserAction, SandboxBrowser, WorkbenchBrowsers } from '../src/browsers.js'
+
+it('validates the optional wheel position without changing older wheel requests', () => {
+  const old = { action: 'wheel', x: 0, y: 200 }
+  expect(browserAction(old)).toEqual(old)
+  expect(browserAction({ ...old, position: { x: 600, y: 200, extra: true } }))
+    .toEqual({ ...old, position: { x: 600, y: 200 } })
+  for (const position of [null, {}, {x:-1,y:0}, {x:3840,y:0}, {x:0,y:2160}, {x:1.5,y:0}])
+    expect(() => browserAction({ ...old, position })).toThrow('浏览器操作参数无效')
+})
 const id = '12345678-1234-1234-1234-123456789abc'
 const signal = () => new AbortController().signal
 it('keeps an adopted browser at its launch directory and opens its replacement at the task directory', async () => {

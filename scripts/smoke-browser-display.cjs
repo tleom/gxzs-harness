@@ -35,9 +35,13 @@ async function assertWhiteRoot() {
 
 async function main() {
   await assertWhiteRoot()
-  const server = createServer((_request, response) => {
+  const server = createServer((request, response) => {
     response.setHeader('content-type', 'text/html; charset=utf-8')
-    response.end('<!doctype html><meta charset=utf-8><style>body{background:#fff}#edge{position:fixed;right:0;bottom:0;width:30px;height:30px;background:#c24;border:0;padding:0}</style><input id="value" aria-label="Value"><a id="popup" href="/popup" target="_blank">Open</a><button id="edge" onclick="this.textContent=Number(this.textContent)+1;this.style.background=Number(this.textContent)%2?\'#2c4\':\'#c24\'">0</button>')
+    if (request.url === '/nested') {
+      response.end('<!doctype html><style>body{margin:0}.pane{position:absolute;top:80px;width:300px;height:300px;overflow:auto}#left{left:60px}#right{left:450px}.content{height:2000px}</style><input id="leftValue" value="0"><input id="rightValue" value="0"><div class="pane" id="left" onscroll="leftValue.value=this.scrollTop"><div class="content">left</div></div><div class="pane" id="right" onscroll="rightValue.value=this.scrollTop"><div class="content">right</div></div>')
+      return
+    }
+    response.end('<!doctype html><meta charset=utf-8><style>html{scrollbar-width:none}body{background:#fff;height:12000px}#edge{position:fixed;right:0;bottom:0;width:30px;height:30px;background:#c24;border:0;padding:0}</style><input id="value" aria-label="Value"><a id="popup" href="/popup" target="_blank">Open</a><button id="edge" onclick="this.textContent=Number(this.textContent)+1;this.style.background=Number(this.textContent)%2?\'#2c4\':\'#c24\'">0</button>')
   })
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
   const input = new PassThrough(), output = new PassThrough(), pending = new Map(), packets = []
@@ -79,11 +83,15 @@ async function main() {
     assert.equal(snapshot.viewport.width, 823)
     assert.equal(snapshot.viewport.height, 617)
     assert.equal(snapshot.elements.find(element => element.selector === '#value').value, '可见浏览器中文验收')
+    await call('wheel', { x: 0, y: 2000, modifiers: [] })
+    await new Promise(resolve => setTimeout(resolve, 150))
     let clicks = 0
     for (const [width, height, scale = 1] of [[320, 240], [361, 521], [499, 544], [500, 521], [1920, 1080], [1174, 681, 2.2], [1740, 810, 2.2], [1280, 720, 3], [320, 240], [823, 617]]) {
       await call('resize', { width, height, device_scale_factor: scale })
       // A transient matching size must not hide a later minimum-window clamp.
       await new Promise(resolve => setTimeout(resolve, 250))
+      await call('wheel', { x: 0, y: 200, modifiers: [] })
+      await new Promise(resolve => setTimeout(resolve, 100))
       const resized = await call('snapshot')
       assert.equal(resized.viewport.width, width)
       assert.equal(resized.viewport.height, height)
@@ -141,6 +149,18 @@ async function main() {
     assert.match(greeting, /^RFB /)
     await call('display-close', { connection })
     assert.equal((await call('snapshot')).elements[0].value, '可见浏览器中文验收')
+    await call('navigate', {url:`http://127.0.0.1:${server.address().port}/nested`})
+    await call('move', {x:200,y:200})
+    await call('wheel', {x:0,y:200,position:{x:600,y:200}})
+    let nested
+    for (let attempt = 0; attempt < 30; attempt++) {
+      nested = await call('snapshot')
+      if (nested.elements.find(element => element.selector === '#rightValue')?.value === '200') break
+      await new Promise(resolve => setTimeout(resolve, 50))
+    }
+    assert.equal(nested.elements.find(element => element.selector === '#leftValue').value, '0')
+    assert.equal(nested.elements.find(element => element.selector === '#rightValue').value, '200')
+    console.log('PASS wheel over a nested pane ignores the stale pointer location')
     console.log('PASS private Kasm display: narrow/wide and native-density 4K resize, desktop pixels and edge clicks after AI screenshots, AI Unicode edit, RFB handshake and view-only disconnect')
   } finally {
     await worker.shutdown()

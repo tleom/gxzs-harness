@@ -294,7 +294,7 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
     if (!closed) notice = '网页画面暂时获取失败，正在重试'
     throw new Error('frame_unavailable')
   }
-  async function fitDisplayWindow(cdp) {
+  async function fitDisplayWindow(cdp, target) {
     const window = await cdp.send('Browser.getWindowForTarget')
     await cdp.send('Browser.setWindowBounds', { windowId: window.windowId, bounds: { windowState: 'normal' } })
     await cdp.send('Browser.setWindowBounds', { windowId: window.windowId,
@@ -302,15 +302,16 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
     await cdp.send('Browser.setWindowBounds', { windowId: window.windowId, bounds: { windowState: 'fullscreen' } })
     // Chromium enforces a minimum outer-window width even in kiosk mode. Keep
     // layout and input coordinates aligned with the visible X display below it.
+    const position = deviceScaleFactor === 1 ? undefined : await target.evaluate(() => ({ x: scrollX, y: scrollY }))
     await cdp.send('Emulation.setDeviceMetricsOverride', {
       ...viewport, deviceScaleFactor, mobile: false,
-      viewport: { x: 0, y: 0, ...viewport, scale: 1 },
+      ...(position ? { viewport: { x: position.x, y: position.y, ...viewport, scale: 1 } } : {}),
     })
   }
   async function bind(target, id) {
     const cdp = await context.newCDPSession(target)
     if (display) {
-      await fitDisplayWindow(cdp)
+      await fitDisplayWindow(cdp, target)
       await target.bringToFront()
     } else streams.set(target, createScreencast({ page: target, session: cdp, nextId: () => ++frameSequence,
       getDeviceScaleFactor: () => deviceScaleFactor,
@@ -456,9 +457,36 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
       if (closed) { await context.close(); throw new Error('browser_closed') }
       if (display) {
         await context.exposeBinding('__workbenchInputChanged', () => { revision++ })
+        await context.exposeBinding('__workbenchViewportChanged', async ({ page: target, frame: source }, x, y) => {
+          if (closed || deviceScaleFactor === 1 || target !== page || source !== target.mainFrame() || !Number.isFinite(x) || !Number.isFinite(y)) return
+          // CDP's viewport is a document-coordinate crop, so it must follow root
+          // scrolling. Keep the native input coordinate system unchanged.
+          await session.send('Emulation.setDeviceMetricsOverride', {
+            ...viewport, deviceScaleFactor, mobile: false,
+            viewport: { x, y, ...viewport, scale: 1 },
+          }).catch(() => {})
+        })
         await context.addInitScript(() => {
           for (const name of ['pointerdown', 'keydown', 'input', 'wheel'])
             addEventListener(name, event => { if (event.isTrusted) void window.__workbenchInputChanged() }, { capture: true, passive: true })
+          if (window !== window.top) return
+          let pending = false, last = 0
+          const followViewport = () => {
+            if (pending) return
+            pending = true
+            setTimeout(async () => {
+              const x = scrollX, y = scrollY
+              last = performance.now()
+              try { await window.__workbenchViewportChanged(x, y) }
+              catch { /* The document may navigate while its update is pending. */ }
+              finally {
+                pending = false
+                if (x !== scrollX || y !== scrollY) followViewport()
+              }
+            }, Math.max(0, 34 - (performance.now() - last)))
+          }
+          addEventListener('scroll', event => { if (event.target === document) followViewport() }, { passive: true })
+          addEventListener('pageshow', followViewport)
         })
       }
       context.on?.('page', target => {
@@ -560,7 +588,7 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
         deviceScaleFactor = value.device_scale_factor ?? 1
         if (display) {
           await display.resize(Math.round(value.width * deviceScaleFactor), Math.round(value.height * deviceScaleFactor))
-          await fitDisplayWindow(session)
+          await fitDisplayWindow(session, page)
           // XRandR and CDP acknowledge before Chromium applies the resize.
           // Observe the renderer before accepting another input or snapshot.
           const resized = await page.waitForFunction(({ width, height }) =>
@@ -644,7 +672,13 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
       case 'move': await setModifiers(value.modifiers || []); await page.mouse.move(value.x, value.y); break
       case 'wheel':
         await setModifiers(value.modifiers || [])
-        try { await page.mouse.wheel(value.x, value.y) } finally { await setModifiers([]) }
+        try {
+          if (value.position) {
+            await page.mouse.move(value.position.x, value.position.y)
+            assertCurrent(value)
+          }
+          await page.mouse.wheel(value.x, value.y)
+        } finally { await setModifiers([]) }
         break
       case 'text': await page.keyboard.insertText(value.text); break
       case 'key': await page.keyboard.press(value.key); break
@@ -699,8 +733,11 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
     await value.beforeUnloadHandled
     assertCurrent(value)
     // Observed frames stream independently; a click never waits for image encoding.
-    if (display) await frame()
-    else if (!streams.get(page)?.active && (!watching || !['move', 'wheel', 'text', 'key'].includes(action))) await freshFrame()
+    if (display) {
+      // Kasm streams pixels independently and watch already refreshes metadata.
+      // Keep rapid input off that renderer round trip; clicks/navigation still refresh immediately.
+      if (!watching || legacyPixels || !['move', 'wheel', 'text', 'key', 'modifiers', 'pointer-down'].includes(action)) await frame()
+    } else if (!streams.get(page)?.active && (!watching || !['move', 'wheel', 'text', 'key'].includes(action))) await freshFrame()
     return { page_id: pageId, ...(value.beforeUnloadCancelled
       ? { revision, outcome: { kind: 'navigation_cancelled', message: '已取消离开当前页面' } } : {}) }
   }
