@@ -569,8 +569,10 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
           await fitDisplayWindow(session)
           // XRandR and CDP acknowledge before Chromium applies the resize.
           // Observe the renderer before accepting another input or snapshot.
+          // Fractional native DPI can round the CSS viewport by one pixel even
+          // when the physical framebuffer and screenshot dimensions are exact.
           const resized = await page.waitForFunction(({ width, height }) =>
-            innerWidth === width && innerHeight === height,
+            Math.abs(innerWidth - width) <= 1 && Math.abs(innerHeight - height) <= 1,
           { width: value.width, height: value.height }, { timeout: 5000, polling: 50 })
           await resized.dispose()
         } else await page.setViewportSize({ width: value.width, height: value.height })
