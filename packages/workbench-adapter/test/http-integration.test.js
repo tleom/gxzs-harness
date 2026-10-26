@@ -739,7 +739,7 @@ describe('authenticated workbench HTTP handler', () => {
     context.workbenchFileManager.operate.mockClear()
     const deleted = await call(handler, key, 'DELETE', '/files', { path: `${chat.body.data.file_directory}/a.bin`, version: 'v1' })
     expect(deleted).toMatchObject({ status: 409 })
-    expect(context.workbenchFileManager.operate).not.toHaveBeenCalled()
+    expect(context.workbenchFileManager.operate).toHaveBeenCalledExactlyOnceWith({ operation: 'stat', path: `${chat.body.data.file_directory}/a.bin` })
   })
 
   it('allocates a dated task directory and checks it when reopening the chat', async () => {
