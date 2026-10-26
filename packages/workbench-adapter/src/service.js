@@ -29,6 +29,7 @@ import { dispatchRunPrompt } from './native-prompt.js'
 import { goalFailureReason, presentRunEvent, resumeGoalSelection, runFailure } from './run-failure.js'
 import { ownedSessionRoots } from './owned-session-roots.js'
 import { DirectoryLifecycle } from './directory-lifecycle.js'
+import { presentContextPressure } from './context-usage.js'
 
 const directoryAdjectives = ['calm', 'clear', 'cool', 'fair', 'fresh', 'gentle', 'green', 'happy', 'light', 'little', 'quiet', 'silver', 'soft', 'sunny', 'warm', 'wild']
 const directoryNouns = ['birch', 'brook', 'cedar', 'cloud', 'dawn', 'fern', 'field', 'forest', 'grove', 'hill', 'lake', 'leaf', 'maple', 'meadow', 'moon', 'moss', 'oak', 'ocean', 'olive', 'pearl', 'pine', 'pond', 'reed', 'river', 'shore', 'sky', 'snow', 'star', 'stone', 'sun', 'wave', 'willow']
@@ -1176,8 +1177,10 @@ export class WorkbenchService {
           reason: goalFailureReason({ ...goal, activation: 'disarmed' }, this.database.goalRun(chat.sessionId)), max_rounds: goal.maxGoalRounds,
           rounds_started: projection.roundsStarted, last_run_id: this.database.goalRun(chat.sessionId)?.id ?? null } : null }
       }
-      return withGoalResources({ ...state, plan, contextPressure: source.projections?.values?.contextPressure ?? null,
-        contextBreakdown: source.projections?.values?.contextBreakdown ?? null,
+      const { contextPressure, contextBreakdown } = source.projections?.values ?? {}
+      return withGoalResources({ ...state, plan,
+        contextPressure: presentContextPressure(source.events ?? [], contextPressure, contextBreakdown),
+        contextBreakdown: contextBreakdown ?? null,
         commands: nativeCommandRecords(source.events ?? [], this.database.listRunReferences(owner.ownerId, chatId)) })
     } finally { source[Symbol.dispose]?.() }
   }
