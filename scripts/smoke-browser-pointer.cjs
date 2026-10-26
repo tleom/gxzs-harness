@@ -17,7 +17,8 @@ async function main() {
       const event = JSON.parse(buffer.slice(0, end)); buffer = buffer.slice(end + 1)
       if (event.type !== 'result') continue
       const request = pending.get(event.id); pending.delete(event.id)
-      event.error ? request.reject(Error(event.error)) : request.resolve(event.value)
+      if (!request) continue
+      event.error ? request.reject(Error(`${request.action}: ${event.error}`)) : request.resolve(event.value)
     }
   })
   const call = async (action, extra = {}) => {
@@ -25,7 +26,7 @@ async function main() {
     let timeout
     try {
       return await new Promise((resolve, reject) => {
-        pending.set(id, {resolve, reject})
+        pending.set(id, {resolve, reject, action})
         timeout = setTimeout(() => reject(Error(`Pointer smoke timed out: ${action}`)), 30000)
         input.write(JSON.stringify({id, action, ...extra}) + '\n')
       })
