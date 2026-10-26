@@ -4,6 +4,9 @@ import { platformToolName, platformToolNames, publicToolName } from '../src/name
 import { apply } from '../src/index.js'
 import * as schemas from '../src/schema.js'
 import { buildCatalog, renderCatalog } from '../../tool-discovery/src/catalog.js'
+import { Context } from '@deepseek-ai/cordis'
+import { WorkbenchDatabase } from '../../workbench-adapter/src/persistence.js'
+import { WorkbenchRuntime } from '../../workbench-adapter/src/runtime.js'
 
 const catalogTool = {
   id: 'personal:server:search', runtime_name: 'personal_mcp_search', version: 'v1', manifest_version: 'm1',
@@ -31,6 +34,29 @@ function setup({ authorized = true } = {}) {
 }
 
 describe('platform MCP proxy tools', () => {
+  it('restores discovery and call authorization for an unchanged frozen global catalog after restart', async () => {
+    const { ctx, platform } = setup()
+    const database = new WorkbenchDatabase(':memory:')
+    cleanups.unshift(() => database.close())
+    const runtime = new WorkbenchRuntime(new Context(), database, 't:1')
+    ctx.workbenchRuntime = runtime
+    const agent = { id: 's1', status: 'running', ctx: { tools: { restrict: () => () => {} } } }
+    runtime.agents = { get: id => id === agent.id ? agent : undefined, list: () => [agent] }
+    const tool = { ...catalogTool, id: 'global:mcp:server:search', scope: 'global' }
+    const plugin = { id: 'global:mcp:server', scope: 'global', name: 'server', version: 'v1', manifest_version: 'm1', available: true, capabilities: { tools: {} } }
+    platform.json.mockResolvedValue({ plugins: [plugin], tools: [tool] })
+    await apply(ctx, { discovery: true })
+    const frozen = await runtime.refreshMcpCatalog()
+    const chat = database.createChat({ ownerId: 't:1', sessionId: 's1', selection: {} })
+    const { run } = database.createRun({ ownerId: 't:1', chatId: chat.id, sessionId: 's1', query: 'q', selection: {}, mcpTools: frozen.tools, mcpServers: frozen.plugins })
+    database.transitionRun('t:1', run.id, 'running')
+    platform.json.mockResolvedValue({ plugins: [{ ...plugin, manifest_version: 'm2' }], tools: [{ ...tool, manifest_version: 'm2' }] })
+    await runtime.refreshMcpCatalog()
+    expect(ctx.toolDiscoveryCatalog.snapshot(agent).tools).toHaveLength(1)
+    expect(database.getRun('t:1', run.id).mcpTools[0].manifest_version).toBe('m2')
+    expect((await runtime.authorizeMcpCall('s1', tool.id, 'v1')).resource.manifest_version).toBe('m2')
+    expect(runtime.authorizeMcp('s1', 'ungranted', 'v1')).toBeUndefined()
+  })
   it.each([
     ['personal', {}], ['personal', { version: 'v1' }], ['personal', { manifest_version: 'm1' }],
     ['global', {}], ['global', { version: 'v1' }], ['global', { manifest_version: 'm1' }],

@@ -74,7 +74,6 @@ export class DirectoryLifecycle {
       const chats = db.directoryChats(owner.ownerId)
       const deleting = new Set(db.pendingWorkspaceDeletions(owner.ownerId).flatMap(plan => plan.chatIds))
       const live = chats.filter(chat => db.getChat(owner.ownerId, chat.id) && !db.chatDeletion(owner.ownerId, chat.id) && !deleting.has(chat.id))
-      this.assertInactive(owner, [directory], live, '删除')
       const bound = live.filter(chat => containsWorkspacePath(directory, this.chatPath(chat)))
       if (bound.length) throw httpError(409, `文件夹包含会话：${bound.slice(0, 5).map(chat => chat.title).join('、')}，请先删除会话`, 'DIRECTORY_IN_USE')
       // Keep system roots under the file manager's existing boundary. Never
@@ -84,8 +83,10 @@ export class DirectoryLifecycle {
       if (requestedEntry.kind === 'blocked') throw httpError(400, '不支持此文件类型', 'FILE_TYPE_UNSUPPORTED')
       // Ordinary files do not own resources or registrations. Keep the caller's
       // CAS version even if a native process writes between this read and delete.
-      if (requestedEntry.kind === 'file')
+      if (requestedEntry.kind === 'file') {
+        this.assertInactive(owner, [directory], live, '删除')
         return service.fileManager.operate({ operation: 'delete', path: directory, version })
+      }
       const key = `file:${createHash('sha256').update(`${owner.ownerId}\0${directory}`).digest('hex')}`
       let plan = db.workspaceDeletion(owner.ownerId, key)
       if (plan?.completedAt) {

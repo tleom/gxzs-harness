@@ -6,6 +6,7 @@ import { mcpDeadline } from './deadline.js'
 import { adaptInputSchema } from './schema.js'
 import { platformToolNames } from './names.js'
 import { ToolDiscoveryCatalog } from './discovery-catalog.js'
+import { migrateEquivalentManifests } from './manifest-migration.js'
 import z from '@deepseek-ai/schemastery'
 import { createHash } from 'node:crypto'
 
@@ -32,6 +33,13 @@ export async function apply(ctx, config = {}) {
   ctx.workbenchRuntime.mcpCatalogIssues = () => catalogIssues
   ctx.workbenchRuntime.mcpResources = () => [...registrations.values()].map(({ tool }) => ({ ...tool }))
   ctx.workbenchRuntime.mcpPlugins = () => pluginMetadata.map(plugin => ({ ...plugin }))
+  const migrateRun = run => {
+    if (!ctx.workbenchRuntime.mcpCatalogState?.ready || !ctx.workbenchRuntime.database) return run
+    const migrated = migrateEquivalentManifests(run, [...registrations.values()].map(item => item.tool), pluginMetadata)
+    if (migrated !== run) ctx.workbenchRuntime.database.updateRunResources(run, migrated.selection, migrated.mcpTools)
+    return migrated
+  }
+  ctx.workbenchRuntime.migrateMcpRun = migrateRun
   const restrictions = new Map()
   let catalogLoaded = false
   let disposed = false
@@ -254,6 +262,7 @@ export async function apply(ctx, config = {}) {
   }, { global: true })
   ctx.effect(() => () => {
     disposed = true
+    if (ctx.workbenchRuntime.migrateMcpRun === migrateRun) ctx.workbenchRuntime.migrateMcpRun = undefined
     if (ctx.workbenchRuntime.refreshMcpCatalog === refreshForAdmission) ctx.workbenchRuntime.refreshMcpCatalog = undefined
     if (ctx.workbenchRuntime.restrictMcpScope === restrictAgent) ctx.workbenchRuntime.restrictMcpScope = undefined
     if (ctx.workbenchRuntime.mcpToolForName === toolForName) ctx.workbenchRuntime.mcpToolForName = undefined

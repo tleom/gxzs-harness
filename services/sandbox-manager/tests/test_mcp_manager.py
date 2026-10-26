@@ -548,6 +548,41 @@ def test_manager_http_preserves_utf8_catalog_budget(manager, monkeypatch):
     assert json.loads(data) == catalog
 
 
+@pytest.mark.parametrize('operation,count,size,expected', [
+    ('mcp_list', 1, 3900, 200),
+    ('mcp_list', 1, 4050, 413),
+    ('mcp_list', 2, 2100, 413),
+    ('mcp_test', 1, 4050, 413),
+    ('mcp_call', 1, 4050, 413),
+])
+def test_manager_checks_complete_response_envelope(manager, monkeypatch, operation, count, size, expected):
+    from io import BytesIO
+    module, _, _, _ = manager
+    original = module.mcp_limit
+    monkeypatch.setattr(module, 'mcp_limit', lambda key: 4096 if key == 'response_bytes' else original(key))
+    catalog = {'mcp': [{'id': str(index), 'tools': [{'name': 'lookup', 'description': 'x' * size}]} for index in range(count)]}
+    dispatched = []
+    def call(*args):
+        dispatched.append(args)
+        return catalog
+    monkeypatch.setattr(module, 'operation', call)
+    handler = object.__new__(module.Handler)
+    body = json.dumps({'operation': operation}).encode()
+    handler.path = '/sandboxes/' + str(uuid4()) + '/personal-mcp'
+    handler.headers = {'Authorization': 'Bearer ' + module.TOKEN, 'Content-Length': str(len(body))}
+    handler.rfile = BytesIO(body)
+    responses = []
+    handler.write_json = lambda code, data, **kwargs: responses.append((code, data))
+    handler.do_POST()
+    status, data = responses[0]
+    assert status == expected and len(data) <= 4096
+    assert len(dispatched) == 1
+    if status == 200:
+        assert json.loads(data) == catalog
+    else:
+        assert json.loads(data)['code'] == ('MCP_RESPONSE_TOO_LARGE' if operation == 'mcp_call' else 'MCP_DISCOVERY_TOO_LARGE')
+
+
 def test_stop_plain_text_or_known_complete_tool_is_not_uncertain(manager):
     module, _, _, _ = manager
     key, text_binding, known_binding = [str(uuid4()) for _ in range(3)]

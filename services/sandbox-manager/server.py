@@ -946,6 +946,7 @@ class Handler(BaseHTTPRequestHandler):
         REQUEST_CONTEXT.operation_capacity = False
         request_id = uuid.uuid4().hex[:12]
         key = action = role = 'unresolved'
+        payload = {}
         try:
             parts = self.path.strip("/").split("/")
             if len(parts) != 3 or parts[0] != "sandboxes":
@@ -1063,6 +1064,21 @@ class Handler(BaseHTTPRequestHandler):
         if code >= 400:
             output.setdefault('request_id', request_id)
         data = json.dumps(output, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+        if action in {'personal-mcp', 'global-mcp', 'global-memory'} and len(data) > mcp_limit('response_bytes'):
+            # Worker frames and the final HTTP envelope have different sizes.
+            # Enforce the budget on the complete serialized response, including
+            # all providers, rather than sending an unreadable successful list.
+            discovery = isinstance(payload, dict) and payload.get('operation') in {'mcp_list', 'mcp_test'}
+            code = 413
+            output = {
+                'error': 'MCP 完整工具目录超过响应传输预算，请调整 response_bytes' if discovery else
+                         'MCP 响应已收到但超过传输预算，请勿自动重放业务调用',
+                'code': 'MCP_DISCOVERY_TOO_LARGE' if discovery else 'MCP_RESPONSE_TOO_LARGE',
+                'request_id': request_id,
+            }
+            data = json.dumps(output, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+            if len(data) > mcp_limit('response_bytes'):
+                data = b'{}' if mcp_limit('response_bytes') >= 2 else b''
         self.write_json(code, data, request_id=request_id, action=action)
 
 
