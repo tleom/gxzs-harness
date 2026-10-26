@@ -899,8 +899,9 @@ describe('followup and control service', () => {
     const first = await service.createChat(owner, '/workspace', {})
     const second = await service.createChat(owner, '/workspace', {})
     expect(first.id).not.toBe(second.id)
+    expect(first.directory).toMatch(/^conversations\/\d{4}-\d{2}-\d{2}\/new-chat$/)
+    expect(second.directory).toBe(`${first.directory}-2`)
     for (const chat of [first, second]) {
-      expect(chat.directory).toMatch(/^conversations\/\d{4}-\d{2}-\d{2}\/[a-z]+-[a-z]+(?:-\d+)?$/)
       expect(fileManager.operate).toHaveBeenCalledWith({ operation: 'mkdir', path: chat.directory.replace(/-\d+$/, ''), unique: true })
       expect(sessionController.create).toHaveBeenCalledWith({ cwd: `/workspace/${chat.directory}` })
     }
@@ -913,7 +914,7 @@ describe('followup and control service', () => {
     fileManager.operate.mockImplementation(async ({ path, unique }) => ({ path: unique ? `${path}-2` : path }))
     sessionController.create.mockResolvedValue({ sessionId: 'collision' })
     const chat = await service.createChat(owner, '/workspace', {})
-    expect(chat.directory).toMatch(/\/[a-z]+-[a-z]+-2$/)
+    expect(chat.directory).toMatch(/\/new-chat-2$/)
     expect(sessionController.create).toHaveBeenCalledWith({ cwd: `/workspace/${chat.directory}` })
   })
 

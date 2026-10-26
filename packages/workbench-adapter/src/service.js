@@ -1,7 +1,7 @@
 import { platformToolNames } from '@gxzs/dsh-workbench-mcp-tools/names'
 import { readSkillDefinition, skillDisplayName } from '@gxzs/dsh-workbench-sandbox-skills/definition'
 import { orderGlobalSkills } from '@gxzs/dsh-workbench-sandbox-skills/global'
-import { randomInt, randomUUID } from 'node:crypto'
+import { randomUUID } from 'node:crypto'
 import path from 'node:path'
 import { isDeepStrictEqual } from 'node:util'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
@@ -30,9 +30,6 @@ import { goalFailureReason, presentRunEvent, resumeGoalSelection, runFailure } f
 import { ownedSessionRoots } from './owned-session-roots.js'
 import { DirectoryLifecycle } from './directory-lifecycle.js'
 import { presentContextPressure } from './context-usage.js'
-
-const directoryAdjectives = ['calm', 'clear', 'cool', 'fair', 'fresh', 'gentle', 'green', 'happy', 'light', 'little', 'quiet', 'silver', 'soft', 'sunny', 'warm', 'wild']
-const directoryNouns = ['birch', 'brook', 'cedar', 'cloud', 'dawn', 'fern', 'field', 'forest', 'grove', 'hill', 'lake', 'leaf', 'maple', 'meadow', 'moon', 'moss', 'oak', 'ocean', 'olive', 'pearl', 'pine', 'pond', 'reed', 'river', 'shore', 'sky', 'snow', 'star', 'stone', 'sun', 'wave', 'willow']
 
 export class WorkbenchService {
   constructor({ database, sessionController, agents, commands, skills, globalSkillOrder, workingDirectory, onGoalChanged, fileManager, platformClient, workspace, sessionQuery, agentPresets, agentDefaultModel, modelSettings, scheduler, attachments, goals, fileUploads, nativeFileAttachments = false }) {
@@ -82,7 +79,7 @@ export class WorkbenchService {
     await this.fileManager.operate({ operation: 'mkdir', path: `conversations/${date}` })
     // A new chat may start from a terminal before it has a title or first prompt.
     // Reserve the short directory atomically; retain its mapping when the chat is renamed.
-    const name = directoryName ?? `${directoryAdjectives[randomInt(directoryAdjectives.length)]}-${directoryNouns[randomInt(directoryNouns.length)]}`
+    const name = directoryName ?? 'new-chat'
     const { path: directory } = await this.fileManager.operate({ operation: 'mkdir', path: `conversations/${date}/${name}`, unique: true })
     const created = await this.sessions.create({ cwd: this.chatDirectory(id, directory) })
     const chat = this.database.createChat({ id, ownerId: owner.ownerId, sessionId: created.sessionId, selection, directory })
