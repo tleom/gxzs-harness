@@ -185,7 +185,7 @@ def connected(request, modules, tmp_path):
     )
     connection = None
     try:
-        connection = Connection(base, tmp_path, saved["version"])
+        connection = Connection(base, tmp_path, saved["runtime_version"])
         yield connection, ops, tmp_path, transport
     finally:
         if connection:
@@ -261,6 +261,24 @@ def test_timeout_does_not_replay_business_call(connected):
     assert counter.read_text() == "1"
 
 
+def test_live_connection_survives_presentation_edit_but_rejects_connection_change(connected):
+    connection, ops, root, _ = connected
+    first = connection.call('add', {'value': 1})['result']['structuredContent']
+    read = ops.personal_mcp({'operation': 'mcp_read', 'name': 'demo'}, str(root))
+    config = json.loads(read['content'])
+    config.update(display_name='新展示名', description='新说明')
+    saved = ops.personal_mcp({'operation': 'mcp_save', 'name': 'demo', 'version': read['version'],
+                              'content': json.dumps(config, indent=4)}, str(root))
+    assert saved['runtime_version'] == connection.ready['version'] and saved['connection_changed'] is False
+    second = connection.call('add', {'value': 2})['result']['structuredContent']
+    assert first['pid'] == second['pid'] and second['calls'] == first['calls'] + 1
+    config['timeout'] = 6
+    changed = ops.personal_mcp({'operation': 'mcp_save', 'name': 'demo', 'version': saved['version'],
+                                'content': json.dumps(config)}, str(root))
+    assert changed['connection_changed'] is True and changed['runtime_version'] != saved['runtime_version']
+    assert connection.call('add', {'value': 3}) == {'conflict': True}
+
+
 def test_manager_disconnect_cancels_inflight_call_without_waiting_for_tool_timeout(
     connected,
 ):
@@ -289,6 +307,10 @@ def test_direct_config_change_fences_existing_connection(connected):
     connection, _, root, _ = connected
     path = root / "mcp/demo/mcp.json"
     path.write_text(path.read_text() + "\n")
+    assert connection.call("add", {"value": 1})['result']['structuredContent']['value'] == 2
+    config = json.loads(path.read_text())
+    config['timeout'] = config['timeout'] + 1
+    path.write_text(json.dumps(config))
     assert connection.call("add", {"value": 1}) == {"conflict": True}
 
 

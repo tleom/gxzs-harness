@@ -647,10 +647,17 @@ def operation(key, action, payload):
             output = json.loads(result.stdout)
             if tracked:
                 touch(key)
-        if payload["operation"] in {"mcp_save", "mcp_delete", "mcp_toggle"} and not output.get("conflict"):
+        if (payload["operation"] in {"mcp_save", "mcp_delete", "mcp_toggle"} and not output.get("conflict")
+                and (payload["operation"] != "mcp_save" or output.get("connection_changed") is not False)):
             invalidate(key, payload["name"])
         if payload["operation"] in {"mcp_test", "mcp_call", "mcp_browse", "mcp_request", "mcp_task"}:
             discovered_at = payload.get("catalog_discovered_at", output.get("discovered_at"))
+            # Editing CAS uses the file hash; execution uses the connection hash.
+            # Only unsigned management probes may translate the current CAS hash.
+            if output.get("runtime_version"):
+                if payload["operation"] in {"mcp_test", "mcp_browse"} and payload.get("version") == output["version"]:
+                    payload = {**payload, "version": output["runtime_version"]}
+                output = {**output, "version": output["runtime_version"]}
             output = invoke(key, name, payload, output, authorize=authorize_mcp)
             if (payload["operation"] == "mcp_test"
                     and output.get("error") and output.get("code") != "MCP_BUSY"

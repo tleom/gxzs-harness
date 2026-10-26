@@ -75,7 +75,7 @@ def test_task_frames_retain_capabilities_and_same_session_without_replaying(modu
     script.write_text(TASK_SERVER)
     config = {'transport':'stdio','command':sys.executable,'args':[str(script),generation],'cwd':'/workspace','env':{},'timeout':10}
     ops.personal_mcp({'operation':'mcp_save','name':'demo','content':json.dumps(config)}, str(tmp_path))
-    version = ops.personal_mcp({'operation':'mcp_probe','name':'demo'}, str(tmp_path))['version']
+    version = ops.personal_mcp({'operation':'mcp_probe','name':'demo'}, str(tmp_path))['runtime_version']
     conn = Connection(base, tmp_path, version)
     try:
         capabilities=conn.ready['server_info']['capabilities']
@@ -113,7 +113,7 @@ def test_terminal_task_pins_and_result_retry(modules, tmp_path, generation, stat
     config = {'transport':'stdio','command':sys.executable,'args':[str(script),generation,status],
               'cwd':'/workspace','env':{},'timeout':10}
     ops.personal_mcp({'operation':'mcp_save','name':'demo','content':json.dumps(config)}, str(tmp_path))
-    version = ops.personal_mcp({'operation':'mcp_probe','name':'demo'}, str(tmp_path))['version']
+    version = ops.personal_mcp({'operation':'mcp_probe','name':'demo'}, str(tmp_path))['runtime_version']
     conn = Connection(base, tmp_path, version)
     def request(method, params):
         return conn.call('report', operation='mcp_task', method=method, params=params,
@@ -148,7 +148,7 @@ def test_modern_task_frames_are_accepted_by_the_core_sdk(modules, tmp_path):
     config = {'transport':'stdio','command':sys.executable,'args':[str(script),'stdio'],
               'cwd':'/workspace','env':{},'timeout':10}
     ops.personal_mcp({'operation':'mcp_save','name':'demo','content':json.dumps(config)}, str(tmp_path))
-    version = ops.personal_mcp({'operation':'mcp_probe','name':'demo'}, str(tmp_path))['version']
+    version = ops.personal_mcp({'operation':'mcp_probe','name':'demo'}, str(tmp_path))['runtime_version']
     conn = Connection(base, tmp_path, version)
     try:
         assert conn.ready['server_info']['protocolVersion']=='2026-07-28'
@@ -174,7 +174,7 @@ def test_inflight_query_can_be_cancelled_and_deadline_does_not_destroy_connectio
     script.write_text(server)
     ops.personal_mcp({'operation': 'mcp_save', 'name': 'demo', 'content': json.dumps({
         'command': sys.executable, 'args': [str(script), generation], 'timeout': 5})}, str(tmp_path))
-    version = ops.personal_mcp({'operation': 'mcp_probe', 'name': 'demo'}, str(tmp_path))['version']
+    version = ops.personal_mcp({'operation': 'mcp_probe', 'name': 'demo'}, str(tmp_path))['runtime_version']
     conn = Connection(base, tmp_path, version)
     def send(method, request_id, deadline=5000):
         params = {'name': 'report', 'arguments': {'fixture': 'kept'}, **({'task': {}} if generation == 'legacy' else {})} if method == 'tools/call' else {'taskId': 'one-task'}

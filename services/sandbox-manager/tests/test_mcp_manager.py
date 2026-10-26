@@ -78,6 +78,43 @@ def manager(tmp_path, monkeypatch):
     assert not mcp_runtime.ACTIVE
 
 
+@pytest.mark.parametrize('connection_changed', [False, True, None])
+def test_presentation_save_keeps_active_connection_but_real_changes_close_it(manager, monkeypatch, connection_changed):
+    module, runtime, _, _ = manager
+    key, binding = str(uuid4()), str(uuid4())
+    module.operation(key, 'personal-mcp', payload(key, binding, tool='fast'))
+    worker = runtime.WORKERS[(key, 'demo')]
+    original = module.docker
+    def docker(*args, stdin=None, **kwargs):
+        if stdin and json.loads(stdin).get('operation') == 'mcp_save':
+            result = {'version': 'cas2'}
+            if connection_changed is not None:
+                result['connection_changed'] = connection_changed
+            return SimpleNamespace(returncode=0, stdout=json.dumps(result))
+        return original(*args, stdin=stdin, **kwargs)
+    monkeypatch.setattr(module, 'docker', docker)
+    module.operation(key, 'personal-mcp', {'operation': 'mcp_save', 'name': 'demo', 'version': 'cas1', 'content': '{}'})
+    assert worker.closed.is_set() is (connection_changed is not False)
+
+
+def test_management_cas_is_translated_but_signed_calls_must_use_runtime_version(manager, monkeypatch):
+    module, runtime, _, _ = manager
+    key, binding = str(uuid4()), str(uuid4())
+    monkeypatch.setattr(module, 'docker', lambda *a, **kw: SimpleNamespace(returncode=0, stdout=json.dumps({
+        'version': 'cas', 'runtime_version': 'binding', 'enabled': True, 'timeout': 5})))
+    original = runtime.invoke
+    observed = []
+    def invoke(key, name, request, state, **kwargs):
+        observed.append((request['version'], state['version']))
+        return {'ready': True}
+    monkeypatch.setattr(runtime, 'invoke', invoke)
+    module.operation(key, 'personal-mcp', {'operation': 'mcp_test', 'name': 'demo', 'version': 'cas'})
+    assert observed == [('binding', 'binding')]
+    monkeypatch.setattr(runtime, 'invoke', original)
+    assert module.operation(key, 'personal-mcp', {**payload(key, binding), 'version': 'cas'}) == {'conflict': True}
+    assert (key, 'demo') not in runtime.WORKERS
+
+
 def payload(key, binding, *, tool="slow", request="call-1"):
     return {
         "operation": "mcp_call",

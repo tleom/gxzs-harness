@@ -9,6 +9,19 @@ function create(fetchImpl) {
 }
 
 describe('restricted platform client', () => {
+  it.each([401, 403, 409, 429, 503, 504])('preserves backend error metadata and HTTP status %i', async status => {
+    const client = create(async () => new Response(JSON.stringify({ code: status, message: 'fixture',
+      resource_code: 'MCP_CATALOG_UNAVAILABLE', request_id: 'audit-fixture', retry_after: 2 }), { status }))
+    await expect(client.request({ owner: { ownerId: 't:1' }, method: 'POST', route: 'mcp/call' }))
+      .rejects.toMatchObject({ status, upstreamStatus: status, code: 'MCP_CATALOG_UNAVAILABLE', request_id: 'audit-fixture', retry_after: 2 })
+  })
+  it('drops unsafe metadata while retaining a valid legacy error code', async () => {
+    const client = create(async () => new Response(JSON.stringify({ code: 'LEGACY_CODE',
+      resource_code: 'https://secret.invalid', request_id: 'secret?token=abc' }), { status: 409 }))
+    const error = await client.request({ owner: { ownerId: 't:1' }, method: 'POST', route: 'mcp/call' }).catch(error => error)
+    expect(error.code).toBe('LEGACY_CODE')
+    expect(error).not.toHaveProperty('request_id')
+  })
   it('refreshes policy using the bootstrap budget even after a smaller business budget was accepted', async () => {
     let budget = 256
     const client = create(async () => new Response(JSON.stringify({ policy: { request_bytes: 4096, response_bytes: budget,
@@ -154,7 +167,7 @@ describe('restricted platform client', () => {
     const client = create(fetchImpl)
     const request = { owner: { ownerId: 't:1' }, method: 'GET', route: 'workbench/config', timeoutMs: 5000 }
     await client.request(request)
-    await expect(client.request(request)).rejects.toMatchObject({ status: 502, upstreamStatus: 503 })
+    await expect(client.request(request)).rejects.toMatchObject({ status: 503, upstreamStatus: 503 })
     expect(fetchImpl).toHaveBeenCalledTimes(6)
     expect(client.configCache.has('t:1')).toBe(false)
   })
@@ -187,7 +200,7 @@ describe('restricted platform client', () => {
   it('never retries tool calls, even for a transient upstream failure', async () => {
     const fetchImpl = vi.fn(async () => new Response(null, { status: 503 }))
     await expect(create(fetchImpl).request({ owner: { ownerId: 't:1' }, method: 'POST', route: 'mcp/call', body: Buffer.from('{}') }))
-      .rejects.toMatchObject({ status: 502 })
+      .rejects.toMatchObject({ status: 503 })
     expect(fetchImpl).toHaveBeenCalledOnce()
   })
 
@@ -242,6 +255,6 @@ describe('restricted platform client', () => {
     await expect(create(async () => response(400, { message: 'bad' })).request({ owner: { ownerId: 't:1' }, method: 'POST', route: 'audio' }))
       .rejects.toMatchObject({ status: 400, message: 'bad' })
     await expect(create(async () => response(503, {})).request({ owner: { ownerId: 't:1' }, method: 'POST', route: 'audio' }))
-      .rejects.toMatchObject({ status: 502 })
+      .rejects.toMatchObject({ status: 503 })
   })
 })

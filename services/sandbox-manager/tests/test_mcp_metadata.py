@@ -125,10 +125,45 @@ def test_metadata_edit_preserves_manifest_but_connection_edit_invalidates_it(ops
     assert item["description"] == "新说明"
     assert item["call_name"] == "demo"
     assert item["status"] == "ready" and item["tools"] == tools
+    assert item['runtime_version'] == save['runtime_version'] == updated['runtime_version']
+    assert updated['version'] != save['version'] and updated['connection_changed'] is False
+    assert ops.personal_mcp({'operation': 'mcp_save', 'name': 'demo', 'version': save['version'],
+                             'content': config(display_name='stale')}, str(tmp_path)) == {'conflict': True}
 
     ops.personal_mcp({"operation": "mcp_save", "name": "demo", "version": updated["version"],
                       "content": config(url="https://other.example.com/mcp")}, str(tmp_path))
     assert ops.personal_mcp({"operation": "mcp_list"}, str(tmp_path))["mcp"][0]["status"] == "unverified"
+    assert ops.personal_mcp({'operation': 'mcp_probe', 'name': 'demo'}, str(tmp_path))['runtime_version'] != save['runtime_version']
+
+
+@pytest.mark.parametrize('legacy', [False, True])
+def test_unicode_cache_remains_readable_at_wire_budget(ops, tmp_path, monkeypatch, legacy):
+    original = ops.policy
+    monkeypatch.setattr(ops, 'policy', lambda key: 4096 if key == 'response_bytes' else original(key))
+    saved = ops.personal_mcp({'operation': 'mcp_save', 'name': 'demo', 'content': config()}, str(tmp_path))
+    request = {'operation': 'mcp_cache', 'name': 'demo', 'version': saved['runtime_version'],
+               'tools': [{'name': 'lookup', 'description': '查' * 1000, 'inputSchema': {'type': 'object'}}]}
+    ops.personal_mcp(request, str(tmp_path))
+    path = tmp_path / 'mcp/.cache/demo.json'
+    if legacy:
+        path.write_text(json.dumps(json.loads(path.read_text())))
+        assert path.stat().st_size > 4096
+    snapshot = ops.personal_mcp({'operation': 'mcp_list'}, str(tmp_path))
+    assert snapshot['mcp'][0]['status'] == 'ready' and snapshot['mcp'][0]['tools'] == request['tools']
+    assert not snapshot['warnings']
+    with pytest.raises(ops.ManifestError, match='传输预算'):
+        ops.personal_mcp({**request, 'tools': [{**request['tools'][0], 'description': '查' * 1400}]}, str(tmp_path))
+    assert ops.personal_mcp({'operation': 'mcp_list'}, str(tmp_path))['mcp'][0]['tools'] == request['tools']
+
+
+def test_cache_envelope_can_exceed_wire_size_without_becoming_unreadable(ops, tmp_path, monkeypatch):
+    original = ops.policy
+    monkeypatch.setattr(ops, 'policy', lambda key: 1024 if key == 'response_bytes' else original(key))
+    saved = ops.personal_mcp({'operation': 'mcp_save', 'name': 'demo', 'content': config()}, str(tmp_path))
+    tools = [{'name': 'lookup', 'description': 'x' * 650, 'inputSchema': {'type': 'object'}}]
+    ops.personal_mcp({'operation': 'mcp_cache', 'name': 'demo', 'version': saved['version'], 'tools': tools}, str(tmp_path))
+    assert (tmp_path / 'mcp/.cache/demo.json').stat().st_size > 1024
+    assert ops.personal_mcp({'operation': 'mcp_list'}, str(tmp_path))['mcp'][0]['tools'] == tools
 
 
 def test_new_config_rejects_name_different_from_call_name(ops, tmp_path):

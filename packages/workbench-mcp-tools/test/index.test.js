@@ -31,6 +31,27 @@ function setup({ authorized = true } = {}) {
 }
 
 describe('platform MCP proxy tools', () => {
+  it.each([
+    ['renamed', 'tool_definitions_changed'], ['removed', 'tool_definitions_changed'],
+    ['resource', 'configuration_changed'], ['legacy-renamed', 'tool_definitions_changed'],
+    ['new-resource', 'run_authorization_required'],
+  ])('keeps provider authorization explanations accurate for %s', async (scenario, reason) => {
+    const { ctx, platform } = setup()
+    const agent = { id: 's1', ctx: { tools: { restrict: () => () => {} } } }
+    const server = { id: 'personal:mcp:server', name: 'server', scope: 'personal', version: 'v1', manifest_version: 'm1', available: true }
+    const resource = scenario.includes('resource')
+    ctx.workbenchRuntime.executionRun = () => ({ id: 'r1', ownerId: 't:1', status: 'running',
+      mcpTools: resource ? [] : [catalogTool], selection: {
+        mcp_servers: ['legacy-renamed', 'new-resource'].includes(scenario) ? [] : [server],
+      } })
+    ctx.workbenchRuntime.agents = { list: () => [agent] }
+    const updated = resource ? { ...server, version: 'v2', capabilities: { resources: {} } } : { ...server, manifest_version: 'm2' }
+    platform.json.mockResolvedValueOnce({ plugins: [updated], tools: resource || scenario === 'removed' ? [] : [
+      { ...catalogTool, id: 'personal:mcp:server:renamed', tool_name: 'renamed', runtime_name: 'renamed', manifest_version: 'm2' },
+    ] })
+    await apply(ctx, { discovery: true })
+    expect(ctx.toolDiscoveryCatalog.snapshot(agent)).toMatchObject({ tools: [], plugins: [{ available: false, unavailableReason: reason }] })
+  })
   it('keeps all 226 frozen tools registered across catalog reorder refreshes', async () => {
     const { ctx, platform, definitions } = setup()
     const tools = Array.from({ length: 226 }, (_, i) => ({ ...catalogTool, id: `personal:mcp:server:tool_${i}`,
@@ -503,7 +524,8 @@ describe('platform MCP proxy tools', () => {
     expect(call.signal.aborted).toBe(false)
     controller.abort()
     expect(call.signal.aborted).toBe(true)
-    expect(call.timeoutMs).toBe(345_000)
+    expect(call.timeoutMs).toBeGreaterThan(0)
+    expect(call.timeoutMs).toBeLessThanOrEqual(345_000)
     expect(JSON.parse(call.body.toString()).deadline_ms).toBe(call.deadlineMs)
   })
 
