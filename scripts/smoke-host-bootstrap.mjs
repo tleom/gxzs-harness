@@ -177,11 +177,11 @@ const manager = fixture(async (req, res) => {
   if (req.url === `${base}files`) {
     const value = req.fixtureBody
     if (['stat', 'delete'].includes(value?.operation)) {
-      assert.match(value.path, /^(?:conversations\/\d{4}-\d{2}-\d{2}\/new-chat(?:-\d+)?|\.agent-output\/[a-f0-9]{32})$/)
+      assert.match(value.path, /^(?:conversations\/\d{4}-\d{2}-\d{2}\/[a-z]+-[a-z]+(?:-\d+)?|\.agent-output\/[a-f0-9]{32})$/)
       respond(res, 200, sandboxFileOperation(value)); return
     }
     if (nativeAttachments && ['upload', 'get', 'download'].includes(value?.operation)) {
-      assert.match(value.path, /^conversations\/\d{4}-\d{2}-\d{2}\/new-chat(?:-\d+)?\/native-evidence\.(txt|png)$/)
+      assert.match(value.path, /^conversations\/\d{4}-\d{2}-\d{2}\/[a-z]+-[a-z]+(?:-\d+)?\/native-evidence\.(txt|png)$/)
       if (value.operation === 'upload') {
         assert.equal(value.version, null)
         assert.ok(!fixtureFiles.has(value.path), 'Cold continuation must not upload the attachment again')
@@ -203,7 +203,7 @@ const manager = fixture(async (req, res) => {
     }
     if (sessionCreate) {
       assert.ok(['mkdir', 'list'].includes(req.fixtureBody?.operation))
-      assert.match(req.fixtureBody.path, /^conversations\/\d{4}-\d{2}-\d{2}(?:\/new-chat(?:-\d+)?)?$/)
+      assert.match(req.fixtureBody.path, /^conversations\/\d{4}-\d{2}-\d{2}(?:\/[a-z]+-[a-z]+(?:-\d+)?)?$/)
       if (req.fixtureBody.operation === 'mkdir') {
         let result
         if (realSsh) result = sandboxFileOperation(value)
@@ -754,7 +754,7 @@ try {
     assert.equal(response.status, 201, 'Actual Workbench -> native sessionController.create must succeed')
     const chat = (await response.json()).data
     assert.match(chat.id, /^[a-f0-9-]{36}$/)
-    assert.match(chat.file_directory, /^conversations\/\d{4}-\d{2}-\d{2}\/new-chat(?:-\d+)?$/)
+    assert.match(chat.file_directory, /^conversations\/\d{4}-\d{2}-\d{2}\/[a-z]+-[a-z]+(?:-\d+)?$/)
     assert.ok(remoteDirectories.has(chat.file_directory), 'Sandbox mkdir must run before native creation')
     if (realSsh) remote(`printf restart-proof > /workspace/${chat.file_directory}/restart-proof.txt`)
     assert.deepEqual(await readdir(`/workspace/${chat.file_directory}`), [], 'Host cwd remains an empty placeholder')
@@ -1092,7 +1092,7 @@ try {
     const target = (await created.json()).data
     const detail = (await (await signedRequest('GET', `/chats/${target.id}`)).json()).data
     malformedToolProbe = { calls: 0, path: `/workspace/${detail.file_directory}/guard-count.txt` }
-    assert.match(malformedToolProbe.path, /^\/workspace\/conversations\/\d{4}-\d{2}-\d{2}\/new-chat(?:-\d+)?\/guard-count\.txt$/)
+    assert.match(malformedToolProbe.path, /^\/workspace\/conversations\/\d{4}-\d{2}-\d{2}\/[a-z]+-[a-z]+(?:-\d+)?\/guard-count\.txt$/)
     const submitted = await signedRequest('POST', `/chats/${target.id}/runs`, { query: 'Exercise malformed provider recovery', request_key: 'malformed-tool-probe' })
     assert.equal(submitted.status, 202)
     const runId = (await submitted.json()).data.id
