@@ -341,7 +341,7 @@ def allocate_directory(fd, name, payload, path):
             try:
                 child = os.open(candidate, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
             except OSError as error:
-                if error.errno in (errno.ENOENT, errno.ENOTDIR, errno.ELOOP):
+                if error.errno in (errno.ENOENT, errno.ENOTDIR, errno.ELOOP, errno.EACCES, errno.EPERM):
                     continue
                 raise
             try:

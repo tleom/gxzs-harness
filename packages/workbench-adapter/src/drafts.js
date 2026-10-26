@@ -110,13 +110,15 @@ export class WorkbenchDrafts {
       if (!agent || !this.service.workingDirectory) throw httpError(503, '会话目录服务尚未就绪')
       await this.service.workingDirectory.set(agent, this.service.chatDirectory(draft.chatId, draft.directory))
     }
-    let chat = this.db.getChat(owner.ownerId, draft.chatId)
-    if (!chat) chat = this.db.createChat({ id: draft.chatId, ownerId: owner.ownerId, sessionId: draft.sessionId,
-      selection, directory: draft.directory })
-    // Publishing the binding precedes resource handoff: a retry recovers the
-    // same business chat if the browser acknowledgement was lost.
-    draft.bound = true
-    this.save(owner, draft)
+    const chat = this.db.transaction(() => {
+      const existing = this.db.getChat(owner.ownerId, draft.chatId)
+      const created = existing ?? this.db.createChat({ id: draft.chatId, ownerId: owner.ownerId, sessionId: draft.sessionId,
+        selection, directory: draft.directory })
+      // A committed chat must never leave its session eligible for draft cleanup.
+      draft.bound = true
+      this.save(owner, draft)
+      return created
+    })()
     await this.attachProject(owner, draft)
     await this.service.adoptDraftResources?.(owner, id, chat)
     return chat
@@ -134,7 +136,8 @@ export class WorkbenchDrafts {
   async close(owner, id) {
     const draft = this.get(owner, id)
     if (!draft || draft.closed) return
-    if (draft.bound) return // A late draft release must never close a submitted chat.
+    // Also protect bindings left incomplete by an older process interruption.
+    if (draft.bound || this.db.getChatBySession(draft.sessionId)) return
     draft.closing = true
     this.save(owner, draft)
     await this.service.closeDraftResources?.(owner, draft)

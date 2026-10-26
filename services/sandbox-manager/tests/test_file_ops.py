@@ -62,6 +62,24 @@ def test_allocation_does_not_follow_a_staging_symlink(root, tmp_path):
     assert list(outside.iterdir()) == []
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason='requires unprivileged filesystem access')
+def test_allocation_ignores_unreadable_siblings_and_replays_its_own_directory(root):
+    sibling = Path(root) / 'conversations/new-chat'
+    sibling.mkdir()
+    sibling.chmod(0)
+    payload = {'operation': 'mkdir', 'path': 'conversations/new-chat',
+               'unique': True, 'allocation_id': str(uuid.uuid4())}
+    try:
+        with pytest.raises(PermissionError):
+            os.listdir(sibling)
+        result = module.operate(payload, root)
+        assert result == {'path': 'conversations/new-chat-2'}
+        assert module.operate(payload, root) == result
+        assert sibling.stat().st_mode & 0o777 == 0
+    finally:
+        sibling.chmod(0o700)
+
+
 @pytest.fixture
 def root(tmp_path):
     (tmp_path/'conversations').mkdir()
