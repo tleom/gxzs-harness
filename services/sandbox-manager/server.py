@@ -1036,7 +1036,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         if code >= 400:
             output.setdefault('request_id', request_id)
-        data = json.dumps(output).encode()
+        data = json.dumps(output, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
         self.write_json(code, data, request_id=request_id, action=action)
 
 

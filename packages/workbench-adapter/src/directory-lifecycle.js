@@ -80,6 +80,11 @@ export class DirectoryLifecycle {
       // Keep system roots under the file manager's existing boundary. Never
       // stop resources before discovering that such a target is forbidden.
       if (['.', 'conversations', 'mcp', 'skills'].includes(directory)) throw httpError(400, '系统目录不能删除')
+      const requestedEntry = await service.fileManager.operate({ operation: 'stat', path: directory })
+      // Ordinary files do not own resources or registrations. Keep the caller's
+      // CAS version even if a native process writes between this read and delete.
+      if (requestedEntry.kind === 'file')
+        return service.fileManager.operate({ operation: 'delete', path: directory, version })
       const key = `file:${createHash('sha256').update(`${owner.ownerId}\0${directory}`).digest('hex')}`
       let plan = db.workspaceDeletion(owner.ownerId, key)
       if (plan?.completedAt) {

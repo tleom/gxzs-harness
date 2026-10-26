@@ -46,7 +46,9 @@ export class ToolDiscoveryCatalog extends Service {
         // Installation metadata survives recovery even when this run's frozen
         // authorization excludes the recovered tools. This grants no capability.
         const current = currentByProvider.get(plugin.id) ?? []
-        const previous = frozenServers.has(plugin.id) ? [frozenServers.get(plugin.id)] : frozenByProvider.get(plugin.id) ?? []
+        const frozenServer = frozenServers.get(plugin.id)
+        const previous = typeof frozenServer?.version === 'string' && typeof frozenServer?.manifest_version === 'string'
+          ? [frozenServer] : frozenByProvider.get(plugin.id) ?? []
         const version = plugin.version ?? current[0]?.version
         const manifest = plugin.manifest_version ?? current[0]?.manifest_version ?? ''
         const unavailableReason = previous.some(binding => version !== undefined && version !== binding.version)

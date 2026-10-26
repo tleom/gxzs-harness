@@ -502,6 +502,24 @@ def test_saturated_business_capacity_keeps_root_cancel_available(manager, monkey
     capacity.release()
 
 
+def test_manager_http_preserves_utf8_catalog_budget(manager, monkeypatch):
+    from io import BytesIO
+    module, _, _, _ = manager
+    catalog = {'mcp': [{'id': 'demo', 'tools': [{'name': 'lookup', 'description': '查' * 1000}]}]}
+    monkeypatch.setattr(module, 'operation', lambda *args: catalog)
+    handler = object.__new__(module.Handler)
+    body = b'{"operation":"mcp_list"}'
+    handler.path = '/sandboxes/' + str(uuid4()) + '/personal-mcp'
+    handler.headers = {'Authorization': 'Bearer ' + module.TOKEN, 'Content-Length': str(len(body))}
+    handler.rfile = BytesIO(body)
+    responses = []
+    handler.write_json = lambda code, data, **kwargs: responses.append((code, data))
+    handler.do_POST()
+    code, data = responses[0]
+    assert code == 200 and len(data) < 4096
+    assert json.loads(data) == catalog
+
+
 def test_stop_plain_text_or_known_complete_tool_is_not_uncertain(manager):
     module, _, _, _ = manager
     key, text_binding, known_binding = [str(uuid4()) for _ in range(3)]

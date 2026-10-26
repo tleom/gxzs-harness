@@ -6,6 +6,20 @@ import { WorkbenchService } from '../src/service.js'
 import { WorkbenchWorkspaces } from '../src/workspaces.js'
 
 const cleanups = []
+it('retains the caller file version across native writes and retries', async () => {
+  const f = fixture(), source = 'conversations/2026-10-26/note.txt'
+  let currentVersion = 'v2'
+  f.fileManager.operate.mockImplementation(async request => {
+    if (request.operation === 'stat') return { kind: 'file', version: currentVersion }
+    expect(request).toEqual({ operation: 'delete', path: source, version: 'v1' })
+    if (request.version !== currentVersion) throw Object.assign(new Error('changed'), { code: 'FILE_VERSION_CONFLICT' })
+    return { deleted: true }
+  })
+  await expect(f.service.directories.deleteFile(f.owner, source, 'v1')).rejects.toMatchObject({ code: 'FILE_VERSION_CONFLICT' })
+  currentVersion = 'v3'
+  await expect(f.service.directories.deleteFile(f.owner, source, 'v1')).rejects.toMatchObject({ code: 'FILE_VERSION_CONFLICT' })
+  expect(f.db.pendingWorkspaceDeletions(f.owner.ownerId)).toEqual([])
+})
 it('moves ordinary files but preserves registered conversation directories and their ancestors', async () => {
   const f = fixture(); f.chat('owner')
   await f.service.directories.transferFile(f.owner, 'move', 'conversations/2026-10-22/original/nested/delivery.docx', 'delivery.docx')

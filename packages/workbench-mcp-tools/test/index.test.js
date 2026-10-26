@@ -32,6 +32,26 @@ function setup({ authorized = true } = {}) {
 
 describe('platform MCP proxy tools', () => {
   it.each([
+    ['personal', {}], ['personal', { version: 'v1' }], ['personal', { manifest_version: 'm1' }],
+    ['global', {}], ['global', { version: 'v1' }], ['global', { manifest_version: 'm1' }],
+  ])('uses frozen tool evidence when %s provider metadata is incomplete: %j', async (scope, metadata) => {
+    const { ctx, platform } = setup()
+    const agent = { id: 's1', ctx: { tools: { restrict: () => () => {} } } }
+    const tool = { ...catalogTool, scope, id: `${scope}:mcp:server:search` }
+    const plugin = { id: `${scope}:mcp:server`, name: 'server', scope, available: true, ...metadata }
+    ctx.workbenchRuntime.executionRun = () => ({ id: 'r1', ownerId: 't:1', status: 'running',
+      mcpTools: [tool], selection: { mcp_servers: [plugin] } })
+    ctx.workbenchRuntime.agents = { list: () => [agent] }
+    platform.json.mockResolvedValueOnce({ plugins: [plugin], tools: [tool] })
+    await apply(ctx, { discovery: true })
+    const snapshot = ctx.toolDiscoveryCatalog.snapshot(agent)
+    expect(snapshot.tools).toHaveLength(1)
+    expect(snapshot.plugins[0].unavailableReason).toBeUndefined()
+    platform.json.mockResolvedValueOnce({ plugins: [plugin], tools: [{ ...tool, version: 'v2' }] })
+    await ctx.workbenchRuntime.refreshMcpCatalog()
+    expect(ctx.toolDiscoveryCatalog.snapshot(agent).tools).toEqual([])
+  })
+  it.each([
     ['renamed', 'tool_definitions_changed'], ['removed', 'tool_definitions_changed'],
     ['resource', 'configuration_changed'], ['legacy-renamed', 'tool_definitions_changed'],
     ['new-resource', 'run_authorization_required'],
@@ -175,6 +195,7 @@ describe('platform MCP proxy tools', () => {
   })
 
   it('loads one complete catalog and applies the manager-owned call budget', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
     const { ctx, platform, definitions } = setup()
     const second = { ...catalogTool, id: 'personal:server:other', runtime_name: 'personal_other', tool_name: 'other' }
     const policy = { request_bytes: 40 * 1024 * 1024, response_bytes: 40 * 1024 * 1024, max_call_seconds: 900, catalog_timeout_seconds: 300 }
