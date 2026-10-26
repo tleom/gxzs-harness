@@ -65,11 +65,16 @@ def modules():
 
 
 class Connection:
-    def __init__(self, base, root, version):
+    def __init__(self, base, root, version, reorder_discovery=False):
         source = (
-            f"import sys,asyncio; sys.path.insert(0,{str(base)!r}); "
-            f"from mcp_worker import serve; asyncio.run(serve('demo',{version!r},{str(root)!r}))"
+            f"import sys,asyncio; sys.path.insert(0,{str(base)!r})\nimport mcp_worker as worker\n"
         )
+        if reorder_discovery:
+            source += ("original = worker.discover\nflip = False\n"
+                       "async def reordered(client):\n global flip\n tools = await original(client)\n"
+                       " flip = not flip\n return list(reversed(tools)) if flip else tools\n"
+                       "worker.discover = reordered\n")
+        source += f"asyncio.run(worker.serve('demo',{version!r},{str(root)!r}))"
         self.process = subprocess.Popen(
             [sys.executable, "-I", "-u", "-c", source],
             stdin=subprocess.PIPE,
@@ -180,7 +185,7 @@ def connected(request, modules, tmp_path):
     )
     connection = None
     try:
-        connection = Connection(base, tmp_path, saved["version"])
+        connection = Connection(base, tmp_path, saved["runtime_version"])
         yield connection, ops, tmp_path, transport
     finally:
         if connection:
@@ -224,12 +229,54 @@ def test_transports_schema_results_persistence_and_clean_exit(connected):
     assert "已停用" in connection.call("add", {"value": 1})["error"]
 
 
+def test_legacy_binding_stays_callable_across_reordered_refresh_and_reconnect(connected):
+    initial, ops, root, _ = connected
+    base = Path(__file__).parents[1]
+    path = root / "mcp/.cache/demo.json"
+    cache = json.loads(path.read_text())
+    tools = sorted(cache["tools"], key=lambda item: item["name"], reverse=True)
+    legacy = ops.legacy_manifest_version(tools)
+    assert legacy != ops.manifest_version(tools)
+    path.write_text(json.dumps({**cache, "tools": tools, "manifest_version": legacy}))
+    for _ in range(2):
+        connection = Connection(base, root, initial.ready["version"], reorder_discovery=True)
+        try:
+            assert connection.ready["manifest_version"] == legacy
+            for _ in range(3):
+                connection.process.stdin.write(json.dumps({"operation": "mcp_test"}).encode() + b"\n")
+                connection.process.stdin.flush()
+                assert connection.read()["manifest_version"] == legacy
+                response = connection.call("add", {"value": 3}, manifest_version=legacy)
+                assert response["result"]["structuredContent"]["value"] == 4
+                assert ops.personal_mcp({"operation": "mcp_list"}, str(root))["mcp"][0]["manifest_version"] == legacy
+        finally:
+            connection.close()
+
+
 def test_timeout_does_not_replay_business_call(connected):
     connection, _, root, _ = connected
     counter = root / "counter"
     result = connection.call("slow", {"counter": str(counter)})
     assert result["uncertain"] and "不要自动重试" in result["error"]
     assert counter.read_text() == "1"
+
+
+def test_live_connection_survives_presentation_edit_but_rejects_connection_change(connected):
+    connection, ops, root, _ = connected
+    first = connection.call('add', {'value': 1})['result']['structuredContent']
+    read = ops.personal_mcp({'operation': 'mcp_read', 'name': 'demo'}, str(root))
+    config = json.loads(read['content'])
+    config.update(display_name='新展示名', description='新说明')
+    saved = ops.personal_mcp({'operation': 'mcp_save', 'name': 'demo', 'version': read['version'],
+                              'content': json.dumps(config, indent=4)}, str(root))
+    assert saved['runtime_version'] == connection.ready['version'] and saved['connection_changed'] is False
+    second = connection.call('add', {'value': 2})['result']['structuredContent']
+    assert first['pid'] == second['pid'] and second['calls'] == first['calls'] + 1
+    config['timeout'] = 6
+    changed = ops.personal_mcp({'operation': 'mcp_save', 'name': 'demo', 'version': saved['version'],
+                                'content': json.dumps(config)}, str(root))
+    assert changed['connection_changed'] is True and changed['runtime_version'] != saved['runtime_version']
+    assert connection.call('add', {'value': 3}) == {'conflict': True}
 
 
 def test_manager_disconnect_cancels_inflight_call_without_waiting_for_tool_timeout(
@@ -260,6 +307,10 @@ def test_direct_config_change_fences_existing_connection(connected):
     connection, _, root, _ = connected
     path = root / "mcp/demo/mcp.json"
     path.write_text(path.read_text() + "\n")
+    assert connection.call("add", {"value": 1})['result']['structuredContent']['value'] == 2
+    config = json.loads(path.read_text())
+    config['timeout'] = config['timeout'] + 1
+    path.write_text(json.dumps(config))
     assert connection.call("add", {"value": 1}) == {"conflict": True}
 
 

@@ -4,6 +4,9 @@ import { platformToolName, platformToolNames, publicToolName } from '../src/name
 import { apply } from '../src/index.js'
 import * as schemas from '../src/schema.js'
 import { buildCatalog, renderCatalog } from '../../tool-discovery/src/catalog.js'
+import { Context } from '@deepseek-ai/cordis'
+import { WorkbenchDatabase } from '../../workbench-adapter/src/persistence.js'
+import { WorkbenchRuntime } from '../../workbench-adapter/src/runtime.js'
 
 const catalogTool = {
   id: 'personal:server:search', runtime_name: 'personal_mcp_search', version: 'v1', manifest_version: 'm1',
@@ -31,6 +34,102 @@ function setup({ authorized = true } = {}) {
 }
 
 describe('platform MCP proxy tools', () => {
+  it('restores discovery and call authorization for an unchanged frozen global catalog after restart', async () => {
+    const { ctx, platform } = setup()
+    const database = new WorkbenchDatabase(':memory:')
+    cleanups.unshift(() => database.close())
+    const runtime = new WorkbenchRuntime(new Context(), database, 't:1')
+    ctx.workbenchRuntime = runtime
+    const agent = { id: 's1', status: 'running', ctx: { tools: { restrict: () => () => {} } } }
+    runtime.agents = { get: id => id === agent.id ? agent : undefined, list: () => [agent] }
+    const tool = { ...catalogTool, id: 'global:mcp:server:search', scope: 'global' }
+    const plugin = { id: 'global:mcp:server', scope: 'global', name: 'server', version: 'v1', manifest_version: 'm1', available: true, capabilities: { tools: {} } }
+    platform.json.mockResolvedValue({ plugins: [plugin], tools: [tool] })
+    await apply(ctx, { discovery: true })
+    const frozen = await runtime.refreshMcpCatalog()
+    const chat = database.createChat({ ownerId: 't:1', sessionId: 's1', selection: {} })
+    const { run } = database.createRun({ ownerId: 't:1', chatId: chat.id, sessionId: 's1', query: 'q', selection: {}, mcpTools: frozen.tools, mcpServers: frozen.plugins })
+    database.transitionRun('t:1', run.id, 'running')
+    platform.json.mockResolvedValue({ plugins: [{ ...plugin, manifest_version: 'm2' }], tools: [{ ...tool, manifest_version: 'm2' }] })
+    await runtime.refreshMcpCatalog()
+    expect(ctx.toolDiscoveryCatalog.snapshot(agent).tools).toHaveLength(1)
+    expect(database.getRun('t:1', run.id).mcpTools[0].manifest_version).toBe('m2')
+    expect((await runtime.authorizeMcpCall('s1', tool.id, 'v1')).resource.manifest_version).toBe('m2')
+    expect(runtime.authorizeMcp('s1', 'ungranted', 'v1')).toBeUndefined()
+  })
+  it.each([
+    ['personal', {}], ['personal', { version: 'v1' }], ['personal', { manifest_version: 'm1' }],
+    ['global', {}], ['global', { version: 'v1' }], ['global', { manifest_version: 'm1' }],
+  ])('uses frozen tool evidence when %s provider metadata is incomplete: %j', async (scope, metadata) => {
+    const { ctx, platform } = setup()
+    const agent = { id: 's1', ctx: { tools: { restrict: () => () => {} } } }
+    const tool = { ...catalogTool, scope, id: `${scope}:mcp:server:search` }
+    const plugin = { id: `${scope}:mcp:server`, name: 'server', scope, available: true, ...metadata }
+    ctx.workbenchRuntime.executionRun = () => ({ id: 'r1', ownerId: 't:1', status: 'running',
+      mcpTools: [tool], selection: { mcp_servers: [plugin] } })
+    ctx.workbenchRuntime.agents = { list: () => [agent] }
+    platform.json.mockResolvedValueOnce({ plugins: [plugin], tools: [tool] })
+    await apply(ctx, { discovery: true })
+    const snapshot = ctx.toolDiscoveryCatalog.snapshot(agent)
+    expect(snapshot.tools).toHaveLength(1)
+    expect(snapshot.plugins[0].unavailableReason).toBeUndefined()
+    platform.json.mockResolvedValueOnce({ plugins: [plugin], tools: [{ ...tool, version: 'v2' }] })
+    await ctx.workbenchRuntime.refreshMcpCatalog()
+    expect(ctx.toolDiscoveryCatalog.snapshot(agent).tools).toEqual([])
+  })
+  it.each([
+    ['renamed', 'tool_definitions_changed'], ['removed', 'tool_definitions_changed'],
+    ['resource', 'configuration_changed'], ['legacy-renamed', 'tool_definitions_changed'],
+    ['new-resource', 'run_authorization_required'],
+  ])('keeps provider authorization explanations accurate for %s', async (scenario, reason) => {
+    const { ctx, platform } = setup()
+    const agent = { id: 's1', ctx: { tools: { restrict: () => () => {} } } }
+    const server = { id: 'personal:mcp:server', name: 'server', scope: 'personal', version: 'v1', manifest_version: 'm1', available: true }
+    const resource = scenario.includes('resource')
+    ctx.workbenchRuntime.executionRun = () => ({ id: 'r1', ownerId: 't:1', status: 'running',
+      mcpTools: resource ? [] : [catalogTool], selection: {
+        mcp_servers: ['legacy-renamed', 'new-resource'].includes(scenario) ? [] : [server],
+      } })
+    ctx.workbenchRuntime.agents = { list: () => [agent] }
+    const updated = resource ? { ...server, version: 'v2', capabilities: { resources: {} } } : { ...server, manifest_version: 'm2' }
+    platform.json.mockResolvedValueOnce({ plugins: [updated], tools: resource || scenario === 'removed' ? [] : [
+      { ...catalogTool, id: 'personal:mcp:server:renamed', tool_name: 'renamed', runtime_name: 'renamed', manifest_version: 'm2' },
+    ] })
+    await apply(ctx, { discovery: true })
+    expect(ctx.toolDiscoveryCatalog.snapshot(agent)).toMatchObject({ tools: [], plugins: [{ available: false, unavailableReason: reason }] })
+  })
+  it('keeps all 226 frozen tools registered across catalog reorder refreshes', async () => {
+    const { ctx, platform, definitions } = setup()
+    const tools = Array.from({ length: 226 }, (_, i) => ({ ...catalogTool, id: `personal:mcp:server:tool_${i}`,
+      tool_name: `tool_${i}`, runtime_name: `fixture_${i}` }))
+    const agent = { id: 's1', ctx: { tools: { restrict: () => () => {} } } }
+    ctx.workbenchRuntime.executionRun = () => ({ id: 'r1', ownerId: 't:1', status: 'running', mcpTools: tools })
+    ctx.workbenchRuntime.agents = { list: () => [agent] }
+    const plugin = { id: 'personal:mcp:server', name: 'server', scope: 'personal', available: true }
+    platform.json.mockResolvedValueOnce({ tools, plugins: [plugin] })
+    await apply(ctx, { discovery: true })
+    const original = new Map(definitions)
+    for (let i = 0; i < 3; i++) {
+      platform.json.mockResolvedValueOnce({ tools: [...tools].reverse(), plugins: [plugin] })
+      await ctx.workbenchRuntime.refreshMcpCatalog()
+      expect(ctx.toolDiscoveryCatalog.snapshot(agent).tools).toHaveLength(226)
+      for (const [name, definition] of original) expect(definitions.get(name)).toBe(definition)
+    }
+  })
+  it.each([
+    [{ version: 'v2' }, 'configuration_changed'],
+    [{ manifest_version: 'm2' }, 'tool_definitions_changed'],
+  ])('reports a changed frozen binding accurately: %s', async (change, reason) => {
+    const { ctx, platform } = setup()
+    const agent = { id: 's1', ctx: { tools: { restrict: () => () => {} } } }
+    ctx.workbenchRuntime.executionRun = () => ({ id: 'r1', ownerId: 't:1', status: 'running', mcpTools: [catalogTool] })
+    ctx.workbenchRuntime.agents = { list: () => [agent] }
+    platform.json.mockResolvedValueOnce({ tools: [{ ...catalogTool, ...change }],
+      plugins: [{ id: 'personal:mcp:server', name: 'server', scope: 'personal', available: true }] })
+    await apply(ctx, { discovery: true })
+    expect(ctx.toolDiscoveryCatalog.snapshot(agent)).toMatchObject({ tools: [],
+      plugins: [{ available: false, unavailableReason: reason }] })
+  })
   it('reuses unchanged schema validation while applying current versions, definitions and removals', async () => {
     const { ctx, platform, definitions } = setup()
     const schema = { type: 'object', properties: { query: { type: 'string', minLength: 2 } } }
@@ -122,6 +221,7 @@ describe('platform MCP proxy tools', () => {
   })
 
   it('loads one complete catalog and applies the manager-owned call budget', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
     const { ctx, platform, definitions } = setup()
     const second = { ...catalogTool, id: 'personal:server:other', runtime_name: 'personal_other', tool_name: 'other' }
     const policy = { request_bytes: 40 * 1024 * 1024, response_bytes: 40 * 1024 * 1024, max_call_seconds: 900, catalog_timeout_seconds: 300 }
@@ -401,14 +501,14 @@ describe('platform MCP proxy tools', () => {
     bridge.notify()
     expect(listener).toHaveBeenCalledTimes(calls)
   })
-  it('retains registered tools on transient catalog failure and removes them only after a successful empty catalog', async () => {
+  it.each([500, 502, 503, 504])('retains registered tools on transient %s catalog failure and removes them only after a successful empty catalog', async status => {
     const { ctx, definitions, platform } = setup()
     await apply(ctx)
     const refresh = ctx.on.mock.calls.find(([event]) => event === 'workbench/resources-changed')[1]
-    platform.json.mockRejectedValueOnce(Object.assign(new Error('unavailable'), { status: 503 }))
+    platform.json.mockRejectedValueOnce(Object.assign(new Error('unavailable'), { status }))
     await refresh()
     expect(definitions.has(platformToolName(catalogTool))).toBe(true)
-    expect(ctx.workbenchRuntime.mcpCatalogState).toMatchObject({ ready: true, status: 'degraded', errorCode: 'HTTP_503' })
+    expect(ctx.workbenchRuntime.mcpCatalogState).toMatchObject({ ready: true, status: 'degraded', errorCode: `HTTP_${status}` })
     platform.json.mockResolvedValueOnce({ tools: [] })
     await refresh()
     expect(definitions.size).toBe(0)
@@ -471,7 +571,8 @@ describe('platform MCP proxy tools', () => {
     expect(call.signal.aborted).toBe(false)
     controller.abort()
     expect(call.signal.aborted).toBe(true)
-    expect(call.timeoutMs).toBe(345_000)
+    expect(call.timeoutMs).toBeGreaterThan(0)
+    expect(call.timeoutMs).toBeLessThanOrEqual(345_000)
     expect(JSON.parse(call.body.toString()).deadline_ms).toBe(call.deadlineMs)
   })
 

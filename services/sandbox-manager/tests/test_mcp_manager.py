@@ -78,6 +78,45 @@ def manager(tmp_path, monkeypatch):
     assert not mcp_runtime.ACTIVE
 
 
+@pytest.mark.parametrize('connection_changed', [False, True, None])
+def test_presentation_save_keeps_active_connection_but_real_changes_close_it(manager, monkeypatch, connection_changed):
+    module, runtime, _, _ = manager
+    key, binding = str(uuid4()), str(uuid4())
+    module.operation(key, 'personal-mcp', payload(key, binding, tool='fast'))
+    worker = runtime.WORKERS[(key, 'demo')]
+    original = module.docker
+    def docker(*args, stdin=None, **kwargs):
+        if stdin and json.loads(stdin).get('operation') == 'mcp_save':
+            result = {'version': 'cas2'}
+            if connection_changed is not None:
+                result['connection_changed'] = connection_changed
+            return SimpleNamespace(returncode=0, stdout=json.dumps(result))
+        return original(*args, stdin=stdin, **kwargs)
+    monkeypatch.setattr(module, 'docker', docker)
+    module.operation(key, 'personal-mcp', {'operation': 'mcp_save', 'name': 'demo', 'version': 'cas1', 'content': '{}'})
+    assert worker.closed.is_set() is (connection_changed is not False)
+
+
+def test_management_cas_is_translated_but_signed_calls_must_use_runtime_version(manager, monkeypatch):
+    module, runtime, _, _ = manager
+    key, binding = str(uuid4()), str(uuid4())
+    monkeypatch.setattr(module, 'docker', lambda *a, **kw: SimpleNamespace(returncode=0, stdout=json.dumps({
+        'version': 'cas', 'runtime_version': 'binding', 'enabled': True, 'timeout': 5})))
+    original = runtime.invoke
+    observed = []
+    def invoke(key, name, request, state, **kwargs):
+        observed.append((request['version'], state['version']))
+        return {'ready': True}
+    monkeypatch.setattr(runtime, 'invoke', invoke)
+    module.operation(key, 'personal-mcp', {'operation': 'mcp_test', 'name': 'demo', 'version': 'cas'})
+    assert observed == [('binding', 'binding')]
+    monkeypatch.setattr(runtime, 'invoke', original)
+    request = payload(key, binding)
+    request['version'] = request['authorization']['version'] = 'cas'
+    assert module.operation(key, 'personal-mcp', request) == {'conflict': True}
+    assert (key, 'demo') not in runtime.WORKERS
+
+
 def payload(key, binding, *, tool="slow", request="call-1"):
     return {
         "operation": "mcp_call",
@@ -91,6 +130,32 @@ def payload(key, binding, *, tool="slow", request="call-1"):
                           "request_key": request, "resource_id": 'personal:mcp:demo:' + tool,
                           "version": "v1", "manifest_version": "m1", "arguments": {}},
     }
+
+
+@pytest.mark.parametrize('stage', ['entry', 'lock', 'ensure'])
+def test_expired_calls_do_not_probe_or_dispatch_after_preparation(manager, monkeypatch, stage):
+    from contextlib import contextmanager
+    module, _, calls, _ = manager
+    now = [time.time()]
+    monkeypatch.setattr(module, 'time', SimpleNamespace(time=lambda: now[0]))
+    @contextmanager
+    def controlled_lock(_key):
+        if stage == 'lock': now[0] += 2
+        yield
+    prepared, probed = [], []
+    def ensure(*args, **kwargs):
+        prepared.append(True)
+        if stage == 'ensure': now[0] += 2
+    monkeypatch.setattr(module, 'lock', controlled_lock)
+    monkeypatch.setattr(module, 'ensure', ensure)
+    monkeypatch.setattr(module, 'docker', lambda *args, **kwargs: probed.append(True))
+    key, binding = str(uuid4()), str(uuid4())
+    request = payload(key, binding, tool='fast')
+    request['deadline_ms'] = int((now[0] + (-1 if stage == 'entry' else 1)) * 1000)
+    request['authorization']['deadline_ms'] = request['deadline_ms']
+    assert module.operation(key, 'personal-mcp', request)['code'] == 'DEADLINE_EXCEEDED'
+    assert prepared == ([True] if stage == 'ensure' else [])
+    assert probed == [] and calls == []
 
 
 def test_background_catalog_refresh_keeps_each_observed_version(manager, monkeypatch):
@@ -463,6 +528,59 @@ def test_saturated_business_capacity_keeps_root_cancel_available(manager, monkey
     assert request('stop-binding', 'invalid') == 403
     assert operation.call_count == 1
     capacity.release()
+
+
+def test_manager_http_preserves_utf8_catalog_budget(manager, monkeypatch):
+    from io import BytesIO
+    module, _, _, _ = manager
+    catalog = {'mcp': [{'id': 'demo', 'tools': [{'name': 'lookup', 'description': '查' * 1000}]}]}
+    monkeypatch.setattr(module, 'operation', lambda *args: catalog)
+    handler = object.__new__(module.Handler)
+    body = b'{"operation":"mcp_list"}'
+    handler.path = '/sandboxes/' + str(uuid4()) + '/personal-mcp'
+    handler.headers = {'Authorization': 'Bearer ' + module.TOKEN, 'Content-Length': str(len(body))}
+    handler.rfile = BytesIO(body)
+    responses = []
+    handler.write_json = lambda code, data, **kwargs: responses.append((code, data))
+    handler.do_POST()
+    code, data = responses[0]
+    assert code == 200 and len(data) < 4096
+    assert json.loads(data) == catalog
+
+
+@pytest.mark.parametrize('operation,count,size,expected', [
+    ('mcp_list', 1, 3900, 200),
+    ('mcp_list', 1, 4050, 413),
+    ('mcp_list', 2, 2100, 413),
+    ('mcp_test', 1, 4050, 413),
+    ('mcp_call', 1, 4050, 413),
+])
+def test_manager_checks_complete_response_envelope(manager, monkeypatch, operation, count, size, expected):
+    from io import BytesIO
+    module, _, _, _ = manager
+    original = module.mcp_limit
+    monkeypatch.setattr(module, 'mcp_limit', lambda key: 4096 if key == 'response_bytes' else original(key))
+    catalog = {'mcp': [{'id': str(index), 'tools': [{'name': 'lookup', 'description': 'x' * size}]} for index in range(count)]}
+    dispatched = []
+    def call(*args):
+        dispatched.append(args)
+        return catalog
+    monkeypatch.setattr(module, 'operation', call)
+    handler = object.__new__(module.Handler)
+    body = json.dumps({'operation': operation}).encode()
+    handler.path = '/sandboxes/' + str(uuid4()) + '/personal-mcp'
+    handler.headers = {'Authorization': 'Bearer ' + module.TOKEN, 'Content-Length': str(len(body))}
+    handler.rfile = BytesIO(body)
+    responses = []
+    handler.write_json = lambda code, data, **kwargs: responses.append((code, data))
+    handler.do_POST()
+    status, data = responses[0]
+    assert status == expected and len(data) <= 4096
+    assert len(dispatched) == 1
+    if status == 200:
+        assert json.loads(data) == catalog
+    else:
+        assert json.loads(data)['code'] == ('MCP_RESPONSE_TOO_LARGE' if operation == 'mcp_call' else 'MCP_DISCOVERY_TOO_LARGE')
 
 
 def test_stop_plain_text_or_known_complete_tool_is_not_uncertain(manager):

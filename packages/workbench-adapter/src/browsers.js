@@ -63,9 +63,13 @@ function parseBrowserAction(request) {
       if (action === 'move') return { action, x: request.x, y: request.y, ...(modifiers ? { modifiers } : {}) }
       if (!['left', 'middle', 'right'].includes(request.button === undefined ? 'left' : request.button) || !integer(request.count === undefined ? 1 : request.count, 1, 2)) break
       return { action, x: request.x, y: request.y, button: request.button === undefined ? 'left' : request.button, count: request.count === undefined ? 1 : request.count, ...(modifiers ? { modifiers } : {}) }
-    case 'wheel':
-      if (integer(request.x, -3000, 3000) && integer(request.y, -3000, 3000)) return { action, x: request.x, y: request.y, ...(modifiers ? { modifiers } : {}) }
+    case 'wheel': {
+      const position = request.position
+      if (position !== undefined && (!integer(position?.x, 0, 3839) || !integer(position?.y, 0, 2159))) break
+      if (integer(request.x, -3000, 3000) && integer(request.y, -3000, 3000)) return { action, x: request.x, y: request.y,
+        ...(position ? { position: { x: position.x, y: position.y } } : {}), ...(modifiers ? { modifiers } : {}) }
       break
+    }
     case 'text':
       if (typeof request.text === 'string' && request.text.length <= 32 * 1024) return { action, text: request.text }
       break
@@ -327,7 +331,8 @@ export class WorkbenchBrowsers {
     if (this.disposed) throw httpError(410, '浏览器服务已经关闭')
     if (!uuid.test(request.id)) throw httpError(400, '浏览器标识无效')
     if (request.chat_id !== undefined) {
-      this.service?.requireChat(owner, request.chat_id)
+      const context = (this.service?.resourceContext ?? this.service?.requireChat)?.call(this.service, owner, request.chat_id)
+      if (context) request = { ...request, chat_id: context.id }
     }
     const key = `${owner.ownerId}/${request.id}`
     let browser = this.items.get(key)
@@ -371,12 +376,13 @@ export class WorkbenchBrowsers {
         await this.close(owner, key.slice(owner.ownerId.length + 1))
       signal.throwIfAborted()
       if (this.disposed) throw httpError(410, '浏览器服务已经关闭')
-      const chat = request.chat_id && this.service?.requireChat(owner, request.chat_id)
+      const chat = request.chat_id && (this.service?.resourceContext ?? this.service?.requireChat)?.call(this.service, owner, request.chat_id)
       const cwd = chat ? this.service.chatDirectory(chat.id, chat.directory) : '/workspace'
       const browser = this.createBrowser(cwd)
       browser.rootPageId = request.id
       browser.id = request.id
       browser.chatId = request.chat_id
+      browser.directory = cwd
       this.slots.set(key, { ownerId: owner.ownerId, chatId: request.chat_id, worker: browser })
       this.workers.add(browser)
       const worker = browser
@@ -459,6 +465,25 @@ export class WorkbenchBrowsers {
     if (this.slots.get(key)?.worker === browser) this.slots.delete(key)
     const currentKey = `${owner.ownerId}/${browser.chatId}`
     if (this.current.get(currentKey) === id && !this.items.has(key)) this.current.delete(currentKey)
+  }
+  async adopt(owner, draftId, chat) {
+    for (const [key, slot] of this.slots) {
+      if (slot.ownerId !== owner.ownerId || ![draftId, chat.id].includes(slot.chatId)) continue
+      const browser = slot.worker
+      if (browser.closed) continue
+      const id = key.slice(owner.ownerId.length + 1)
+      // Existing processes keep their launch directory. Only browsers opened
+      // after submission receive the chat's directory during allocation.
+      browser.chatId = chat.id
+      slot.chatId = chat.id
+      this.current.delete(`${owner.ownerId}/${draftId}`)
+      this.current.set(`${owner.ownerId}/${chat.id}`, id)
+    }
+  }
+  async closeChat(owner, chatId) {
+    for (const [key, slot] of [...this.slots])
+      if (slot.ownerId === owner.ownerId && slot.chatId === chatId)
+        await this.close(owner, key.slice(owner.ownerId.length + 1))
   }
   dispose() { this.disposed = true; for (const worker of this.workers) worker.dispose(); this.items.clear(); this.current.clear() }
 }

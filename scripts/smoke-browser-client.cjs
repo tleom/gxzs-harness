@@ -51,7 +51,7 @@ async function main() {
       const encodingBytes = Uint8Array.from(encodings)
       const view = new DataView(encodingBytes.buffer)
       const negotiated = Array.from({ length: view.getUint16(2) }, (_, index) => view.getInt32(4 + index * 4))
-      const requestPacing = !negotiated.includes(-313)
+      const continuousUpdates = negotiated.includes(-313)
       const updateRequests = writes.filter(bytes => bytes[0] === 3).length
       await receive([0, 0, 0, 0])
       const requestsNextFrame = writes.filter(bytes => bytes[0] === 3).length === updateRequests + 1
@@ -137,14 +137,14 @@ async function main() {
       await tick()
       const enabledWebRtcClosed = peer?.connectionState === 'closed' && dataChannel?.readyState === 'closed'
       const upgradeCancelled = rtc._udpPeer === null && rtc._udpChannel === null
-      return { connected, disconnected: initialDisconnected, requestPacing, requestsNextFrame, coalescedFenceReplied, incompleteDidNotReply, fragmentedFenceReplied,
+      return { connected, disconnected: initialDisconnected, continuousUpdates, requestsNextFrame, coalescedFenceReplied, incompleteDidNotReply, fragmentedFenceReplied,
         initialPixelsTransparent, resetPixelsTransparent, websiteBlackPixelPreserved, whiteBackdrop,
         disabledWebRtcAllocatedNoPeers, reconnectsAllocatedNoPeers, reconnectsRemovedCanvases, enabledWebRtcClosed, upgradeCancelled,
         paintedBitmapsReleased, evictedBitmapReleased, supersededFrameReleased, lateFrameReleased, clearedBitmapsReleased, disposedBitmapsReleased, channelClosed }
     })
     assert.equal(result.connected, true)
     assert.equal(result.disconnected, false)
-    assert.equal(result.requestPacing, true, 'Lossless updates must use upstream request/reply pacing')
+    assert.equal(result.continuousUpdates, true, 'The viewer must advertise upstream continuous updates')
     assert.equal(result.requestsNextFrame, true, 'Completing an update must request the next frame')
     assert.equal(result.coalescedFenceReplied, true, 'Coalesced encoder capabilities must not strand the ServerFence')
     assert.equal(result.incompleteDidNotReply, true)
@@ -157,6 +157,34 @@ async function main() {
       assert.equal(result[key], true, key)
     for (const key of ['paintedBitmapsReleased', 'evictedBitmapReleased', 'supersededFrameReleased', 'lateFrameReleased', 'clearedBitmapsReleased', 'disposedBitmapsReleased', 'channelClosed'])
       assert.equal(result[key], true, key)
+    for (const hasTouch of [false, true]) {
+      const context = await browser.newContext({ hasTouch })
+      try {
+        const cursorPage = await context.newPage()
+        await cursorPage.goto(`http://127.0.0.1:${server.address().port}`)
+        await cursorPage.waitForFunction(() => window.Client)
+        const cursor = await cursorPage.evaluate(async () => {
+          const screen = document.querySelector('#screen')
+          const channel = {readyState:1,protocol:'binary',send(){},close(){}}
+          const rfb = new window.Client(screen, document.querySelector('#keyboard'), channel, {shared:true}, [])
+          rfb.enableWebRTC = false
+          await new Promise(resolve => setTimeout(resolve, 30))
+          const pixels = new Uint8Array(16 * 16 * 4); pixels.fill(255)
+          rfb._cursor.change(pixels, 0, 0, 16, 16)
+          rfb._canvas.dispatchEvent(new MouseEvent('mousemove', {clientX:100,clientY:100,bubbles:true}))
+          const rich = { native:getComputedStyle(rfb._canvas).cursor,
+            overlay:rfb._cursor._canvas.style.visibility !== 'hidden' && rfb._cursor._canvas.width > 0 }
+          rfb._cursor.clear()
+          const empty = { native:getComputedStyle(rfb._canvas).cursor, width:rfb._cursor._canvas.width }
+          rfb.disconnect()
+          return { rich, empty }
+        })
+        assert.equal(cursor.rich.overlay, hasTouch)
+        assert.equal(cursor.rich.native === 'none', hasTouch, 'The fallback must not duplicate the system cursor')
+        assert.deepEqual(cursor.empty, {native:'none',width:0}, 'An empty remote cursor must retain the upstream state')
+      } finally { await context.close() }
+    }
+    console.log('PASS mouse and touch-capable viewers: one native cursor, no added local arrow; upstream empty state preserved')
     console.log('PASS bundled Kasm client: coalesced/fragmented ServerFence; initial and resized white backdrop; actual black webpage pixels preserved')
     console.log('PASS 20 reconnects: no unused WebRTC peers or retained canvases; enabled WebRTC peer and channel close on disconnect')
     console.log('PASS 120 animated frames: decoded bitmaps released after paint, eviction, late arrival, clear and disconnect; display channel closed')

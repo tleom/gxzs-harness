@@ -1,8 +1,40 @@
 import { PassThrough } from 'node:stream'
 import { expect, it, vi } from 'vitest'
 import { browserAction, SandboxBrowser, WorkbenchBrowsers } from '../src/browsers.js'
+
+it('validates the optional wheel position without changing older wheel requests', () => {
+  const old = { action: 'wheel', x: 0, y: 200 }
+  expect(browserAction(old)).toEqual(old)
+  expect(browserAction({ ...old, position: { x: 600, y: 200, extra: true } }))
+    .toEqual({ ...old, position: { x: 600, y: 200 } })
+  for (const position of [null, {}, {x:-1,y:0}, {x:3840,y:0}, {x:0,y:2160}, {x:1.5,y:0}])
+    expect(() => browserAction({ ...old, position })).toThrow('浏览器操作参数无效')
+})
 const id = '12345678-1234-1234-1234-123456789abc'
 const signal = () => new AbortController().signal
+it('keeps an adopted browser at its launch directory and opens its replacement at the task directory', async () => {
+  const owner = { ownerId: 'owner' }, draftId = `draft:${id}`, workers = []
+  const chat = { id: 'chat', directory: 'conversations/2026-10-26/new-chat' }
+  let bound = false
+  const service = { resourceContext: () => bound ? chat : { id: draftId, directory: 'conversations/2026-10-26' },
+    chatDirectory: (_, directory) => `/workspace/${directory}` }
+  const create = vi.fn(() => {
+    let finish
+    const worker = { command: vi.fn(async () => {}), done: new Promise(resolve => { finish = resolve }),
+      dispose() { this.closed = true; finish() } }
+    workers.push(worker); return worker
+  })
+  const browsers = new WorkbenchBrowsers({ service, create })
+  await browsers.create(owner, { id, chat_id: draftId }, signal())
+  bound = true
+  await browsers.adopt(owner, draftId, chat)
+  expect(workers[0].directory).toBe('/workspace/conversations/2026-10-26')
+  expect(workers[0].chatId).toBe(chat.id)
+  expect(workers[0].command).toHaveBeenCalledOnce()
+  await browsers.create(owner, { id: 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', chat_id: chat.id }, signal())
+  expect(create.mock.calls.map(([cwd]) => cwd)).toEqual(['/workspace/conversations/2026-10-26', '/workspace/conversations/2026-10-26/new-chat'])
+  await browsers.closeChat(owner, chat.id)
+})
 it('accepts native display density with a bounded 4K framebuffer and keeps legacy resize compatible', () => {
   expect(browserAction({action:'resize',width:1174,height:681,device_scale_factor:2.2}))
     .toEqual({action:'resize',width:1174,height:681,device_scale_factor:2.2})

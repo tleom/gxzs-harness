@@ -5,6 +5,7 @@ import hmac
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import logging
+import math
 import os
 import re
 import sqlite3
@@ -624,12 +625,30 @@ def operation(key, action, payload):
             raise ValueError("Personal MCP request contains reserved fields")
         if payload.get('operation') == 'mcp_task' and payload.get('method') == 'tasks/cancel':
             return cancel_task(key, payload, authorize=authorize_mcp)
+        if payload['operation'] in {'mcp_call', 'mcp_request', 'mcp_task'}:
+            from mcp_authorization import validate_grant
+            resource = 'personal:mcp:' + payload['name']
+            if payload['operation'] in {'mcp_call', 'mcp_task'}:
+                resource += ':' + payload['tool']
+            validate_grant(key, payload, resource)
+        deadline = payload.get('deadline_ms') if payload['operation'] in {'mcp_test', 'mcp_call', 'mcp_browse', 'mcp_request', 'mcp_task'} else None
+        if deadline is not None and (type(deadline) not in (int, float) or not math.isfinite(deadline)):
+            raise ValueError('Invalid MCP deadline')
+        def remaining():
+            return 90 if deadline is None else max(0, deadline / 1000 - time.time())
+        expired = {'error': 'MCP 调用截止时间已过期，本次操作未执行', 'code': 'DEADLINE_EXCEEDED'}
+        if not remaining():
+            return expired
         tracked = payload['operation'] != 'mcp_list' and payload.get('maintenance') is not True
         with lock(key):
+            if not remaining():
+                return expired
             record = HOSTS.root / key / 'host.json'
             if payload.get('maintenance') is True and record.exists() and json.loads(record.read_text(encoding='utf-8')).get('state') == 'stopped':
                 raise ResourceUnavailable('个人工作环境已休眠，维护请求稍后重试', 'HOST_IDLE', 30)
             ensure(key, track_activity=tracked, allow_existing_image=payload['operation'] == 'mcp_list')
+            if not remaining():
+                return expired
             name, _ = identity(key)
             request = payload
             if payload["operation"] in {"mcp_test", "mcp_call", "mcp_browse", "mcp_request", "mcp_task"}:
@@ -639,18 +658,32 @@ def operation(key, action, payload):
             source = module_source("mcp_policy", "file_ops", "resource_ops", "mcp_ops")
             source += "sys.modules['mcp_policy'].configure(" + repr(mcp_policy()) + "); "
             source += "import json; print(json.dumps(sys.modules['mcp_ops'].personal_mcp(json.load(sys.stdin))))"
-            result = docker("exec", "--user", "1000", "-i", name, *MANAGER_PYTHON, "-c", source,
-                            stdin=json.dumps(request), check=False)
+            try:
+                result = docker("exec", "--user", "1000", "-i", name, *MANAGER_PYTHON, "-c", source,
+                                stdin=json.dumps(request), timeout=min(90, remaining()), check=False)
+            except subprocess.TimeoutExpired:
+                if not remaining():
+                    return expired
+                raise
+            if not remaining():
+                return expired
             if result.returncode:
                 # Parse errors and tracebacks may include user-supplied secrets.
                 raise ValueError("MCP 配置操作失败，请检查 JSON、路径和版本")
             output = json.loads(result.stdout)
             if tracked:
                 touch(key)
-        if payload["operation"] in {"mcp_save", "mcp_delete", "mcp_toggle"} and not output.get("conflict"):
+        if (payload["operation"] in {"mcp_save", "mcp_delete", "mcp_toggle"} and not output.get("conflict")
+                and (payload["operation"] != "mcp_save" or output.get("connection_changed") is not False)):
             invalidate(key, payload["name"])
         if payload["operation"] in {"mcp_test", "mcp_call", "mcp_browse", "mcp_request", "mcp_task"}:
             discovered_at = payload.get("catalog_discovered_at", output.get("discovered_at"))
+            # Editing CAS uses the file hash; execution uses the connection hash.
+            # Only unsigned management probes may translate the current CAS hash.
+            if output.get("runtime_version"):
+                if payload["operation"] in {"mcp_test", "mcp_browse"} and payload.get("version") == output["version"]:
+                    payload = {**payload, "version": output["runtime_version"]}
+                output = {**output, "version": output["runtime_version"]}
             output = invoke(key, name, payload, output, authorize=authorize_mcp)
             if (payload["operation"] == "mcp_test"
                     and output.get("error") and output.get("code") != "MCP_BUSY"
@@ -913,6 +946,7 @@ class Handler(BaseHTTPRequestHandler):
         REQUEST_CONTEXT.operation_capacity = False
         request_id = uuid.uuid4().hex[:12]
         key = action = role = 'unresolved'
+        payload = {}
         try:
             parts = self.path.strip("/").split("/")
             if len(parts) != 3 or parts[0] != "sandboxes":
@@ -1029,7 +1063,22 @@ class Handler(BaseHTTPRequestHandler):
             return
         if code >= 400:
             output.setdefault('request_id', request_id)
-        data = json.dumps(output).encode()
+        data = json.dumps(output, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+        if action in {'personal-mcp', 'global-mcp', 'global-memory'} and len(data) > mcp_limit('response_bytes'):
+            # Worker frames and the final HTTP envelope have different sizes.
+            # Enforce the budget on the complete serialized response, including
+            # all providers, rather than sending an unreadable successful list.
+            discovery = isinstance(payload, dict) and payload.get('operation') in {'mcp_list', 'mcp_test'}
+            code = 413
+            output = {
+                'error': 'MCP 完整工具目录超过响应传输预算，请调整 response_bytes' if discovery else
+                         'MCP 响应已收到但超过传输预算，请勿自动重放业务调用',
+                'code': 'MCP_DISCOVERY_TOO_LARGE' if discovery else 'MCP_RESPONSE_TOO_LARGE',
+                'request_id': request_id,
+            }
+            data = json.dumps(output, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+            if len(data) > mcp_limit('response_bytes'):
+                data = b'{}' if mcp_limit('response_bytes') >= 2 else b''
         self.write_json(code, data, request_id=request_id, action=action)
 
 

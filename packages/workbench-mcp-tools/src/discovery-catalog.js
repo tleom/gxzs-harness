@@ -37,14 +37,28 @@ export class ToolDiscoveryCatalog extends Service {
     const preferred = new Set(run?.selection?.resource_mentions?.plugins ?? [])
     const selectedTools = new Set(run?.selection?.resource_mentions?.tools ?? [])
     const servers = new Map((runtime.mcpPlugins?.() ?? []).map(server => [server.id, server]))
+    const frozenServers = new Map((run?.selection?.mcp_servers ?? []).map(server => [server.id, server]))
+    const providerId = tool => `${tool.scope}:mcp:${tool.server_id}`
+    const currentByProvider = Map.groupBy([...this.registrations.values()].map(item => item.tool), providerId)
+    const frozenByProvider = Map.groupBy(run?.mcpTools ?? [], providerId)
     if (ready) {
-      const providersWithTools = new Set([...this.registrations.values()].map(({ tool }) => `${tool.scope}:mcp:${tool.server_id}`))
       for (const plugin of runtime.mcpPlugins?.() ?? []) {
         // Installation metadata survives recovery even when this run's frozen
         // authorization excludes the recovered tools. This grants no capability.
-        const requiresAuthorization = plugin.available !== false && providersWithTools.has(plugin.id)
+        const current = currentByProvider.get(plugin.id) ?? []
+        const frozenServer = frozenServers.get(plugin.id)
+        const previous = typeof frozenServer?.version === 'string' && typeof frozenServer?.manifest_version === 'string'
+          ? [frozenServer] : frozenByProvider.get(plugin.id) ?? []
+        const version = plugin.version ?? current[0]?.version
+        const manifest = plugin.manifest_version ?? current[0]?.manifest_version ?? ''
+        const unavailableReason = previous.some(binding => version !== undefined && version !== binding.version)
+          ? 'configuration_changed'
+          : previous.some(binding => manifest !== (binding.manifest_version ?? ''))
+            ? 'tool_definitions_changed'
+            : !previous.length && (current.length || plugin.capabilities?.resources)
+              && !current.some(tool => allowed.has(tool.public_name)) ? 'run_authorization_required' : undefined
         plugins.set(plugin.id, { ...plugin,
-          ...(requiresAuthorization ? { available: false, unavailableReason: 'run_authorization_required' } : {}),
+          ...(plugin.available !== false && unavailableReason ? { available: false, unavailableReason } : {}),
           preferred: preferred.has(plugin.id) || preferred.has(plugin.name) })
       }
     }
@@ -53,6 +67,7 @@ export class ToolDiscoveryCatalog extends Service {
     for (const { tool, definition } of this.registrations.values()) {
       if (!allowed.has(tool.public_name)) continue
       const pluginId = `${tool.scope}:mcp:${tool.server_id}`
+      if (plugins.get(pluginId)?.unavailableReason) continue
       const server = servers.get(pluginId)
       const taskUnavailable = tool.execution?.taskSupport === 'required' && (!runtime.database
         || server?.version !== tool.version || server?.manifest_version !== tool.manifest_version

@@ -133,14 +133,21 @@ export class WorkbenchRuntime extends Service {
         const bound = this.database.getRun(this.ownerId, binding)
         const root = this.rootOf(agent)
         // A parent question pauses the parent, not its already owned child work.
-        if (bound && root?.id === bound.sessionId) return ['completed', 'waiting_input'].includes(bound.status) && agent.status === 'running'
-          ? { ...bound, status: 'running', background: true } : bound
+        if (bound?.ownerId === this.ownerId && root?.id === bound.sessionId) {
+          const run = ['completed', 'waiting_input'].includes(bound.status) && agent.status === 'running'
+            ? { ...bound, status: 'running', background: true } : bound
+          return this.migrateMcpRun?.(run) ?? run
+        }
       }
       const id = agent.session?.id ?? agent.id
       const turn = nativeTurn(agent)?.lastTurn
-      const run = Number.isInteger(turn) ? this.database.runForTurn(id, turn) : this.database.activeRunBySession(id)
-      if (run) return run.ownerId !== this.ownerId ? undefined : run.status === 'completed' && this.hasOwnedWork(run.sessionId, run.id)
-        ? { ...run, status: 'running', background: true } : run
+      const stored = Number.isInteger(turn) ? this.database.runForTurn(id, turn) : this.database.activeRunBySession(id)
+      if (stored) {
+        if (stored.ownerId !== this.ownerId) return undefined
+        const run = stored.status === 'completed' && this.hasOwnedWork(stored.sessionId, stored.id)
+          ? { ...stored, status: 'running', background: true } : stored
+        return this.migrateMcpRun?.(run) ?? run
+      }
       // Durable parentSession alone is not authority: require live registry ownership.
       agent = this.agents.list?.().find(parent => this.agents.isOwnedBy?.(agent.id, parent))
     }

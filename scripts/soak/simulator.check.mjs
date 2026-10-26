@@ -41,18 +41,25 @@ const tools = [{ type: 'function', function: { name: 'bash', parameters: { type:
 test('synthetic platform forwards the manager-owned MCP policy after authenticating the binding', async t => {
   const policy = { request_bytes: 123456, response_bytes: 234567, max_call_seconds: 45, catalog_timeout_seconds: 90 }
   let requests = 0
-  const manager = createServer((req, res) => {
+  let personalCall
+  const manager = createServer(async (req, res) => {
     requests++
-    assert.equal(req.url, '/mcp-policy')
     assert.equal(req.headers.authorization, `Bearer ${token}`)
-    res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify(policy))
+    let result = policy
+    if (req.url === '/sandboxes/fixture-workspace/personal-mcp') {
+      let text = ''; for await (const chunk of req) text += chunk
+      const body = JSON.parse(text)
+      if (body.operation === 'mcp_list') result = { mcp: [{ id: 'soak-personal', enabled: true, status: 'ready', version: 'file-hash', runtime_version: 'connection-hash', manifest_version: 'manifest', tools: [{ name: 'echo', inputSchema: {} }] }] }
+      else { personalCall = body; result = { content: [{ type: 'text', text: 'ok' }] } }
+    } else assert.equal(req.url, '/mcp-policy')
+    res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify(result))
   })
   await new Promise(resolve => manager.listen(0, '127.0.0.1', resolve))
   t.after(async () => { manager.closeAllConnections(); await new Promise(resolve => manager.close(resolve)) })
   const output = await mkdtemp(path.join(os.tmpdir(), 'gxzs-sim-platform-'))
   t.after(() => rm(output, { recursive: true }))
   const owner = 'soak1017:910001', instance = 'fixture-instance'
-  await writeFile(path.join(output, 'bindings.json'), JSON.stringify([{ owner_id: owner, generation: 1, instance_id: instance }]))
+  await writeFile(path.join(output, 'bindings.json'), JSON.stringify([{ owner_id: owner, workspace_id: 'fixture-workspace', generation: 1, instance_id: instance }]))
   const config = path.join(output, 'config.json')
   await writeFile(config, JSON.stringify({ token, output, host: '127.0.0.1', port: 0,
     managerURL: `http://127.0.0.1:${manager.address().port}`, globalSkills: [] }))
@@ -84,6 +91,17 @@ test('synthetic platform forwards the manager-owned MCP policy after authenticat
   assert.deepEqual(await empty.json(), { data: { sequence: 3, tasks: [], complete: true } })
   const active = await fetch(wakeupURL, { method: 'POST', headers, body: JSON.stringify({ sequence: 4, tasks: [{ id: 'future' }] }) })
   assert.equal(active.status, 503)
+  const catalogResponse = await fetch(`http://127.0.0.1:${ready.port}/internal/workbench/mcp/catalog`, { headers })
+  const tool = (await catalogResponse.json()).data.tools.find(tool => tool.scope === 'personal')
+  assert.equal(tool.version, 'connection-hash')
+  const call = await fetch(`http://127.0.0.1:${ready.port}/internal/workbench/mcp/call`, { method: 'POST', headers, body: JSON.stringify({
+    resource_id: tool.id, server_id: tool.server_id, tool_name: tool.tool_name, version: tool.version, manifest_version: tool.manifest_version,
+    run_id: 'run-1', request_key: 'request-1', deadline_ms: Date.now() + 10000, arguments: {},
+  }) })
+  assert.equal(call.status, 200)
+  assert.equal(personalCall.version, 'connection-hash')
+  assert.equal(personalCall.authorization.version, 'connection-hash')
+  assert.equal(personalCall.authorization.runtime_version, 'connection-hash')
 })
 
 async function fixture(t) {

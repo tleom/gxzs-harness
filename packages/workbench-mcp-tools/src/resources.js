@@ -1,3 +1,5 @@
+import { mcpDeadline } from './deadline.js'
+
 /** Register resource providers in the native DSH agent scope. */
 export function resourceScopes(ctx) {
   const scopes = new Map()
@@ -24,17 +26,22 @@ export function resourceScopes(ctx) {
         // The platform identity is unique even when personal/global display names match.
         if (registry && server.capabilities?.resources) disposers.push(registry.register(server.id, { request: async (request, exec) => {
           exec.signal?.throwIfAborted()
+          const deadlineMs = mcpDeadline(runtime.mcpPolicy, exec)
+          const signal = AbortSignal.any([...(exec.signal ? [exec.signal] : []), AbortSignal.timeout(Math.max(0, deadlineMs - Date.now()))])
           const authorization = await runtime.authorizeMcpCall(exec.agent?.session?.id ?? exec.agent?.id,
-            server.id, server.version, exec.signal)
+            server.id, server.version, signal)
+          signal.throwIfAborted()
+          if (deadlineMs <= Date.now()) throw new DOMException('MCP call deadline exceeded', 'TimeoutError')
+          // sync disposes the provider when its binding changes during admission.
+          if (!runtime.mcpCatalogState?.ready || scopes.get(agent)?.stamp !== stamp)
+            throw new Error('MCP 工具目录已改变，本次资源读取未执行')
           if (!authorization || authorization.runId !== run.id
             || authorization.resource.manifest_version !== server.manifest_version)
             throw new Error('MCP 资源不属于当前任务，或插件已改变')
           const { method, ...params } = request
-          const timeoutMs = Math.ceil((runtime.mcpPolicy?.max_call_seconds ?? 350) * 1000)
-          const deadlineMs = Date.now() + timeoutMs
           const payload = await ctx.workbenchPlatformClient.json({ owner: { ownerId: authorization.ownerId },
-            method: 'POST', route: 'mcp/request', contentType: 'application/json', signal: exec.signal,
-            timeoutMs, deadlineMs,
+            method: 'POST', route: 'mcp/request', contentType: 'application/json', signal,
+            timeoutMs: Math.max(1, deadlineMs - Date.now()), deadlineMs,
             body: Buffer.from(JSON.stringify({ server_id: server.id, version: server.version,
               manifest_version: server.manifest_version, run_id: run.id, request_key: exec.callId,
               method, params, deadline_ms: deadlineMs })) })

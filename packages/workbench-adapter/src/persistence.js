@@ -50,6 +50,13 @@ export class WorkbenchDatabase {
         deleted_at INTEGER
       );
       CREATE INDEX IF NOT EXISTS chats_owner_updated ON chats(owner_id, updated_at DESC);
+      CREATE TABLE IF NOT EXISTS chat_drafts (
+        owner_id TEXT NOT NULL,
+        draft_id TEXT NOT NULL,
+        state_json TEXT NOT NULL,
+        PRIMARY KEY(owner_id, draft_id)
+      );
+      CREATE INDEX IF NOT EXISTS chat_drafts_chat ON chat_drafts(owner_id, json_extract(state_json, '$.chatId'));
       CREATE TABLE IF NOT EXISTS chat_deletions (
         chat_id TEXT PRIMARY KEY,
         owner_id TEXT NOT NULL,
@@ -197,6 +204,8 @@ export class WorkbenchDatabase {
     if (versions.some((version) => version !== 3)) throw new Error('unsupported workbench database schema; provision a new empty database')
     if (!this.db.prepare('PRAGMA table_info(chats)').all().some((column) => column.name === 'directory'))
       this.db.exec('ALTER TABLE chats ADD COLUMN directory TEXT')
+    if (!this.db.prepare('PRAGMA table_info(chats)').all().some((column) => column.name === 'original_directory'))
+      this.db.exec('ALTER TABLE chats ADD COLUMN original_directory TEXT')
     if (!this.db.prepare('PRAGMA table_info(run_fences)').all().some((column) => column.name === 'result_json'))
       this.db.exec('ALTER TABLE run_fences ADD COLUMN result_json TEXT')
     this.db.prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (3, ?)').run(Date.now())
@@ -252,13 +261,13 @@ export class WorkbenchDatabase {
     catch { /* Observers cannot roll back a committed cursor or trigger replay. */ }
   }
 
-  importChat({ id, ownerId, sessionId, title, pinned = false, favorited = false, selection, createdAt, updatedAt, directory = null }) {
+  importChat({ id, ownerId, sessionId, title, pinned = false, favorited = false, selection, createdAt, updatedAt, directory = null, originalDirectory = null }) {
     const existing = this.getChat(ownerId, id)
     if (existing) return existing
     this.db.prepare(`INSERT INTO chats
-      (id, owner_id, session_id, title, pinned, favorited, selection_json, created_at, updated_at, directory)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-      .run(id, ownerId, sessionId, title, Number(pinned), Number(favorited), JSON.stringify(selection), createdAt, updatedAt, directory)
+      (id, owner_id, session_id, title, pinned, favorited, selection_json, created_at, updated_at, directory, original_directory)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(id, ownerId, sessionId, title, Number(pinned), Number(favorited), JSON.stringify(selection), createdAt, updatedAt, directory, originalDirectory)
     this.db.prepare('INSERT INTO control_state(chat_id, updated_at) VALUES (?, ?)').run(id, updatedAt)
     return this.getChat(ownerId, id)
   }
@@ -273,6 +282,28 @@ export class WorkbenchDatabase {
       return this.getChat(ownerId, id)
     })
     return create()
+  }
+
+  draft(ownerId, draftId) {
+    const row = this.db.prepare('SELECT state_json FROM chat_drafts WHERE owner_id=? AND draft_id=?').get(ownerId, draftId)
+    return row ? JSON.parse(row.state_json) : undefined
+  }
+
+  drafts(ownerId) {
+    return this.db.prepare('SELECT state_json FROM chat_drafts WHERE owner_id=?').all(ownerId).map(row => JSON.parse(row.state_json))
+  }
+
+  draftForChat(ownerId, chatId) {
+    const row = this.db.prepare("SELECT state_json FROM chat_drafts WHERE owner_id=? AND json_extract(state_json, '$.chatId')=?")
+      .get(ownerId, chatId)
+    return row ? JSON.parse(row.state_json) : undefined
+  }
+
+  saveDraft(ownerId, draft) {
+    this.db.prepare(`INSERT INTO chat_drafts(owner_id,draft_id,state_json) VALUES(?,?,?)
+      ON CONFLICT(owner_id,draft_id) DO UPDATE SET state_json=excluded.state_json`)
+      .run(ownerId, draft.id, JSON.stringify(draft))
+    return draft
   }
 
   getChat(ownerId, id) {
@@ -1191,6 +1222,7 @@ export class WorkbenchDatabase {
 function decodeChat(row) {
   return {
     id: row.id, ownerId: row.owner_id, sessionId: row.session_id, title: row.title, directory: row.directory ?? undefined,
+    originalDirectory: row.original_directory ?? undefined,
     pinned: Boolean(row.pinned), favorited: Boolean(row.favorited), version: row.version, selection: JSON.parse(row.selection_json),
     createdAt: row.created_at, updatedAt: row.updated_at,
   }

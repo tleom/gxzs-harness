@@ -36,14 +36,14 @@ export class WorkbenchTerminals {
   }
   async agent(owner, chatId) {
     if (this.disposed) throw httpError(503, '终端连接服务已更新，请重新连接')
-    const chat = this.service.requireChat(owner, chatId)
+    const chat = (this.service.resourceContext ?? this.service.requireChat).call(this.service, owner, chatId)
     this.knownSessions.add(chat.sessionId)
     const resolved = await this.sessions.resolveAgent(chat.sessionId)
     if (this.disposed) throw httpError(503, '终端连接服务已更新，请重新连接')
     if ('error' in resolved) throw resolved.error
     return resolved.agent
   }
-  list(owner, chatId) { return this.native.list(this.service.requireChat(owner, chatId).sessionId) }
+  list(owner, chatId) { return this.native.list((this.service.resourceContext ?? this.service.requireChat).call(this.service, owner, chatId).sessionId) }
   async create(owner, chatId, request, signal) {
     signal.throwIfAborted()
     if (!uuid.test(request.id)) throw httpError(400, '终端标识无效')

@@ -1,6 +1,7 @@
 """Personal MCP presentation metadata must not disconnect unchanged tools."""
 
 import importlib.util
+import copy
 import json
 import os
 from pathlib import Path
@@ -32,6 +33,49 @@ def config(**changes):
         "url": "https://example.com/mcp",
         **changes,
     })
+
+
+def test_manifest_is_independent_of_tool_order_but_preserves_definition_changes(ops):
+    tools = [{"name": f"tool_{i}", "description": "中文工具", "inputSchema": {"type": "object",
+              "properties": {"value": {"type": "array", "prefixItems": [{"type": "string"}, {"type": "number"}]}}}}
+             for i in range(226)]
+    assert ops.manifest_version(tools) == ops.manifest_version(list(reversed(tools)))
+    changed = copy.deepcopy(tools)
+    changed[0]["inputSchema"]["properties"]["value"]["prefixItems"].reverse()
+    assert ops.manifest_version(tools) != ops.manifest_version(changed)
+    assert ops.manifest_version(tools) != ops.manifest_version(tools[:-1])
+
+
+def test_legacy_cache_survives_reordered_refresh_without_changing_run_binding(ops, tmp_path):
+    saved = ops.personal_mcp({"operation": "mcp_save", "name": "demo", "content": config()}, str(tmp_path))
+    tools = [{"name": name, "description": "", "inputSchema": {"type": "object"}} for name in ("z", "a")]
+    request = {"operation": "mcp_cache", "name": "demo", "version": saved["version"], "tools": tools}
+    ops.personal_mcp(request, str(tmp_path))
+    path = tmp_path / "mcp/.cache/demo.json"
+    cache = json.loads(path.read_text())
+    legacy = ops.legacy_manifest_version(tools)
+    path.write_text(json.dumps({**cache, "tools": tools, "manifest_version": legacy}))
+    assert ops.personal_mcp({"operation": "mcp_list"}, str(tmp_path))["mcp"][0]["manifest_version"] == legacy
+    refreshed = ops.personal_mcp({**request, "tools": list(reversed(tools))}, str(tmp_path))
+    assert refreshed["manifest_version"] == legacy
+    assert refreshed["tools"] == tools
+    assert ops.personal_mcp({"operation": "mcp_list"}, str(tmp_path))["mcp"][0]["status"] == "ready"
+    changed = [{**tools[0], "annotations": {"readOnlyHint": False}}, tools[1]]
+    fresh = ops.personal_mcp({**request, "tools": changed}, str(tmp_path))
+    assert fresh["manifest_version"] == ops.manifest_version(changed) != legacy
+
+
+@pytest.mark.parametrize("field", ["version", "connection_fingerprint", "authentication_version", "manifest_version"])
+def test_refresh_never_retains_unverified_legacy_binding(ops, tmp_path, field):
+    saved = ops.personal_mcp({"operation": "mcp_save", "name": "demo", "content": config()}, str(tmp_path))
+    tools = [{"name": name, "description": "", "inputSchema": {"type": "object"}} for name in ("z", "a")]
+    request = {"operation": "mcp_cache", "name": "demo", "version": saved["version"], "tools": tools}
+    ops.personal_mcp(request, str(tmp_path))
+    path = tmp_path / "mcp/.cache/demo.json"
+    cache = json.loads(path.read_text())
+    path.write_text(json.dumps({**cache, "manifest_version": ops.legacy_manifest_version(tools), field: "changed"}))
+    assert ops.personal_mcp({"operation": "mcp_list"}, str(tmp_path))["mcp"][0]["status"] == "unverified"
+    assert ops.personal_mcp(request, str(tmp_path))["manifest_version"] == ops.manifest_version(tools)
 
 
 def test_full_metadata_survives_manifest_cache(ops, tmp_path):
@@ -81,10 +125,45 @@ def test_metadata_edit_preserves_manifest_but_connection_edit_invalidates_it(ops
     assert item["description"] == "新说明"
     assert item["call_name"] == "demo"
     assert item["status"] == "ready" and item["tools"] == tools
+    assert item['runtime_version'] == save['runtime_version'] == updated['runtime_version']
+    assert updated['version'] != save['version'] and updated['connection_changed'] is False
+    assert ops.personal_mcp({'operation': 'mcp_save', 'name': 'demo', 'version': save['version'],
+                             'content': config(display_name='stale')}, str(tmp_path)) == {'conflict': True}
 
     ops.personal_mcp({"operation": "mcp_save", "name": "demo", "version": updated["version"],
                       "content": config(url="https://other.example.com/mcp")}, str(tmp_path))
     assert ops.personal_mcp({"operation": "mcp_list"}, str(tmp_path))["mcp"][0]["status"] == "unverified"
+    assert ops.personal_mcp({'operation': 'mcp_probe', 'name': 'demo'}, str(tmp_path))['runtime_version'] != save['runtime_version']
+
+
+@pytest.mark.parametrize('legacy', [False, True])
+def test_unicode_cache_remains_readable_at_wire_budget(ops, tmp_path, monkeypatch, legacy):
+    original = ops.policy
+    monkeypatch.setattr(ops, 'policy', lambda key: 4096 if key == 'response_bytes' else original(key))
+    saved = ops.personal_mcp({'operation': 'mcp_save', 'name': 'demo', 'content': config()}, str(tmp_path))
+    request = {'operation': 'mcp_cache', 'name': 'demo', 'version': saved['runtime_version'],
+               'tools': [{'name': 'lookup', 'description': '查' * 1000, 'inputSchema': {'type': 'object'}}]}
+    ops.personal_mcp(request, str(tmp_path))
+    path = tmp_path / 'mcp/.cache/demo.json'
+    if legacy:
+        path.write_text(json.dumps(json.loads(path.read_text())))
+        assert path.stat().st_size > 4096
+    snapshot = ops.personal_mcp({'operation': 'mcp_list'}, str(tmp_path))
+    assert snapshot['mcp'][0]['status'] == 'ready' and snapshot['mcp'][0]['tools'] == request['tools']
+    assert not snapshot['warnings']
+    with pytest.raises(ops.ManifestError, match='传输预算'):
+        ops.personal_mcp({**request, 'tools': [{**request['tools'][0], 'description': '查' * 1400}]}, str(tmp_path))
+    assert ops.personal_mcp({'operation': 'mcp_list'}, str(tmp_path))['mcp'][0]['tools'] == request['tools']
+
+
+def test_cache_envelope_can_exceed_wire_size_without_becoming_unreadable(ops, tmp_path, monkeypatch):
+    original = ops.policy
+    monkeypatch.setattr(ops, 'policy', lambda key: 1024 if key == 'response_bytes' else original(key))
+    saved = ops.personal_mcp({'operation': 'mcp_save', 'name': 'demo', 'content': config()}, str(tmp_path))
+    tools = [{'name': 'lookup', 'description': 'x' * 650, 'inputSchema': {'type': 'object'}}]
+    ops.personal_mcp({'operation': 'mcp_cache', 'name': 'demo', 'version': saved['version'], 'tools': tools}, str(tmp_path))
+    assert (tmp_path / 'mcp/.cache/demo.json').stat().st_size > 1024
+    assert ops.personal_mcp({'operation': 'mcp_list'}, str(tmp_path))['mcp'][0]['tools'] == tools
 
 
 def test_new_config_rejects_name_different_from_call_name(ops, tmp_path):

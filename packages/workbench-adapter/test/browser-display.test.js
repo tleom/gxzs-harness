@@ -5,7 +5,7 @@ import { runInNewContext } from 'node:vm'
 import { expect, it, vi } from 'vitest'
 
 it('reconnects after overflow without inheriting queued bytes or a failed old delivery', async () => {
-  const require = createRequire(import.meta.url), sockets = [], frames = []
+  const require = createRequire(import.meta.url), sockets = [], frames = [], children = [], writes = vi.fn()
   let spawned = false, rejectOld
   const oldDelivery = new Promise((_, reject) => { rejectOld = reject })
   class Socket {
@@ -16,10 +16,16 @@ it('reconnects after overflow without inheriting queued bytes or a failed old de
     close = vi.fn(() => this.onclose?.())
     constructor() { sockets.push(this) }
   }
-  const child = Object.assign(new EventEmitter(), { stderr: new EventEmitter(), kill: () => queueMicrotask(() => child.emit('exit')) })
   const modules = {
-    'node:child_process': { spawn: () => { spawned = true; return child }, execFile: (_file, _args, _options, done) => done() },
-    'node:fs': { existsSync: path => spawned && path.startsWith('/tmp/.X11-unix/'), mkdtempSync: () => '/tmp/display-fixture', rmSync() {} },
+    'node:child_process': { spawn: () => {
+      spawned = true
+      const child = Object.assign(new EventEmitter(), { stderr: new EventEmitter(), kill: vi.fn(signal => {
+        if (signal !== 'SIGHUP') queueMicrotask(() => child.emit('exit'))
+        return true
+      }) })
+      children.push(child); return child
+    }, execFile: (_file, _args, _options, done) => done(null, { stdout: 'Xft/DPI 98304\n' }) },
+    'node:fs': { existsSync: path => spawned && path.startsWith('/tmp/.X11-unix/'), mkdtempSync: () => '/tmp/display-fixture', rmSync() {}, writeFileSync: writes },
     'node:net': {
       createServer: () => Object.assign(new EventEmitter(), { listen: (_port, _host, done) => done(), address: () => ({ port: 12345 }), close: done => done() }),
       connect: () => { const socket = Object.assign(new EventEmitter(), { destroy() {} }); queueMicrotask(() => socket.emit('connect')); return socket },
@@ -48,5 +54,10 @@ it('reconnects after overflow without inheriting queued bytes or a failed old de
     expect(sockets[1].close).not.toHaveBeenCalled()
     display.write('new', 'YWJj')
     expect(sockets[1].send).toHaveBeenCalledOnce()
+    await display.resize(100, 100, 2)
+    expect(writes).toHaveBeenLastCalledWith(expect.stringMatching(/xsettings\.conf$/), 'Xft/DPI 196608\n')
+    expect(children[1].kill).toHaveBeenCalledWith('SIGHUP')
   } finally { await display.stop() }
+  expect(children).toHaveLength(2)
+  for (const child of children) expect(child.kill).toHaveBeenCalledWith('SIGTERM')
 })

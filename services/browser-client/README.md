@@ -27,4 +27,10 @@ The single-display adaptation releases decoded ImageBitmap/VideoFrame images
 after painting, on dropped frames, and on disconnect, including late decodes.
 It also closes the display BroadcastChannel. Desktop pixels follow the viewer's
 device pixel ratio (at most 3840x2160), while layout and AI input retain CSS
-coordinates. The viewer requests 15 fps to bound animation work.
+coordinates. The viewer requests at most 30 fps using upstream continuous
+updates; actual frame rate depends on changed regions and available CPU.
+Root scrolling follows the CDP crop with at most one pending update per page.
+The unmodified upstream cursor owns pointer rendering, including its native
+cursor shapes, touch fallback and empty-cursor state.
+Wheel input carries its CSS position in the same request, so nested scroll
+areas do not depend on a previously queued pointer move.

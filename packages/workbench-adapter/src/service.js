@@ -1,7 +1,7 @@
 import { platformToolNames } from '@gxzs/dsh-workbench-mcp-tools/names'
 import { readSkillDefinition, skillDisplayName } from '@gxzs/dsh-workbench-sandbox-skills/definition'
 import { orderGlobalSkills } from '@gxzs/dsh-workbench-sandbox-skills/global'
-import { randomInt, randomUUID } from 'node:crypto'
+import { randomUUID } from 'node:crypto'
 import path from 'node:path'
 import { isDeepStrictEqual } from 'node:util'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
@@ -29,10 +29,8 @@ import { dispatchRunPrompt } from './native-prompt.js'
 import { goalFailureReason, presentRunEvent, resumeGoalSelection, runFailure } from './run-failure.js'
 import { ownedSessionRoots } from './owned-session-roots.js'
 import { DirectoryLifecycle } from './directory-lifecycle.js'
+import { WorkbenchDrafts, dateDirectory } from './drafts.js'
 import { presentContextPressure } from './context-usage.js'
-
-const directoryAdjectives = ['calm', 'clear', 'cool', 'fair', 'fresh', 'gentle', 'green', 'happy', 'light', 'little', 'quiet', 'silver', 'soft', 'sunny', 'warm', 'wild']
-const directoryNouns = ['birch', 'brook', 'cedar', 'cloud', 'dawn', 'fern', 'field', 'forest', 'grove', 'hill', 'lake', 'leaf', 'maple', 'meadow', 'moon', 'moss', 'oak', 'ocean', 'olive', 'pearl', 'pine', 'pond', 'reed', 'river', 'shore', 'sky', 'snow', 'star', 'stone', 'sun', 'wave', 'willow']
 
 export class WorkbenchService {
   constructor({ database, sessionController, agents, commands, skills, globalSkillOrder, workingDirectory, onGoalChanged, fileManager, platformClient, workspace, sessionQuery, agentPresets, agentDefaultModel, modelSettings, scheduler, attachments, goals, fileUploads, nativeFileAttachments = false }) {
@@ -60,11 +58,16 @@ export class WorkbenchService {
     this.fileUploads = fileUploads
     this.nativeFileAttachments = nativeFileAttachments
     this.directories = new DirectoryLifecycle(this)
+    this.drafts = new WorkbenchDrafts(this)
   }
 
-  async createChat(owner, workspace, selection, workspaceId, directoryName) {
-    return this.directories.run(owner, () => this.createChatLocked(owner, workspace, selection, workspaceId, directoryName))
+  async createChat(owner, workspace, selection, workspaceId, directoryName, draftId, submission) {
+    return this.directories.run(owner, () => draftId
+      ? this.drafts.materialize(owner, draftId, workspaceId, submission, selection)
+      : this.createChatLocked(owner, workspace, selection, workspaceId, directoryName))
   }
+
+  resourceContext(owner, id) { return this.drafts.context(owner, id) }
 
   async createChatLocked(owner, workspace, selection, workspaceId, directoryName) {
     const id = randomUUID()
@@ -82,7 +85,7 @@ export class WorkbenchService {
     await this.fileManager.operate({ operation: 'mkdir', path: `conversations/${date}` })
     // A new chat may start from a terminal before it has a title or first prompt.
     // Reserve the short directory atomically; retain its mapping when the chat is renamed.
-    const name = directoryName ?? `${directoryAdjectives[randomInt(directoryAdjectives.length)]}-${directoryNouns[randomInt(directoryNouns.length)]}`
+    const name = directoryName ?? 'new-chat'
     const { path: directory } = await this.fileManager.operate({ operation: 'mkdir', path: `conversations/${date}/${name}`, unique: true })
     const created = await this.sessions.create({ cwd: this.chatDirectory(id, directory) })
     const chat = this.database.createChat({ id, ownerId: owner.ownerId, sessionId: created.sessionId, selection, directory })
@@ -93,12 +96,24 @@ export class WorkbenchService {
 
   async referenceCandidates(owner, chatId, query = '', signal = new AbortController().signal) {
     const chat = this.requireChat(owner, chatId)
-    await this.ensureChatSession(owner, chat)
-    const agent = this.agents.get(chat.sessionId)
-    if (!agent || !this.sessionReferences) throw httpError(503, '对话引用服务尚未就绪')
+    const observed = await this.sessionQuery.observeSession(chat.sessionId)
+    try { return await this.observedReferenceCandidates(owner, observed, query, signal) }
+    finally { observed[Symbol.dispose]?.() }
+  }
+
+  async draftReferenceCandidates(owner, workspaceId, query, signal, draftId) {
+    signal.throwIfAborted()
+    if (!this.sessionReferences?.listSessionCandidates)
+      throw httpError(503, '对话引用服务尚未就绪')
+    const target = workspaceId === undefined ? undefined : await this.workspaces?.requireWorkspace(owner, workspaceId, true)
+    if (workspaceId !== undefined && !target) throw httpError(404, '工作区不存在')
+    const draft = draftId ? this.drafts.get(owner, draftId) : undefined
+    const directory = target ? path.posix.join('conversations', target.path) : draft?.base ?? dateDirectory()
+    const entry = target ? { kind: 'directory' } : await this.fileManager.operate({ operation: 'stat', path: directory })
+    const header = { id: draftId ?? `draft:${workspaceId ?? 'ungrouped'}`, cwd: resolveWorkspacePath(this.workspace, directory) }
     return this.collectReferenceCandidates(owner, query, signal,
-      () => this.fileReferences?.list(agent, query, signal) ?? [],
-      (sessionQuery, limit) => this.sessionReferences.listCandidates(agent, sessionQuery, limit, signal))
+      () => entry?.kind === 'directory' ? this.fileReferences?.listObserved({ header }, query, signal) ?? [] : [],
+      (sessionQuery, limit) => this.sessionReferences.listSessionCandidates(header, sessionQuery, limit, signal))
   }
 
   async observedReferenceCandidates(owner, observed, query, signal) {
@@ -155,6 +170,8 @@ export class WorkbenchService {
   async prepareChatSession(owner, chat) {
     await this.ensureChatDirectory(owner, chat.id)
     const cwd = this.chatDirectory(chat.id, chat.directory)
+    const original = chat.originalDirectory ?? this.drafts.originalDirectory(owner, chat)
+    const headerCwd = original ? this.chatDirectory(chat.id, original) : cwd
     const live = this.agents.get(chat.sessionId)
     let header = live?.session?.header
     if (!header && this.sessionQuery) {
@@ -165,7 +182,7 @@ export class WorkbenchService {
         if (error?.code !== 'SESSION_QUERY_SESSION_NOT_FOUND') throw error
       }
     }
-    if (header && header.cwd !== cwd)
+    if (header && header.cwd !== headerCwd)
       throw httpError(409, '会话工作目录与当前配置不一致，请新建对话')
     if (!live) {
       if (header) {
@@ -173,7 +190,7 @@ export class WorkbenchService {
         // create() has a separate adoption path and can race their writer lease.
         const resolved = await this.sessions.resolveAgent(chat.sessionId)
         if ('error' in resolved) throw resolved.error
-        if (resolved.agent.session.header.cwd !== cwd)
+        if (resolved.agent.session.header.cwd !== headerCwd)
           throw httpError(409, '会话工作目录与当前配置不一致，请新建对话')
       } else if (!this.agents.get(chat.sessionId)) {
         // alpha.5 may mint a different ID when the named Session has started.
@@ -277,6 +294,7 @@ export class WorkbenchService {
         // Native archive commits the wake-up fence before stopping schedules, jobs and children.
         await this.workspaces?.controller?.archiveSession?.({ sessionId: chat.sessionId, stopActivity: true })
         await this.closeTerminals?.(chat.sessionId)
+        await this.closeBrowsers?.(owner, chat.id)
         const agent = this.agents.get(chat.sessionId)
         for (const run of cancelling) this.database.requireRunFence(owner.ownerId, run.id, access)
         if (agent) {

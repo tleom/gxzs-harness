@@ -302,10 +302,7 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
     await cdp.send('Browser.setWindowBounds', { windowId: window.windowId, bounds: { windowState: 'fullscreen' } })
     // Chromium enforces a minimum outer-window width even in kiosk mode. Keep
     // layout and input coordinates aligned with the visible X display below it.
-    await cdp.send('Emulation.setDeviceMetricsOverride', {
-      ...viewport, deviceScaleFactor, mobile: false,
-      viewport: { x: 0, y: 0, ...viewport, scale: 1 },
-    })
+    await cdp.send('Emulation.setDeviceMetricsOverride', { ...viewport, deviceScaleFactor, mobile: false })
   }
   async function bind(target, id) {
     const cdp = await context.newCDPSession(target)
@@ -447,7 +444,7 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
       if (closed) { await display?.stop(); throw new Error('browser_closed') }
       browser = await chromium.launch({ executablePath: '/usr/bin/chromium', headless: !display,
         ...(display ? { env: display.env } : {}),
-        args: ['--no-sandbox', '--disable-dev-shm-usage', ...(display ? ['--force-device-scale-factor=1', '--no-first-run',
+        args: ['--no-sandbox', '--disable-dev-shm-usage', ...(display ? ['--no-first-run',
           '--kiosk', '--window-position=0,0', `--window-size=${value.width},${value.height}`] : [])], timeout: 20000 })
       if (closed) { await browser.close(); throw new Error('browser_closed') }
       browser.on('disconnected', () => fatal('沙盒浏览器已退出，请重新打开浏览器'))
@@ -554,12 +551,21 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
       case 'reload': navigationResponse = await page.reload(navigationOptions); break
       case 'back': navigationResponse = await page.goBack(navigationOptions); break
       case 'forward': navigationResponse = await page.goForward(navigationOptions); break
-      case 'resize':
+      case 'resize': {
+        const previousScale = deviceScaleFactor
         navigation++
         viewport = { width: value.width, height: value.height }
         deviceScaleFactor = value.device_scale_factor ?? 1
         if (display) {
-          await display.resize(Math.round(value.width * deviceScaleFactor), Math.round(value.height * deviceScaleFactor))
+          if (previousScale !== deviceScaleFactor) await session.send('Emulation.clearDeviceMetricsOverride')
+          await display.resize(Math.round(value.width * deviceScaleFactor), Math.round(value.height * deviceScaleFactor), deviceScaleFactor)
+          if (previousScale !== deviceScaleFactor) {
+            // Blink can round the exposed ratio to 1/64. Wait for the native DPI
+            // update before applying the logical viewport and accepting input.
+            const ready = await page.waitForFunction(scale => Math.abs(window.devicePixelRatio - scale) < 1 / 64,
+              deviceScaleFactor, { timeout: 5000, polling: 50 })
+            await ready.dispose()
+          }
           await fitDisplayWindow(session)
           // XRandR and CDP acknowledge before Chromium applies the resize.
           // Observe the renderer before accepting another input or snapshot.
@@ -572,6 +578,7 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
         if (capturing) await captureFinished
         await streams.get(page)?.resize()
         break
+      }
       case 'modifiers': await setModifiers(value.modifiers); break
       case 'cut-selection':
         if (!value.text || await selectedText() !== value.text) throw new Error('stale_observation')
@@ -644,7 +651,13 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
       case 'move': await setModifiers(value.modifiers || []); await page.mouse.move(value.x, value.y); break
       case 'wheel':
         await setModifiers(value.modifiers || [])
-        try { await page.mouse.wheel(value.x, value.y) } finally { await setModifiers([]) }
+        try {
+          if (value.position) {
+            await page.mouse.move(value.position.x, value.position.y)
+            assertCurrent(value)
+          }
+          await page.mouse.wheel(value.x, value.y)
+        } finally { await setModifiers([]) }
         break
       case 'text': await page.keyboard.insertText(value.text); break
       case 'key': await page.keyboard.press(value.key); break
@@ -699,8 +712,11 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
     await value.beforeUnloadHandled
     assertCurrent(value)
     // Observed frames stream independently; a click never waits for image encoding.
-    if (display) await frame()
-    else if (!streams.get(page)?.active && (!watching || !['move', 'wheel', 'text', 'key'].includes(action))) await freshFrame()
+    if (display) {
+      // Kasm streams pixels independently and watch already refreshes metadata.
+      // Keep rapid input off that renderer round trip; clicks/navigation still refresh immediately.
+      if (!watching || legacyPixels || !['move', 'wheel', 'text', 'key', 'modifiers', 'pointer-down'].includes(action)) await frame()
+    } else if (!streams.get(page)?.active && (!watching || !['move', 'wheel', 'text', 'key'].includes(action))) await freshFrame()
     return { page_id: pageId, ...(value.beforeUnloadCancelled
       ? { revision, outcome: { kind: 'navigation_cancelled', message: '已取消离开当前页面' } } : {}) }
   }

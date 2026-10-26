@@ -7,6 +7,19 @@ const cleanups = []
 afterEach(async () => { for (const close of cleanups.splice(0)) await close() })
 
 for (const mode of ['native', 'ptc']) {
+  for (const [reason, wording] of [['configuration_changed', '插件配置'], ['tool_definitions_changed', '插件工具定义']]) {
+    test(`${mode}: ${reason} is not misreported as missing authorization`, async () => {
+      const h = await mount({ rows: [], mode, script: [call('mcp', { name: 'changed' }, mode), response()] })
+      cleanups.push(() => h.close())
+      h.bridge.plugins = [{ id: 'g:changed', name: 'changed', available: false, unavailableReason: reason }]
+      const agent = await h.create(); await h.send(agent)
+      const request = JSON.stringify(h.adapter.requests.at(-1))
+      assert.match(request, new RegExp(reason))
+      assert.match(request, new RegExp(wording))
+      assert.doesNotMatch(request, /未获.*授权|run_authorization_required/)
+      assert.deepEqual(h.executions, [])
+    })
+  }
   test(`${mode}: complete source metadata and large callable schemas remain available together`, async () => {
     const schema = { type: 'object', properties: Object.fromEntries(Array.from({ length: 100 }, (_, i) =>
       [`field_${i}`, { type: 'string', description: 'x'.repeat(180) }])) }

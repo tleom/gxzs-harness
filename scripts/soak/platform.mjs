@@ -76,7 +76,7 @@ const simulation = await createSimulator({ ...config, extraHandler: async ({ req
     for (const server of personal.mcp ?? []) {
       plugins.push({ id: `personal:mcp:${server.id}`, name: server.call_name ?? server.id, displayName: server.name, description: server.description, scope: 'personal', available: server.status === 'ready' && server.enabled })
       if (server.status !== 'ready' || !server.enabled) continue
-      for (const tool of server.tools) tools.push({ id: `personal:mcp:${server.id}:${tool.name}`, runtime_name: `personal_mcp_${tool.name}`, scope: 'personal', group: 'mcp', provider: `personal:mcp:${server.id}`, provider_call_name: server.call_name ?? server.id, provider_name: server.name, provider_description: server.description, name: tool.name, tool_name: tool.name, server_id: server.id, description: tool.description, version: server.version, manifest_version: server.manifest_version, inputSchema: tool.inputSchema })
+      for (const tool of server.tools) tools.push({ id: `personal:mcp:${server.id}:${tool.name}`, runtime_name: `personal_mcp_${tool.name}`, scope: 'personal', group: 'mcp', provider: `personal:mcp:${server.id}`, provider_call_name: server.call_name ?? server.id, provider_name: server.name, provider_description: server.description, name: tool.name, tool_name: tool.name, server_id: server.id, description: tool.description, version: server.runtime_version, manifest_version: server.manifest_version, inputSchema: tool.inputSchema })
     }
     json(res, 200, { data: { tools, plugins } }); return true
   }

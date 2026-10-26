@@ -142,17 +142,21 @@ export class PlatformClient {
             if (cacheKey) this.configCache.delete(cacheKey)
             let message = '平台服务请求失败'
             let code
+            let requestId
             let retryAfter
             try {
               const payload = JSON.parse(Buffer.from(bytes).toString('utf8'))
               message = payload.message || payload.msg || message
-              if (typeof payload.code === 'string' && /^[A-Za-z][A-Za-z0-9_/-]{0,99}$/.test(payload.code)) code = payload.code
+              if (typeof payload.resource_code === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/.test(payload.resource_code)) code = payload.resource_code
+              else if (typeof payload.code === 'string' && /^[A-Za-z][A-Za-z0-9_/-]{0,99}$/.test(payload.code)) code = payload.code
+              if (typeof payload.request_id === 'string' && /^[a-zA-Z0-9_-]{1,128}$/.test(payload.request_id)) requestId = payload.request_id
               if (Number.isInteger(payload.retry_after) && payload.retry_after >= 0 && payload.retry_after <= 60) retryAfter = payload.retry_after
             } catch {}
             const retryHeader = response.headers.get('retry-after')
             if (retryAfter === undefined && /^\d+$/.test(retryHeader ?? '') && Number(retryHeader) <= 60) retryAfter = Number(retryHeader)
-            throw Object.assign(new Error(message), { status: response.status >= 400 && response.status < 500 ? response.status : 502, upstreamStatus: response.status,
-              ...(code ? { code } : {}), ...(retryAfter === undefined ? {} : { retry_after: retryAfter }) })
+            throw Object.assign(new Error(message), { status: response.status, upstreamStatus: response.status,
+              ...(code ? { code } : {}), ...(requestId ? { request_id: requestId } : {}),
+              ...(retryAfter === undefined ? {} : { retry_after: retryAfter }) })
           }
           const etag = response.headers.get('etag')
           if (cacheKey && etag) {
