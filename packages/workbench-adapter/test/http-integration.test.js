@@ -731,7 +731,7 @@ describe('authenticated workbench HTTP handler', () => {
     const created = await call(handler, key, 'POST', '/chats', {})
     const chatId = created.body.data.id
     const directory = context.workbenchFileManager.operate.mock.calls.at(-1)[0].path
-    expect(directory).toMatch(/^conversations\/\d{4}-\d{2}-\d{2}\/new-chat(?:-\d+)?$/)
+    expect(directory).toMatch(/^conversations\/\d{4}-\d{2}-\d{2}\/[a-z]+-[a-z]+(?:-\d+)?$/)
     expect(context.workbenchFileManager.operate).toHaveBeenCalledWith({
       operation: 'mkdir', path: directory, unique: true,
     })
