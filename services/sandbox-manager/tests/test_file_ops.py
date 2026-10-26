@@ -3,10 +3,63 @@ import importlib.util
 from pathlib import Path
 import os
 import pytest
+import uuid
 
 spec=importlib.util.spec_from_file_location('file_ops',Path(__file__).parents[1]/'file_ops.py')
 module=importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
+
+
+def test_allocation_replays_after_response_loss_and_ignores_copied_markers(root):
+    import shutil
+    payload = {'operation': 'mkdir', 'path': 'conversations/new-chat', 'unique': True, 'allocation_id': str(uuid.uuid4())}
+    first = module.operate(payload, root)
+    assert module.operate(payload, root) == first
+    shutil.copytree(Path(root) / first['path'], Path(root) / 'conversations/copied', copy_function=shutil.copy2)
+    assert module.operate(payload, root) == first
+    # The inode identity prevents a copied xattr from claiming another directory.
+    shutil.rmtree(Path(root) / first['path'])
+    assert module.operate(payload, root) == first
+    assert (Path(root) / 'conversations/copied').is_dir()
+
+
+def test_allocation_recovers_both_sides_of_atomic_publication(root, monkeypatch):
+    payload = {'operation': 'mkdir', 'path': 'conversations/new-chat', 'unique': True, 'allocation_id': str(uuid.uuid4())}
+    rename = module.rename_new
+    def interrupted(*args):
+        raise OSError('simulated interruption before publication')
+    monkeypatch.setattr(module, 'rename_new', interrupted)
+    with pytest.raises(OSError, match='interruption'):
+        module.operate(payload, root)
+    monkeypatch.setattr(module, 'rename_new', rename)
+    first = module.operate(payload, root)
+    assert module.operate(payload, root) == first
+    assert not list((Path(root) / 'conversations').glob('.allocation-*'))
+
+
+def test_concurrent_retries_reserve_one_path_per_identity(root):
+    from concurrent.futures import ThreadPoolExecutor
+    identifiers = [str(uuid.uuid4()) for _ in range(8)]
+    def create(identity):
+        return identity, module.operate({'operation': 'mkdir', 'path': 'conversations/new-chat',
+            'unique': True, 'allocation_id': identity}, root)['path']
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(create, identifiers * 3))
+    paths = {}
+    for identity, path in results:
+        assert paths.setdefault(identity, path) == path
+    assert len(set(paths.values())) == 8
+    assert 'conversations/new-chat' in paths.values()
+    assert 'conversations/new-chat-8' in paths.values()
+
+
+def test_allocation_does_not_follow_a_staging_symlink(root, tmp_path):
+    identity = str(uuid.uuid4())
+    outside = tmp_path / 'outside'; outside.mkdir()
+    (Path(root) / 'conversations' / ('.allocation-' + identity)).symlink_to(outside, target_is_directory=True)
+    with pytest.raises(OSError):
+        module.operate({'operation': 'mkdir', 'path': 'conversations/new-chat', 'unique': True, 'allocation_id': identity}, root)
+    assert list(outside.iterdir()) == []
 
 
 @pytest.fixture

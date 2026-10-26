@@ -50,6 +50,13 @@ export class WorkbenchDatabase {
         deleted_at INTEGER
       );
       CREATE INDEX IF NOT EXISTS chats_owner_updated ON chats(owner_id, updated_at DESC);
+      CREATE TABLE IF NOT EXISTS chat_drafts (
+        owner_id TEXT NOT NULL,
+        draft_id TEXT NOT NULL,
+        state_json TEXT NOT NULL,
+        PRIMARY KEY(owner_id, draft_id)
+      );
+      CREATE INDEX IF NOT EXISTS chat_drafts_chat ON chat_drafts(owner_id, json_extract(state_json, '$.chatId'));
       CREATE TABLE IF NOT EXISTS chat_deletions (
         chat_id TEXT PRIMARY KEY,
         owner_id TEXT NOT NULL,
@@ -273,6 +280,28 @@ export class WorkbenchDatabase {
       return this.getChat(ownerId, id)
     })
     return create()
+  }
+
+  draft(ownerId, draftId) {
+    const row = this.db.prepare('SELECT state_json FROM chat_drafts WHERE owner_id=? AND draft_id=?').get(ownerId, draftId)
+    return row ? JSON.parse(row.state_json) : undefined
+  }
+
+  drafts(ownerId) {
+    return this.db.prepare('SELECT state_json FROM chat_drafts WHERE owner_id=?').all(ownerId).map(row => JSON.parse(row.state_json))
+  }
+
+  draftForChat(ownerId, chatId) {
+    const row = this.db.prepare("SELECT state_json FROM chat_drafts WHERE owner_id=? AND json_extract(state_json, '$.chatId')=?")
+      .get(ownerId, chatId)
+    return row ? JSON.parse(row.state_json) : undefined
+  }
+
+  saveDraft(ownerId, draft) {
+    this.db.prepare(`INSERT INTO chat_drafts(owner_id,draft_id,state_json) VALUES(?,?,?)
+      ON CONFLICT(owner_id,draft_id) DO UPDATE SET state_json=excluded.state_json`)
+      .run(ownerId, draft.id, JSON.stringify(draft))
+    return draft
   }
 
   getChat(ownerId, id) {

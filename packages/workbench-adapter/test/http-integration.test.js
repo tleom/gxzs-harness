@@ -83,6 +83,22 @@ function setup({ databasePath = ':memory:', configure = () => {} } = {}) {
   return { handler, key, context }
 }
 
+it('authenticates draft reference reads without creating a persistent conversation', async () => {
+  const { handler, key, context } = setup({ configure: context => {
+    context.sessionQuery = { listSessions: vi.fn(async () => []) }
+    context.sessionReferenceResolver = { config: { candidateLimit: 50 }, listSessionCandidates: vi.fn(async () => []) }
+    context.sessionController.create = vi.fn(context.sessionController.create)
+  } })
+  const route = '/chats/draft/references?query=case'
+  expect(await call(handler, key, 'GET', route)).toMatchObject({ status: 200, body: { data: [] } })
+  expect((await call(handler, key, 'GET', route, undefined, false)).status).toBe(401)
+  expect((await call(handler, key, 'GET', route, undefined, true, 'other')).status).toBe(403)
+  expect((await call(handler, key, 'GET', route + '&workspace_id=foreign')).status).toBe(404)
+  expect(context.sessionController.create).not.toHaveBeenCalled()
+  expect(context.workbenchFileManager.operate.mock.calls.every(([value]) => value.operation === 'stat')).toBe(true)
+  expect(await call(handler, key, 'GET', '/chats')).toMatchObject({ status: 200, body: { data: [] } })
+})
+
 it('refuses new admission while native MCP registration is unavailable', async () => {
   const { handler, key, context } = setup()
   const chat = (await call(handler, key, 'POST', '/chats', {})).body.data
@@ -358,12 +374,12 @@ describe('authenticated workbench HTTP handler', () => {
     const runtime = context.reflect.provide.mock.calls.find(([name]) => name === 'workbenchRuntime')[1]
     const sessionId = runtime.database.getChat('t:42', chat.id).sessionId
     runtime.hasOwnedWork = vi.fn(id => id === sessionId)
-    const response = await call(handler, key, 'DELETE', '/files', { path: `${chat.file_directory}/a.txt` })
+    const response = await call(handler, key, 'DELETE', '/files', { path: `${chat.file_directory}/a.txt`, version: 'sha256-v1' })
     expect(response.status).toBe(409)
     expect(context.workbenchFileManager.operate.mock.calls.some(([request]) => request.operation === 'delete')).toBe(false)
-    expect((await call(handler, key, 'DELETE', '/files', { path: 'case/a.txt' })).status).toBe(200)
+    expect((await call(handler, key, 'DELETE', '/files', { path: 'case/a.txt', version: 'sha256-v1' })).status).toBe(200)
     runtime.hasOwnedWork = () => false
-    expect((await call(handler, key, 'DELETE', '/files', { path: `${chat.file_directory}/a.txt` })).status).toBe(200)
+    expect((await call(handler, key, 'DELETE', '/files', { path: `${chat.file_directory}/a.txt`, version: 'sha256-v1' })).status).toBe(200)
   })
   it('returns the directory warning before any file operation for a live conversation or its parent', async () => {
     const { handler, key, context } = setup()
@@ -371,7 +387,7 @@ describe('authenticated workbench HTTP handler', () => {
     context.workbenchFileManager.operate.mockClear()
     for (const path of [chat.file_directory, chat.file_directory.split('/').slice(0, -1).join('/')]) {
       const response = await call(handler, key, 'DELETE', '/files', { path, version: 'v1' })
-      expect(response).toMatchObject({ status: 409, body: { code: 'DIRECTORY_IN_USE', message: '文件已绑定会话，暂不可删除' } })
+      expect(response).toMatchObject({ status: 409, body: { code: 'DIRECTORY_IN_USE', message: '文件夹包含会话：新会话，请先删除会话' } })
     }
     expect(context.workbenchFileManager.operate).not.toHaveBeenCalled()
   })

@@ -1,4 +1,5 @@
 import { httpError } from './http.js'
+import { isDraftId } from './drafts.js'
 
 const uuid = /^[a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12}$/i
 
@@ -16,9 +17,10 @@ export class SidebarLeases {
       throw httpError(400, '侧栏窗口参数无效')
     const resources = new Map()
     for (const item of request.resources) {
-      if (!['browser', 'terminal'].includes(item.kind) || !uuid.test(item.id) || !uuid.test(item.chat_id))
+      if (!['browser', 'terminal'].includes(item.kind) || !uuid.test(item.id) || (!uuid.test(item.chat_id) && !isDraftId(item.chat_id)))
         throw httpError(400, '侧栏资源参数无效')
-      this.service.requireChat(owner, item.chat_id)
+      const context = (this.service.resourceContext ?? this.service.requireChat).call(this.service, owner, item.chat_id)
+      if (!context) throw httpError(404, '资源所属会话不存在')
       resources.set(`${item.kind}:${item.id}`, item)
     }
     const key = `${owner.ownerId}/${request.window_id}`
@@ -63,10 +65,10 @@ export class SidebarLeases {
     }
   }
   async retain(owner, resource, signal) {
-    const chat = this.service.requireChat(owner, resource.chat_id)
+    const chat = (this.service.resourceContext ?? this.service.requireChat).call(this.service, owner, resource.chat_id)
     if (resource.kind === 'browser') {
       const browser = this.browsers.require(owner, resource.id)
-      if (browser.chatId !== resource.chat_id) throw httpError(403, '浏览器不属于当前对话')
+      if (browser.chatId !== chat.id) throw httpError(403, '浏览器不属于当前对话')
       return { release: browser.retainWindow(), live: () => !browser.closed }
     }
     const native = this.terminals.native

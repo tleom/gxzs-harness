@@ -7,7 +7,7 @@ afterEach(()=>vi.useRealTimers())
 function fixture() {
   let holds=0, nativeHolds=0
   const browser={chatId:chat,closed:false,retainWindow:()=>{holds++;return()=>{holds--}}}
-  const service={requireChat:(_,value)=>{if(value!==chat)throw Object.assign(new Error('denied'),{status:403});return{sessionId:'session'}}}
+  const service={requireChat:(_,value)=>{if(value!==chat)throw Object.assign(new Error('denied'),{status:403});return{id:chat,sessionId:'session'}}}
   const native={list:()=>[{id}], async *retain(session,terminal,signal){
     expect([session,terminal]).toEqual(['session',id]);nativeHolds++
     try{yield{type:'retained'};await new Promise(resolve=>{signal.addEventListener('abort',resolve,{once:true});if(signal.aborted)resolve()})}

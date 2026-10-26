@@ -15,7 +15,7 @@ import { isSkillPackage, SKILL_JSON_BYTES } from './skill-import.js'
 import { streamRunEvents } from './sse.js'
 import { streamHistoryEvents, streamNativeEvents } from './history-events.js'
 import { WorkbenchDatabase } from './persistence.js'
-import { resolveWorkspacePath } from './paths.js'
+import { containsWorkspacePath, resolveWorkspacePath } from './paths.js'
 import { claimNeedsResources, createAssistantStreamProjector, prepareRecoveredInboxes, projectInboxClaim, projectSessionEvent, reconcileNativeSessions, settleNativeIdle } from './projection.js'
 import { WorkbenchRuntime } from './runtime.js'
 import { WorkbenchService } from './service.js'
@@ -33,6 +33,7 @@ import { WorkbenchSubagents } from './subagents.js'
 import { WorkbenchTerminals } from './terminals.js'
 import { WorkbenchBrowsers } from './browsers.js'
 import { SidebarLeases } from './sidebar-leases.js'
+import { dateDirectory } from './drafts.js'
 import { registerBrowserTool } from './browser-tool.js'
 import { browserClient } from './browser-client.js'
 import { registerTerminalTool } from './terminal-tool.js'
@@ -150,6 +151,35 @@ export function apply(ctx, config) {
     const resolved = await ctx.sessionController.resolveAgent(sessionId)
     if ('error' in resolved) throw resolved.error
     await Promise.all(items.map(item => ctx.terminalController.close(resolved.agent, item.id)))
+  }
+  service.closeBrowsers = (owner, chatId) => browsers.closeChat(owner, chatId)
+  service.adoptDraftResources = (owner, draftId, chat) => browsers.adopt(owner, draftId, chat)
+  service.closeDraftResources = async (owner, draft) => {
+    await browsers.closeChat(owner, draft.id)
+    await service.closeTerminals(draft.sessionId)
+  }
+  service.closeUnboundPathResources = async (owner, directory) => {
+    for (const [key, slot] of browsers.slots) {
+      if (slot.ownerId !== owner.ownerId || (slot.chatId && database.getChat(owner.ownerId, slot.chatId))) continue
+      const root = service.directories.relative(slot.worker.directory || '/workspace')
+      if (containsWorkspacePath(directory, root) || containsWorkspacePath(root, directory))
+        await browsers.close(owner, key.slice(owner.ownerId.length + 1))
+    }
+  }
+  service.closeUnboundWorkspaceSessions = async (owner, workspaceIds) => {
+    if (!workspaceIds.length) return
+    const abort = new AbortController()
+    const source = ctx.workspaceController.follow(abort.signal)[Symbol.asyncIterator]()
+    let items
+    try { items = (await source.next()).value?.value?.items ?? [] }
+    finally { abort.abort(); await source.return?.() }
+    const ids = new Set(items.filter(item => workspaceIds.includes(item.workspaceId)).flatMap(item => item.sessionIds))
+    for (const sessionId of ids) {
+      if (database.getChatBySession(sessionId)) throw httpError(409, '文件夹中仍有有效会话', 'DIRECTORY_IN_USE')
+      await ctx.workspaceController.archiveSession({ sessionId, stopActivity: true })
+      await service.closeTerminals(sessionId)
+      await service.permanentDeletion.erase({ sessionIds: [sessionId] })
+    }
   }
   service.subscribeGoal = (sessionId, listener) => ctx.on('goal/activation-changed', event => {
     if (event.sessionId === sessionId) listener()
@@ -296,7 +326,7 @@ export function apply(ctx, config) {
     })))
     return {
       resources_pending: modelsOnly,
-      dsh_version: '0.2.1-rc.2', schedule_protocol: 1, schedule_notification_protocol: 1, schedule_creation_protocol: 1, subagent_protocol: 1, terminal_protocol: 1, browser_protocol: 1, browser_input_protocol: 2, job_protocol: 1,
+      dsh_version: '0.2.1-rc.2', draft_resource_protocol: 1, draft_directory: dateDirectory(), schedule_protocol: 1, schedule_notification_protocol: 1, schedule_creation_protocol: 1, subagent_protocol: 1, terminal_protocol: 1, browser_protocol: 1, browser_input_protocol: 2, job_protocol: 1,
       activity_protocol: 1, sidebar_lease_protocol: 1, human_input_protocol: 1, followup_protocol: 1, history_protocol: 1, native_history_protocol: 1,
       ...(ctx.get('clientModules') ? { native_client_protocol: 1, native_session_client_protocol: 2, native_schedule_client_protocol: 1,
         ...(ctx.sessionReferenceResolver.listSessionCandidates && ctx.get('fileReferences')?.listObserved ? { native_subagent_reference_protocol: 1 } : {}),
@@ -420,6 +450,25 @@ export function apply(ctx, config) {
     ['GET', /^\/native\/settings$/, async (_context, res) => sendJson(res, 200, { data: subagentSettings.describe() })],
     ['POST', /^\/native\/settings\/mutate$/, async ({ owner, body }, res) => sendJson(res, 200, { data: await subagentSettings.mutate(owner, parseJson(body)) })],
     ['GET', /^\/native\/models$/, async ({ owner }, res) => sendJson(res, 200, { data: await databaseModelCatalog(ctx.workbenchPlatformClient, ctx.sessionController, owner, ctx.settings) })],
+    ['GET', /^\/chats\/draft\/references$/, async ({ owner, url }, res) => withResponseSignal(res, async signal => {
+      const data = await service.draftReferenceCandidates(owner, url.searchParams.get('workspace_id') ?? undefined,
+        url.searchParams.get('query') || '', signal, url.searchParams.get('draft_id') ?? undefined)
+      if (!signal.aborted) sendJson(res, 200, { data })
+    })],
+    ['POST', /^\/drafts\/([\w-]+)\/resources$/, async ({ owner, json }, res, match) => {
+      const value = await service.drafts.resources(owner, `draft:${match[1]}`, json.workspaceId)
+      sendJson(res, 200, { data: { id: value.id, directory: value.directory } })
+    }],
+    ['GET', /^\/drafts\/([\w-]+)$/, async ({ owner }, res, match) => {
+      const draft = service.drafts.get(owner, `draft:${match[1]}`)
+      if (!draft || draft.closed || draft.closing) throw httpError(404, '草稿资源不存在或已经关闭')
+      const value = service.resourceContext(owner, draft.id)
+      sendJson(res, 200, { data: { id: value.id, directory: value.directory, workspaceId: draft.workspaceId } })
+    }],
+    ['DELETE', /^\/drafts\/([\w-]+)$/, async ({ owner }, res, match) => {
+      await service.directories.run(owner, () => service.drafts.close(owner, `draft:${match[1]}`))
+      sendJson(res, 200, { data: {} })
+    }],
     ['GET', /^\/chats\/([\w-]+)\/references$/, async ({ owner, url }, res, match) => {
       const abort = new AbortController()
       const disconnected = () => abort.abort()
@@ -441,7 +490,7 @@ export function apply(ctx, config) {
       const abort = new AbortController()
       const cancel = () => abort.abort()
       res.on('close', cancel)
-      try { sendJson(res, 201, { data: await browsers.create(owner, json, abort.signal) }) }
+      try { sendJson(res, 201, { data: await service.directories.run(owner, () => browsers.create(owner, json, abort.signal)) }) }
       finally { res.off('close', cancel) }
     }],
     ['GET', /^\/browser-client$/, async (_context, res) => sendJson(res, 200, { data: await browserClient() })],
@@ -463,19 +512,19 @@ export function apply(ctx, config) {
     ['DELETE', /^\/browsers\/([\w-]+)$/, async ({ owner }, res, match) => {
       await browsers.close(owner, match[1]); sendJson(res, 200, { data: {} })
     }],
-    ['GET', /^\/chats\/([\w-]+)\/terminals$/, async ({ owner }, res, match) => sendJson(res, 200, { data: terminals.list(owner, match[1]) })],
-    ['POST', /^\/chats\/([\w-]+)\/terminals$/, async ({ owner, json }, res, match) => {
+    ['GET', /^\/chats\/([\w:-]+)\/terminals$/, async ({ owner }, res, match) => sendJson(res, 200, { data: terminals.list(owner, match[1]) })],
+    ['POST', /^\/chats\/([\w:-]+)\/terminals$/, async ({ owner, json }, res, match) => {
       const abort = new AbortController()
       const disconnected = () => abort.abort()
       res.once('close', disconnected)
       try {
-        const data = await terminals.create(owner, match[1], json, abort.signal)
+        const data = await service.directories.run(owner, () => terminals.create(owner, match[1], json, abort.signal))
         if (!abort.signal.aborted) sendJson(res, 201, { data })
       } finally { res.off('close', disconnected) }
     }],
-    ['GET', /^\/chats\/([\w-]+)\/terminals\/([\w-]+)\/events$/, async ({ owner, url }, res, match) => streamNativeEvents({ res, follow: signal => terminals.follow(owner, match[1], match[2], url.searchParams.get('attachment'), signal) })],
-    ['POST', /^\/chats\/([\w-]+)\/terminals\/([\w-]+)\/(write|resize)$/, async ({ owner, json }, res, match) => { await terminals.control(owner, match[1], match[2], match[3], json); sendJson(res, 200, { data: {} }) }],
-    ['DELETE', /^\/chats\/([\w-]+)\/terminals\/([\w-]+)$/, async ({ owner }, res, match) => { await terminals.control(owner, match[1], match[2], 'close', {}); sendJson(res, 200, { data: {} }) }],
+    ['GET', /^\/chats\/([\w:-]+)\/terminals\/([\w-]+)\/events$/, async ({ owner, url }, res, match) => streamNativeEvents({ res, follow: signal => terminals.follow(owner, match[1], match[2], url.searchParams.get('attachment'), signal) })],
+    ['POST', /^\/chats\/([\w:-]+)\/terminals\/([\w-]+)\/(write|resize)$/, async ({ owner, json }, res, match) => { await terminals.control(owner, match[1], match[2], match[3], json); sendJson(res, 200, { data: {} }) }],
+    ['DELETE', /^\/chats\/([\w:-]+)\/terminals\/([\w-]+)$/, async ({ owner }, res, match) => { await terminals.control(owner, match[1], match[2], 'close', {}); sendJson(res, 200, { data: {} }) }],
     ['GET', /^\/chats\/([\w-]+)\/jobs\/events$/, async ({ owner, url }, res, match) =>
       streamNativeEvents({ res, follow: signal => jobs.list(owner, match[1], signal, url.searchParams.get('session_id')) })],
     ['GET', /^\/chats\/([\w-]+)\/jobs\/([\w-]{1,128})\/events$/, async ({ owner, url }, res, match) =>
@@ -576,7 +625,7 @@ export function apply(ctx, config) {
       const defaultModel = catalog.default ? `${catalog.default.provider}/${catalog.default.model}` : ''
       const chat = await service.createChat(owner, config.workspace, {
         model: defaultModel, tools: [], skills: [], knowledge: [], model_parameters: {}, tool_parameters: {},
-      }, json.workspaceId, json.directoryName)
+      }, json.workspaceId, json.directoryName, json.draft_id, json.submission)
       sendJson(res, 201, { data: service.getChat(owner, chat.id) })
     }],
     ['GET', /^\/chats\/([\w-]+)$/, async ({ owner }, res, match) => {
@@ -658,6 +707,11 @@ export function apply(ctx, config) {
     }],
     ['GET', /^\/files$/, async ({ url }, res) => withResponseSignal(res, async signal => {
       const requested = managerPath(url.searchParams.get('path') || '.', { allowRoot: true })
+      if (/^conversations\/\d{4}-\d{2}-\d{2}$/.test(requested)
+        && (await ctx.workbenchFileManager.operate({ operation: 'stat', path: requested }, signal)).kind === 'missing') {
+        sendJson(res, 200, { data: { entries: [] } })
+        return
+      }
       const result = await ctx.workbenchFileManager.operate({ operation: 'list', path: requested, ...(url.searchParams.get('cursor') ? { cursor: url.searchParams.get('cursor') } : {}) }, signal)
       signal.throwIfAborted()
       if (result.conflict) throw httpError(409, result.message || '目录已改变，请刷新后重试')
@@ -681,7 +735,8 @@ export function apply(ctx, config) {
       if (typeof json.data !== 'string') throw httpError(400, '缺少 data')
       const bytes = Buffer.from(json.data, 'base64')
       if (bytes.length > 100 * 1024 * 1024) throw httpError(413, '文件超过 100 MiB')
-      const result = await ctx.workbenchFileManager.operate({ operation: 'upload', path: requested, version: json.version ?? null, data: json.data })
+      const result = await service.directories.writeFile(owner, requested,
+        () => ctx.workbenchFileManager.operate({ operation: 'upload', path: requested, version: json.version ?? null, data: json.data }))
       sendJson(res, 200, { data: result })
     }],
     ['DELETE', /^\/files$/, async ({ owner, json }, res) => {
@@ -689,8 +744,10 @@ export function apply(ctx, config) {
       const result = await service.directories.deleteFile(owner, requested, json.version ?? null)
       sendJson(res, 200, { data: result })
     }],
-    ['POST', /^\/files\/directories$/, async ({ json }, res) => {
-      const result = await ctx.workbenchFileManager.operate({ operation: 'mkdir', path: managerPath(json.path), exclusive: true })
+    ['POST', /^\/files\/directories$/, async ({ owner, json }, res) => {
+      const requested = managerPath(json.path)
+      const result = await service.directories.writeFile(owner, requested,
+        () => ctx.workbenchFileManager.operate({ operation: 'mkdir', path: requested, exclusive: true }))
       sendJson(res, 200, { data: result })
     }],
     ['GET', /^\/files\/download$/, async ({ url }, res) => withResponseSignal(res, async signal => {
@@ -800,7 +857,8 @@ export function apply(ctx, config) {
             if (upload.metadata.operation !== 'upload') throw httpError(400, '文件上传操作无效')
             upload.metadata.path = managerPath(upload.metadata.path)
           } else if (!['skill_inspect', 'skill_import', 'skill_stage'].includes(upload.metadata.operation)) throw httpError(400, '技能包上传操作无效')
-          const result = action === 'files' ? await ctx.workbenchFileManager.upload(action, upload, signal)
+          const result = action === 'files' ? await service.directories.writeFile(owner, upload.metadata.path,
+            () => ctx.workbenchFileManager.upload(action, upload, signal))
             : await service.mutateResource(upload.metadata, owner, metadata => ctx.workbenchFileManager.upload(action, { ...upload, metadata }, signal), signal)
           if (action === 'personal-resources' && upload.metadata.operation === 'skill_import') ctx.emit('workbench/resources-changed')
           sendJson(res, 200, { data: result })

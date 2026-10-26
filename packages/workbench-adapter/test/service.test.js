@@ -13,7 +13,7 @@ import { HumanInputBridge } from '../src/human-input.js'
 function referenceResolver(test, candidates) {
   test.service.sessionQuery = { listSessions: vi.fn(async () => candidates),
     observeSession: async () => ({ header: { cwd: test.service.chatDirectory(test.chat.id) } }) }
-  test.service.sessionReferences = { config: { candidateLimit: 50 }, listCandidates: vi.fn(async () => candidates) }
+  test.service.sessionReferences = { config: { candidateLimit: 50 }, listSessionCandidates: vi.fn(async () => candidates) }
 }
 
 const opened = []
@@ -315,6 +315,36 @@ it('persists inline plugin positions and canonical names while keeping the displ
   expect(service.getRun(owner, run.id).mentioned_resources).toEqual([{ kind: 'tools', id: 'law', name: '法律检索', offset: 3 }])
 })
 
+it('reads draft references without allocating a chat, session or directory', async () => {
+  const { service, owner, chat, database, sessionController, fileManager } = setup()
+  service.sessionQuery = { listSessions: vi.fn(async () => [{ header: { id: chat.sessionId } }]) }
+  service.sessionReferences = { config: { candidateLimit: 50 }, listSessionCandidates: vi.fn(async () => [
+    { sessionId: chat.sessionId, label: '案件', cwd: '/workspace/private' },
+    { sessionId: 'foreign', label: '外部' },
+  ]) }
+  service.fileReferences = { listObserved: vi.fn(async () => [{ path: '证据.md', kind: 'file' }]) }
+  service.workspaces = {
+    baseline: vi.fn(async () => ({ archivedSessionIds: [] })),
+    requireWorkspace: vi.fn(async () => ({ workspaceId: 'cases', path: 'cases' })),
+  }
+  const signal = new AbortController().signal
+  expect(await service.draftReferenceCandidates(owner, undefined, '案件', signal))
+    .toMatchObject([{ path: '证据.md' }, { chatId: chat.id, label: '案件' }])
+  expect(service.fileReferences.listObserved).toHaveBeenCalledWith({ header: { id: 'draft:ungrouped', cwd: expect.stringMatching(/^\/workspace\/conversations\/\d{4}-\d{2}-\d{2}$/) } }, '案件', signal)
+  expect(service.workspaces.requireWorkspace).not.toHaveBeenCalled()
+  const candidates = await service.draftReferenceCandidates(owner, 'cases', '案件', signal)
+  expect(candidates.map(item => item.path ?? item.sessionId)).toEqual(['证据.md', chat.sessionId])
+  expect(candidates[1]).not.toHaveProperty('cwd')
+  expect(service.workspaces.requireWorkspace).toHaveBeenCalledWith(owner, 'cases', true)
+  expect(service.fileReferences.listObserved).toHaveBeenCalledWith(
+    { header: { id: 'draft:cases', cwd: '/workspace/conversations/cases' } }, '案件', signal)
+  service.workspaces.requireWorkspace.mockRejectedValueOnce(Object.assign(new Error('missing'), { status: 404 }))
+  await expect(service.draftReferenceCandidates(owner, 'foreign', '', signal)).rejects.toMatchObject({ status: 404 })
+  expect(database.listChats(owner.ownerId)).toHaveLength(1)
+  expect(sessionController.create).not.toHaveBeenCalled()
+  expect(fileManager.operate.mock.calls.every(([value]) => value.operation === 'stat')).toBe(true)
+})
+
 it('uses an observed child target while sharing native ranking and platform archive visibility', async () => {
   const test=setup(), {service,owner,chat}=test
   const observed={header:{id:'child',parentSession:chat.sessionId,cwd:'/workspace/child'}}
@@ -333,9 +363,6 @@ it('uses an observed child target while sharing native ranking and platform arch
   const files=service.fileReferences
   service.fileReferences=undefined
   expect((await service.observedReferenceCandidates(owner,observed,'',signal)).map(item=>item.sessionId)).toEqual([chat.sessionId])
-  service.fileReferences={list:vi.fn()}
-  await expect(service.observedReferenceCandidates(owner,observed,'',signal)).rejects.toMatchObject({status:503})
-  expect(service.fileReferences.list).not.toHaveBeenCalled()
   service.fileReferences=files
   service.workspaces={baseline:async()=>({archivedSessionIds:[chat.sessionId]})}
   expect(await service.observedReferenceCandidates(owner,observed,'',signal)).toHaveLength(1)
@@ -546,13 +573,13 @@ describe('followup and control service', () => {
     const test = setup()
     const { service, owner, chat, agent } = test
     const signal = new AbortController().signal
-    service.fileReferences = { list: vi.fn(async () => [{ path: '证据 原件.pdf', kind: 'file' }, { path: '材料', kind: 'directory' }]) }
+    service.fileReferences = { listObserved: vi.fn(async () => [{ path: '证据 原件.pdf', kind: 'file' }, { path: '材料', kind: 'directory' }]) }
     referenceResolver(test, [{ sessionId: chat.sessionId, label: '当前对话' }])
     const candidates = await service.referenceCandidates(owner, chat.id, '证据', signal)
     expect(candidates.map(item => item.group ?? 'sessions')).toEqual(['files', 'files', 'sessions'])
     expect(candidates[0]).toMatchObject({ path: '证据 原件.pdf', kind: 'file' })
-    expect(service.fileReferences.list).toHaveBeenCalledWith(agent, '证据', signal)
-    expect(service.sessionReferences.listCandidates).toHaveBeenCalledWith(agent, '证据', 1, signal)
+    expect(service.fileReferences.listObserved).toHaveBeenCalledWith({ header: { cwd: service.chatDirectory(chat.id) } }, '证据', signal)
+    expect(service.sessionReferences.listSessionCandidates).toHaveBeenCalledWith({ cwd: service.chatDirectory(chat.id) }, '证据', 1, signal)
   })
   it('uses native reference candidates and keeps only owner conversations without host paths', async () => {
     const test = setup()
@@ -565,7 +592,7 @@ describe('followup and control service', () => {
     expect(await service.referenceCandidates(owner, chat.id, '案件')).toEqual([
       { sessionId: 'source', chatId: source.id, label: '案件', mention: '@[案件](dsh-session:InNvdXJjZSI)' },
     ])
-    expect(service.sessionReferences.listCandidates).toHaveBeenCalledWith(agent, '案件', 2, expect.any(AbortSignal))
+    expect(service.sessionReferences.listSessionCandidates).toHaveBeenCalledWith({ cwd: service.chatDirectory(chat.id) }, '案件', 2, expect.any(AbortSignal))
     await expect(service.referenceCandidates({ ownerId: 'other' }, chat.id)).rejects.toMatchObject({ status: 404 })
   })
   it('excludes archived native sessions from reference candidates and restores them after unarchiving', async () => {
@@ -574,7 +601,7 @@ describe('followup and control service', () => {
     const source = database.createChat({ ownerId: owner.ownerId, sessionId: 'source', selection: {} })
     let archivedSessionIds = ['source']
     service.workspaces = { baseline: vi.fn(async () => ({ archivedSessionIds })) }
-    service.fileReferences = { list: vi.fn(async () => [{ path: '证据.pdf', kind: 'file' }]) }
+    service.fileReferences = { listObserved: vi.fn(async () => [{ path: '证据.pdf', kind: 'file' }]) }
     referenceResolver(test, [{ sessionId: 'source', label: '案件' }])
     const signal = new AbortController().signal
     expect(await service.referenceCandidates(owner, chat.id, '', signal)).toEqual([
@@ -611,7 +638,7 @@ describe('followup and control service', () => {
     for (const sessionId of ['empty', 'session-untitled']) database.createChat({ ownerId: owner.ownerId, sessionId, selection: {} })
     const sessions = [{ sessionId: 'empty', blank: true }, { sessionId: 'session-untitled', blank: false }]
     service.workspaces = { baseline: vi.fn(async () => ({ sessions })) }
-    service.fileReferences = { list: vi.fn(async () => [{ path: '材料.pdf', kind: 'file' }]) }
+    service.fileReferences = { listObserved: vi.fn(async () => [{ path: '材料.pdf', kind: 'file' }]) }
     referenceResolver(test, [{ sessionId: 'empty', label: '已命名的空会话' }, { sessionId: 'session-untitled', label: 'session-untitled' }])
     expect((await service.referenceCandidates(owner, chat.id)).map(item => item.sessionId ?? item.path))
       .toEqual(['材料.pdf', 'session-untitled'])
@@ -646,10 +673,12 @@ describe('followup and control service', () => {
       records.push({ header: { id: `child-${index}`, parentSession: chat.sessionId, cwd, createdAt: 110 + index } })
     const ctx = new Context()
     try {
-      ctx.provide('sessionQuery', { listSessions: vi.fn(async () => records) })
+      ctx.provide('sessionQuery', { listSessions: vi.fn(async () => records), observeSession: async () => ({ header: { cwd } }) })
       service.sessionQuery = ctx.sessionQuery
       agent.session = { header: { cwd } }
       service.sessionReferences = new SessionReferences(ctx)
+      // Production prepare-session-references exposes this same read-only scope.
+      service.sessionReferences.listSessionCandidates = (header, ...args) => service.sessionReferences.listCandidates({ id: header.id, session: { header } }, ...args)
       service.workspaces = { baseline: async () => ({ archivedSessionIds, sessions }) }
       const candidates = await service.referenceCandidates(owner, chat.id)
       expect(candidates).toHaveLength(50)

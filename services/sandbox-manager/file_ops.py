@@ -3,6 +3,7 @@ import base64
 import bisect
 import ctypes
 import errno
+import fcntl
 import hashlib
 import io
 import json
@@ -322,6 +323,69 @@ def rename_new(source_fd, source, target_fd, target):
         raise OSError(code, os.strerror(code))
 
 
+def allocate_directory(fd, name, payload, path):
+    """Replay one allocation after a lost response or a crash around publication."""
+    identity = payload['allocation_id']
+    if not isinstance(identity, str) or str(uuid.UUID(identity)) != identity:
+        raise ValueError('Invalid directory allocation identity')
+    attribute = 'user.gxzs.directory-allocation'
+    temporary = '.allocation-' + identity
+    def marker(child):
+        info = os.fstat(child)
+        return f'{identity}:{info.st_dev}:{info.st_ino}'.encode()
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        for candidate in os.listdir(fd):
+            if candidate == temporary:
+                continue
+            try:
+                child = os.open(candidate, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            except OSError as error:
+                if error.errno in (errno.ENOENT, errno.ENOTDIR, errno.ELOOP):
+                    continue
+                raise
+            try:
+                try:
+                    if os.getxattr(child, attribute) == marker(child):
+                        return {'path': os.path.join(os.path.dirname(path), candidate)}
+                except OSError as error:
+                    if error.errno != errno.ENODATA:
+                        raise
+            finally:
+                os.close(child)
+        try:
+            os.mkdir(temporary, mode=0o700, dir_fd=fd)
+        except FileExistsError:
+            pass
+        child = os.open(temporary, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+        try:
+            try:
+                recorded = os.getxattr(child, attribute)
+            except OSError as error:
+                if error.errno != errno.ENODATA:
+                    raise
+                if os.listdir(child):
+                    raise ValueError('Directory allocation path is occupied')
+                recorded = marker(child)
+                os.setxattr(child, attribute, recorded)
+            if recorded != marker(child):
+                raise ValueError('Directory allocation identity changed')
+            os.fsync(child)
+        finally:
+            os.close(child)
+        original, suffix = name, 1
+        while True:
+            try:
+                rename_new(fd, temporary, fd, name)
+                os.fsync(fd)
+                return {'path': os.path.join(os.path.dirname(path), name)}
+            except FileExistsError:
+                suffix += 1
+                name = f'{original}-{suffix}'
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+
+
 def copy_entry(source_fd, source, target_fd, target):
     info = os.stat(source, dir_fd=source_fd, follow_symlinks=False)
     if stat.S_ISDIR(info.st_mode):
@@ -432,6 +496,10 @@ def operate(payload, root="/workspace"):
             return {"path": path, "kind": "missing"}
     try:
         if operation == "mkdir":
+            if payload.get('allocation_id') is not None:
+                if payload.get('unique') is not True:
+                    raise ValueError('Allocation requires a unique directory')
+                return allocate_directory(fd, name, payload, path)
             original, suffix = name, 1
             while True:
                 try:

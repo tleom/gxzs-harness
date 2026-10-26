@@ -1,4 +1,5 @@
 import path from 'node:path'
+import { createHash } from 'node:crypto'
 import { containsWorkspacePath, resolveWorkspacePath } from './paths.js'
 import { httpError } from './http.js'
 
@@ -52,17 +53,71 @@ export class DirectoryLifecycle {
     return !this.service.database.pendingWorkspaceDeletions(owner.ownerId).some(item => overlaps(directory, item.path))
   }
 
+  writeFile(owner, requested, operation) {
+    return this.run(owner, async () => {
+      const directory = this.relative(requested)
+      this.assertAvailable(owner, directory)
+      const date = /^(conversations\/\d{4}-\d{2}-\d{2})\//.exec(directory)?.[1]
+      // Explicit file writes may create their date container; reads never do.
+      if (date && (await this.service.fileManager.operate({ operation: 'stat', path: date })).kind === 'missing')
+        await this.service.fileManager.operate({ operation: 'mkdir', path: date })
+      return operation()
+    })
+  }
+
   async deleteFile(owner, requested, version) {
     return this.run(owner, async () => {
       const directory = this.relative(requested)
-      const chats = this.service.database.directoryChats(owner.ownerId)
-      this.assertInactive(owner, [directory], chats, '删除')
-      // Check ancestors too: deleting a date folder must not bypass protection.
-      if (chats.some(chat => containsWorkspacePath(directory, this.chatPath(chat)))
-        || (await this.workspaces(owner)).some(item => containsWorkspacePath(directory, this.workspacePath(item)))
-        || this.service.database.pendingWorkspaceDeletions(owner.ownerId).some(item => overlaps(directory, item.path)))
-        throw protectedDirectory()
-      return this.service.fileManager.operate({ operation: 'delete', path: directory, version })
+      const { service } = this, db = service.database
+      // Read the complete binding set, including hidden deletion remnants, but
+      // only surviving chats prevent an ordinary folder delete.
+      const chats = db.directoryChats(owner.ownerId)
+      const deleting = new Set(db.pendingWorkspaceDeletions(owner.ownerId).flatMap(plan => plan.chatIds))
+      const live = chats.filter(chat => db.getChat(owner.ownerId, chat.id) && !db.chatDeletion(owner.ownerId, chat.id) && !deleting.has(chat.id))
+      this.assertInactive(owner, [directory], live, '删除')
+      const bound = live.filter(chat => containsWorkspacePath(directory, this.chatPath(chat)))
+      if (bound.length) throw httpError(409, `文件夹包含会话：${bound.slice(0, 5).map(chat => chat.title).join('、')}，请先删除会话`, 'DIRECTORY_IN_USE')
+      // Keep system roots under the file manager's existing boundary. Never
+      // stop resources before discovering that such a target is forbidden.
+      if (['.', 'conversations', 'mcp', 'skills'].includes(directory)) throw httpError(400, '系统目录不能删除')
+      const key = `file:${createHash('sha256').update(`${owner.ownerId}\0${directory}`).digest('hex')}`
+      let plan = db.workspaceDeletion(owner.ownerId, key)
+      if (plan?.completedAt) {
+        const entry = await service.fileManager.operate({ operation: 'stat', path: directory })
+        if (entry.kind === 'missing') return { deleted: true }
+        // A newly created directory at the same path is a separate operation.
+        db.db.prepare('DELETE FROM workspace_deletions WHERE owner_id=? AND workspace_id=?').run(owner.ownerId, key)
+        plan = undefined
+      }
+      if (!plan) {
+        const entry = await service.fileManager.operate({ operation: 'stat', path: directory })
+        if (entry.kind !== 'missing' && entry.version !== version) throw httpError(409, '文件已改变，请刷新后重试', 'FILE_VERSION_CONFLICT')
+        const workspaces = (await this.workspaces(owner)).filter(item => containsWorkspacePath(directory, this.workspacePath(item)))
+        const stale = chats.filter(chat => !live.some(item => item.id === chat.id) && containsWorkspacePath(directory, this.chatPath(chat)))
+        plan = db.beginWorkspaceDeletion(owner.ownerId, key, { path: directory, chatIds: stale.map(chat => chat.id),
+          workspaceIds: workspaces.sort((a, b) => b.path.length - a.path.length).map(item => item.workspaceId), fileOnly: true })
+      }
+      await service.drafts?.closeForPath(owner, directory)
+      await service.closeUnboundPathResources?.(owner, directory)
+      for (const id of plan.chatIds) await service.deleteChatLocked(owner, id)
+      // A registered project can retain native members after a failed platform
+      // import/deletion. Drain those members before removing its registration.
+      await service.closeUnboundWorkspaceSessions?.(owner, plan.workspaceIds)
+      if (db.listChats(owner.ownerId).some(chat => containsWorkspacePath(directory, this.chatPath(chat)))) throw protectedDirectory()
+      const currentWorkspaces = await this.workspaces(owner)
+      if (currentWorkspaces.some(item => containsWorkspacePath(directory, this.workspacePath(item)) && !plan.workspaceIds.includes(item.workspaceId))) throw protectedDirectory()
+      const entry = await service.fileManager.operate({ operation: 'stat', path: directory })
+      if (entry.kind !== 'missing') await service.fileManager.operate({ operation: 'delete', path: directory, version: entry.version })
+      for (const workspaceId of plan.workspaceIds) {
+        try { await service.workspaces.controller.delete({ workspaceId }) }
+        catch (error) { if (error?.code !== 'workspace/not-found') throw error }
+      }
+      for (const pending of db.pendingWorkspaceDeletions(owner.ownerId))
+        if (containsWorkspacePath(directory, pending.path)
+          && !db.directoryChats(owner.ownerId).some(chat => containsWorkspacePath(pending.path, this.chatPath(chat))))
+          db.finishWorkspaceDeletion(owner.ownerId, pending.workspaceId)
+      db.finishWorkspaceDeletion(owner.ownerId, key)
+      return { deleted: true }
     })
   }
 
