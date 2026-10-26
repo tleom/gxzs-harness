@@ -2,6 +2,7 @@ import { createMcpToolDefinition } from '@deepseek-ai/dsh-mcp-client'
 import { McpTaskJournal, executeMcpTask } from './tasks.js'
 import { isTaskRecoveryName, taskRecoveryScopes } from './task-recovery.js'
 import { resourceScopes } from './resources.js'
+import { mcpDeadline } from './deadline.js'
 import { adaptInputSchema } from './schema.js'
 import { platformToolNames } from './names.js'
 import { ToolDiscoveryCatalog } from './discovery-catalog.js'
@@ -12,7 +13,6 @@ export const name = 'workbench-mcp-tools'
 export const inject = ['tools', 'workbenchPlatformClient', 'workbenchRuntime']
 export const Config = z.object({ discovery: z.boolean().default(false) })
 
-// Reserve clock skew inside the published absolute call budget.
 // Providers may serialize identical nested schema objects in a different order.
 // Keep registration identity stable without discarding any definition fields.
 const definitionStamp = value => JSON.stringify(value, (_key, item) => item && typeof item === 'object' && !Array.isArray(item)
@@ -270,9 +270,7 @@ export async function apply(ctx, config = {}) {
 
 async function callProxy(ctx, tool, args, exec, { task = false, recovery, journal } = {}) {
   exec.signal?.throwIfAborted()
-  const callBudgetMs = Math.ceil((ctx.workbenchRuntime.mcpPolicy?.max_call_seconds ?? 350) * 1000)
-  const callTimeoutMs = Math.max(1, callBudgetMs - Math.min(5_000, Math.floor(callBudgetMs / 10)))
-  const taskDeadlineMs = Math.min(Number.isSafeInteger(exec.deadlineMs) ? exec.deadlineMs : Infinity, Date.now() + callTimeoutMs)
+  const taskDeadlineMs = mcpDeadline(ctx.workbenchRuntime.mcpPolicy, exec)
   const controlTimeoutMs = Math.ceil((ctx.workbenchRuntime.mcpPolicy?.control_timeout_seconds ?? 15) * 1000)
   const cleanupMs = task ? Math.max(0, Math.min(controlTimeoutMs, 5_000, Math.floor((taskDeadlineMs - Date.now()) / 10))) : 0
   const deadlineMs = taskDeadlineMs - cleanupMs
@@ -315,7 +313,7 @@ async function callProxy(ctx, tool, args, exec, { task = false, recovery, journa
   const payload = await ctx.workbenchPlatformClient.json({
     owner: { ownerId: authorization.ownerId }, method: 'POST', route: 'mcp/call',
     contentType: 'application/json',
-    signal, timeoutMs: callTimeoutMs, deadlineMs,
+    signal, timeoutMs: Math.max(1, deadlineMs - Date.now()), deadlineMs,
     body: Buffer.from(JSON.stringify({
       run_id: authorization.runId, resource_id: tool.id, version: tool.version,
       manifest_version: tool.manifest_version, server_id: tool.server_id,

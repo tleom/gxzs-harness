@@ -37,14 +37,21 @@ export class ToolDiscoveryCatalog extends Service {
     const preferred = new Set(run?.selection?.resource_mentions?.plugins ?? [])
     const selectedTools = new Set(run?.selection?.resource_mentions?.tools ?? [])
     const servers = new Map((runtime.mcpPlugins?.() ?? []).map(server => [server.id, server]))
+    const frozen = new Map((run?.mcpTools ?? []).map(tool => [tool.id, tool]))
     if (ready) {
       const providersWithTools = new Set([...this.registrations.values()].map(({ tool }) => `${tool.scope}:mcp:${tool.server_id}`))
       for (const plugin of runtime.mcpPlugins?.() ?? []) {
         // Installation metadata survives recovery even when this run's frozen
         // authorization excludes the recovered tools. This grants no capability.
         const requiresAuthorization = plugin.available !== false && providersWithTools.has(plugin.id)
+        const changed = [...this.registrations.values()].filter(({ tool }) => `${tool.scope}:mcp:${tool.server_id}` === plugin.id)
+          .map(({ tool }) => ({ current: tool, previous: frozen.get(tool.id) })).filter(item => item.previous)
+        const unavailableReason = changed.some(({ current, previous }) => current.version !== previous.version)
+          ? 'configuration_changed'
+          : changed.some(({ current, previous }) => current.manifest_version !== (previous.manifest_version ?? ''))
+            ? 'tool_definitions_changed' : 'run_authorization_required'
         plugins.set(plugin.id, { ...plugin,
-          ...(requiresAuthorization ? { available: false, unavailableReason: 'run_authorization_required' } : {}),
+          ...(requiresAuthorization ? { available: false, unavailableReason } : {}),
           preferred: preferred.has(plugin.id) || preferred.has(plugin.name) })
       }
     }

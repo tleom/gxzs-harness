@@ -142,9 +142,11 @@ export function apply(ctx, supplied = {}) {
 
   const unavailablePlugin = plugin => ({ status: 'unavailable', plugin: pluginSummary(plugin), items: [],
     ...(plugin.unavailableReason ? { reason: plugin.unavailableReason } : {}),
-    message: plugin.unavailableReason === 'run_authorization_required'
-      ? '插件当前可用，但本任务未获这些工具的授权。请重新提交任务以核验当前权限；重复搜索不会增加权限。'
-      : '插件已安装，但工具目录暂不可用。请检查插件连接或授权状态后重试。' })
+    message: ({
+      run_authorization_required: '插件当前可用，但这些工具未包含在本任务的授权范围内。重新提交任务时会重新核验；重复加载不会扩大权限',
+      configuration_changed: '插件配置在任务开始后发生变化，本轮仍使用原配置授权。请确认配置后重新提交任务；重复加载不会更新本轮授权',
+      tool_definitions_changed: '插件工具定义在任务开始后发生变化，本轮保存的定义已不匹配。请重新提交任务以核验新定义；重复加载不会更新本轮授权',
+    })[plugin.unavailableReason] ?? '插件已安装，但工具目录暂不可用。请检查插件连接或授权状态后重试' })
 
   function findPlugin(catalog, name) {
     if (typeof name !== 'string' || !name.trim()) return undefined

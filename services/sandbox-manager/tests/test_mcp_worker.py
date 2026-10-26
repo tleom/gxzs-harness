@@ -65,11 +65,16 @@ def modules():
 
 
 class Connection:
-    def __init__(self, base, root, version):
+    def __init__(self, base, root, version, reorder_discovery=False):
         source = (
-            f"import sys,asyncio; sys.path.insert(0,{str(base)!r}); "
-            f"from mcp_worker import serve; asyncio.run(serve('demo',{version!r},{str(root)!r}))"
+            f"import sys,asyncio; sys.path.insert(0,{str(base)!r})\nimport mcp_worker as worker\n"
         )
+        if reorder_discovery:
+            source += ("original = worker.discover\nflip = False\n"
+                       "async def reordered(client):\n global flip\n tools = await original(client)\n"
+                       " flip = not flip\n return list(reversed(tools)) if flip else tools\n"
+                       "worker.discover = reordered\n")
+        source += f"asyncio.run(worker.serve('demo',{version!r},{str(root)!r}))"
         self.process = subprocess.Popen(
             [sys.executable, "-I", "-u", "-c", source],
             stdin=subprocess.PIPE,
@@ -222,6 +227,30 @@ def test_transports_schema_results_persistence_and_clean_exit(connected):
         {"operation": "mcp_toggle", "name": "demo", "enabled": False}, str(root)
     )
     assert "已停用" in connection.call("add", {"value": 1})["error"]
+
+
+def test_legacy_binding_stays_callable_across_reordered_refresh_and_reconnect(connected):
+    initial, ops, root, _ = connected
+    base = Path(__file__).parents[1]
+    path = root / "mcp/.cache/demo.json"
+    cache = json.loads(path.read_text())
+    tools = sorted(cache["tools"], key=lambda item: item["name"], reverse=True)
+    legacy = ops.legacy_manifest_version(tools)
+    assert legacy != ops.manifest_version(tools)
+    path.write_text(json.dumps({**cache, "tools": tools, "manifest_version": legacy}))
+    for _ in range(2):
+        connection = Connection(base, root, initial.ready["version"], reorder_discovery=True)
+        try:
+            assert connection.ready["manifest_version"] == legacy
+            for _ in range(3):
+                connection.process.stdin.write(json.dumps({"operation": "mcp_test"}).encode() + b"\n")
+                connection.process.stdin.flush()
+                assert connection.read()["manifest_version"] == legacy
+                response = connection.call("add", {"value": 3}, manifest_version=legacy)
+                assert response["result"]["structuredContent"]["value"] == 4
+                assert ops.personal_mcp({"operation": "mcp_list"}, str(root))["mcp"][0]["manifest_version"] == legacy
+        finally:
+            connection.close()
 
 
 def test_timeout_does_not_replay_business_call(connected):

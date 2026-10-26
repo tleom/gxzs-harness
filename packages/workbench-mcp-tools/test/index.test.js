@@ -31,6 +31,38 @@ function setup({ authorized = true } = {}) {
 }
 
 describe('platform MCP proxy tools', () => {
+  it('keeps all 226 frozen tools registered across catalog reorder refreshes', async () => {
+    const { ctx, platform, definitions } = setup()
+    const tools = Array.from({ length: 226 }, (_, i) => ({ ...catalogTool, id: `personal:mcp:server:tool_${i}`,
+      tool_name: `tool_${i}`, runtime_name: `fixture_${i}` }))
+    const agent = { id: 's1', ctx: { tools: { restrict: () => () => {} } } }
+    ctx.workbenchRuntime.executionRun = () => ({ id: 'r1', ownerId: 't:1', status: 'running', mcpTools: tools })
+    ctx.workbenchRuntime.agents = { list: () => [agent] }
+    const plugin = { id: 'personal:mcp:server', name: 'server', scope: 'personal', available: true }
+    platform.json.mockResolvedValueOnce({ tools, plugins: [plugin] })
+    await apply(ctx, { discovery: true })
+    const original = new Map(definitions)
+    for (let i = 0; i < 3; i++) {
+      platform.json.mockResolvedValueOnce({ tools: [...tools].reverse(), plugins: [plugin] })
+      await ctx.workbenchRuntime.refreshMcpCatalog()
+      expect(ctx.toolDiscoveryCatalog.snapshot(agent).tools).toHaveLength(226)
+      for (const [name, definition] of original) expect(definitions.get(name)).toBe(definition)
+    }
+  })
+  it.each([
+    [{ version: 'v2' }, 'configuration_changed'],
+    [{ manifest_version: 'm2' }, 'tool_definitions_changed'],
+  ])('reports a changed frozen binding accurately: %s', async (change, reason) => {
+    const { ctx, platform } = setup()
+    const agent = { id: 's1', ctx: { tools: { restrict: () => () => {} } } }
+    ctx.workbenchRuntime.executionRun = () => ({ id: 'r1', ownerId: 't:1', status: 'running', mcpTools: [catalogTool] })
+    ctx.workbenchRuntime.agents = { list: () => [agent] }
+    platform.json.mockResolvedValueOnce({ tools: [{ ...catalogTool, ...change }],
+      plugins: [{ id: 'personal:mcp:server', name: 'server', scope: 'personal', available: true }] })
+    await apply(ctx, { discovery: true })
+    expect(ctx.toolDiscoveryCatalog.snapshot(agent)).toMatchObject({ tools: [],
+      plugins: [{ available: false, unavailableReason: reason }] })
+  })
   it('reuses unchanged schema validation while applying current versions, definitions and removals', async () => {
     const { ctx, platform, definitions } = setup()
     const schema = { type: 'object', properties: { query: { type: 'string', minLength: 2 } } }

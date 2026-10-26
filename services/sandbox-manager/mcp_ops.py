@@ -196,7 +196,27 @@ def tool_manifest(tools):
 
 
 def manifest_version(tools):
+    # tools/list order is presentation, while arrays inside a schema remain significant.
+    return legacy_manifest_version(sorted(tools, key=lambda tool: tool["name"]))
+
+
+def legacy_manifest_version(tools):
     return version(json.dumps(tools, sort_keys=True, separators=(",", ":")).encode())
+
+
+def cached_manifest(cached, config, revision):
+    """Validate the old binding before retaining its version for an unchanged catalog."""
+    if (not isinstance(cached, dict) or cached.get("version") != revision
+            or cached.get("connection_fingerprint") != connection_fingerprint(config)
+            or cached.get("authentication_version") != authentication_version(config)
+            or not isinstance(cached.get("discovered_at"), (int, float))
+            or not 0 <= time.time() - cached["discovered_at"]):
+        return None
+    tools = tool_manifest(cached.get("tools", []))
+    fingerprint = cached.get("manifest_version")
+    if fingerprint not in (manifest_version(tools), legacy_manifest_version(tools)):
+        return None
+    return tools, fingerprint
 
 
 def mapping(rootfd, name):
@@ -274,20 +294,15 @@ def snapshot(rootfd, selected=None):
                     continue
                 try:
                     cached = json.loads(read_file(cachefd, name + ".json", max_bytes=policy('response_bytes')) or b"{}")
-                    if (isinstance(cached, dict) and cached.get("version") == revision
-                            and cached.get("connection_fingerprint") == connection_fingerprint(config)
-                            and cached.get("authentication_version") == authentication_version(config)
-                            and isinstance(cached.get("discovered_at"), (int, float))
-                            and 0 <= time.time() - cached["discovered_at"]):
-                        tools = tool_manifest(cached.get("tools", []))
-                        fingerprint = manifest_version(tools)
-                        if fingerprint == cached.get("manifest_version"):
-                            item["discovered_at"] = cached["discovered_at"]
-                            # Age requests revalidation; it is not evidence that a
-                            # previously verified, unchanged plugin is unavailable.
-                            if not cached.get("refresh_failed"):
-                                item.update(server_info=cached.get("server_info", {}), tools=tools, manifest_version=fingerprint, status="ready",
-                                            refresh_due=time.time() - cached["discovered_at"] >= policy('discovery_cache_seconds'))
+                    verified = cached_manifest(cached, config, revision)
+                    if verified:
+                        tools, fingerprint = verified
+                        item["discovered_at"] = cached["discovered_at"]
+                        # Age requests revalidation; it is not evidence that a
+                        # previously verified, unchanged plugin is unavailable.
+                        if not cached.get("refresh_failed"):
+                            item.update(server_info=cached.get("server_info", {}), tools=tools, manifest_version=fingerprint, status="ready",
+                                        refresh_due=time.time() - cached["discovered_at"] >= policy('discovery_cache_seconds'))
                 except (ValueError, OSError, RecursionError):
                     warnings.append(f"个人 MCP {name} 的目录缓存无效，正在重新发现")
                 items.append(item)
@@ -520,20 +535,30 @@ def personal_mcp(payload, root="/workspace"):
                 if operation == "mcp_cache":
                     tools = tool_manifest(payload.get("tools"))
                     config = configuration(raw)
+                    fingerprint = manifest_version(tools)
                     cachefd = directory(statefd, ".cache")
                     try:
                         fcntl.flock(cachefd, fcntl.LOCK_EX)
+                        try:
+                            previous = json.loads(read_file(cachefd, name + ".json", max_bytes=policy('response_bytes')) or b"{}")
+                            verified = cached_manifest(previous, config, revision)
+                        except (ValueError, OSError, RecursionError):
+                            verified = None
+                        # Keep a verified legacy version across upgrade/reconnect only
+                        # when every definition still matches. Never accept a caller alias.
+                        if verified and manifest_version(verified[0]) == fingerprint:
+                            tools, fingerprint = verified
                         atomic_write(
                             cachefd, name + ".json", json.dumps({
                                 "version": revision, "connection_fingerprint": connection_fingerprint(config),
                                 "authentication_version": authentication_version(config),
-                                "discovered_at": time.time(), "manifest_version": manifest_version(tools),
+                                "discovered_at": time.time(), "manifest_version": fingerprint,
                                 "tools": tools, "server_info": payload.get("server_info", {}),
                             }).encode()
                         )
                     finally:
                         os.close(cachefd)
-                    return {"id": name, "version": revision, "tools": tools}
+                    return {"id": name, "version": revision, "tools": tools, "manifest_version": fingerprint}
                 raise ValueError("不支持的 MCP 配置操作")
             finally:
                 os.close(fd)

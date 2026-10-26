@@ -124,8 +124,12 @@ def publish_catalog(name, root, revision, tools, fingerprint, server_info, globa
         'operation': 'mcp_cache', 'name': name, 'version': revision, 'tools': tools,
         'issues': getattr(discover, 'issues', []), 'server_info': server_info,
     }, root)
+    if not cached.get('conflict') and cached.get('manifest_version'):
+        ready['manifest_version'] = cached['manifest_version']
+        ready['tools'] = cached['tools']
+        encoded = json.dumps(ready, ensure_ascii=False).encode()
     emit(cached if cached.get('conflict') else ready, None if cached.get('conflict') else encoded)
-    return not cached.get('conflict')
+    return None if cached.get('conflict') else ready['manifest_version']
 
 
 async def serve(name, expected_version, root="/workspace", global_config=None):
@@ -204,7 +208,8 @@ async def serve_connection(name, expected_version, root, config, revision, globa
         active_tasks = set()
         tools = await asyncio.wait_for(discover(client), policy("discovery_timeout_seconds")) if "tools" in server_info["capabilities"] else []
         fingerprint = manifest_version(tools)
-        if not publish_catalog(name, root, revision, tools, fingerprint, server_info, global_scope):
+        fingerprint = publish_catalog(name, root, revision, tools, fingerprint, server_info, global_scope)
+        if fingerprint is None:
             return
         reader = asyncio.StreamReader(limit=policy("request_bytes"))
         pipe, _ = await asyncio.get_running_loop().connect_read_pipe(
@@ -291,7 +296,8 @@ async def serve_connection(name, expected_version, root, config, revision, globa
                         remaining = (request.get('deadline_ms', int(time.time()*1000 + policy('discovery_timeout_seconds')*1000)) - time.time()*1000) / 1000
                         tools = await connected(discover(client), disconnected, min(policy('discovery_timeout_seconds'), remaining))
                         fingerprint = manifest_version(tools)
-                    if not publish_catalog(name, root, revision, tools, fingerprint, server_info, global_scope):
+                    fingerprint = publish_catalog(name, root, revision, tools, fingerprint, server_info, global_scope)
+                    if fingerprint is None:
                         return
                     continue
                 if not state["enabled"]:
