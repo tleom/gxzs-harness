@@ -471,8 +471,15 @@ def test_mcp_maintenance_does_not_refresh_user_activity(server, monkeypatch, ope
     monkeypatch.setattr(mcp_runtime, 'invalidate', Mock())
     key = str(uuid4())
     # A caller cannot opt writes or tool execution into the catalog exception.
-    server.operation(key, 'personal-mcp', {'operation': operation, 'maintenance': maintenance,
-                                         'name': 'example', 'allow_existing_image': True})
+    request = {'operation': operation, 'maintenance': maintenance,
+               'name': 'example', 'allow_existing_image': True}
+    if operation == 'mcp_call':
+        binding = str(uuid4())
+        request.update(tool='echo', version='v1', manifest_version='m1', arguments={}, request_key=binding + ':request')
+        request['authorization'] = {'workspace_id': key, 'binding_id': binding, 'run_id': binding,
+                                    'resource_id': 'personal:mcp:example:echo', 'version': 'v1',
+                                    'manifest_version': 'm1', 'arguments': {}, 'request_key': 'request'}
+    server.operation(key, 'personal-mcp', request)
     ensured.assert_called_once_with(key, track_activity=tracked, allow_existing_image=operation == 'mcp_list')
     assert bool(touched.call_count) is tracked
 
