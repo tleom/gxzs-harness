@@ -26,7 +26,9 @@ async function startDisplay({ width, height, emit, onExit }) {
   const child = spawn('/usr/bin/Xvnc', [`:${display}`, '-geometry', `${width}x${height}`, '-depth', '24',
     '-websocketPort', String(port), '-interface', '127.0.0.1', '-UseIPv6', '0', '-publicIP', '127.0.0.1',
     '-DisableBasicAuth', '1', '-SecurityTypes', 'None', '-sslOnly', '0', '-rfbport', '0', '-nolisten', 'tcp',
-    '-s', '0', '-dpms', '-wr',
+    // CDP owns input; its virtual pointer does not move the X desktop pointer.
+    // Keep that stationary cursor out of streamed pixels. The viewer uses its local cursor.
+    '-s', '0', '-dpms', '-wr', '-nocursor',
     '-FrameRate', '30', '-AcceptSetDesktopSize', '0', '-MaxVideoResolution', '1920x1080',
     '-DLP_ClipAcceptMax', '32768', '-DLP_ClipSendMax', '32768', '-DLP_ClipTypes', 'text/plain',
     '-httpd', '/usr/share/kasmvnc/www'], { env: { ...process.env, HOME: home }, stdio: ['ignore', 'ignore', 'pipe'] })
