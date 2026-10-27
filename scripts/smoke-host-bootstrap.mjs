@@ -463,7 +463,7 @@ async function nativeSettingsView() {
   assert.equal(response.status, 200, 'Native subagent settings must be available in the built Host')
   const view = (await response.json()).data
   assert.equal(view.hasDocument, false, 'The carrier must not expose the whole settings document')
-  assert.deepEqual(view.namespaces.map(row => row.ns).sort(), ['subagent', 'subagent-model-selection-settings', 'ui-conversation'])
+  assert.deepEqual(view.namespaces.map(row => row.ns).sort(), ['subagent', 'subagent-model-selection-settings', 'ui-chat', 'ui-conversation'])
   return view
 }
 

@@ -74,6 +74,8 @@ it('forwards native settings and model invalidations without exposing other sett
   listeners.get('settings/document-updated')('subagent',2)
   const changed=(await source.next()).value
   expect(changed.value).toEqual({type:'emit',event:'settings/document-updated',args:['subagent',2]})
+  listeners.get('settings/document-updated')('ui-chat',3)
+  expect((await source.next()).value.value).toEqual({type:'emit',event:'settings/document-updated',args:['ui-chat',3]})
   listeners.get('llm/adapters-updated')()
   expect((await source.next()).value.value).toEqual({type:'emit',event:'llm/adapters-updated',args:[]})
   listeners.get('schedule/changed')()

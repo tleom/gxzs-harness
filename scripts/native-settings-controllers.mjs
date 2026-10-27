@@ -20,12 +20,13 @@ export async function nativeSettingsControllers(profile) {
     if (manifest.version !== '0.2.1-rc.2') throw new Error('Unverified native settings version: ' + manifest.version)
     return readFile(require.resolve(entry ?? name + '/client'), 'utf8')
   }
-  const [forms, primitives, card, conversation, schedule] = await Promise.all([
+  const [forms, primitives, card, conversation, schedule, chat] = await Promise.all([
     read('@deepseek-ai/dsh-client-ui-settings'),
     read('@deepseek-ai/dsh-client-ui-primitives', '@deepseek-ai/dsh-client-ui-primitives'),
     read('@deepseek-ai/dsh-client-ui-settings-subagent'),
     read('@deepseek-ai/dsh-client-ui-conversation'),
     read('@deepseek-ai/dsh-client-ui-schedule'),
+    read('@deepseek-ai/dsh-client-ui-chat'),
   ])
   const start = forms.indexOf('factory: (require) => {')
   const end = forms.lastIndexOf('return module.exports;')
@@ -33,8 +34,8 @@ export async function nativeSettingsControllers(profile) {
     throw new Error('Native settings factory contract changed')
   const body = forms.slice(start + 'factory: (require) => {'.length, end)
   const settings = region(conversation, 'lib/types/submission-settings.js')
-  const literal = name => {
-    const matches = [...settings.matchAll(new RegExp('const ' + name + ' = ("[^"\\n]*");', 'g'))]
+  const literal = (name, source = settings) => {
+    const matches = [...source.matchAll(new RegExp('const ' + name + ' = ("[^"\\n]*");', 'g'))]
     if (matches.length !== 1) throw new Error('Native submission setting changed: ' + name)
     return matches[0][1]
   }
@@ -66,15 +67,17 @@ ${region(card, 'lib/types/client/subagent-card-controller.js')}
 const BUSY_ENTER_FIELD = ${literal('BUSY_ENTER_FIELD')};
 const DEFAULT_BUSY_ENTER_BEHAVIOR = ${literal('DEFAULT_BUSY_ENTER_BEHAVIOR')};
 ${region(conversation, 'lib/types/client/input/submission-policy.js')}
+${['TRANSCRIPT_VIEW_FIELD', 'COLLAPSE_TIMING_FIELD', 'DEFAULT_COLLAPSE_TIMING', 'DEFAULT_TRANSCRIPT_VIEW_MODE', 'LEGACY_TRANSCRIPT_VIEW_MODE', 'LEGACY_EXPANDED_TRANSCRIPT_VIEW_MODE'].map(name => `const ${name} = ${literal(name, region(chat, 'lib/types/chat-settings.js'))};`).join('\n')}
+${region(chat, 'lib/types/client/transcript-view.js')}
 ${header.slice(ancestryStart, ancestryEnd)}
 ${region(schedule, 'lib/types/client/catalog-source.js')}
 export { ConfigForms, SettingsSchemaService, SettingsDescribeMirror, SubagentLimitsCardController,
-  SubagentModelSelectionCardController, subagentCardFace, subagentCardShell, ComposerSubmissionPolicy, resolveSubmitMode, deriveAncestry, createCatalogSource };
+  SubagentModelSelectionCardController, subagentCardFace, subagentCardShell, ComposerSubmissionPolicy, resolveSubmitMode, TranscriptViewPolicy, deriveAncestry, createCatalogSource };
 export const nativeSettingsProvenance = ${JSON.stringify({
   version: '0.2.1-rc.2',
     sources: Object.fromEntries([['dsh-client-ui-settings/client', forms], ['dsh-client-ui-primitives', primitives],
-      ['dsh-client-ui-settings-subagent/client', card], ['dsh-client-ui-conversation/client', conversation], ['dsh-client-ui-schedule/client', schedule]].map(([name, source]) => [name, createHash('sha256').update(source).digest('hex')])),
-    regions: ['settings-form/form-model', 'subagent-limits-card-controller', 'subagent-model-selection-card-controller', 'subagent-card-controller', 'submission-policy', 'ConversationSession.deriveAncestry', 'schedule/catalog-source'],
+      ['dsh-client-ui-settings-subagent/client', card], ['dsh-client-ui-conversation/client', conversation], ['dsh-client-ui-schedule/client', schedule], ['dsh-client-ui-chat/client', chat]].map(([name, source]) => [name, createHash('sha256').update(source).digest('hex')])),
+    regions: ['settings-form/form-model', 'subagent-limits-card-controller', 'subagent-model-selection-card-controller', 'subagent-card-controller', 'submission-policy', 'transcript-view', 'ConversationSession.deriveAncestry', 'schedule/catalog-source'],
 })};
 `
 }

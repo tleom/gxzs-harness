@@ -73,7 +73,7 @@ export class WorkbenchNativeSessions {
         while (queue.length && !signal.aborted) {
           const value = queue.shift()
           if (GLOBAL_EVENTS.includes(value.event)) {
-            if (value.event === 'settings/document-updated' && !['subagent', 'subagent-model-selection-settings', 'ui-conversation'].includes(value.args[0])) continue
+            if (value.event === 'settings/document-updated' && !['subagent', 'subagent-model-selection-settings', 'ui-conversation', 'ui-chat'].includes(value.args[0])) continue
             // Keep existing clients' catalog invalidation contract at the transport boundary.
             yield { event: 'native_session_events', value: { type: 'emit', ...value,
               event: value.event === 'workbench/schedule-notifications-changed' ? 'schedule/changed' : value.event } }

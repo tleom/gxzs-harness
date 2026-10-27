@@ -11,11 +11,12 @@ const profilePath = fileURLToPath(new URL('../../../profiles/workbench/', import
 const require = createRequire(join(profilePath,'package.json'))
 const native = name => import(pathToFileURL(require.resolve('@deepseek-ai/' + name)).href)
 const [{Context}, {boot,initProfile,readProfilePatches}, {default:Settings}, {default:ConfigEditor},
-  {default:Subagents}, {default:Choice}, {SettingsController}, Store, Cordis, Conversation] = await Promise.all([
+  {default:Subagents}, {default:Choice}, {SettingsController}, Store, Cordis, Conversation, Chat] = await Promise.all([
   native('cordis'),native('dsh-app-boot'),native('dsh-settings'),native('dsh-config-editor'),native('dsh-subagent'),
   import(pathToFileURL(require.resolve('@deepseek-ai/dsh-tool-subagent/model-selection-settings')).href),
   native('dsh-api-settings-controller'),native('dsh-client-store'),native('cordis'),
   native('dsh-client-ui-conversation'),
+  native('dsh-client-ui-chat'),
 ])
 const contexts=[], directories=[]
 afterEach(async () => {
@@ -37,6 +38,7 @@ async function fixture() {
     {id:'subagent',name:'cordis:subagents'},
     {id:'subagent-model-selection-settings',name:'cordis:choice'},
     {id:'ui-conversation',name:'cordis:conversation'},
+    {id:'ui-chat',name:'cordis:chat'},
   ]}]))
   await writeFile(join(dir,'cordis.yml'),'[]\n')
   const profile={name:'test',startedBundles:['test-bundle'],dir,patchPath:join(dir,'cordis.patch.yml'),
@@ -45,7 +47,7 @@ async function fixture() {
     ctx.provide('profileContext',profile)
     ctx.provide('appReady',{onReady:listener=>{listener();return ()=>{}}})
     ctx.provide('workingDirectory',{ensure:async()=>'/workspace'})
-    Object.assign(ctx.loader.builtins,{editor:ConfigEditor,settings:Settings,subagents:Subagents,choice:Choice,conversation:Conversation})
+    Object.assign(ctx.loader.builtins,{editor:ConfigEditor,settings:Settings,subagents:Subagents,choice:Choice,conversation:Conversation,chat:Chat})
   }); contexts.push(ctx)
   await ctx.plugin(SettingsController)
   const gateway=new WorkbenchSubagentSettings({controller:()=>ctx.settingsController,modelCatalog:async()=>({groups:[{id:'p',models:[{id:'current'}]}]})})
@@ -132,6 +134,22 @@ it('uses the exact generated native form/controllers over real Host schema, stag
   const face=core.subagentCardFace(limits.inject(),models.inject())
   const limitState=()=>face.hooks.subagentLimitsCard.getSnapshot()
   const policy=new core.ComposerSubmissionPolicy(forms.get('ui-conversation'))
+  const transcript=new core.TranscriptViewPolicy(forms.get('ui-chat'),'standard')
+  expect(transcript.mode.getSnapshot()).toBe('standard')
+  expect(transcript.collapseTiming.getSnapshot()).toBe('completion')
+  expect(await readFile(host.profile.patchPath,'utf8')).not.toContain('transcriptView')
+  transcript.setMode('detailed')
+  transcript.setCollapseTiming('next-input')
+  await vi.waitFor(()=>expect(host.gateway.describe().namespaces.find(row=>row.ns==='ui-chat').value)
+    .toMatchObject({transcriptView:'detailed',collapseTiming:'next-input'}))
+  expect(await readFile(host.profile.patchPath,'utf8')).toContain('collapseTiming')
+  const restored=new core.TranscriptViewPolicy(forms.get('ui-chat'),'standard')
+  expect(restored.mode.getSnapshot()).toBe('detailed')
+  expect(restored.collapseTiming.getSnapshot()).toBe('next-input')
+  const chatSection=host.gateway.describe().namespaces.find(row=>row.ns==='ui-chat')
+  await expect(host.gateway.mutate({}, {ns:'ui-chat',expectedRevision:chatSection.revision,ops:[{op:'set',path:['collapseTiming'],value:'invalid'}]})).rejects.toBeDefined()
+  await expect(host.gateway.mutate({}, {ns:'ui-chat',expectedRevision:chatSection.revision,ops:[{op:'set',path:['linkOpening'],value:'new-tab'}]})).rejects.toMatchObject({status:400})
+  restored.dispose();transcript.dispose()
   expect(policy.busyEnter.getSnapshot()).toBe('queue')
   for (const preferred of ['queue','steer']) {
     policy.setBusyEnter(preferred)
