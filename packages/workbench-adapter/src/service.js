@@ -1580,6 +1580,7 @@ export function runDto(run, events = [], pending = null) {
   return {
     id: run.id, chat_id: run.chatId, revision_id: run.id, version: 1, query: run.query,
     created_at: run.createdAt / 1000,
+    ...(run.selection?.prompt_mode ? { prompt_mode: run.selection.prompt_mode } : {}),
     can_fork: ['completed', 'failed', 'cancelled', 'interrupted'].includes(run.status) && Number.isSafeInteger(forkEnd) && forkEnd >= 0,
     resource_mentions: normalizeResourceMentions(run.selection?.resource_mentions),
     mentioned_resources: groupPluginMentions(mentioned, mentioned.some(resource => resource.kind === 'tools') ? run.mcpTools ?? [] : []),
