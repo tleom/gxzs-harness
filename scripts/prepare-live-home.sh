@@ -23,6 +23,7 @@ case "$HARNESS/" in "$DSH_HOME/"*) fail 'Validation home overlaps the source rep
 packages='workbench-adapter workbench-control-commands workbench-file-manager workbench-platform-client workbench-sandbox-skills workbench-sandbox-runtime workbench-mcp-tools tool-discovery'
 [ -f "$HARNESS/profiles/workbench/package-lock.json" ] || fail 'Source profile lockfile is missing'
 [ -d "$HARNESS/scripts" ] || fail 'Source scripts are missing'
+[ -d "$HARNESS/patches" ] || fail 'Source patches are missing'
 for package in $packages; do
   [ -d "$HARNESS/packages/$package" ] || fail 'A source package is missing'
 done
@@ -36,7 +37,7 @@ elif [ -e "$DSH_HOME" ]; then
   [ -d "$DSH_HOME" ] || fail 'Validation home is not a directory'
   [ -z "$(find "$DSH_HOME" -mindepth 1 -maxdepth 1 -print -quit)" ] || fail 'Existing nonempty home has no validation marker'
 fi
-for directory in profiles packages scripts; do
+for directory in profiles packages scripts patches; do
   [ ! -L "$DSH_HOME/$directory" ] || fail 'Validation home contains a symlinked working directory'
   if [ -e "$DSH_HOME/$directory" ]; then
     [ -d "$DSH_HOME/$directory" ] || fail 'Validation working path is not a directory'
@@ -50,7 +51,7 @@ rm -rf "$DSH_HOME/profiles/workbench" "$DSH_HOME/packages/workbench-adapter" \
   "$DSH_HOME/packages/workbench-platform-client" "$DSH_HOME/packages/workbench-sandbox-skills" \
   "$DSH_HOME/packages/workbench-sandbox-runtime" "$DSH_HOME/packages/workbench-mcp-tools" \
   "$DSH_HOME/packages/tool-discovery"
-mkdir -p "$DSH_HOME/profiles" "$DSH_HOME/packages" "$DSH_HOME/scripts"
+mkdir -p "$DSH_HOME/profiles" "$DSH_HOME/packages" "$DSH_HOME/scripts" "$DSH_HOME/patches"
 cp -a "$HARNESS/profiles/workbench" "$DSH_HOME/profiles/workbench"
 cp -a "$HARNESS/packages/workbench-adapter" "$DSH_HOME/packages/workbench-adapter"
 cp -a "$HARNESS/packages/workbench-control-commands" "$DSH_HOME/packages/workbench-control-commands"
@@ -61,6 +62,7 @@ cp -a "$HARNESS/packages/workbench-sandbox-runtime" "$DSH_HOME/packages/workbenc
 cp -a "$HARNESS/packages/workbench-mcp-tools" "$DSH_HOME/packages/workbench-mcp-tools"
 cp -a "$HARNESS/packages/tool-discovery" "$DSH_HOME/packages/tool-discovery"
 cp -a "$HARNESS/scripts/." "$DSH_HOME/scripts/"
+cp -a "$HARNESS/patches/." "$DSH_HOME/patches/"
 find "$DSH_HOME" -type d -name node_modules -prune -exec rm -rf {} +
 mkdir -p "$DSH_HOME/profiles/workbench/node_modules"
 ln -sfn "profiles/workbench/node_modules" "$DSH_HOME/node_modules"
