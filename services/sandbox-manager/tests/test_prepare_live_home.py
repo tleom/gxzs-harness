@@ -18,7 +18,7 @@ MARKER = '.gxzs-disposable-validation-home'
 @pytest.fixture
 def preparation(tmp_path):
     source = tmp_path / 'source'
-    for relative in ['profiles/workbench', 'scripts'] + ['packages/' + name for name in PACKAGES]:
+    for relative in ['profiles/workbench', 'scripts', 'patches'] + ['packages/' + name for name in PACKAGES]:
         directory = source / relative
         directory.mkdir(parents=True)
         (directory / 'fixture').write_text('source', encoding='utf-8')
@@ -51,6 +51,7 @@ def test_fresh_home_and_marked_repeat_preserve_unrelated_data(preparation):
     assert result.returncode == 0, result.stderr
     assert (home / 'profiles/workbench/npm-invoked').read_text().strip() == 'ci --no-audit --no-fund'
     assert (home / 'node_modules').is_symlink()
+    assert (home / 'patches/fixture').read_text() == 'source'
     (home / 'history').write_text('keep', encoding='utf-8')
     (home / 'packages/workbench-adapter/stale').write_text('old', encoding='utf-8')
     result = run()
@@ -61,7 +62,7 @@ def test_fresh_home_and_marked_repeat_preserve_unrelated_data(preparation):
 
 @pytest.mark.parametrize('case', ['outside', 'root', 'filesystem-root', 'source', 'source-parent',
                                   'unmarked', 'wrong-marker', 'symlink-marker', 'symlink-parent',
-                                  'profiles', 'packages', 'scripts', 'missing-source'])
+                                  'profiles', 'packages', 'scripts', 'patches', 'missing-source'])
 def test_unsafe_home_rejected_before_deleting_existing_data(preparation, tmp_path, case):
     source, root, home, run = preparation
     overrides = {}
