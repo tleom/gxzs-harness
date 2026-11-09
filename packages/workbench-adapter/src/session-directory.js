@@ -9,7 +9,7 @@ export async function copySessionDirectory({ agents, sessionQuery, agentPresets,
     const childId = `session-${randomUUID()}`
     await agents.create({
       sessionId: childId, seed: events, inheritedEventCount: events.length,
-      meta: { cwd, parentSession: sessionId, isSeeded: true, agentPreset: preset.id },
+      meta: { cwd, isSeeded: true, agentPreset: preset.id },
       agentOptions: agentDefaultModel.currentSelection(),
       setup: async (agentCtx) => { await agentPresets.mount(agentCtx, preset.id) },
     })

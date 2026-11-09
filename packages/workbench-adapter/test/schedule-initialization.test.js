@@ -14,9 +14,9 @@ function fixture(path = ':memory:') {
   const ownerId = 'tenant:7'
   const chat = database.chatBindings(ownerId)[0]
     ?? database.createChat({ ownerId, sessionId: 'session', selection: {} })
-  const task = { id: 'schedule-one', sessionId: chat.sessionId, chat_id: chat.id, title: '提醒' }
+  const task = { id: 'schedule-one', target: { kind: 'session', sessionId: chat.sessionId }, chat_id: chat.id, title: '提醒' }
   const native = { create: vi.fn(async () => task), catalog: vi.fn(async () => [task]) }
-  const schedules = new WorkbenchSchedules({ native, database, service: { requireChat: () => chat } })
+  const schedules = new WorkbenchSchedules({ ownerId, native, database, service: { requireChat: () => chat } })
   const reports = []
   const platformClient = { json: vi.fn(async ({ body }) => {
     const request = JSON.parse(body)
@@ -40,11 +40,12 @@ it('does not acknowledge a completion while the native create or initialization 
   h.native.create.mockImplementationOnce(() => new Promise(resolve => { releaseNative = resolve }))
   h.platformClient.json.mockImplementationOnce(() => new Promise(resolve => { releaseInitialization = resolve }))
   const creating = h.schedules.create({ ownerId: h.ownerId }, h.chat.id, {
-    request_key: 'logical', title: '提醒', prompt: '内容', after_seconds: 1, notify_enabled: true,
+    request_key: 'logical', target: h.task.target, title: '提醒', prompt: '内容', timing: { kind: 'after', after_seconds: 1 }, notify_enabled: true,
   })
   h.complete()
   await h.bridge.flush()
   expect(h.platformClient.json).not.toHaveBeenCalled()
+  await vi.waitFor(() => expect(releaseNative).toBeTypeOf('function'))
   releaseNative(h.task)
   await vi.waitFor(() => expect(releaseInitialization).toBeTypeOf('function'))
   await h.bridge.flush()
@@ -60,7 +61,7 @@ it('retains completion until a failed creation initialization can be retried', a
   const h = fixture()
   h.platformClient.json.mockRejectedValueOnce(new Error('unavailable'))
   expect(await h.schedules.create({ ownerId: h.ownerId }, h.chat.id, {
-    title: '提醒', prompt: '内容', notify_enabled: true,
+    target: h.task.target, title: '提醒', prompt: '内容', notify_enabled: true,
   })).toHaveProperty('notification_error')
   h.complete()
   h.platformClient.json.mockRejectedValueOnce(new Error('still unavailable'))

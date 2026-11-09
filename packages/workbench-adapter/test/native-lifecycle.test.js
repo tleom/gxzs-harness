@@ -1,3 +1,5 @@
+import { executeNativeTool } from '../../../scripts/test-native-tool.mjs'
+import * as NativeExecutor from '@deepseek-ai/dsh-tool-executor-native'
 import { HumanInputBridge } from '../src/human-input.js'
 import { afterEach, expect, it, vi } from 'vitest'
 import { createRequire } from 'node:module'
@@ -7,6 +9,7 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { WorkbenchDatabase } from '../src/persistence.js'
 import { TaskScheduler } from '../src/scheduler.js'
 import { WorkbenchService } from '../src/service.js'
+import { WorkbenchSchedules } from '../src/schedules.js'
 import { WorkbenchRuntime } from '../src/runtime.js'
 import { createAssistantStreamProjector, projectInboxClaim, projectSessionEvent, reconcileNativeSessions, settleNativeIdle } from '../src/projection.js'
 import { apply as applyMcpTools } from '../../workbench-mcp-tools/src/index.js'
@@ -34,6 +37,7 @@ const [{ Context }, { default: LlmRuntime, LlmAdapter, createUserMessage },
 ])
 const controllerPath = join(dirname(nativeRequire.resolve('@deepseek-ai/dsh-api-session-controller')), 'types', 'commands.js')
 const { SessionCommandController } = await import(pathToFileURL(controllerPath).href)
+const { ApiSessionAgentController } = await import(pathToFileURL(join(dirname(controllerPath), 'agent.js')).href)
 const cleanups = []
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup() })
 
@@ -55,6 +59,27 @@ it('settles two original queued Schedule turns without leaving the second receip
   expect(test.db.getRun(test.owner.ownerId, second.id)).toMatchObject({ status: 'completed' })
   expect(test.db.getRun(test.owner.ownerId, first.id).selection.mcp_servers).toEqual([resourceServer])
   expect(test.db.getRun(test.owner.ownerId, second.id).selection.mcp_servers).toEqual([resourceServer])
+})
+
+it('keeps Schedule change notices as context without stealing the next user turn or replaying receipts', async () => {
+  const test = await fixture(['ordinary task complete'], { scheduledClaims: true })
+  test.runtime.mcpCatalogState = { ready: true }
+  test.runtime.mcpResources = () => []
+  const notices = ['updated', 'deleted'].map(change => createUserMessage({ source: { kind: 'schedule' }, content: [{ type: 'text',
+    text: `[SCHEDULE CHANGE]\nA scheduled task involving this session was changed outside this session. This notice is not a delivery of the task and needs no action.\nchange: ${change}\nschedule_id_json: "fixture-task"\nschedule_title_json: "Fixture task"` }] }))
+  for (const notice of notices) test.agent.inject(notice)
+  const run = test.create('ordinary user request')
+  test.scheduler.start()
+  test.agent.followup(createUserMessage({ source: { kind: 'user', rpcId: run.id }, content: [{ type: 'text', text: run.query }] }))
+  await vi.waitFor(() => expect(test.model.requests).toHaveLength(1))
+  await test.agent.whenIdle()
+  expect(test.db.getRun(test.owner.ownerId, run.id)).toMatchObject({ status: 'completed' })
+  expect(test.model.requests).toHaveLength(1)
+  expect(JSON.stringify(test.model.requests[0])).toContain('[SCHEDULE CHANGE]')
+  for (const notice of notices) expect(test.db.getRun(test.owner.ownerId, notice.id)).toBeUndefined()
+  await reconcileNativeSessions(test.db, { observeSession: async () => ({ events: test.agent.session.snapshotEvents() }) }, test.owner.ownerId)
+  for (const notice of notices) expect(test.db.getRun(test.owner.ownerId, notice.id)).toBeUndefined()
+  expect(test.db.getRun(test.owner.ownerId, run.id)).toMatchObject({ status: 'completed' })
 })
 
 it('admits an owned child notice as a fresh turn with current permissions after the parent completed', async () => {
@@ -286,7 +311,7 @@ async function fixture(script, { scheduledClaims = false } = {}) {
   const db = new WorkbenchDatabase(':memory:')
   cleanups.push(() => db.close())
   cleanups.push(() => ctx.fiber.dispose())
-  for (const plugin of [LlmRuntime, SessionStore, Projections, SystemPrompt, ToolRuntime, AgentRegistry, GoalService]) await ctx.plugin(plugin)
+  for (const plugin of [LlmRuntime, SessionStore, Projections, SystemPrompt, ToolRuntime, NativeExecutor, AgentRegistry, GoalService]) await ctx.plugin(plugin)
   await ctx.plugin(GoalDriver)
   await ctx.plugin(Commands)
   await ctx.plugin(GoalCommand)
@@ -363,6 +388,58 @@ async function delayedScheduledCatalog(test) {
   await applyMcpTools(test.ctx)
   return { tool, configRequests, release() { available = true; test.ctx.emit('workbench/resources-changed') } }
 }
+
+it.each(['new_once', 'new'])('runs native Schedule %s in a new owned chat with first-step MCP admission', async kind => {
+  const test = await fixture(['scheduled result'], { scheduledClaims: true })
+  const catalog = await delayedScheduledCatalog(test)
+  catalog.release()
+  await vi.waitFor(() => expect(test.runtime.mcpCatalogState.ready).toBe(true))
+  const [{ default: Storage }, Json, { DomainFacility }, { default: Schedule }, { default: DefaultModel }, { default: SessionQuery }] = await Promise.all([
+    native('dsh-storage'), native('dsh-storage-json'), native('dsh-storage-domain'), native('dsh-schedule'), native('dsh-agent-default-model'), native('dsh-session-query'),
+  ])
+  const root = await mkdtemp(join(process.cwd(), '.schedule-loop-'))
+  cleanups.unshift(() => rm(root, { recursive: true, force: true }))
+  await test.ctx.plugin(Storage)
+  await test.ctx.plugin(Json, { root })
+  const domain = new DomainFacility(test.ctx, { backend: 'json' })
+  test.ctx.provide('storageDomain', domain)
+  test.ctx.effect(() => async () => domain.closeAll())
+  await test.ctx.plugin(await native('dsh-session-persistence-jsonl'), { root: join(root, 'sessions') })
+  await test.ctx.plugin(SessionQuery)
+  await test.ctx.plugin(DefaultModel, { provider: 'mock', model: 'mock' })
+  test.ctx.provide('workspaceRegistry', { archivedSessionIds: [], resolveByPath: async () => undefined })
+  // Exercise the published creation/default-model path. Only the remote model
+  // transport is fake; Session creation, lookup and JSONL storage are native.
+  const workspace = root.replaceAll('\\', '/').replace(/^[A-Za-z]:/, '')
+  const agents = new ApiSessionAgentController(test.ctx)
+  const commands = new SessionCommandController(test.ctx, agents, workspace)
+  test.ctx.provide('sessionController', {
+    resolveAgent: id => agents.resolveAgent(id),
+    create: request => commands.create(request),
+  })
+  test.ctx.on('session/flush', () => {})
+  await test.ctx.plugin(Schedule)
+  const gateway = new WorkbenchSchedules({ native: test.ctx.schedule, ownerId: test.owner.ownerId, database: test.db,
+    sessionHeader: async id => test.ctx.sessions.get(id)?.header,
+    service: { workspace, fileManager: { operate: async () => ({}) } } })
+  test.ctx.on('schedule/resolve-agent', (id, next) => gateway.activate(test.owner, id, next))
+  const task = await gateway.create(test.owner, undefined, { title: '检查资料', prompt: 'Use search to check records',
+    timing: { kind: 'after', after_seconds: 3600 }, target: { kind } })
+  await gateway.run(test.owner, task.id)
+  const page = await gateway.history(test.owner, task.id)
+  const sessionId = page.records[0].targetSessionId
+  const agent = test.ctx.agents.get(sessionId)
+  await agent.whenIdle()
+  const chat = test.db.getChatBySession(sessionId)
+  expect(chat.ownerId).toBe(test.owner.ownerId)
+  expect(chat.directory).toMatch(/^conversations\/scheduled\//)
+  expect(test.model.requests).toHaveLength(1)
+  expect(agent.model.current()).toMatchObject(test.ctx.agentDefaultModel.currentSelection())
+  expect((await test.ctx.sessionPersistence.stat(sessionId)).header.cwd).toBe(agent.session.header.cwd)
+  expect(test.model.requests[0].tools.map(tool => tool.name)).toContain('search')
+  expect(test.db.listRuns(test.owner.ownerId, chat.id)).toMatchObject([{ status: 'completed',
+    mcpTools: [expect.objectContaining({ id: catalog.tool.id })] }])
+})
 
 it.each(['queue', 'steer'])('delivers native root %s after renewal without a second ticket or queue-to-steer request', async mode => {
   let release
@@ -571,7 +648,7 @@ it.each([false, true])('assembles the actual first scheduled native request with
 })
 
 it('cancels a delayed scheduled native assembly before creating a receipt or model request', async () => {
-  const test = await fixture(['must not request'], { scheduledClaims: true })
+  const test = await fixture(['next scheduled answer'], { scheduledClaims: true })
   const catalog = await delayedScheduledCatalog(test)
   const claimed = vi.fn()
   test.ctx.on('agent/inbox/claimed', claimed)
@@ -583,6 +660,12 @@ it('cancels a delayed scheduled native assembly before creating a receipt or mod
   catalog.release()
   await vi.waitFor(() => expect(test.runtime.mcpCatalogState.ready).toBe(true))
   expect(test.model.requests).toHaveLength(0)
+  expect(test.db.getRun(test.owner.ownerId, message.id)).toBeUndefined()
+  const next = createUserMessage({ content: [{ type: 'text', text: 'next scheduled task' }], source: { kind: 'schedule' } })
+  test.agent.followup(next)
+  await test.agent.whenIdle()
+  expect(test.model.requests).toHaveLength(1)
+  expect(test.db.getRun(test.owner.ownerId, next.id)).toMatchObject({ status: 'completed' })
   expect(test.db.getRun(test.owner.ownerId, message.id)).toBeUndefined()
 })
 
@@ -946,7 +1029,7 @@ it('uses the native plan command and review tool without submitting the task twi
   await test.agent.whenIdle()
   expect(test.model.requests).toHaveLength(1)
   expect(test.ctx.sessionProjections.snapshot(test.agent.session, ['plan']).values.plan.active).toBe(true)
-  const result = await test.ctx.tools.execute({ callId: 'plan-review', name: 'exit_plan_mode',
+  const result = await executeNativeTool(test.ctx.tools, { callId: 'plan-review', name: 'exit_plan_mode',
     arguments: { plan: '# Case evidence\nRead the supplied documents and compare the dates.' },
     agent: test.agent, signal: new AbortController().signal })
   expect(result.isError).not.toBe(true)
@@ -984,7 +1067,7 @@ it('advertises only selected MCP tools on the actual first native request and bi
   await test.agent.whenIdle()
   expect(test.model.requests).toHaveLength(1)
   expect(test.model.requests[0].tools?.map(tool => tool.name) ?? []).not.toContain('maps_weather')
-  const denied = await test.ctx.tools.execute({ callId: 'not-selected', name: 'maps_weather', arguments: { city: 'fixture' }, agent: test.agent, signal: new AbortController().signal })
+  const denied = await executeNativeTool(test.ctx.tools, { callId: 'not-selected', name: 'maps_weather', arguments: { city: 'fixture' }, agent: test.agent, signal: new AbortController().signal })
   expect(denied.isError).toBe(true)
   expect(calls).toHaveLength(0)
   await test.scheduler.tick()
@@ -994,7 +1077,7 @@ it('advertises only selected MCP tools on the actual first native request and bi
   await vi.waitFor(() => expect(test.model.requests).toHaveLength(2))
   expect(test.model.requests[1].tools.map(tool => tool.name)).toContain('maps_weather')
   expect(test.model.requests[1].tools.some(tool => tool.name.startsWith('mcp__'))).toBe(false)
-  const result = await test.ctx.tools.execute({ callId: 'selected-weather', name: 'maps_weather', arguments: { city: 'fixture' }, agent: test.agent, signal: new AbortController().signal })
+  const result = await executeNativeTool(test.ctx.tools, { callId: 'selected-weather', name: 'maps_weather', arguments: { city: 'fixture' }, agent: test.agent, signal: new AbortController().signal })
   expect(result.isError).not.toBe(true)
   expect(calls).toEqual([expect.objectContaining({ run_id: second.id, resource_id: weather.id, server_id: 'gaode', tool_name: 'maps_weather', version: 'v1', manifest_version: 'm1' })])
   test.agent.cancel({ kind: 'user' }, { keepInbox: true })
@@ -1216,7 +1299,7 @@ it('uses the native retained estimate immediately after compaction, on reload, t
   await test.ctx.plugin(TokenMeter)
   const session = test.agent.session
   session.append('system/message', { message: createMessage({ role: 'system', content: [{ type: 'text', text: 'native test instructions' }] }) }, { surfaceOp: 'append' })
-  session.append('request/header', { header: { config: {}, tools: [{ name: 'inspect', description: 'inspect test artifacts', inputSchema: { type: 'object', properties: {} } }] } })
+  session.append('request/header', { header: { config: { provider: 'mock', model: 'mock' }, tools: [{ name: 'inspect', description: 'inspect test artifacts', inputSchema: { type: 'object', properties: {} } }] } })
   session.append('request/context', { provider: 'mock', model: 'mock', contextWindow: 100000 })
   const first = session.append('user/message', createUserMessage({ content: [{ type: 'text', text: 'long context '.repeat(1000) }], source: { kind: 'test' } }), { surfaceOp: 'append' }).seq
   const usage = { inputTokens: 9000, outputTokens: 20 }
@@ -1725,7 +1808,7 @@ it.each(['approve', 'discuss'])('settles native plan review through the Workbenc
   const bridge=new HumanInputBridge({database:t.db,executionRun:()=>t.db.getRun(t.owner.ownerId,response.run.id),
     resumeInput:(run,signal)=>t.scheduler.resumeInput(run,signal)})
   t.ctx.on('user-questions/request',bridge.handleRequest,{global:true,prepend:true})
-  const pending=t.ctx.tools.execute({callId:'review',name:'exit_plan_mode',arguments:{plan:'# Evidence plan\nReview facts.'},agent:t.agent,signal:new AbortController().signal})
+  const pending=executeNativeTool(t.ctx.tools, {callId:'review',name:'exit_plan_mode',arguments:{plan:'# Evidence plan\nReview facts.'},agent:t.agent,signal:new AbortController().signal})
   await vi.waitFor(()=>expect(bridge.pendings.size).toBe(1))
   const saved=t.db.getPendingInput(t.owner.ownerId,response.run.id)
   expect(saved.deadlineAt).toBeNull()

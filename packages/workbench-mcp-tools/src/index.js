@@ -174,7 +174,9 @@ export async function apply(ctx, config = {}) {
         call: (args, exec) => callProxy(ctx, tool, args, exec),
         taskCall: (args, exec) => callProxy(ctx, tool, args, exec, { task: true, journal }),
       })
-      registrations.set(tool.runtime_name, { tool, definition, dispose: ctx.tools.register(definition) })
+      registrations.set(tool.runtime_name, { tool, definition, dispose: ctx.tools.register(definition, {
+        when: ({ agent }) => (!config.discovery || discoveryReady) && allowedNames(agent).has(tool.public_name),
+      }) })
     }
     // A refresh can move one provider without replacing the others. Rebuild the
     // iteration order from the published catalog while retaining registrations.
@@ -236,11 +238,10 @@ export async function apply(ctx, config = {}) {
     restrictAgent(context.scope)
     const assembly = await next()
     const allowed = allowedNames(context.scope)
-    const mcpNames = new Set([...registrations.values()].map(({ tool }) => tool.public_name))
     const providers = new Map()
     for (const { tool } of registrations.values()) {
       if (config.discovery) break
-      if (!allowed.has(tool.public_name)) continue
+      if (!allowed.has(tool.public_name) || !ctx.tools.get(tool.public_name, context.scope, context.toolSet)) continue
       const key = `${tool.scope}:${tool.server_id}`
       if (!providers.has(key)) providers.set(key, {
         name: tool.provider_call_name ?? tool.server_id,
@@ -252,7 +253,6 @@ export async function apply(ctx, config = {}) {
     }
     return {
       ...assembly,
-      tools: assembly.tools.filter(tool => !mcpNames.has(tool.name) || allowed.has(tool.name)),
       sections: providers.size ? [...assembly.sections, {
         name: 'gxzs:mcp-provider-catalog',
         text: `当前可用 MCP 插件（调用名、展示名、用途和已注册子工具）：\n${JSON.stringify([...providers.values()])}\n按任务选择真实子工具；用户说出插件调用名或展示名时，可据此找到对应子工具。`,

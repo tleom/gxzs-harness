@@ -41,8 +41,16 @@ export class ChatDeletion {
     }
     const schedule = this.ctx.get('schedule')
     if (schedule) {
-      if (typeof schedule.deleteSessionPermanently !== 'function') throw new Error('Permanent schedule deletion is not installed')
-      for (const id of ids) await schedule.deleteSessionPermanently(id)
+      // Host tasks own their destinations. A task which merely originated in
+      // this chat keeps its independent/new-session execution destination.
+      for (const task of await schedule.catalog()) {
+        if (task.target?.kind !== 'new' && ids.has(task.target?.sessionId))
+          await schedule.edit({ id: task.id, action: 'delete' })
+      }
+      // Native edit owns cancellation and rows; shared domain cleanup erases orphan stages.
+      const domain = this.ctx.storageDomain.get('schedule')
+      if (!domain?.purgeOrphanStages) throw new Error('Schedule storage cleanup is not installed')
+      await domain.purgeOrphanStages()
     }
     await sessionQuery.deleteSessionsPermanently([...ids], async () => {
       const cache = this.ctx.get('sessionProjectionCache')

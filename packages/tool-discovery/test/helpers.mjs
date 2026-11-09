@@ -4,6 +4,8 @@ import SessionStore from '@deepseek-ai/dsh-session'
 import SessionProjection from '@deepseek-ai/dsh-session-projection'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
+import * as NativeExecutor from '@deepseek-ai/dsh-tool-executor-native'
+import * as PtcExecutor from '@deepseek-ai/dsh-tool-executor-ptc'
 import AgentRegistry from '@deepseek-ai/dsh-agent'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import { PtcRuntime } from '@deepseek-ai/dsh-ptc-runtime'
@@ -64,8 +66,9 @@ export async function mount({ rows = [row('g:cases', 'case_lookup')], mode = 'na
   const ctx = new Context(), executions = []
   ctx.provide('workingDirectory', { defaultDirectory: process.cwd(), get: () => process.cwd(), ensure: async () => process.cwd() })
   for (const plugin of [LlmRuntime, SessionStore, SessionProjection, SystemPrompt]) await ctx.plugin(plugin)
-  await ctx.plugin(ToolRuntime, { mode })
+  await ctx.plugin(ToolRuntime)
   if (mode === 'ptc') await ctx.plugin(FixturePtc)
+  await ctx.plugin(mode === 'ptc' ? PtcExecutor : NativeExecutor)
   await ctx.plugin(AgentRegistry); await ctx.plugin(AgentLoop, { agents: [] })
   const adapter = new Adapter(script); ctx.llm.registerAdapter(['fixture'], adapter)
   const registrations = new Map()

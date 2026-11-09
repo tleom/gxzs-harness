@@ -9,17 +9,17 @@ function fixture() {
   const owner = { ownerId: 'owner' }
   const chat = db.createChat({ ownerId: owner.ownerId, sessionId: 'native', selection: { model: 'chosen/model' } })
   const foreign = db.createChat({ ownerId: 'foreign', sessionId: 'other', selection: {} })
-  const task = { sessionId: chat.sessionId, record: { id: 'task', title: '提醒', prompt: '该打卡了', kind: 'daily' }, status: 'active' }
-  const native = { catalog: vi.fn(async () => [{ ...task.record, sessionId: task.sessionId, status: task.status }, { ...task.record, sessionId: foreign.sessionId, status: task.status, id: 'foreign-task' }]),
-    create: vi.fn(async () => task.record), history: vi.fn(async () => ({ records: [] })), update: vi.fn(async () => ({ updated: true })), delete: vi.fn(async () => ({ deleted: true })) }
+  const task = { sessionId: chat.sessionId, record: { id: 'task', target: { kind: 'session', sessionId: chat.sessionId }, title: '提醒', prompt: '该打卡了', kind: 'daily' }, status: 'active' }
+  const native = { catalog: vi.fn(async () => [{ ...task.record, target: { kind: 'session', sessionId: task.sessionId }, status: task.status }, { ...task.record, target: { kind: 'session', sessionId: foreign.sessionId }, status: task.status, id: 'foreign-task' }]),
+    create: vi.fn(async () => task.record), history: vi.fn(async () => ({ records: [] })), edit: vi.fn(async () => task.record) }
   const service = { requireChat: (owner, id) => { const value = db.getChat(owner.ownerId, id); if (!value) throw Object.assign(new Error('missing'), { status: 404 }); return value } }
-  return { db, owner, chat, task, foreign, native, gateway: new WorkbenchSchedules({ native, database: db, service }) }
+  return { db, owner, chat, task, foreign, native, gateway: new WorkbenchSchedules({ ownerId: 'owner', native, database: db, service }) }
 }
 it('scopes native tasks and their history/deletion to the signed chat owner', async () => {
   const test = fixture()
-  expect(await test.gateway.catalog(test.owner)).toEqual([{ ...test.task.record, sessionId: test.chat.sessionId, status: test.task.status, chat_id: test.chat.id, chat_title: test.chat.title, chat_deleted: false }])
+  expect(await test.gateway.catalog(test.owner)).toEqual([{ ...test.task.record, status: test.task.status, chat_id: test.chat.id, chat_title: test.chat.title, chat_deleted: false, execution_directory: null }])
   for (const method of ['history', 'delete', 'update']) await expect(test.gateway[method](test.owner, 'foreign-task', {})).rejects.toMatchObject({ status: 404 })
-  expect(test.native.history).not.toHaveBeenCalled(); expect(test.native.delete).not.toHaveBeenCalled(); expect(test.native.update).not.toHaveBeenCalled()
+  expect(test.native.history).not.toHaveBeenCalled(); expect(test.native.edit).not.toHaveBeenCalled()
 })
 it('retains native delivery names without admitting another session task or overwriting later catalog edits', async () => {
   const test = fixture()
@@ -66,7 +66,7 @@ it('records native IDs before display lookup settles and preserves later scope c
   test.db.updateRunResources(current, { ...current.selection, model: 'updated/model' }, [{ id: 'current' }])
   const repeated = test.gateway.rememberRun(current)
   expect(test.native.catalog).toHaveBeenCalledOnce()
-  release([{ id: 'task', sessionId: test.chat.sessionId, title: '提醒' }])
+  release([{ id: 'task', target: { kind: 'session', sessionId: test.chat.sessionId }, title: '提醒' }])
   await Promise.all([pending, repeated])
   expect(test.db.getRun(test.owner.ownerId, run.id)).toMatchObject({
     selection: { model: 'updated/model', schedule_ids: ['task'], schedule_titles: ['提醒'] }, mcpTools: [{ id: 'current' }],
@@ -99,7 +99,7 @@ it('bounds display lookup before execution and discards metadata arriving after 
     expect(test.gateway.pendingCatalog).toBeDefined()
     test.db.transitionRun(test.owner.ownerId, run.id, 'completed')
     test.db.appendEvent(test.owner.ownerId, run.id, { event: 'workbench_end', status: 'completed' })
-    release([{ id: 'task', sessionId: test.chat.sessionId, title: '迟到名称' }])
+    release([{ id: 'task', target: { kind: 'session', sessionId: test.chat.sessionId }, title: '迟到名称' }])
     await vi.advanceTimersByTimeAsync(1)
     expect(test.db.getRun(test.owner.ownerId, run.id).selection).toMatchObject({ schedule_ids: ['task'] })
     expect(test.db.getRun(test.owner.ownerId, run.id).selection.schedule_titles).toBeUndefined()
@@ -114,23 +114,25 @@ it('bounds display lookup before execution and discards metadata arriving after 
     vi.useRealTimers()
   }
 })
-it('uses the owning native Session and preserves compare-and-update without accepting a body binding', async () => {
+it('validates the target owner and forwards native revision, timing and history contracts', async () => {
   const test = fixture(); const signal = new AbortController().signal
-  await test.gateway.create(test.owner, test.chat.id, { title: '提醒', prompt: '内容', daily: { time: '08:00:00', time_zone: 'Asia/Shanghai' }, sessionId: test.foreign.sessionId }, signal)
-  expect(test.native.create).toHaveBeenCalledWith(test.chat.sessionId, { title: '提醒', prompt: '内容', daily: { time: '08:00:00', time_zone: 'Asia/Shanghai' } }, signal)
-  const expected = test.task.record
-  await test.gateway.update(test.owner, 'task', { expected, title: '新名称', sessionId: 'foreign' }, signal)
-  expect(test.native.update).toHaveBeenCalledWith({ sessionId: test.chat.sessionId, id: 'task', expected, title: '新名称' }, signal)
+  const timing = { kind: 'daily', daily: { time: '08:00:00', time_zone: 'Asia/Shanghai' } }
+  const target = { kind: 'session', sessionId: test.chat.sessionId }
+  await test.gateway.create(test.owner, test.chat.id, { title: '提醒', prompt: '内容', timing, target }, signal)
+  expect(test.native.create).toHaveBeenCalledWith({ title: '提醒', prompt: '内容', timing, target }, test.chat.sessionId, signal)
+  await expect(test.gateway.create(test.owner, test.chat.id, { title: '提醒', prompt: '内容', timing, target: { kind: 'session', sessionId: test.foreign.sessionId } }, signal)).rejects.toMatchObject({ status: 404 })
+  await test.gateway.update(test.owner, 'task', { expectedUpdatedAt: 'version', patch: { title: '新名称' } }, signal)
+  expect(test.native.edit).toHaveBeenCalledWith({ id: 'task', action: 'update', expectedUpdatedAt: 'version', patch: { title: '新名称' } }, undefined, signal)
   await test.gateway.history(test.owner, 'task', 'cursor')
-  expect(test.native.history).toHaveBeenCalledWith({ sessionId: test.chat.sessionId, id: 'task', limit: 50, before: 'cursor' })
+  expect(test.native.history).toHaveBeenCalledWith({ id: 'task', limit: 50, before: 'cursor' })
 })
 it('keeps retained receipts owner-scoped after a chat is soft-deleted', async () => {
   const test = fixture()
   test.db.db.prepare('UPDATE chats SET deleted_at = 1 WHERE id = ?').run(test.chat.id)
   expect(await test.gateway.catalog(test.owner)).toEqual([expect.objectContaining({ id: 'task', chat_deleted: true })])
   await test.gateway.history(test.owner, 'task')
-  expect(test.native.history).toHaveBeenCalledWith({ sessionId: test.chat.sessionId, id: 'task', limit: 50 })
-  await expect(test.gateway.history({ ownerId: 'unknown' }, 'task')).rejects.toMatchObject({ status: 404 })
+  expect(test.native.history).toHaveBeenCalledWith({ id: 'task', limit: 50 })
+  await expect(test.gateway.history({ ownerId: 'unknown' }, 'task')).rejects.toMatchObject({ status: 403 })
 })
 it('adopts one native scheduled delivery for admission without re-enqueuing it or renaming the chat', () => {
   const { db, chat, owner } = fixture()

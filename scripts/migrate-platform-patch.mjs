@@ -54,6 +54,72 @@ export function inheritedUserPatch(user, baseline) {
   return {text:String(document),removed:remove.length,retained:document.contents.items.length}
 }
 
+/** Upgrade only retired DSH configuration fields; preserve unrelated AST nodes and JS tags. */
+export function dsh022UserPatch(user) {
+  const document = documentOf(user)
+  let changes = 0
+  const set = (row, key, value) => { row.set(key, value); changes++ }
+  const value = (row, key) => row.get(key)
+  const plugin = (row, id, name) => value(row, 'id') === id || value(row, 'name') === name
+  visit(document, { Seq(_key, rows) {
+    const maps = rows.items.filter(isMap)
+    const find = id => rows.items.find(row => isMap(row) && value(row, 'id') === id)
+    const executor = kind => {
+      const id = `tool-executor-${kind}`
+      let row = find(id)
+      if (!row) { row = document.createNode({ id, name: `@deepseek-ai/dsh-${id}` }); rows.add(row); changes++ }
+      return row
+    }
+    for (const row of maps) {
+      const config = row.get('config', true)
+      if (plugin(row, 'tools', '@deepseek-ai/dsh-tools') && isMap(config)) {
+        const mode = config.get('mode', true)
+        if (mode !== undefined) {
+          if (!isScalar(mode) || mode.tag || !['native', 'ptc'].includes(mode.value))
+            throw new Error('DSH 0.2.2 migration requires a literal tools.mode (native or ptc)')
+          for (const kind of ['native', 'ptc']) {
+            const target = executor(kind), disabled = kind !== mode.value
+            if (target.has('disabled') && value(target, 'disabled') !== disabled)
+              throw new Error('Legacy tools.mode conflicts with an explicit tool executor; resolve the profile before startup')
+            set(target, 'disabled', disabled)
+          }
+          config.delete('mode'); changes++
+        }
+        const parallel = config.get('maxParallelSubCalls', true)
+        if (parallel !== undefined) {
+          const existingPtc = find('tool-executor-ptc')
+          const target = executor('ptc')
+          if (!existingPtc && mode === undefined) set(target, 'disabled', true)
+          if (!target.has('config')) target.set('config', document.createNode({}))
+          const options = target.get('config', true)
+          if (!isMap(options)) throw new Error('PTC executor configuration must be a mapping')
+          if (!options.has('maxParallelSubCalls')) set(options, 'maxParallelSubCalls', parallel.clone())
+          config.delete('maxParallelSubCalls'); changes++
+        }
+      }
+      if ((plugin(row, 'tool-subagent', '@deepseek-ai/dsh-tool-subagent') || value(row, 'id') === 'tool-subagent-fork') && isMap(config) && config.has('modelSelectionSettings')) {
+        const legacy = config.get('modelSelectionSettings', true)
+        if (!config.has('modelSelection')) set(config, 'modelSelection', legacy.clone())
+        if (!config.has('modelDiscovery') && isScalar(legacy) && legacy.value === true
+          && !maps.some(other => isMap(other.get('config', true)) && other.get('config', true).get('modelDiscovery') === true))
+          set(config, 'modelDiscovery', true)
+        config.delete('modelSelectionSettings'); changes++
+      }
+      if (plugin(row, 'tool-subagent-list-agents', '@deepseek-ai/dsh-tool-subagent-control/list-agents')) {
+        // The upstream control entry owns all three control tools. An id-only
+        // patch for the retired row has no target and must also be removed.
+        const control = maps.find(other => other !== row && plugin(other, 'tool-subagent-control', '@deepseek-ai/dsh-tool-subagent-control'))
+        if (control || !row.has('name')) { rows.items.splice(rows.items.indexOf(row), 1); changes++ }
+        else {
+          set(row, 'id', 'tool-subagent-control')
+          set(row, 'name', '@deepseek-ai/dsh-tool-subagent-control')
+        }
+      }
+    }
+  } })
+  return { text: changes ? String(document) : user, changes }
+}
+
 const optional = async path => {
   try{return await readFile(path,'utf8')}
   catch(error){if(error.code==='ENOENT')return undefined;throw error}
@@ -145,9 +211,34 @@ export async function migratePlatformPatch(profileDirectory,{ownerId}={}) {
   })
 }
 
+/** Independent versioned migration: existing bundle-layout markers must not bypass DSH upgrades. */
+export async function migrateDsh022Profile(profileDirectory) {
+  const directory = resolve(profileDirectory)
+  return withFileLock(join(directory, 'package.json'), async () => {
+    const patch = join(directory, 'cordis.patch.yml')
+    const marker = join(directory, '.gxzs-dsh-0.2.2-rc.1.json')
+    const previous = await optional(marker)
+    if (previous) {
+      if (JSON.parse(previous).version !== '0.2.2-rc.1') throw new Error('Unknown DSH migration receipt')
+      return { changed: false }
+    }
+    const user = await optional(patch) ?? '[]\n'
+    const backup = join(directory, '.cordis.patch.before-dsh-0.2.2-rc.1.yml')
+    const saved = await optional(backup)
+    const result = dsh022UserPatch(saved ?? user)
+    if (saved !== undefined && saved !== user && user !== result.text)
+      throw new Error('Profile changed after an interrupted DSH migration')
+    if (result.changes && saved === undefined) await publishBackupOnce(backup, user)
+    if (result.text !== user) await writeFileAtomic(patch, result.text, { mode: 0o600 })
+    await writeFileAtomic(marker, JSON.stringify({ version: '0.2.2-rc.1', changes: result.changes, userSha256: digest(result.text) }) + '\n', { mode: 0o600 })
+    return { changed: result.changes > 0, changes: result.changes }
+  })
+}
+
 if(process.argv[1] && resolve(process.argv[1])===fileURLToPath(import.meta.url)) {
   if(!process.env.DSH_HOME) throw new Error('DSH_HOME is required')
   const directory=join(process.env.DSH_HOME,'profiles/workbench')
   if(process.argv.length>2) throw new Error('Unknown profile migration operation; prepare baselines with prepare-profile-upgrade.py')
   await migratePlatformPatch(directory,{ownerId:process.env.GXZS_HOST_OWNER_ID})
+  await migrateDsh022Profile(directory)
 }

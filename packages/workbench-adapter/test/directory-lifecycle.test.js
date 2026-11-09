@@ -6,6 +6,19 @@ import { WorkbenchService } from '../src/service.js'
 import { WorkbenchWorkspaces } from '../src/workspaces.js'
 
 const cleanups = []
+it.each(['new', 'new_once'])('protects the future %s execution directory before a chat exists', async kind => {
+  const f = fixture(), directory = 'conversations/scheduled/future'
+  f.files.set(directory, 'directory')
+  f.service.schedules = { ownedCatalog: async () => [{ id: 'task', target: { kind, create: { cwd: `/workspace/${directory}` } } }] }
+  await expect(f.service.directories.deleteFile(f.owner, directory, 'v1')).rejects.toMatchObject({ code: 'WORKSPACE_SCHEDULE_ATTACHED' })
+  await expect(f.service.directories.transferFile(f.owner, 'move', directory, 'renamed')).rejects.toMatchObject({ code: 'WORKSPACE_SCHEDULE_ATTACHED' })
+  expect(f.files.has(directory)).toBe(true)
+  expect(f.db.pendingWorkspaceDeletions(f.owner.ownerId)).toEqual([])
+  await f.service.directories.transferFile(f.owner, 'copy', directory, 'copied')
+  expect(f.fileManager.operate).toHaveBeenLastCalledWith({ operation: 'copy', path: directory, destination: 'copied' })
+  f.service.schedules.ownedCatalog = async () => []
+  await expect(f.service.directories.deleteFile(f.owner, directory, 'v1')).resolves.toEqual({ deleted: true })
+})
 it('rejects unsupported entries without leaving a directory deletion lock', async () => {
   const f = fixture(), source = 'conversations/2026-10-26/link'
   f.fileManager.operate.mockResolvedValue({ kind: 'blocked', version: null })

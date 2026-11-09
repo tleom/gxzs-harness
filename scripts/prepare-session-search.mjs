@@ -23,7 +23,7 @@ export function sessionSearchLiveSource(source) {
 export async function prepareSessionSearch(root) {
   const directory = join(root, 'node_modules/@deepseek-ai/dsh-session-query-sqlite')
   const metadata = JSON.parse(await readFile(join(directory, 'package.json'), 'utf8'))
-  if (metadata.version !== '0.2.1-rc.2') throw new Error('Review native session search against the new DSH version first')
+  if (metadata.version !== '0.2.2-rc.1') throw new Error('Review native session search against the new DSH version first')
   const path = join(directory, 'lib/index.js')
   const source = await readFile(path, 'utf8')
   const stamp = '// gxzs-session-search-live:' + createHash('sha256').update(sessionSearchLiveSource.toString()).digest('hex')

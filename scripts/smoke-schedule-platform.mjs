@@ -8,8 +8,15 @@ export function createSchedulePlatformFixture() {
   let snapshot
   const register = (task, retain = false) => {
     assert.match(task.id, /^[A-Za-z0-9_-]{1,96}$/)
-    assert.match(task.sessionId, /^[A-Za-z0-9_-]{1,128}$/)
-    assert.match(task.chatId, /^[A-Za-z0-9_-]{1,36}$/)
+    const targetKind = task.targetKind ?? 'session'
+    assert.ok(['session', 'new_once', 'new'].includes(targetKind))
+    if (targetKind === 'session') {
+      assert.match(task.sessionId, /^[A-Za-z0-9_-]{1,128}$/)
+      assert.match(task.chatId, /^[A-Za-z0-9_-]{1,36}$/)
+    } else {
+      assert.equal(task.sessionId, null)
+      assert.equal(task.chatId, null)
+    }
     assert.ok(typeof task.title === 'string' && task.title.trim() && task.title.length <= 120)
     let job = jobs.get(task.id)
     if (!job) {
@@ -18,9 +25,7 @@ export function createSchedulePlatformFixture() {
         lastNotifiedRunId: null, lastNotifiedOccurrenceAt: null }
       jobs.set(task.id, job)
     }
-    assert.equal(job.sessionId, task.sessionId, 'Job Session binding changed')
-    assert.equal(job.chatId, task.chatId, 'Job chat binding changed')
-    if (!retain) job.title = task.title
+    if (!retain) Object.assign(job, { title: task.title, sessionId: task.sessionId, chatId: task.chatId })
     return job
   }
   return (method, route, body) => {
@@ -33,8 +38,9 @@ export function createSchedulePlatformFixture() {
         register(task)
         assert.ok(!ids.has(task.id), 'Duplicate wakeup task')
         ids.add(task.id)
-        assert.ok(['active', 'inactive'].includes(task.status))
-        assert.ok(Number.isSafeInteger(task.scheduledAt) && task.scheduledAt > 0)
+        assert.ok(['active', 'paused', 'ended'].includes(task.status))
+        assert.ok(task.status !== 'active' && task.scheduledAt === null
+          || Number.isSafeInteger(task.scheduledAt) && task.scheduledAt > 0)
         assert.match(task.revision, /^[a-f0-9]{64}$/)
       }
       if (body.sequence === sequence) assert.deepEqual(body.tasks, snapshot, 'Same sequence changed its snapshot')

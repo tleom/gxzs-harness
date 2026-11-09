@@ -51,7 +51,7 @@ import { WorkbenchSubagentSettings } from './settings.js'
 import { setTimeout as delay } from 'node:timers/promises'
 
 export const name = 'workbench-adapter'
-export const inject = ['sessionPersistence', 'sessions', 'connection', 'typertGateway', 'webServer', 'sessionController', 'workspaceController', 'sessionReferenceResolver', 'fileReferences', 'workspaceChanges', 'workingDirectory', 'agents', 'commands', 'skills', 'systemPrompt', 'tokenMeter', 'workbenchFileManager', 'workbenchPlatformClient', 'sessionQuery', 'sessionProjections', 'agentPresets', 'agentDefaultModel', 'settings', 'attachments', 'fileUploads', 'goals', 'terminalController', 'subagents', 'subprocess', 'jobs', 'jobController', 'tools']
+export const inject = ['sessionPersistence', 'sessions', 'connection', 'typertGateway', 'webServer', 'sessionController', 'workspaceController', 'sessionReferenceResolver', 'fileReferences', 'workspaceChanges', 'workingDirectory', 'agents', 'commands', 'skills', 'systemPrompt', 'tokenMeter', 'workbenchFileManager', 'workbenchPlatformClient', 'sessionQuery', 'sessionProjections', 'storageDomain', 'agentPresets', 'agentDefaultModel', 'settings', 'attachments', 'fileUploads', 'goals', 'terminalController', 'subagents', 'subprocess', 'jobs', 'jobController', 'tools']
 
 export const Config = z.object({
   basePath: z.string().default('/ai/workbench'),
@@ -116,7 +116,10 @@ export function apply(ctx, config) {
     return runtime.refreshMcpCatalog()
   }
   service.waitSessionActivity = sessionId => waitSessionActivity(ctx, sessionId)
-  const schedules = new WorkbenchSchedules({ native: () => ctx.get('schedule'), database, service })
+  const schedules = new WorkbenchSchedules({ native: () => ctx.get('schedule'), database, service, ownerId: config.ownerId,
+    sessionHeader: async id => ctx.sessions.get(id)?.header ?? (await ctx.sessionPersistence.stat(id))?.header })
+  service.schedules = schedules
+  ctx.on('schedule/resolve-agent', (sessionId, next) => schedules.activate({ ownerId: config.ownerId }, sessionId, next), { global: true })
   const scheduleNotifications = new ScheduleNotifications({ database, platformClient: ctx.workbenchPlatformClient,
     ownerId: config.ownerId, schedules, logger: ctx.logger })
   schedules.notifications = scheduleNotifications
@@ -326,7 +329,7 @@ export function apply(ctx, config) {
     })))
     return {
       resources_pending: modelsOnly,
-      dsh_version: '0.2.1-rc.2', draft_resource_protocol: 1, draft_directory: dateDirectory(), schedule_protocol: 1, schedule_notification_protocol: 1, schedule_creation_protocol: 1, subagent_protocol: 1, terminal_protocol: 1, browser_protocol: 1, browser_input_protocol: 2, job_protocol: 1,
+      dsh_version: '0.2.2-rc.1', draft_resource_protocol: 1, draft_directory: dateDirectory(), schedule_protocol: 2, schedule_notification_protocol: 1, schedule_creation_protocol: 2, subagent_protocol: 1, terminal_protocol: 1, browser_protocol: 1, browser_input_protocol: 2, job_protocol: 1,
       activity_protocol: 1, sidebar_lease_protocol: 1, human_input_protocol: 1, followup_protocol: 1, history_protocol: 1, native_history_protocol: 1,
       ...(ctx.get('clientModules') ? { native_client_protocol: 1, native_session_client_protocol: 2, native_schedule_client_protocol: 1,
         ...(ctx.sessionReferenceResolver.listSessionCandidates && ctx.get('fileReferences')?.listObserved ? { native_subagent_reference_protocol: 1 } : {}),
@@ -566,7 +569,7 @@ export function apply(ctx, config) {
         if (!abort.signal.aborted) sendJson(res, 200, { data: page })
       } finally { res.off('close', disconnected) }
     }],
-    ['POST', /^\/chats\/([\w-]+)\/schedules$/, async ({ owner, json }, res, match) => {
+    ['POST', /^\/(?:chats\/([\w-]+)\/)?schedules$/, async ({ owner, json }, res, match) => {
       const abort = new AbortController()
       const disconnected = () => abort.abort()
       res.once('close', disconnected)
@@ -575,6 +578,10 @@ export function apply(ctx, config) {
         if (!abort.signal.aborted) sendJson(res, 201, { data })
       } finally { res.off('close', disconnected) }
     }],
+    ['POST', /^\/schedules\/([\w-]+)\/run$/, async ({ owner }, res, match) =>
+      sendJson(res, 200, { data: await schedules.run(owner, match[1]) })],
+    ['DELETE', /^\/schedules\/ended$/, async ({ owner }, res) =>
+      sendJson(res, 200, { data: await schedules.deleteEnded(owner) })],
     ['GET', /^\/schedules\/([\w-]+)\/history$/, async ({ owner, url }, res, match) => sendJson(res, 200, { data: await schedules.history(owner, match[1], url.searchParams.get('before')) })],
     ['PATCH', /^\/schedules\/([\w-]+)$/, async ({ owner, json }, res, match) => {
       const abort = new AbortController()

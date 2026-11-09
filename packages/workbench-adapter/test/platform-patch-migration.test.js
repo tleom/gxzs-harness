@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
 import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { inheritedUserPatch, migratePlatformPatch, provisionLegacyBaseline } from '../../../scripts/migrate-platform-patch.mjs'
+import { inheritedUserPatch, migratePlatformPatch, provisionLegacyBaseline, dsh022UserPatch, migrateDsh022Profile } from '../../../scripts/migrate-platform-patch.mjs'
 
 const failure=vi.hoisted(()=>({backup:''}))
 vi.mock('node:fs/promises',async original=>{
@@ -74,6 +74,60 @@ it('initializes a new owner and then leaves changed native user settings byte-fo
   await writeFile(join(directory,'cordis.patch.yml'),user)
   expect(await migratePlatformPatch(directory,{ownerId:'owner'})).toEqual({changed:false,layout:'bundle-base'})
   expect(await readFile(join(directory,'cordis.patch.yml'),'utf8')).toBe(user)
+})
+it('migrates nested executor and subagent configuration once while retaining unrelated fields and expression tags', () => {
+  const user = `- id: preset-custom
+  config:
+    plugins:
+      - id: tools
+        config:
+          mode: ptc
+          maxParallelSubCalls: 3
+      - id: tool-subagent-control
+      - id: tool-subagent-list-agents
+        name: '@deepseek-ai/dsh-tool-subagent-control/list-agents'
+      - id: tool-subagent
+        config: { modelSelectionSettings: true, maxDepth: 4 }
+      - id: tool-subagent-fork
+        config: { modelSelectionSettings: true }
+- id: custom
+  config: { secret: !!js process.env.MY_TOKEN }
+`
+  const result = dsh022UserPatch(user)
+  expect(result.changes).toBeGreaterThan(0)
+  expect(result.text).not.toContain('modelSelectionSettings')
+  expect(result.text).not.toContain('/list-agents')
+  expect(result.text).not.toContain('mode: ptc')
+  expect(result.text).toContain('maxParallelSubCalls: 3')
+  expect(result.text.match(/modelDiscovery: true/g)).toHaveLength(1)
+  expect(result.text).toContain('maxDepth: 4')
+  expect(result.text).toContain('!!js process.env.MY_TOKEN')
+  expect(result.text).toMatch(/id: tool-executor-native[\s\S]*?disabled: true/)
+  expect(result.text).toMatch(/id: tool-executor-ptc[\s\S]*?disabled: false/)
+  expect(dsh022UserPatch(result.text)).toEqual({ text: result.text, changes: 0 })
+})
+it('does not enable PTC for a legacy concurrency setting alone and refuses ambiguous mode expressions', () => {
+  const result = dsh022UserPatch('- id: tools\n  config: { maxParallelSubCalls: 2 }\n')
+  expect(result.text).toMatch(/id: tool-executor-ptc[\s\S]*?disabled: true/)
+  expect(() => dsh022UserPatch('- id: tools\n  config: { mode: !!js process.env.MODE }\n')).toThrow('literal tools.mode')
+  expect(() => dsh022UserPatch('- id: tools\n  config: { mode: ptc }\n- id: tool-executor-ptc\n  disabled: true\n')).toThrow('conflicts')
+})
+it('upgrades an already converted profile with a separate receipt and resumes after an interrupted write', async () => {
+  const directory = await fixture()
+  await migratePlatformPatch(directory, { ownerId: 'owner' })
+  const user = '- id: tools\n  config: { mode: ptc, maxParallelSubCalls: 5 }\n'
+  await writeFile(join(directory, 'cordis.patch.yml'), user)
+  const result = await migrateDsh022Profile(directory)
+  expect(result.changed).toBe(true)
+  expect(await readFile(join(directory, '.cordis.patch.before-dsh-0.2.2-rc.1.yml'), 'utf8')).toBe(user)
+  const migrated = await readFile(join(directory, 'cordis.patch.yml'), 'utf8')
+  // Simulate the data write committing before the version receipt.
+  await rm(join(directory, '.gxzs-dsh-0.2.2-rc.1.json'))
+  await migrateDsh022Profile(directory)
+  expect(await readFile(join(directory, 'cordis.patch.yml'), 'utf8')).toBe(migrated)
+  await writeFile(join(directory, 'cordis.patch.yml'), migrated + '# user edit\n')
+  expect(await migrateDsh022Profile(directory)).toEqual({ changed: false })
+  expect(await readFile(join(directory, 'cordis.patch.yml'), 'utf8')).toContain('# user edit')
 })
 it('refuses missing or mismatched legacy baseline identities before changing the user document',async()=>{
   const user='- id: subagent\n  config: { maxDepth: 2 }\n'

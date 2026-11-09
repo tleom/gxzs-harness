@@ -8,6 +8,11 @@ import { goalMentionResources } from './resource-mentions.js'
 import { scheduleOccurrences } from './schedule-notifications.js'
 import { setImmediate as yieldToEventLoop } from 'node:timers/promises'
 
+// Native Schedule uses the same source kind for deliveries and quiet edit notices.
+// Edit notices remain model context; they do not own a platform execution receipt.
+const isScheduleChange = message => message?.source?.kind === 'schedule'
+  && contentText(message.content).startsWith('[SCHEDULE CHANGE]\n')
+
 const END_STATUS = {
   completed: 'completed', aborted: 'cancelled', error: 'failed',
   'max-tokens': 'failed', blocked: 'failed', interrupted: 'interrupted',
@@ -245,7 +250,7 @@ function projectEvent(database, sessionId, event, expectedOwnerId, context) {
 export function claimNeedsResources(database, { agent, message, turn }, ownerId) {
   const sessionId = agent?.session?.id ?? agent?.id
   const chat = database.getChatBySession(sessionId)
-  if (!chat || chat.ownerId !== ownerId || database.getRun(ownerId, message?.id)) return false
+  if (!chat || chat.ownerId !== ownerId || isScheduleChange(message) || database.getRun(ownerId, message?.id)) return false
   if (message?.source?.kind === 'schedule') return true
   if (isNativeNotice(message) && !noticeParent(database, chat, message)) return false
   return (message?.source?.kind === 'tool-jobs' || isNativeNotice(message))
@@ -368,6 +373,7 @@ function adoptNativeNotice(database, chat, message, context) {
 }
 
 function adoptMessage(database, sessionId, message, context) {
+  if (isScheduleChange(message)) return
   if (message?.source?.kind === 'schedule' && typeof message.id === 'string') {
     const chat = database.getChatBySession(sessionId)
     if (!chat) return
@@ -502,7 +508,7 @@ async function reconcileNativeSessionSnapshots(database, sessionQuery, ownerId, 
   let replayed = 0
   for (const chat of chats) {
     const resources = message => {
-      if ((!['schedule', 'tool-jobs'].includes(message?.source?.kind) && !isNativeNotice(message)) || database.getRunState(ownerId, message.id)) return undefined
+      if (isScheduleChange(message) || (!['schedule', 'tool-jobs'].includes(message?.source?.kind) && !isNativeNotice(message)) || database.getRunState(ownerId, message.id)) return undefined
       if (isNativeNotice(message) && !noticeParent(database, chat, message)) return undefined
       return typeof context === 'function' ? context() : context
     }

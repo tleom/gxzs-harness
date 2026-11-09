@@ -1,6 +1,6 @@
 # DSH tool discovery
 
-`@gxzs/dsh-tool-discovery` is a DSH 0.2.1-rc.2 plugin. It registers the native
+`@gxzs/dsh-tool-discovery` is a DSH 0.2.2-rc.1 plugin. It registers the native
 `mcp` and `tool_search` capabilities and restricts managed tools per Agent. Original tool
 definitions and executors remain registered with DSH; authorization stays with
 the host bridge and the original executor.

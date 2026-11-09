@@ -1,4 +1,5 @@
 import { createRequire } from 'node:module'
+import * as NativeExecutor from '@deepseek-ai/dsh-tool-executor-native'
 import { readFile, writeFile, unlink } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { randomUUID } from 'node:crypto'
@@ -35,7 +36,7 @@ const [{ Context }, { default: Llm, LlmAdapter }, { default: Sessions }, { defau
 async function runtime() {
   const ctx = new Context()
   ctx.provide('workingDirectory', { defaultDirectory: process.cwd(), get: () => process.cwd(), ensure: async () => process.cwd() })
-  for (const plugin of [Llm, Sessions, Projections, Prompt, Tools, Agents, Loop]) await ctx.plugin(plugin)
+  for (const plugin of [Llm, Sessions, Projections, Prompt, Tools, NativeExecutor, Agents, Loop]) await ctx.plugin(plugin)
   let calls = 0
   class Model extends LlmAdapter {
     async resolveModel(provider, model) { return { provider, id: model, name: model } }
@@ -91,8 +92,8 @@ function fixture(rpcId = 'same-id') {
   return { message, manager, inbox, agent, submit }
 }
 function durableInbox(test) {
-  const inbox = new Inbox({ stateOf: session => session.snapshotEvents()
-    .filter(event => session.isOwnSeq(event.seq)).reduce(projection.apply, projection.init()) },
+  const inbox = new Inbox(() => test.agent.session.snapshotEvents()
+    .filter(event => test.agent.session.isOwnSeq(event.seq)).reduce(projection.apply, projection.init()),
   test.agent.session, { emit: vi.fn() })
   test.agent.inbox = inbox
   test.manager.deliver.mockImplementation((_activation, message) => inbox.append('next-turn', message))

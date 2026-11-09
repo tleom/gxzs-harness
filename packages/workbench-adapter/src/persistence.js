@@ -166,6 +166,17 @@ export class WorkbenchDatabase {
         created_at INTEGER NOT NULL,
         PRIMARY KEY(owner_id, chat_id, request_key)
       );
+      CREATE TABLE IF NOT EXISTS host_command_receipts (
+        owner_id TEXT NOT NULL,
+        request_key TEXT NOT NULL,
+        result_json TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY(owner_id, request_key)
+      );
+      INSERT OR IGNORE INTO host_command_receipts(owner_id,request_key,result_json,created_at)
+        SELECT owner_id,request_key,result_json,created_at FROM command_receipts
+        WHERE request_key LIKE 'schedule-notify-init:%';
+      DELETE FROM command_receipts WHERE request_key LIKE 'schedule-notify-init:%';
       CREATE TABLE IF NOT EXISTS control_state (
         chat_id TEXT PRIMARY KEY REFERENCES chats(id) ON DELETE CASCADE,
         revision INTEGER NOT NULL DEFAULT 0,
@@ -327,7 +338,7 @@ export class WorkbenchDatabase {
   }
   // Retained native tasks keep their original owner even after chat soft deletion.
   chatBindings(ownerId) {
-    return this.db.prepare('SELECT id, session_id AS sessionId, title, deleted_at AS deletedAt FROM chats WHERE owner_id = ?')
+    return this.db.prepare('SELECT id, session_id AS sessionId, title, directory, deleted_at AS deletedAt FROM chats WHERE owner_id = ?')
       .all(ownerId)
   }
 
@@ -659,22 +670,22 @@ export class WorkbenchDatabase {
   }
 
   rememberScheduleInitialization(ownerId, chatId, task, createdAt) {
-    return this.saveCommandReceipt(ownerId, chatId, `schedule-notify-init:${task.id}`, { task, createdAt })
+    return this.saveHostReceipt(ownerId, `schedule-notify-init:${task.id}`, { task, createdAt })
   }
 
   pendingScheduleInitializations(ownerId) {
-    return this.db.prepare(`SELECT r.chat_id,r.result_json FROM command_receipts r JOIN chats c ON c.id=r.chat_id
-      WHERE r.owner_id=? AND c.deleted_at IS NULL AND r.request_key LIKE 'schedule-notify-init:%'
+    return this.db.prepare(`SELECT r.result_json FROM host_command_receipts r
+      WHERE r.owner_id=? AND r.request_key LIKE 'schedule-notify-init:%'
       AND json_extract(r.result_json, '$.createdAt') IS NOT NULL
       ORDER BY r.created_at,r.request_key`).all(ownerId)
-      .map(row => ({ chatId: row.chat_id, ...JSON.parse(row.result_json) }))
+      .map(row => JSON.parse(row.result_json))
   }
 
   acknowledgeScheduleInitialization(ownerId, chatId, jobId) {
     // The platform's config version is the replay fence; completed local
     // initialization records need not accumulate beside creation receipts.
-    this.db.prepare('DELETE FROM command_receipts WHERE owner_id=? AND chat_id=? AND request_key=?')
-      .run(ownerId, chatId, `schedule-notify-init:${jobId}`)
+    this.db.prepare('DELETE FROM host_command_receipts WHERE owner_id=? AND request_key=?')
+      .run(ownerId, `schedule-notify-init:${jobId}`)
   }
 
   acknowledgeScheduleNotification(ownerId, runId) {
@@ -741,6 +752,17 @@ export class WorkbenchDatabase {
     const row = this.db.prepare('SELECT result_json FROM command_receipts WHERE owner_id = ? AND chat_id = ? AND request_key = ?')
       .get(ownerId, chatId, requestKey)
     return row ? JSON.parse(row.result_json) : undefined
+  }
+
+  getHostReceipt(ownerId, requestKey) {
+    const row = this.db.prepare('SELECT result_json FROM host_command_receipts WHERE owner_id=? AND request_key=?').get(ownerId, requestKey)
+    return row ? JSON.parse(row.result_json) : undefined
+  }
+
+  saveHostReceipt(ownerId, requestKey, result, now = Date.now()) {
+    this.db.prepare(`INSERT INTO host_command_receipts(owner_id,request_key,result_json,created_at)
+      VALUES (?,?,?,?) ON CONFLICT(owner_id,request_key) DO NOTHING`).run(ownerId, requestKey, JSON.stringify(result), now)
+    return this.getHostReceipt(ownerId, requestKey)
   }
 
   saveCommandReceipt(ownerId, chatId, requestKey, result, now = Date.now()) {

@@ -1,10 +1,11 @@
+import * as NativeExecutor from '@deepseek-ai/dsh-tool-executor-native'
 import { afterAll, beforeAll, expect, it, vi } from 'vitest'
 import { createRequire } from 'node:module'
 import { readFile, writeFile, unlink } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { randomUUID } from 'node:crypto'
-import { agentLoopPath, prepareAgentInbox } from '../../../scripts/prepare-dsh-agent-inbox.mjs'
+import { agentLoopPath, beforeTools, prepareAgentInbox } from '../../../scripts/prepare-dsh-agent-inbox.mjs'
 import { WorkbenchDatabase } from '../src/persistence.js'
 import { TaskScheduler } from '../src/scheduler.js'
 import { prepareRecoveredInboxes, reconcileNativeSessions, projectInboxClaim, projectSessionEvent } from '../src/projection.js'
@@ -21,8 +22,9 @@ const files = []
 let original, prepared, baselineLoop, fixedLoop
 beforeAll(async () => {
   const path = await agentLoopPath(profile)
-  original = (await readFile(path, 'utf8')).replace('machine.cancel({ kind: "disposed" }, { keepInbox: true });', 'machine.cancel({ kind: "disposed" });')
+  original = (await readFile(path, 'utf8')).replace('machine.cancel({ kind: "disposed" }, { keepInbox: true });', 'machine.cancel({ kind: "disposed" }, { keepInbox: !ready });')
     .replace('\tresumePending() {\n\t\tif (this.phase.kind === "idle" && this.inbox.hasPending) this.wakeDriver();\n\t}\n', '')
+    .replace(beforeTools, '')
   prepared = prepareAgentInbox(original)
   const load = async source => {
     const file = join(dirname(path), `gxzs-inbox-${randomUUID()}.js`)
@@ -38,7 +40,7 @@ afterAll(async () => { await Promise.all(files.map(path => unlink(path))) })
 async function mount(Loop, block = false) {
   const ctx = new Context(), entered = Promise.withResolvers()
   ctx.provide('workingDirectory', { defaultDirectory: process.cwd(), get: () => process.cwd(), ensure: async () => process.cwd() })
-  for (const plugin of [Llm, Sessions, Projections, Prompt, Tools, Agents, Loop]) await ctx.plugin(plugin)
+  for (const plugin of [Llm, Sessions, Projections, Prompt, Tools, NativeExecutor, Agents, Loop]) await ctx.plugin(plugin)
   let requests = 0
   class Model extends LlmAdapter {
     async resolveModel(provider, model) { return { provider, id: model, name: model } }
@@ -71,6 +73,7 @@ function pending(events) {
 it('guards the pinned lifecycle contract and applies idempotently', () => {
   expect(prepareAgentInbox(prepared)).toBe(prepared)
   expect(() => prepareAgentInbox(original.replace('await machine.whenIdle();', 'await machine.changed();'))).toThrow('contract changed')
+  expect(() => prepareAgentInbox(original.replace('const toolSet = await this.loopCtx.tools.resolve({', 'const toolSet = await this.loopCtx.tools.changed({'))).toThrow('contract changed')
 })
 
 it('reproduces upstream disposal losing unclaimed schedule messages', async () => {

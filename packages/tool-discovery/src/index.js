@@ -4,7 +4,7 @@ import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import {
   MCP_NAME, TOOL_SEARCH_NAME, activationEntry, availablePlugins, buildCatalog, hash, matchesEntry, pluginSummary, renderCatalog, search,
 } from './catalog.js'
-import { ACTIVE_EVENT, PROJECTION_KEY, discoveryProjection } from './projection.js'
+import { ACTIVE_EVENT, discoveryProjection } from './projection.js'
 
 export { MCP_NAME, TOOL_SEARCH_NAME } from './catalog.js'
 export const name = 'tool-discovery'
@@ -14,17 +14,18 @@ export const Config = z.object({
 })
 
 /** Register one native DSH discovery capability backed by an injected catalogue. */
-export function apply(ctx, supplied = {}) {
+export async function apply(ctx, supplied = {}) {
   const config = Config(supplied)
   const bridge = ctx.toolDiscoveryCatalog
   const states = new Map(), bySession = new WeakMap()
   let disposed = false, initialized = false
-  ctx.sessionProjections.register(discoveryProjection)
+  const projection = await ctx.sessionProjections.register(discoveryProjection)
+  ctx.effect(() => () => projection.dispose(), 'tool-discovery.projection')
 
   function stateFor(agent) {
     let state = states.get(agent)
     if (state) return state
-    const restored = ctx.sessionProjections.stateOf(agent.session, PROJECTION_KEY)
+    const restored = projection.stateOf(agent.session)
     state = {
       agent, authorityKey: restored?.authorityKey ?? null,
       active: new Map((restored?.tools ?? []).map(tool => [tool.id, tool])),
@@ -100,7 +101,7 @@ export function apply(ctx, supplied = {}) {
   }
 
   function visibleEntries(state, entries) {
-    const visible = bridge.visibleNames?.(state.agent) ?? ctx.tools.view(state.agent).visible
+    const visible = bridge.visibleNames?.(state.agent) ?? new Set(ctx.tools.definitions(state.agent).map(tool => tool.name))
     return new Map([...entries].filter(([, entry]) => visible.has(entry.name)))
   }
 

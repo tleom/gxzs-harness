@@ -11,9 +11,9 @@ WORKDIR /opt/workbench
 COPY packages ./packages
 COPY profiles/workbench ./profiles/workbench
 COPY scripts/prepare-workspace-changes.mjs /opt/workbench/scripts/prepare-workspace-changes.mjs
-COPY scripts/prepare-session-client.mjs /opt/workbench/scripts/prepare-session-client.mjs
 COPY scripts/prepare-subagent-prompt.mjs /opt/workbench/scripts/prepare-subagent-prompt.mjs
 COPY scripts/prepare-dsh-stream-arguments.mjs /opt/workbench/scripts/prepare-dsh-stream-arguments.mjs
+COPY patches ./patches
 COPY scripts/prepare-dsh-agent-inbox.mjs /opt/workbench/scripts/prepare-dsh-agent-inbox.mjs
 COPY scripts/prepare-terminal-cleanup.mjs /opt/workbench/scripts/prepare-terminal-cleanup.mjs
 COPY scripts/prepare-session-references.mjs /opt/workbench/scripts/prepare-session-references.mjs

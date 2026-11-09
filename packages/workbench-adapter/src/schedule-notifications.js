@@ -33,7 +33,9 @@ export class ScheduleNotifications {
     return value.data ?? value
   }
   task(task) {
-    return { id: task.id, sessionId: task.sessionId, chatId: task.chat_id, title: task.title }
+    const targetKind = task.target?.kind ?? 'session'
+    return { id: task.id, targetKind, sessionId: targetKind === 'session' ? task.target?.sessionId ?? task.sessionId : null,
+      chatId: targetKind === 'session' ? task.chat_id : null, title: task.title }
   }
   async read(tasks) {
     const values = new Map()
@@ -195,10 +197,7 @@ export class ScheduleNotifications {
           progressed = true
           continue
         }
-        const earlier = pending.some(other => other.id !== run.id &&
-          (other.selection.schedule_occurrences ?? scheduleOccurrences(other.query)).some(previous =>
-            occurrences.some(item => item.jobId === previous.jobId && item.occurrenceAt > previous.occurrenceAt)))
-        if (!execution || earlier) continue
+        if (!execution) continue
         if (this.schedules.nativeCreations) return
         await this.initializePending()
         const end = this.database.scheduleNotificationEnd(this.ownerId, execution.id)
@@ -208,7 +207,8 @@ export class ScheduleNotifications {
         if (missing.length) await this.sync(missing.map(item => ({ id: item.jobId, sessionId: run.sessionId,
           chat_id: run.chatId, title: run.selection.schedule_titles?.[occurrences.indexOf(item)] || '定时任务' })), 'recover')
         for (let offset = 0; offset < occurrences.length; offset += 200) {
-          await this.request({ action: 'complete', runId: run.id, occurrences: occurrences.slice(offset, offset + 200),
+          await this.request({ action: 'complete', runId: run.id, occurrences: occurrences.slice(offset, offset + 200)
+            .map(item => ({ ...item, sessionId: execution.sessionId, chatId: execution.chatId })),
             status: execution.status, finishedAt })
         }
         this.lifetime.signal.throwIfAborted()
@@ -233,7 +233,7 @@ export class ScheduleNotifications {
 export function registerScheduleNotificationTool(ctx, { schedules, database, runtime, ownerId }) {
   ctx.tools.register(defineTool({
     name: 'schedule_notification_set',
-    description: 'Enable or disable system notifications after each execution of a scheduled task in this conversation. After schedule_create, call this with enabled=true when the user asks to be notified. Notifications default to disabled.',
+    description: 'Enable or disable system notifications after each execution of a scheduled task on this Host. After schedule_create, call this with enabled=true when the user asks to be notified. Notifications default to disabled.',
     parameters: {
       id: { type: 'string', required: true, description: 'Task id returned by schedule_create or schedule_list.' },
       enabled: { type: 'boolean', required: true, description: 'Notify the task creator after future scheduled executions.' },
@@ -250,7 +250,6 @@ export function registerScheduleNotificationTool(ctx, { schedules, database, run
         || run.stopConfirmation?.fenced || !runtime.scheduler.hasAdmission(sessionId))
         throw httpError(403, '当前智能体没有此任务的设置权限')
       let task = await schedules.task({ ownerId }, args.id)
-      if (task.sessionId !== sessionId) throw httpError(404, '定时任务不存在')
       // A native schedule_create can finish before its background wakeup snapshot.
       // This explicit mutation may register the missing row; catalog reads remain read-only.
       if (!task.notification_available && task.notification_version === undefined)

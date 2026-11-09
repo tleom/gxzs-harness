@@ -6,7 +6,7 @@ const cleanups = []
 afterEach(() => { cleanups.splice(0).forEach(clean => clean()); vi.useRealTimers() })
 function fixture() {
   const database = new WorkbenchDatabase(':memory:')
-  let tasks = [{ id: 'one', sessionId: 'session', chat_id: 'chat', title: '提醒', prompt: '内容', status: 'active',
+  let tasks = [{ id: 'one', target: { kind: 'session', sessionId: 'session' }, chat_id: 'chat', title: '提醒', prompt: '内容', status: 'active',
     kind: 'cron', expression: '0 8 * * 1,3,5', timeZone: 'Asia/Shanghai', scheduledAt: new Date(Date.now() + 3_600_000).toISOString() }]
   const hooks = new Map()
   const platformClient = { json: vi.fn(async request => {

@@ -59,7 +59,6 @@ jobs:
         run: |
           node scripts/patch-dsh-skill-catalog.mjs
           node scripts/patch-dsh-mcp-tasks.mjs
-          node scripts/patch-dsh-chat-settings.mjs
           node scripts/check-dsh-skill-catalog.mjs
       - run: pnpm check
         if: steps.scope.outputs.runtime == 'true'

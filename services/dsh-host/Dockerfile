@@ -21,9 +21,9 @@ COPY packages ./packages
 COPY --from=browser-client /dist/ ./services/browser-client/dist/
 COPY profiles/workbench ./profiles/workbench
 COPY scripts/prepare-workspace-changes.mjs /opt/workbench/scripts/prepare-workspace-changes.mjs
-COPY scripts/prepare-session-client.mjs /opt/workbench/scripts/prepare-session-client.mjs
 COPY scripts/prepare-subagent-prompt.mjs /opt/workbench/scripts/prepare-subagent-prompt.mjs
 COPY scripts/prepare-dsh-stream-arguments.mjs /opt/workbench/scripts/prepare-dsh-stream-arguments.mjs
+COPY patches ./patches
 COPY scripts/prepare-dsh-agent-inbox.mjs /opt/workbench/scripts/prepare-dsh-agent-inbox.mjs
 COPY scripts/prepare-terminal-cleanup.mjs /opt/workbench/scripts/prepare-terminal-cleanup.mjs
 COPY scripts/prepare-session-references.mjs /opt/workbench/scripts/prepare-session-references.mjs
@@ -35,13 +35,11 @@ COPY scripts/migrate-platform-patch.mjs /opt/workbench/scripts/migrate-platform-
 COPY scripts/prepare-sidebar-terminal.mjs /opt/workbench/scripts/prepare-sidebar-terminal.mjs
 COPY scripts/check-runtime-imports.mjs ./check-runtime-imports.mjs
 COPY scripts/patch-dsh-mcp-tasks.mjs /opt/workbench/scripts/patch-dsh-mcp-tasks.mjs
-COPY scripts/patch-dsh-chat-settings.mjs /opt/workbench/scripts/patch-dsh-chat-settings.mjs
 COPY scripts/patch-dsh-skill-catalog.mjs /opt/workbench/scripts/patch-dsh-skill-catalog.mjs
 COPY scripts/check-dsh-skill-catalog.mjs /opt/workbench/scripts/check-dsh-skill-catalog.mjs
 RUN ln -s profiles/workbench/node_modules /opt/workbench/node_modules \
     && cd profiles/workbench && npm ci --no-audit --no-fund \
     && node /opt/workbench/scripts/patch-dsh-mcp-tasks.mjs \
-    && node /opt/workbench/scripts/patch-dsh-chat-settings.mjs \
     && node /opt/workbench/scripts/patch-dsh-skill-catalog.mjs \
     && node /opt/workbench/scripts/prepare-sidebar-terminal.mjs \
     && node /opt/workbench/scripts/check-dsh-skill-catalog.mjs \

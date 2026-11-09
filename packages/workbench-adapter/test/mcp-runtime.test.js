@@ -69,7 +69,7 @@ describe('frozen run MCP authorization', () => {
       database.bindRunMessage('root', run.id, 1, 'message')
       database.transitionRun('t:1', run.id, 'running')
       let turn = 1
-      const root = { id: 'root', session: { id: 'root' }, status: 'running', ctx: { sessionProjections: { stateOf: () => ({ lastTurn: turn }) } } }
+      const root = { id: 'root', session: { id: 'root' }, status: 'running', ctx: { agents: { turnBoundaryOf: () => ({ lastTurn: turn }) } } }
       const child = { id: 'child', session: { id: 'child' }, status: 'running', cancel() {} }
       const unrelated = { id: 'unrelated', session: { id: 'unrelated', header: { parentSession: 'root' } }, status: 'running' }
       const agents = { list: () => [root, child, unrelated], get: id => [root, child, unrelated].find(item => item.id === id), isOwnedBy: (id, parent) => id === 'child' && parent === root }

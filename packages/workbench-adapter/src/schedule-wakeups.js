@@ -3,8 +3,8 @@ import { createHash } from 'node:crypto'
 export const PREWARM_MS = 5 * 60_000
 const digest = value => createHash('sha256').update(JSON.stringify(value)).digest('hex')
 export function scheduleRevision(task) {
-  return digest([task.id, task.sessionId, task.kind, task.status, task.scheduledAt,
-    task.title, task.prompt, task.everySeconds, task.time, task.timeZone, task.weekdays, task.expression])
+  return digest([task.id, task.target, task.kind, task.status, task.scheduledAt, task.updatedAt,
+    task.title, task.prompt, task.everySeconds, task.time, task.timeZone, task.weekdays, task.expression, task.rrule])
 }
 
 /** Native commits drive durable platform registrations; only failed/unacknowledged requests retry. */
@@ -46,8 +46,11 @@ export class ScheduleWakeups {
     this.lifetime.signal.throwIfAborted()
     this.dirty = false
     const catalog = await this.schedules.ownedCatalog({ ownerId: this.ownerId })
-    const tasks = catalog.map(task => ({ id: task.id, sessionId: task.sessionId, chatId: task.chat_id,
-      title: task.title, status: task.status, scheduledAt: Date.parse(task.scheduledAt), revision: scheduleRevision(task) }))
+    const tasks = catalog.map(task => ({ id: task.id, targetKind: task.target.kind,
+      sessionId: task.target.kind === 'session' ? task.target.sessionId : null,
+      chatId: task.target.kind === 'session' ? task.chat_id : null,
+      title: task.title, status: task.status, scheduledAt: Number.isFinite(Date.parse(task.scheduledAt)) ? Date.parse(task.scheduledAt) : null,
+      revision: scheduleRevision(task) }))
       .sort((a, b) => a.id.localeCompare(b.id))
     const fingerprint = digest(tasks)
     const sequence = this.database.scheduleSyncSequence(this.ownerId, fingerprint)

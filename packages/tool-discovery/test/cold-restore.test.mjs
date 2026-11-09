@@ -1,3 +1,4 @@
+import * as NativeExecutor from '@deepseek-ai/dsh-tool-executor-native'
 import { afterAll, beforeAll, test } from 'vitest'
 import assert from 'node:assert/strict'
 import { fileURLToPath } from 'node:url'
@@ -46,7 +47,7 @@ async function mount(root, { owner = 'owner-a', runOwner = owner, rows = catalog
   script = [response('case_lookup', { query: 'restored' }), response()] } = {}) {
   const ctx = new Context(), calls = []
   ctx.provide('workingDirectory', { get: () => root, ensure: async () => root })
-  for (const plugin of [LlmRuntime, SessionStore, Projections, SystemPrompt, ToolRuntime, AgentRegistry]) await ctx.plugin(plugin)
+  for (const plugin of [LlmRuntime, SessionStore, Projections, SystemPrompt, ToolRuntime, NativeExecutor, AgentRegistry]) await ctx.plugin(plugin)
   await ctx.plugin(Jsonl, { root, compression: 'none' })
   await ctx.plugin(AgentLoop, { agents: [] })
   const model = new Model(script)
