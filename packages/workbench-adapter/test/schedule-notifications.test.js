@@ -22,7 +22,7 @@ function fixture() {
     sent.push(body)
     return { data: ['lookup', 'sync', 'recover'].includes(body.action) ? body.tasks.map(task => ({ jobId: task.id, notifyEnabled: true, version: 2 })) : ['schedule-one'] }
   }) }
-  const schedules = { ownedCatalog: vi.fn(async () => [{ id: 'schedule-one', sessionId: chat.sessionId,
+  const schedules = { ownedCatalog: vi.fn(async () => [{ id: 'schedule-one', target: { kind: 'session', sessionId: chat.sessionId },
     chat_id: chat.id, title: '提醒' }]) }
   const bridge = new ScheduleNotifications({ database, platformClient, ownerId, schedules })
   bridges.push(bridge)
@@ -135,7 +135,7 @@ it('waits for execution completion and acknowledges the durable receipt once', a
   await h.bridge.flush(); await h.bridge.flush()
   expect(h.sent.filter(body => body.action === 'complete')).toEqual([{
     action: 'complete', runId: 'message-one', status: 'completed', finishedAt: 1792458060000,
-    occurrences: [{ jobId: 'schedule-one', occurrenceAt: 1792458000000 }],
+    occurrences: [{ jobId: 'schedule-one', occurrenceAt: 1792458000000, sessionId: h.chat.sessionId, chatId: h.chat.id }],
   }])
   expect(h.database.pendingScheduleNotifications(h.ownerId)).toEqual([])
 })
@@ -199,27 +199,27 @@ it('reports failed executions and does not scan ordinary completed conversations
   expect(h.database.pendingScheduleNotifications(h.ownerId)).toEqual([])
 })
 
-it('replays occurrences in task order when recovered receipts share a timestamp', async () => {
+it('reports all completed occurrences even when recovery visits newer timestamps first', async () => {
   const h = fixture()
   h.deliver('z-older', 1, '2026-10-20T00:58:00.000Z'); h.end(1)
   h.deliver('a-newer', 2, '2026-10-20T00:59:00.000Z'); h.end(2)
   h.database.db.prepare('UPDATE runs SET created_at=1').run()
   await h.bridge.flush()
-  expect(h.sent.filter(body => body.action === 'complete').map(body => body.runId)).toEqual(['z-older', 'a-newer'])
+  expect(h.sent.filter(body => body.action === 'complete').map(body => body.runId).sort()).toEqual(['a-newer', 'z-older'])
 })
 
 it('registers creation settings and saves notification-only edits without changing native task fields', async () => {
   const h = fixture()
-  const record = { id: 'schedule-one', title: '提醒', prompt: '内容', kind: 'daily' }
+  const record = { id: 'schedule-one', title: '提醒', prompt: '内容', kind: 'daily', target: { kind: 'session', sessionId: h.chat.sessionId } }
   const native = { create: vi.fn(async () => record),
-    catalog: vi.fn(async () => [{ ...record, sessionId: h.chat.sessionId, status: 'active' }]),
-    update: vi.fn(async () => ({ updated: false })) }
-  const gateway = new WorkbenchSchedules({ native, database: h.database,
+    catalog: vi.fn(async () => [{ ...record, target: { kind: 'session', sessionId: h.chat.sessionId }, status: 'active' }]),
+    edit: vi.fn(async () => record) }
+  const gateway = new WorkbenchSchedules({ ownerId: h.ownerId, native, database: h.database,
     service: { requireChat: () => h.chat } })
   gateway.notifications = h.bridge
   await gateway.create({ ownerId: h.ownerId }, h.chat.id, { ...record,
     daily: { time: '08:00:00', time_zone: 'Asia/Shanghai' }, notify_enabled: true })
-  expect(native.create.mock.calls[0][1]).not.toHaveProperty('notify_enabled')
+  expect(native.create.mock.calls[0][0]).not.toHaveProperty('notify_enabled')
   expect(h.sent.find(body => body.action === 'initialize')).toMatchObject({
     task: { id: 'schedule-one', sessionId: h.chat.sessionId, chatId: h.chat.id },
     createdAt: expect.any(Number),
@@ -227,14 +227,14 @@ it('registers creation settings and saves notification-only edits without changi
   await gateway.update({ ownerId: h.ownerId }, 'schedule-one', {
     expected: record, notify_enabled: false, notification_version: 2,
   })
-  expect(native.update).toHaveBeenCalledWith({ sessionId: h.chat.sessionId, id: 'schedule-one', expected: record }, undefined)
+  expect(native.edit).not.toHaveBeenCalled()
   expect(h.sent.filter(body => body.action === 'configure').at(-1)?.notifyEnabled).toBe(false)
 })
 
 it('allows the native creation tool to enable notifications before the wakeup snapshot registers its row', async () => {
   const h = fixture()
   const tasks = await h.bridge.schedules.ownedCatalog()
-  const schedules = new WorkbenchSchedules({ native: { catalog: async () => tasks }, database: h.database, service: {} })
+  const schedules = new WorkbenchSchedules({ ownerId: h.ownerId, native: { catalog: async () => tasks }, database: h.database, service: {} })
   schedules.notifications = h.bridge
   h.platformClient.json.mockImplementation(async ({ body }) => {
     const request = JSON.parse(body); h.sent.push(request)
@@ -257,11 +257,11 @@ it('allows the native creation tool to enable notifications before the wakeup sn
 it('retains the created native task when platform settings cannot be saved', async () => {
   const h = fixture()
   h.platformClient.json.mockRejectedValue(new Error('platform unavailable'))
-  const create = vi.fn(async () => ({ id: 'schedule-one', title: '提醒' }))
-  const gateway = new WorkbenchSchedules({ native: { create }, database: h.database,
+  const create = vi.fn(async () => ({ id: 'schedule-one', title: '提醒', target: { kind: 'session', sessionId: h.chat.sessionId } }))
+  const gateway = new WorkbenchSchedules({ ownerId: h.ownerId, native: { create }, database: h.database,
     service: { requireChat: () => h.chat } })
   gateway.notifications = h.bridge
-  expect(await gateway.create({ ownerId: h.ownerId }, h.chat.id, { title: '提醒', prompt: '内容', notify_enabled: true }))
+  expect(await gateway.create({ ownerId: h.ownerId }, h.chat.id, { title: '提醒', prompt: '内容', target: { kind: 'session', sessionId: h.chat.sessionId }, notify_enabled: true }))
     .toMatchObject({ id: 'schedule-one', notification_error: expect.stringContaining('任务已创建') })
   expect(create).toHaveBeenCalledOnce()
 })
@@ -307,7 +307,7 @@ it('observes a queue removal while the notification catalog request is in flight
   const pending = h.bridge.flush()
   await vi.waitFor(() => expect(release).toBeTypeOf('function'))
   h.database.transitionRun(h.ownerId, old.id, 'discarded')
-  release([{ id: 'schedule-one', sessionId: h.chat.sessionId, chat_id: h.chat.id, title: '提醒' }])
+  release([{ id: 'schedule-one', target: { kind: 'session', sessionId: h.chat.sessionId }, chat_id: h.chat.id, title: '提醒' }])
   await pending
   expect(h.database.pendingScheduleNotifications(h.ownerId)).toEqual([])
   expect(h.sent.filter(item => item.action === 'complete').map(item => item.runId)).toEqual(['message-one'])
@@ -316,7 +316,7 @@ it('observes a queue removal while the notification catalog request is in flight
 it('returns settings per batch and preserves cached registrations when recovering a deleted native task', async () => {
   const h = fixture()
   const tasks = Array.from({ length: 401 }, (_, i) => ({ id: `schedule-${i}`,
-    sessionId: h.chat.sessionId, chat_id: h.chat.id, title: `任务${i}` }))
+    target: { kind: 'session', sessionId: h.chat.sessionId }, chat_id: h.chat.id, title: `任务${i}` }))
   expect(await h.bridge.sync(tasks)).toHaveLength(401)
   expect(h.sent.map(item => item.tasks.length)).toEqual([200, 200, 1])
   h.deliver(); h.end()
@@ -330,24 +330,24 @@ it('rejects a stale settings version before changing native rules and exposes a 
   const h = fixture()
   let record = { id: 'schedule-one', title: '原名称', prompt: '内容', kind: 'daily' }
   const native = {
-    catalog: async () => [{ ...record, sessionId: h.chat.sessionId, status: 'active' }],
-    update: vi.fn(async request => { record = { ...record, title: request.title }; return { updated: true, record } }),
+    catalog: async () => [{ ...record, target: { kind: 'session', sessionId: h.chat.sessionId }, status: 'active' }],
+    edit: vi.fn(async request => { record = { ...record, title: request.patch.title, updatedAt: 'new-version' }; return record }),
   }
-  const gateway = new WorkbenchSchedules({ native, database: h.database, service: {} })
+  const gateway = new WorkbenchSchedules({ ownerId: h.ownerId, native, database: h.database, service: {} })
   gateway.notifications = {
     read: async tasks => tasks.map(task => ({ ...task, notification_available: true, notification_version: 3 })),
     configure: vi.fn().mockRejectedValueOnce(new Error('lost settings response')).mockResolvedValue({}),
   }
   await expect(gateway.update({ ownerId: h.ownerId }, record.id, {
-    title: '新名称', expected: record, notify_enabled: true, notification_version: 2,
+    patch: { title: '新名称' }, expectedUpdatedAt: record.updatedAt ?? null, notify_enabled: true, notification_version: 2,
   })).rejects.toMatchObject({ status: 409 })
-  expect(native.update).not.toHaveBeenCalled()
+  expect(native.edit).not.toHaveBeenCalled()
   const result = await gateway.update({ ownerId: h.ownerId }, record.id, {
-    title: '新名称', expected: record, notify_enabled: true, notification_version: 3,
+    patch: { title: '新名称' }, expectedUpdatedAt: record.updatedAt ?? null, notify_enabled: true, notification_version: 3,
   })
-  expect(result).toMatchObject({ updated: true, record: { title: '新名称' }, notification_version: 3,
+  expect(result).toMatchObject({ title: '新名称', updatedAt: 'new-version', notification_version: 3,
     notification_error: expect.stringContaining('任务规则已保存') })
   await expect(gateway.update({ ownerId: h.ownerId }, record.id, {
-    title: '新名称', expected: result.record, notify_enabled: true, notification_version: result.notification_version,
+    patch: { title: '新名称' }, expectedUpdatedAt: result.updatedAt, notify_enabled: true, notification_version: result.notification_version,
   })).resolves.not.toHaveProperty('notification_error')
 })

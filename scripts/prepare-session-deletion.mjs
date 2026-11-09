@@ -298,22 +298,6 @@ var SingleJsonUnit = class {`)
 \t* Move one record's document aside`)
 }
 
-export function scheduleDeletionSource(source) {
-  if (source.includes('async deleteSessionPermanently(sessionId)')) return source
-  return replaceOnce(source, '\t\tasync delete(request, signal) {', `\t\tasync deleteSessionPermanently(sessionId) {
-\t\t\treturn this.serialize(async () => {
-\t\t\t\tconst domain = await this.getDomain();
-\t\t\t\tconst tasks = domain.table("tasks");
-\t\t\t\tfor (const [id, task] of tasks.entries()) if (task.sessionId === sessionId) await tasks.delete(id);
-\t\t\t\t// Sweep even if archive or a failed earlier attempt removed all rows.
-\t\t\t\tawait domain.purgeOrphanStages();
-\t\t\t\tthis.emitChanged();
-\t\t\t\tthis.runtime?.requestDrive();
-\t\t\t});
-\t\t}
-\t\tasync delete(request, signal) {`)
-}
-
 export function workspaceChangesDeletionSource(source) {
   if (source.includes('deleteSessionPermanently: async (id)')) return source
   source = 'import { readdir } from "node:fs/promises";\n' + source
@@ -353,12 +337,11 @@ export async function prepareSessionDeletion(root) {
     ['dsh-session-projection-cache', projectionDeletionSource],
     ['dsh-storage-domain', domainDeletionSource],
     ['dsh-storage-json', jsonStorageDeletionSource],
-    ['dsh-schedule', scheduleDeletionSource],
     ['dsh-workspace-changes', workspaceChangesDeletionSource],
   ]) {
     const directory = join(root, 'node_modules/@deepseek-ai', name)
     const metadata = JSON.parse(await readFile(join(directory, 'package.json'), 'utf8'))
-    if (metadata.version !== '0.2.1-rc.2') throw new Error('Review permanent deletion against the new DSH version first')
+    if (metadata.version !== '0.2.2-rc.1') throw new Error('Review permanent deletion against the new DSH version first')
     const path = join(directory, 'lib/index.js')
     const source = await readFile(path, 'utf8')
     const stamp = '// gxzs-permanent-deletion:' + createHash('sha256').update(transform.toString()).digest('hex')

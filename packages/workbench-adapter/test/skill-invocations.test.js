@@ -1,3 +1,4 @@
+import * as NativeExecutor from '@deepseek-ai/dsh-tool-executor-native'
 import assert from 'node:assert/strict'
 import { afterEach, test } from 'vitest'
 import { createRequire } from 'node:module'
@@ -78,7 +79,7 @@ async function fixture(t, { goals = false, plan = false } = {}) {
   cleanups.push(() => ctx.fiber.dispose())
   ctx.provide('workingDirectory', { ensure: async agent => agent.session.header.cwd,
     get: session => session.header.cwd })
-  for (const plugin of [LlmRuntime, SessionStore, Projections, SystemPrompt, ToolRuntime, AgentRegistry, Skills, Commands])
+  for (const plugin of [LlmRuntime, SessionStore, Projections, SystemPrompt, ToolRuntime, NativeExecutor, AgentRegistry, Skills, Commands])
     await ctx.plugin(plugin)
   if (plan) await ctx.plugin(PlanMode, { section: 'Prepare a plan for the user.' })
   if (goals) {

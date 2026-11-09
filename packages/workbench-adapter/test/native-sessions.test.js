@@ -25,7 +25,7 @@ function fixture() {
   }) }
   const ctx = { on: (name, callback) => { listeners.set(name, callback); return () => listeners.delete(name) } }
   const gateway = new WorkbenchNativeSessions({ ctx, sessions, subagents, service, database: { listChats: () => [{ sessionId: 'root' }] } })
-  return { gateway, sessions, listeners }
+  return { gateway, sessions, listeners, ctx }
 }
 it('retains original metadata and only returns roots owned by the platform and their recursive descendants', async () => {
   const { gateway } = fixture()
@@ -42,7 +42,9 @@ it('passes the exact native addressed follow, pagination and projection contract
   expect(sessions.page).toHaveBeenCalledWith({ address, throughSeq: 10, beforeSeq: 5 }, signal)
   await gateway.read(owner, 'chat', 'projections', { address, keys: ['inbox'] }, signal)
   expect(sessions.projections).toHaveBeenCalledWith({ sessionId: 'grandchild', keys: ['inbox'] }, signal)
-  expect(await gateway.read(owner, 'chat', 'attachment', { address, attachmentId: 'image' }, signal)).toMatchObject({ data: 'AQI=' })
+  const attachment = { attachmentId: 'image', mediaType: 'image/png', bytes: 2, width: 1, height: 1 }
+  expect(await gateway.read(owner, 'chat', 'attachment', { address, attachment }, signal)).toMatchObject({ data: 'AQI=' })
+  expect(sessions.attachment).toHaveBeenCalledWith({ sessionId: 'grandchild', attachment }, signal)
 })
 it('rejects another root, a forged direct parent and a bare child identity before any native history access', async () => {
   const { gateway, sessions } = fixture()
@@ -54,6 +56,23 @@ it('rejects another root, a forged direct parent and a bare child identity befor
   ]) await expect(gateway.follow(owner, 'chat', { address }, signal).next()).rejects.toBeInstanceOf(Error)
   await expect(gateway.follow({ ownerId: 'foreign' }, 'chat', { address: { kind: 'session', sessionId: 'root' } }, signal).next()).rejects.toMatchObject({ status: 404 })
   expect(sessions.follow).not.toHaveBeenCalled()
+})
+it('resolves legacy Markdown image IDs only from the authorized history and releases its observation', async () => {
+  const { gateway, sessions, ctx } = fixture()
+  const attachment = { attachmentId: 'sha256:legacy', mediaType: 'image/png', bytes: 2, width: 1, height: 1 }
+  const dispose = vi.fn()
+  ctx.sessionQuery = { observeSession: vi.fn(async () => ({
+    events: [{ data: { content: [{ type: 'image', attachment }] } }], [Symbol.dispose]: dispose,
+  })) }
+  const address = { kind: 'session', sessionId: 'root' }
+  await gateway.read(owner, 'chat', 'attachment', { address, attachmentId: attachment.attachmentId })
+  expect(sessions.attachment).toHaveBeenCalledWith({ sessionId: 'root', attachment }, undefined)
+  expect(dispose).toHaveBeenCalledOnce()
+  await expect(gateway.read(owner, 'chat', 'attachment', { address, attachmentId: 'foreign' })).rejects.toMatchObject({ status: 404 })
+  expect(sessions.attachment).toHaveBeenCalledOnce()
+  expect(dispose).toHaveBeenCalledTimes(2)
+  await expect(gateway.read({ ownerId: 'foreign' }, 'chat', 'attachment', { address, attachmentId: attachment.attachmentId })).rejects.toMatchObject({ status: 404 })
+  expect(ctx.sessionQuery.observeSession).toHaveBeenCalledTimes(2)
 })
 it('forwards original Session lifecycle notifications and releases every Host listener on close', async () => {
   const { gateway, listeners } = fixture()

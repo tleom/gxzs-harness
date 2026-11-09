@@ -4,7 +4,6 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { officePreset } from './preset-policy.mjs'
 import { prepareWorkspaceChanges } from '../../scripts/prepare-workspace-changes.mjs'
-import { prepareSessionClient } from '../../scripts/prepare-session-client.mjs'
 import { prepareSubagentPrompt } from '../../scripts/prepare-subagent-prompt.mjs'
 import { prepareSessionReferences } from '../../scripts/prepare-session-references.mjs'
 import { prepareSessionDeletion } from '../../scripts/prepare-session-deletion.mjs'
@@ -18,7 +17,6 @@ const root = dirname(fileURLToPath(import.meta.url))
 await prepareSessionDeletion(root)
 await prepareSessionSearch(root)
 await prepareWorkspaceChanges(root)
-await prepareSessionClient(root)
 await prepareSubagentPrompt(root)
 await prepareSessionReferences(root)
 await prepareWorkbenchClient(root)

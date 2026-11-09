@@ -18,7 +18,7 @@ export class ToolDiscoveryCatalog extends Service {
   }
 
   visibleNames(agent) {
-    const visible = this.ctx.tools.view(agent).visible
+    const visible = new Map(this.ctx.tools.definitions(agent).map(tool => [tool.name, tool]))
     return new Set([...this.registrations.values()]
       .filter(({ tool, definition }) => visible.get(tool.public_name) === definition)
       .map(({ tool }) => tool.public_name))

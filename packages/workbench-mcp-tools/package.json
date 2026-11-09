@@ -8,14 +8,14 @@
     "./names": "./src/names.js"
   },
   "engines": {
-    "node": "^22.19.0 || >=24.0.0"
+    "node": ">=24.9.0"
   },
   "dependencies": {
-    "@deepseek-ai/cordis": "4.0.5",
-    "@deepseek-ai/dsh-mcp-client": "0.2.1-rc.2",
-    "@deepseek-ai/dsh-mcp-resources": "0.2.1-rc.2",
-    "@deepseek-ai/dsh-tools": "0.2.1-rc.2",
-    "@deepseek-ai/schemastery": "3.18.5",
+    "@deepseek-ai/cordis": "4.1.0",
+    "@deepseek-ai/dsh-mcp-client": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-mcp-resources": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-tools": "0.2.2-rc.1",
+    "@deepseek-ai/schemastery": "3.19.0",
     "@modelcontextprotocol/ext-tasks": "0.2.2",
     "ajv": "8.20.0"
   }

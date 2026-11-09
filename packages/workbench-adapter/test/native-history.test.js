@@ -14,7 +14,8 @@ const [{ Context }, { default: Llm, createMessage, createUserMessage }, { defaul
   native('dsh-system-prompt'), native('dsh-tools'), native('dsh-agent'), native('dsh-session-query'),
 ])
 // Exact published implementation, as used by SessionController.page().
-const { SessionHistoryController } = await import(pathToFileURL(join(dirname(require.resolve('@deepseek-ai/dsh-api-session-controller')), 'types/history.js')).href)
+const { HistoryController } = await import(pathToFileURL(join(dirname(require.resolve('@deepseek-ai/dsh-api-session-controller')), 'types/history/controller.js')).href)
+const { WebController } = await import(pathToFileURL(join(dirname(require.resolve('@deepseek-ai/dsh-api-session-controller')), 'types/web/controller.js')).href)
 const contexts = []
 
 it.each([false, true])('retains a terminal query that failed before native turn admission (live=%s)', async nativeLive => {
@@ -36,7 +37,10 @@ async function fixture() {
   const ctx = new Context(); contexts.push(ctx)
   for (const plugin of [Llm, Sessions, Projections, Prompt, Tools, Agents, Query]) await ctx.plugin(plugin)
   const session = ctx.sessions.create(undefined, { meta: { cwd: '/workspace' } })
-  return { ctx, session, services: { sessions: new SessionHistoryController(ctx, observation => observation[Symbol.dispose]()), sessionQuery: ctx.sessionQuery } }
+  const history = new HistoryController(ctx)
+  const web = new WebController(ctx, history, () => { throw new Error('Passive history must not activate an agent') })
+  return { ctx, session, services: { sessions: { page: (request, signal) => history.events(request, signal),
+    follow: (request, signal) => web.follow(request, signal) }, sessionQuery: ctx.sessionQuery } }
 }
 function turn(session, number, count) {
   session.append('turn/start', { turn: number })

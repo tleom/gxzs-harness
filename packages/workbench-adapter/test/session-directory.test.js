@@ -14,7 +14,7 @@ describe('conversation session history', () => {
     }
     const child = await copySessionDirectory(services, 'old', '/workspace/conversations/chat', 1)
     const request = services.agents.create.mock.calls[0][0]
-    expect(request).toMatchObject({ sessionId: child.sessionId, seed: events.slice(0, 2), inheritedEventCount: 2, meta: { cwd: '/workspace/conversations/chat', parentSession: 'old', agentPreset: 'standard' } })
+    expect(request).toMatchObject({ sessionId: child.sessionId, seed: events.slice(0, 2), inheritedEventCount: 2, meta: { cwd: '/workspace/conversations/chat', isSeeded: true, agentPreset: 'standard' } })
     expect(await request.setup('agent-context')).toBeUndefined()
     expect(services.agentPresets.mount).toHaveBeenCalledWith('agent-context', 'standard')
     expect(source.events).toHaveLength(3)

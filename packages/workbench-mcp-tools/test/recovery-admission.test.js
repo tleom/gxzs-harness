@@ -1,3 +1,5 @@
+import { executeNativeTool } from '../../../scripts/test-native-tool.mjs'
+import * as NativeExecutor from '@deepseek-ai/dsh-tool-executor-native'
 import { expect, it, vi } from 'vitest'
 import { DatabaseSync } from 'node:sqlite'
 import { readFileSync } from 'node:fs'
@@ -65,7 +67,8 @@ it('freezes a retained capacity catalog for a new run and resumes through native
     expect(frozen.tools[0].manifest_version).toBe(tool.manifest_version)
     run = { id: 'new-run', ownerId: owner, status: 'running', mcpTools: frozen.tools }
     await nativeContext.plugin(Prompt)
-    await nativeContext.plugin(Tools, { mode: 'native' })
+    await nativeContext.plugin(Tools)
+    await nativeContext.plugin(NativeExecutor)
     const tools = nativeContext.get('tools'), agent = { id: 'a', session: { id: 'session' } }
     scope = createScope(nativeContext, agent)
     // Production injects the Tools property; keep the same native scoped service.
@@ -74,7 +77,7 @@ it('freezes a retained capacity catalog for a new run and resumes through native
     const recovery = tools.schemas(agent).find(item => item.name.startsWith('resume_mcp_task_'))
     expect(recovery).toBeDefined()
     lost = false
-    const result = await tools.execute({ name: recovery.name, arguments: { task_ref: 'old-run:old-call' }, agent,
+    const result = await executeNativeTool(tools, { name: recovery.name, arguments: { task_ref: 'old-run:old-call' }, agent,
       callId: 'native-recovery', signal: new AbortController().signal })
     expect(result.isError).toBe(false)
     expect(JSON.stringify(result.content)).toContain('recovered-complete')

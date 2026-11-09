@@ -1,3 +1,5 @@
+import { executeNativeTool } from '../../../scripts/test-native-tool.mjs'
+import * as NativeExecutor from '@deepseek-ai/dsh-tool-executor-native'
 import { expect, it, vi } from 'vitest'
 import { createRequire } from 'node:module'
 import { pathToFileURL } from 'node:url'
@@ -13,7 +15,8 @@ it('runs resumed results through native structured output, failure and image pro
   const ctx = new Context()
   try {
     await ctx.plugin(Prompt)
-    await ctx.plugin(Tools, { mode: 'native' })
+    await ctx.plugin(Tools)
+  await ctx.plugin(NativeExecutor)
     const tools = ctx.get('tools')
     const agent = { id: 'a', session: { id: 's' } }, other = { id: 'b' }
     const scope = createScope(ctx, agent)
@@ -27,7 +30,7 @@ it('runs resumed results through native structured output, failure and image pro
     scopes.sync(agent)
     const name = tools.schemas(agent)[0].name
     expect(tools.schemas(other)).toHaveLength(0)
-    const execute = () => tools.execute({ name, arguments: { task_ref: record.ref }, agent,
+    const execute = () => executeNativeTool(tools, { name, arguments: { task_ref: record.ref }, agent,
       callId: 'resume', signal: new AbortController().signal })
     resume.mockResolvedValueOnce({ content: [{ type: 'text', text: 'done' }], structuredContent: { count: 'bad' } })
     expect((await execute()).isError).toBe(true)

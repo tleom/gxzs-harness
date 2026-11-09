@@ -1,3 +1,5 @@
+import { executeNativeTool } from '../../../scripts/test-native-tool.mjs'
+import * as NativeExecutor from '@deepseek-ai/dsh-tool-executor-native'
 import { afterEach, expect, it } from 'vitest'
 import { createRequire } from 'node:module'
 import { readFileSync, mkdtempSync, writeFileSync, rmSync, symlinkSync } from 'node:fs'
@@ -19,16 +21,17 @@ async function context(names) {
   const ctx = new Context()
   cleanups.push(() => ctx.fiber.dispose())
   for (const name of names) await ctx.plugin((await native('dsh-' + name)).default)
+  if (names.includes('tools')) await ctx.plugin(NativeExecutor)
   return ctx
 }
 
 function call(ctx, agent, name, args) {
-  return ctx.tools.execute({ name, arguments: args, agent, callId: randomUUID(), signal: AbortSignal.timeout(20_000) })
+  return executeNativeTool(ctx.tools, { name, arguments: args, agent, callId: randomUUID(), signal: AbortSignal.timeout(20_000) })
 }
 const text = result => result.content.filter(block => block.type === 'text').map(block => block.text).join('\n')
 
 it('searches real native sessions and refuses another workspace even with a known session id', async () => {
-  const ctx = await context(['llm', 'session', 'session-projection', 'system-prompt', 'tools'])
+  const ctx = await context(['llm', 'session', 'session-projection', 'system-prompt', 'tools', 'agent'])
   await ctx.plugin((await native('dsh-session-query-sqlite')).default, { path: ':memory:', openAt: 'first-search' })
   await ctx.plugin(await native('dsh-tool-session-query'))
   const { createUserMessage } = await native('dsh-llm')
@@ -85,11 +88,9 @@ it('runs the official Ralph script through the real PTC process with fresh struc
 
 it('revises the native title from all user messages and projects it into the Workbench chat', async () => {
   const { LlmAdapter, createUserMessage } = await native('dsh-llm')
-  const { turnBoundaryProjectionDefinition } = await native('dsh-agent-loop')
   const { WorkbenchDatabase } = await import('../src/persistence.js')
   const { projectSessionEvent } = await import('../src/projection.js')
-  const ctx = await context(['llm', 'session', 'session-projection'])
-  ctx.sessionProjections.register(turnBoundaryProjectionDefinition)
+  const ctx = await context(['llm', 'session', 'session-projection', 'agent'])
   await ctx.plugin((await native('dsh-session-title')).default, { fallbackMaxWords: 5, fallbackMaxBytes: 40, maxTitleBytes: 80 })
   const requests = []
   class TitleAdapter extends LlmAdapter {

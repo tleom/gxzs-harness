@@ -39,7 +39,27 @@ export class WorkbenchNativeSessions {
     const sessionId = address.kind === 'session' ? address.sessionId : address.childSessionId
     if (operation === 'projections') return this.sessions.projections({ sessionId, ...(request.keys ? { keys: request.keys } : {}) }, signal)
     if (operation === 'attachment') {
-      return this.sessions.attachment({ sessionId, attachmentId: request.attachmentId }, signal)
+      let attachment = request.attachment
+      // Markdown emitted by older tools contains only the durable object path.
+      // Resolve its reference from the authorized Session; modern image blocks
+      // already carry the complete reference and never need a history read.
+      if (!attachment && typeof request.attachmentId === 'string') {
+        const observation = await this.ctx.sessionQuery.observeSession(sessionId)
+        try {
+          const find = value => {
+            if (!value || typeof value !== 'object') return
+            if (value.type === 'image' && value.attachment?.attachmentId === request.attachmentId) return value.attachment
+            for (const child of Object.values(value)) {
+              const found = find(child)
+              if (found) return found
+            }
+          }
+          attachment = find(observation.events)
+        } finally { observation[Symbol.dispose]?.() }
+        if (!attachment) throw httpError(404, '会话中未找到图片引用')
+      }
+      if (!attachment) throw httpError(400, '图片引用无效')
+      return this.sessions.attachment({ sessionId, attachment }, signal)
     }
     throw httpError(404, '原生会话读取接口不存在')
   }

@@ -26,7 +26,7 @@ run 的 `selection.mcp_servers` 保存已验证的服务器快照。模型通过
 
 ## Tasks
 
-DSH MCP bridge 固定为 `0.2.1-rc.2`。`scripts/patch-dsh-mcp-tasks.mjs` 添加 `taskCall` 扩展点，保留原生参数校验、结果校验和输出投影。脚本核对版本和唯一锚点，并在 CI、Host 镜像构建中应用。
+DSH MCP bridge 固定为 `0.2.2-rc.1`。`scripts/patch-dsh-mcp-tasks.mjs` 添加 `taskCall` 扩展点，保留原生参数校验、结果校验和输出投影。脚本核对版本和唯一锚点，并在 CI、Host 镜像构建中应用。工具准入使用新版 `when` 和步骤级 `toolSet`；目录刷新继续保留工具定义身份及顺序，避免刷新后已有会话无法调用工具。
 
 required task 工具交给官方 `@modelcontextprotocol/ext-tasks` 执行。扩展根据已协商的能力选择任务协议；Java SDK 的全局连接继续使用其支持的握手版本，Sandbox 使用现有 Python SDK 协商。现代 Tasks 请求使用 SDK 公开 session 发送协商后的协议帧；旧版 Tasks 保留兼容通道。任务等待在原截止时间内预留取消窗口。
 

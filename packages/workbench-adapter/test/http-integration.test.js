@@ -62,6 +62,7 @@ function setup({ databasePath = ':memory:', configure = () => {} } = {}) {
       request: vi.fn(async () => ({ status: 200, headers: new Headers({ 'content-type': 'application/json' }), bytes: Buffer.from('{"data":{"text":"ok"}}') })),
       json: vi.fn(async ({ route }) => route === 'workbench/config' ? publishedModels() : ({ tools: [] })),
     },
+    schedule: { catalog: async () => [] },
     agents: { get: (id) => sessions.has(id) ? { id, session: sessions.get(id) } : undefined }, commands: {},
     logger: { warn: vi.fn() },
     skills: { list: vi.fn(async () => []), get: async () => undefined },
@@ -425,7 +426,7 @@ describe('authenticated workbench HTTP handler', () => {
     runtime.mcpResources = () => []
     const parent = db.createRun({ ownerId: 't:42', chatId: chat.id, sessionId, query: 'working', selection: {} }).run
     db.bindNativeTurn(parent, 1)
-    context.schedule = { catalog: async () => [{ id: 'task', sessionId, title: '原计划' }] }
+    context.schedule = { catalog: async () => [{ id: 'task', target: { kind: 'session', sessionId }, title: '原计划' }] }
     runtime.scheduler.admitNativeStep = vi.fn(async () => ({ kind: 'accept' }))
     const message = { id: 'steered-schedule', source: { kind: 'schedule' }, content: [{ type: 'text', text: 'schedule_id_json: "task"' }] }
     const gate = context.on.mock.calls.find(([name]) => name === 'agent/pre-step')[1]
@@ -485,8 +486,8 @@ describe('authenticated workbench HTTP handler', () => {
       signal = args.at(-1)
       await new Promise((resolve, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }))
     })
-    context.schedule = { catalog: async () => [{ id: 'task', sessionId }], [method === 'PATCH' ? 'update' : 'delete']: mutation }
-    const pending = call(handler, key, method, '/schedules/task', { title: 'Edited reminder' }, true, '42', {}, res => { response = res })
+    context.schedule = { catalog: async () => [{ id: 'task', target: { kind: 'session', sessionId } }], edit: mutation }
+    const pending = call(handler, key, method, '/schedules/task', { patch: { title: 'Edited reminder' } }, true, '42', {}, res => { response = res })
     await vi.waitFor(() => expect(mutation).toHaveBeenCalledOnce())
     response.emit('close')
     await pending

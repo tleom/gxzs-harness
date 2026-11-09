@@ -256,7 +256,7 @@ function activateNative(test, runId, queued = []) {
   database.transitionRun(owner.ownerId, runId, 'running')
   agent.status = 'running'
   agent.session = { snapshotEvents: () => [{ type: 'turn/start', data: { turn: 1 } }] }
-  agent.ctx = { sessionProjections: { stateOf: () => ({ openTurnStartSeq: 0, lastTurn: 1 }) } }
+  agent.ctx = { agents: { turnBoundaryOf: () => ({ openTurnStartSeq: 0, lastTurn: 1 }) } }
   agent.inbox = { nextTurn: queued, nextStep: [], remove: vi.fn(id => {
     const index = agent.inbox.nextTurn.findIndex(message => message.id === id)
     if (index < 0) return false
@@ -681,8 +681,6 @@ describe('followup and control service', () => {
       service.sessionQuery = ctx.sessionQuery
       agent.session = { header: { cwd } }
       service.sessionReferences = new SessionReferences(ctx)
-      // Production prepare-session-references exposes this same read-only scope.
-      service.sessionReferences.listSessionCandidates = (header, ...args) => service.sessionReferences.listCandidates({ id: header.id, session: { header } }, ...args)
       service.workspaces = { baseline: async () => ({ archivedSessionIds, sessions }) }
       const candidates = await service.referenceCandidates(owner, chat.id)
       expect(candidates).toHaveLength(50)
@@ -768,7 +766,7 @@ describe('followup and control service', () => {
     activateNative(test, goalRun.id)
     agent.status = 'idle'
     agent.session.snapshotEvents = () => [{ type: 'turn/start', data: { turn: 1 } }, { type: 'turn/end', data: { turn: 1 } }]
-    agent.ctx.sessionProjections.stateOf = () => ({ openTurnStartSeq: null, lastTurn: 1 })
+    agent.ctx.agents.turnBoundaryOf = () => ({ openTurnStartSeq: null, lastTurn: 1 })
     service.goals = { get: () => ({ id: 'goal', revision: 1, phase: 'active', activation: 'armed' }), pause: vi.fn() }
     const { run: stale } = database.createRun({ ownerId: owner.ownerId, chatId: chat.id, sessionId: chat.sessionId, query: 'stale', selection: {} })
     await expect(service.stopRun(owner, stale.id)).rejects.toMatchObject({ status: 409, code: 'STALE_RUN' })
@@ -2058,6 +2056,8 @@ describe('submission cancellation', () => {
     ['text only', undefined, undefined, false],
     ['completed native bash', 'bash', {}, false],
     ['skipped before dispatch', 'bash', { name: 'AbortError', code: 'TOOL_ABORTED_BEFORE_DISPATCH' }, false],
+    ['settled rc1 PTC cancellation', 'run_code', { name: 'AbortError', code: 'ABORTED' }, false],
+    ['settled legacy PTC failure', 'run_code', { name: 'Error', code: 'CODE_RUN_FAILED' }, false],
   ])('reports native uncertainty for %s', async (_label, toolName, resultError, uncertain) => {
     const test = setup()
     const { service, owner, chat, database } = test

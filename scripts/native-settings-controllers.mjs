@@ -17,7 +17,7 @@ export async function nativeSettingsControllers(profile) {
   const require = createRequire(join(resolve(profile), 'package.json'))
   const read = async (name, entry) => {
     const manifest = JSON.parse(await readFile(require.resolve(name + '/package.json'), 'utf8'))
-    if (manifest.version !== '0.2.1-rc.2') throw new Error('Unverified native settings version: ' + manifest.version)
+    if (manifest.version !== '0.2.2-rc.1') throw new Error('Unverified native settings version: ' + manifest.version)
     return readFile(require.resolve(entry ?? name + '/client'), 'utf8')
   }
   const [forms, primitives, card, conversation, schedule, chat] = await Promise.all([
@@ -67,14 +67,14 @@ ${region(card, 'lib/types/client/subagent-card-controller.js')}
 const BUSY_ENTER_FIELD = ${literal('BUSY_ENTER_FIELD')};
 const DEFAULT_BUSY_ENTER_BEHAVIOR = ${literal('DEFAULT_BUSY_ENTER_BEHAVIOR')};
 ${region(conversation, 'lib/types/client/input/submission-policy.js')}
-${['TRANSCRIPT_VIEW_FIELD', 'COLLAPSE_TIMING_FIELD', 'DEFAULT_COLLAPSE_TIMING', 'DEFAULT_TRANSCRIPT_VIEW_MODE', 'LEGACY_TRANSCRIPT_VIEW_MODE', 'LEGACY_EXPANDED_TRANSCRIPT_VIEW_MODE'].map(name => `const ${name} = ${literal(name, region(chat, 'lib/types/chat-settings.js'))};`).join('\n')}
+${['TRANSCRIPT_VIEW_FIELD', 'COLLAPSE_TIMING_FIELD', 'DEFAULT_COLLAPSE_TIMING', 'DEFAULT_TRANSCRIPT_VIEW_MODE', 'LEGACY_TRANSCRIPT_VIEW_MODE', 'LEGACY_EXPANDED_TRANSCRIPT_VIEW_MODE', 'FOLDED_REPLIES_FIELD'].map(name => `const ${name} = ${literal(name, region(chat, 'lib/types/chat-settings.js'))};`).join('\n')}
 ${region(chat, 'lib/types/client/transcript-view.js')}
 ${header.slice(ancestryStart, ancestryEnd)}
 ${region(schedule, 'lib/types/client/catalog-source.js')}
 export { ConfigForms, SettingsSchemaService, SettingsDescribeMirror, SubagentLimitsCardController,
   SubagentModelSelectionCardController, subagentCardFace, subagentCardShell, ComposerSubmissionPolicy, resolveSubmitMode, TranscriptViewPolicy, deriveAncestry, createCatalogSource };
 export const nativeSettingsProvenance = ${JSON.stringify({
-  version: '0.2.1-rc.2',
+  version: '0.2.2-rc.1',
     sources: Object.fromEntries([['dsh-client-ui-settings/client', forms], ['dsh-client-ui-primitives', primitives],
       ['dsh-client-ui-settings-subagent/client', card], ['dsh-client-ui-conversation/client', conversation], ['dsh-client-ui-schedule/client', schedule], ['dsh-client-ui-chat/client', chat]].map(([name, source]) => [name, createHash('sha256').update(source).digest('hex')])),
     regions: ['settings-form/form-model', 'subagent-limits-card-controller', 'subagent-model-selection-card-controller', 'subagent-card-controller', 'submission-policy', 'transcript-view', 'ConversationSession.deriveAncestry', 'schedule/catalog-source'],

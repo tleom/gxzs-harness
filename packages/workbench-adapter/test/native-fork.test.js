@@ -41,8 +41,9 @@ it.each([false, true].flatMap(grouped => [false, true].map(hasChildren => ({ gro
         return ctx.sessions.get(result.sessionId)
       }
       const child = await fork(source)
-      expect(child.header).toMatchObject({ cwd, parentSession: source.id, isSeeded: true })
+      expect(child.header).toMatchObject({ cwd, isSeeded: true })
       expect(child.header.origin).not.toBe('subagent')
+      expect(child.header.parentSession).toBeUndefined()
       expect(child.snapshotEvents().slice(0, boundary + 1)).toEqual(source.snapshotEvents().slice(0, boundary + 1))
       expect(JSON.stringify(child.snapshotEvents())).not.toContain('切点之后的问题')
       const catalog = session => ctx.sessionProjections.snapshot(session).values.subagentCatalog

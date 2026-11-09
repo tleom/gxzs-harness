@@ -3,33 +3,39 @@ import { readFile, writeFile, unlink } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { createHash, randomUUID } from 'node:crypto'
-import { argumentStreamPaths, assertDshArgumentConsumer, prepareArgumentStream, prepareUpstreamArguments, upstreamArgumentPatches } from '../../../scripts/prepare-dsh-stream-arguments.mjs'
+import { argumentStreamPaths, assertDshArgumentConsumer, upstreamPiAiPatches } from '../../../scripts/prepare-dsh-stream-arguments.mjs'
 
-let original, prepared, consumerSource, stream, parseCount, toStreamChunks
+let original, prepared, consumerSource, stream, parseCount, toStreamChunks, convertMessages, openaiPatch
 const temporary = []
-it.each(Object.keys(upstreamArgumentPatches))('retains the official final-argument parser and patches %s idempotently', async name => {
-  const paths = await argumentStreamPaths(fileURLToPath(new URL('../../../profiles/workbench/', import.meta.url)))
-  const source = await readFile(join(dirname(paths.provider), name), 'utf8')
-  const [before, removed, after] = upstreamArgumentPatches[name]
-  const baseline = source.includes(before + removed + after) ? source : source.replace(before + after, before + removed + after)
-  const patched = prepareUpstreamArguments(name, baseline)
-  expect(patched).toBe(baseline.replace(before + removed + after, before + after))
-  expect(prepareUpstreamArguments(name, patched)).toBe(patched)
-  expect(() => prepareUpstreamArguments(name, patched.replace(before, 'changed'))).toThrow('contract changed')
-  expect(patched.match(/parseStreamingJson\(/g)?.length ?? 0).toBe((baseline.match(/parseStreamingJson\(/g)?.length ?? 0) - 1)
+const profile = fileURLToPath(new URL('../../../profiles/workbench/', import.meta.url))
+it('applies every official release hunk, including Gemini signatures, idempotently', async () => {
+  const paths = await argumentStreamPaths(profile)
+  const patches = await upstreamPiAiPatches(profile)
+  expect(patches).toHaveLength(6)
+  for (const patch of patches) {
+    const installed = await readFile(join(paths.folder, patch.path), 'utf8')
+    const baseline = patch.reverse(installed)
+    expect(baseline).not.toBe(false)
+    expect(patch.apply(baseline)).toBe(installed)
+    expect(patch.apply(installed)).toBe(installed)
+    expect(() => patch.apply('unrecognized provider')).toThrow('contract changed')
+  }
 })
 beforeAll(async () => {
-  const paths = await argumentStreamPaths(fileURLToPath(new URL('../../../profiles/workbench/', import.meta.url)))
+  const paths = await argumentStreamPaths(profile)
+  openaiPatch = (await upstreamPiAiPatches(profile)).find(patch => patch.path.endsWith('/openai-completions.js'))
   original = await readFile(paths.provider, 'utf8')
-  prepared = prepareArgumentStream(original)
+  prepared = openaiPatch.apply(original)
   consumerSource = await readFile(paths.consumer, 'utf8')
   const provider = join(dirname(paths.provider), `gxzs-test-${randomUUID()}.js`)
   const consumer = join(dirname(paths.consumer), `gxzs-test-${randomUUID()}.js`)
   temporary.push(provider, consumer)
-  await writeFile(provider, prepared.replace('import { parseStreamingJson } from "../utils/json-parse.js";',
-    'import { parseStreamingJson as originalParse } from "../utils/json-parse.js";\nlet calls=0; function parseStreamingJson(value){calls++;return originalParse(value)}; export const parseCount=()=>calls;'))
+  const parserImport = 'import { parseStreamingJson, parseToolCallArguments } from "../utils/json-parse.js";'
+  expect(prepared).toContain(parserImport)
+  await writeFile(provider, prepared.replace(parserImport,
+    'import { parseStreamingJson as originalStreaming, parseToolCallArguments as originalFinal } from "../utils/json-parse.js";\nlet calls=0; function parseStreamingJson(value){calls++;return originalStreaming(value)}; function parseToolCallArguments(value){calls++;return originalFinal(value)}; export const parseCount=()=>calls;'))
   await writeFile(consumer, consumerSource+'\nexport { toStreamChunks };\n')
-  ;({ stream, parseCount } = await import(pathToFileURL(provider).href))
+  ;({ stream, parseCount, convertMessages } = await import(pathToFileURL(provider).href))
   ;({ toStreamChunks } = await import(pathToFileURL(consumer).href))
 })
 afterAll(async () => { await Promise.all(temporary.map(path => unlink(path))) })
@@ -66,9 +72,14 @@ const hash=value=>createHash('sha256').update(value).digest('hex')
 
 it('guards the installed producer and native consumer and applies idempotently', () => {
   assertDshArgumentConsumer(consumerSource)
-  expect(prepareArgumentStream(prepared)).toBe(prepared)
-  expect(() => prepareArgumentStream(prepared.replace('const finishBlock = (block) => {','const changed = (block) => {'))).toThrow('contract changed')
+  expect(openaiPatch.apply(prepared)).toBe(prepared)
   expect(() => assertDshArgumentConsumer(consumerSource.replace('argumentsDelta: event.delta','argumentsDelta: event.partial.arguments'))).toThrow('consumer changed')
+})
+it('replays Gemini tool signatures without substituting encrypted reasoning metadata', () => {
+  const replay = convertMessages(model, { messages: [{ role: 'assistant', provider: 'fixture', api: 'openai-completions', model: 'fixture',
+    content: [{ type: 'toolCall', id: 'signature-call', name: 'write', arguments: { path: 'a.txt' }, thoughtSignature: 'gemini-signature' }],
+    stopReason: 'toolUse', timestamp: 0 }] }, {}, {})
+  expect(replay[0].tool_calls[0].extra_content).toEqual({ google: { thought_signature: 'gemini-signature' } })
 })
 it('preserves every raw delta and final native arguments for two interleaved large tools', async () => {
   const objects=[{path:'a.txt',content:'中文\\"\n'.repeat(40_000)},{path:'b.txt',content:'b'.repeat(300_000)}]

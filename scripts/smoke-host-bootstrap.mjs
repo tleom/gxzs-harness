@@ -177,7 +177,7 @@ const manager = fixture(async (req, res) => {
   if (req.url === `${base}files`) {
     const value = req.fixtureBody
     if (['stat', 'delete'].includes(value?.operation)) {
-      assert.match(value.path, /^(?:conversations\/\d{4}-\d{2}-\d{2}(?:\/[a-z0-9]+(?:-[a-z0-9]+)*)?|\.agent-output\/[a-f0-9]{32})$/)
+      assert.match(value.path, /^(?:conversations\/(?:\d{4}-\d{2}-\d{2}(?:\/[a-z0-9]+(?:-[a-z0-9]+)*)?|scheduled(?:\/[a-f0-9-]{36})?)|\.agent-output\/[a-f0-9]{32})$/)
       respond(res, 200, sandboxFileOperation(value)); return
     }
     if (nativeAttachments && ['upload', 'get', 'download'].includes(value?.operation)) {
@@ -203,7 +203,7 @@ const manager = fixture(async (req, res) => {
     }
     if (sessionCreate) {
       assert.ok(['mkdir', 'list'].includes(req.fixtureBody?.operation))
-      assert.match(req.fixtureBody.path, /^conversations\/\d{4}-\d{2}-\d{2}(?:\/[a-z0-9]+(?:-[a-z0-9]+)*)?$/)
+      assert.match(req.fixtureBody.path, /^conversations\/(?:\d{4}-\d{2}-\d{2}(?:\/[a-z0-9]+(?:-[a-z0-9]+)*)?|scheduled(?:\/[a-f0-9-]{36})?)$/)
       if (req.fixtureBody.operation === 'mkdir') {
         let result
         if (realSsh) result = sandboxFileOperation(value)
@@ -236,7 +236,7 @@ const model = fixture((req, res) => {
     res.end('data: [DONE]\n\n')
     return
   }
-  for (const name of ['bash', 'job_output', 'job_kill', 'schedule_create', 'schedule_list', 'schedule_update', 'schedule_delete', 'working_directory']) {
+  for (const name of ['bash', 'job_output', 'job_kill', 'schedule_create', 'schedule_list', 'schedule_view', 'schedule_edit', 'working_directory']) {
     assert.ok(tools.has(name), `Native standard preset must expose ${name} to the model; received: ${JSON.stringify([...tools.keys()])}`)
   }
   for (const name of ['session_search', 'session_event_search', 'session_trace', 'session_event_trace', 'session_event_read',
@@ -407,7 +407,7 @@ async function nativeClientRoundtrip() {
   assert.equal(response.status, 200, `Native client graph must be installed: ${sanitize(JSON.stringify(payload))}`)
   const manifest = payload.data
   assert.equal(manifest.protocol, 1)
-  assert.equal(manifest.version, '0.2.1-rc.2')
+  assert.equal(manifest.version, '0.2.2-rc.1')
   assert.match(manifest.bootstrap, /__ModuleLoader__/)
   assert.match(manifest.boot.rev, /^[a-f0-9]{64}$/)
   const ids = new Set(manifest.boot.entries.map(row => row.id))
@@ -904,10 +904,11 @@ try {
       await terminalRoundtrip(chat)
     }
     const scheduleResponse = await signedRequest('POST', `/chats/${chat.id}/schedules`, {
-      title: 'Fixture scheduled reminder', prompt: 'Synthetic future reminder', after_seconds: 3600,
+      title: 'Fixture scheduled reminder', prompt: 'Synthetic future reminder',
+      timing: { kind: 'after', after_seconds: 3600 }, target: { kind: 'session', chat_id: chat.id },
       notify_enabled: true, request_key: randomUUID(),
     })
-    assert.equal(scheduleResponse.status, 201, 'Full host must resolve the late native schedule service')
+    assert.equal(scheduleResponse.status, 201, `Full host must resolve the late native schedule service: ${sanitize(await scheduleResponse.clone().text())}`)
     const task = (await scheduleResponse.json()).data
     assert.equal(task.notification_error, undefined, 'Creation notification preference must be confirmed')
     const tasks = (await (await signedRequest('GET', '/schedules')).json()).data
@@ -916,11 +917,11 @@ try {
     await waitForHealth((status, body) => status === 200 && body.activity?.protocol === 2
       && body.activity.activeSchedules === 1 && body.activity.registeredSchedules === 1
       && body.activity.pendingScheduleReports === 0, 'future task wakeup acknowledged', 10_000)
-    const updatedTask = await signedRequest('PATCH', `/schedules/${task.id}`, { expected: task, title: 'Updated fixture reminder',
+    const updatedTask = await signedRequest('PATCH', `/schedules/${task.id}`, { expectedUpdatedAt: task.updatedAt ?? null, patch: { title: 'Updated fixture reminder' },
       notify_enabled: false, notification_version: listed.notification_version })
     assert.equal(updatedTask.status, 200)
     const updatedRecord = (await updatedTask.json()).data
-    assert.equal(updatedRecord.record.title, 'Updated fixture reminder')
+    assert.equal(updatedRecord.title, 'Updated fixture reminder')
     assert.equal(updatedRecord.notification_error, undefined)
     const changedTasks = (await (await signedRequest('GET', '/schedules')).json()).data
     assert.equal(changedTasks.find(item => item.id === task.id)?.notify_enabled, false)
@@ -928,8 +929,32 @@ try {
     await waitForHealth((status, body) => status === 200 && body.activity?.protocol === 2
       && body.activity.activeSchedules === 0 && body.activity.registeredSchedules === 0
       && body.activity.pendingScheduleReports === 0, 'deleted task wakeup acknowledged', 10_000)
+    for (const kind of ['new_once', 'new']) {
+      const created = await signedRequest('POST', '/schedules', {
+        title: `Fixture ${kind}`, prompt: 'Synthetic future task without an existing chat',
+        timing: { kind: 'after', after_seconds: 3600 }, target: { kind }, request_key: randomUUID(),
+      })
+      if (fixtureFailure) throw fixtureFailure
+      assert.equal(created.status, 201, sanitize(await created.clone().text()))
+      const fresh = (await created.json()).data
+      assert.equal(fresh.target.kind, kind)
+      const catalog = (await (await signedRequest('GET', '/schedules')).json()).data
+      assert.equal(catalog.find(item => item.id === fresh.id)?.chat_id, undefined)
+      await waitForHealth((status, body) => status === 200 && body.activity.registeredSchedules === 1
+        && body.activity.pendingScheduleReports === 0, `${kind} wakeup acknowledged`, 10_000)
+      const paused = await signedRequest('PATCH', `/schedules/${fresh.id}`, {
+        expectedUpdatedAt: fresh.updatedAt ?? null, patch: { active: false },
+      })
+      assert.equal(paused.status, 200)
+      assert.equal((await paused.json()).data.status, 'paused')
+      await waitForHealth((status, body) => status === 200 && body.activity.activeSchedules === 0
+        && body.activity.pendingScheduleReports === 0, `${kind} pause acknowledged`, 10_000)
+      assert.equal((await signedRequest('DELETE', `/schedules/${fresh.id}`)).status, 200)
+      await waitForHealth((status, body) => status === 200 && body.activity.pendingScheduleReports === 0,
+        `${kind} deletion acknowledged`, 10_000)
+    }
     assert.equal(modelCalls, 0, 'Schedule management must not call the model')
-    console.log('PASS native schedule HTTP: notification initialization/update, wakeup acknowledgment and deletion through the full host')
+    console.log('PASS native schedule HTTP: session/new_once/new targets, notification initialization/update, pause, wakeup acknowledgment and deletion through the full host')
     // Empty native sessions are lazy until their first event or explicit flush.
     const renamed = await signedRequest('PATCH', `/chats/${chat.id}`, { title: 'Native create smoke' })
     assert.equal(renamed.status, 200)
@@ -973,7 +998,13 @@ try {
       }
       assert.equal(modelCalls, 1, 'Native agent must reach the fixture model before restart')
       const active = await signedRequest('GET', `/runs/${runningId}`)
-      assert.equal((await active.json()).data.status, 'running')
+      const activeState = (await active.json()).data
+      if (activeState.status !== 'running') {
+        const db = new DatabaseSync(path.join(env.DSH_HOME, 'workbench.sqlite3'), { readOnly: true })
+        try { process.stderr.write(`Fixture run bindings: ${JSON.stringify(db.prepare('SELECT id,status,query,turn_number,source_start_seq,source_end_seq FROM runs WHERE chat_id=? ORDER BY queue_order').all(chat.id))}\n`) }
+        finally { db.close() }
+      }
+      assert.equal(activeState.status, 'running')
     }
     await stopHost(crashRestart ? 'SIGKILL' : 'SIGTERM')
     child = spawn('/usr/local/bin/start-workbench', [], { env, detached: true, stdio: ['ignore', 'pipe', 'pipe'] })

@@ -23,7 +23,7 @@ it('accepts actual wakeup and notification bridge requests through bootstrap reg
     wakeups.started = true
     await wakeups.flush()
     expect(wakeups.safety(tasks)).toEqual({ registeredSchedules: 0, pendingScheduleReports: 0 })
-    tasks = [{ id: 'job-one', sessionId: chat.sessionId, chat_id: chat.id, title: 'Fixture reminder',
+    tasks = [{ id: 'job-one', target: { kind: 'session', sessionId: chat.sessionId }, chat_id: chat.id, title: 'Fixture reminder',
       status: 'active', kind: 'once', scheduledAt: new Date(Date.now() + 3_600_000).toISOString() }]
     await wakeups.flush()
     expect(wakeups.safety(tasks)).toEqual({ registeredSchedules: 1, pendingScheduleReports: 0 })
@@ -57,7 +57,7 @@ it('keeps catalog reads from registering jobs or overwriting titles', () => {
     .toMatchObject([{ title: 'Original', version: 1, notifyEnabled: false }])
 })
 
-it('rejects malformed snapshots, changed bindings and unsupported fixture requests', () => {
+it('rejects malformed snapshots, inconsistent targets and unsupported fixture requests', () => {
   const fixture = createSchedulePlatformFixture()
   const route = '/internal/workbench/schedule-wakeups'
   const task = { id: 'job', sessionId: 'session', chatId: 'chat', title: 'Fixture',
@@ -66,7 +66,7 @@ it('rejects malformed snapshots, changed bindings and unsupported fixture reques
   expect(() => fixture('POST', route, { sequence: 1, tasks: [{ ...task, revision: 'bad' }] })).toThrow()
   expect(fixture('POST', route, { sequence: 1, tasks: [task] })).toMatchObject({ sequence: 1, complete: true })
   expect(() => fixture('POST', route, { sequence: 1, tasks: [] })).toThrow('Same sequence changed its snapshot')
-  expect(() => fixture('POST', '/internal/workbench/jobs', { action: 'sync', tasks: [{ ...task, chatId: 'other' }] })).toThrow('Job chat binding changed')
+  expect(() => fixture('POST', '/internal/workbench/jobs', { action: 'sync', tasks: [{ ...task, targetKind: 'new', chatId: 'other' }] })).toThrow()
   expect(() => fixture('POST', '/internal/workbench/jobs', { action: 'unknown' })).toThrow('Unexpected smoke job action')
   expect(fixture('GET', route, {})).toBeUndefined()
   expect(fixture('POST', '/internal/workbench/unexpected', {})).toBeUndefined()

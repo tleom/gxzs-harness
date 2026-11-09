@@ -1,3 +1,4 @@
+import * as NativeExecutor from '@deepseek-ai/dsh-tool-executor-native'
 import { afterAll, beforeAll, test } from 'vitest'
 import assert from 'node:assert/strict'
 import { mkdir, mkdtemp, cp, rm } from 'node:fs/promises'
@@ -52,7 +53,7 @@ class Model extends LlmAdapter {
 async function mount(root, { owner = 'owner-a', currentTool = tool, script = [call('case_lookup', { query: 'restored' }), answer()] } = {}) {
   const ctx = new Context(), calls = [], model = new Model(script)
   ctx.provide('workingDirectory', { get: () => root, ensure: async () => root })
-  for (const plugin of [LlmRuntime, SessionStore, SessionProjections, SystemPrompt, ToolRuntime, AgentRegistry]) await ctx.plugin(plugin)
+  for (const plugin of [LlmRuntime, SessionStore, SessionProjections, SystemPrompt, ToolRuntime, NativeExecutor, AgentRegistry]) await ctx.plugin(plugin)
   await ctx.plugin(Jsonl, { root, compression: 'none' })
   await ctx.plugin(AgentLoop, { agents: [] })
   await ctx.plugin(TokenMeter)

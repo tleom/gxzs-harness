@@ -1,3 +1,5 @@
+import { executeNativeTool } from '../../../scripts/test-native-tool.mjs'
+import * as NativeExecutor from '@deepseek-ai/dsh-tool-executor-native'
 import { expect, it, vi } from 'vitest'
 import { createRequire } from 'node:module'
 import { pathToFileURL } from 'node:url'
@@ -24,7 +26,8 @@ async function fixture(scopeName = 'global') {
   ctx.provide('sandboxPolicy', { resolve: () => ({ mode: 'danger-full-access', workspaceRoot: '/workspace' }) })
   ctx.provide('workingDirectory', { ensure: async () => '/workspace' })
   await ctx.plugin(Prompt.default)
-  await ctx.plugin(Tools, { mode: 'native' })
+  await ctx.plugin(Tools)
+  await ctx.plugin(NativeExecutor)
   await ctx.plugin(SandboxSpillStore, { workspace: '/workspace' })
   await ctx.plugin(FsTools, { read: true, write: false, edit: false, readImage: false })
   await ctx.plugin(SpillPolicy, { maxInlineTokens: 1000 })
@@ -45,7 +48,7 @@ async function fixture(scopeName = 'global') {
     return { data: { result: scopeName === 'global' ? result : { result } } }
   } })
   await ctx.plugin(McpTools)
-  const execute = (name = 'large', args = {}) => ctx.tools.execute({ name, arguments: args, agent,
+  const execute = (name = 'large', args = {}) => executeNativeTool(ctx.tools, { name, arguments: args, agent,
     callId: 'combined-spill', signal: new AbortController().signal })
   return { ctx, fs, files, call, execute, close: async () => { scope.rawDispose(); await ctx.fiber.dispose() } }
 }

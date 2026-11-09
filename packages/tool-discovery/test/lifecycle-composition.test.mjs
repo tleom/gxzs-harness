@@ -20,6 +20,7 @@ import SessionStore, { buildForkSeed } from '@deepseek-ai/dsh-session'
 import Projections from '@deepseek-ai/dsh-session-projection'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import Tools from '@deepseek-ai/dsh-tools'
+import * as NativeExecutor from '@deepseek-ai/dsh-tool-executor-native'
 import Agents from '@deepseek-ai/dsh-agent'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import Goals from '@deepseek-ai/dsh-goal'
@@ -74,7 +75,7 @@ const until = async (predicate, text) => { const deadline = Date.now() + 6000; w
 async function fixture(script, { delayed = false, complete = false } = {}) {
   const ctx = new Context(), db = new WorkbenchDatabase(':memory:'), owner = { ownerId: 't:1' }, calls = [], admissions = []
   ctx.provide('workingDirectory', { ensure: async agent => agent.session.header.cwd, get: session => session.header.cwd })
-  for (const plugin of [LlmRuntime, SessionStore, Projections, SystemPrompt, Tools, Agents, Goals, GoalDriver, Commands, GoalCommand]) await ctx.plugin(plugin)
+  for (const plugin of [LlmRuntime, SessionStore, Projections, SystemPrompt, Tools, NativeExecutor, Agents, Goals, GoalDriver, Commands, GoalCommand]) await ctx.plugin(plugin)
   await ctx.plugin(AgentLoop, { agents: [] })
   const model = new Model(script); ctx.llm.registerAdapter(['mock'], model)
   const agent = await ctx.agentLoop.create(`source-${++serial}`, { provider: 'mock', model: 'mock' }, { cwd: '/workspace/conversations/source-chat' })

@@ -6,7 +6,7 @@ import { pathToFileURL } from 'node:url'
 
 export async function patchMcpTasks(root) {
   const info = JSON.parse(await readFile(resolve(root, 'package.json'), 'utf8'))
-  if (info.version !== '0.2.1-rc.2') throw new Error('DSH MCP version changed; review the task executor seam')
+  if (info.version !== '0.2.2-rc.1') throw new Error('DSH MCP version changed; review the task executor seam')
   const file = resolve(root, 'lib/index.js')
   let source = await readFile(file, 'utf8')
   const changes = [

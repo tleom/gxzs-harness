@@ -29,6 +29,17 @@ export class DirectoryLifecycle {
     return (await this.service.workspaces?.baseline(owner, undefined, { includeSchedules: false }))?.items ?? []
   }
 
+  async hasScheduleDirectory(owner, directory) {
+    if (!this.service.schedules) return false
+    return (await this.service.schedules.ownedCatalog(owner)).some(task => task.target.kind !== 'session'
+      && task.target.create.cwd && overlaps(directory, this.relative(task.target.create.cwd)))
+  }
+
+  async assertNoScheduleDirectory(owner, directory) {
+    if (await this.hasScheduleDirectory(owner, directory))
+      throw httpError(409, '目录已关联定时任务，请先修改执行位置或删除任务', 'WORKSPACE_SCHEDULE_ATTACHED')
+  }
+
   assertAvailable(owner, directory) {
     if (this.service.database.pendingWorkspaceDeletions(owner.ownerId).some(item => overlaps(item.path, this.relative(directory))))
       throw httpError(409, '工作区正在删除，请稍后重试', 'WORKSPACE_DELETING')
@@ -48,6 +59,7 @@ export class DirectoryLifecycle {
   async canCleanChat(owner, chat, directory = this.chatPath(chat)) {
     // The shared volume and its conversation root are never deletion targets.
     if (!directory.startsWith('conversations/')) return false
+    if (await this.hasScheduleDirectory(owner, directory)) return false
     if (this.service.database.directoryChats(owner.ownerId).some(other => other.id !== chat.id && overlaps(directory, this.chatPath(other)))) return false
     if ((await this.workspaces(owner)).some(item => overlaps(directory, this.workspacePath(item)))) return false
     return !this.service.database.pendingWorkspaceDeletions(owner.ownerId).some(item => overlaps(directory, item.path))
@@ -87,6 +99,7 @@ export class DirectoryLifecycle {
         this.assertInactive(owner, [directory], live, '删除')
         return service.fileManager.operate({ operation: 'delete', path: directory, version })
       }
+      await this.assertNoScheduleDirectory(owner, directory)
       const key = `file:${createHash('sha256').update(`${owner.ownerId}\0${directory}`).digest('hex')}`
       let plan = db.workspaceDeletion(owner.ownerId, key)
       if (plan?.completedAt) {
@@ -134,6 +147,7 @@ export class DirectoryLifecycle {
       this.assertAvailable(owner, source)
       this.assertAvailable(owner, target)
       if (operation === 'move') {
+        await this.assertNoScheduleDirectory(owner, source)
         const chats = this.service.database.directoryChats(owner.ownerId)
         const label = path.posix.dirname(source) === path.posix.dirname(target) ? '重命名' : '移动'
         this.assertInactive(owner, [source], chats, label)
@@ -153,6 +167,7 @@ export class DirectoryLifecycle {
       const item = items.find(value => value.workspaceId === workspaceId)
       if (!item) throw httpError(404, '工作区不存在')
       const directory = this.workspacePath(item)
+      await this.assertNoScheduleDirectory(owner, directory)
       if (!directory.startsWith('conversations/')) throw httpError(400, '对话文件根目录不能删除')
       this.assertAvailable(owner, directory)
       const children = items.filter(value => containsWorkspacePath(directory, this.workspacePath(value)))

@@ -1,3 +1,5 @@
+import { executeNativeTool } from '../../../scripts/test-native-tool.mjs'
+import * as NativeExecutor from '@deepseek-ai/dsh-tool-executor-native'
 import { expect, it, vi } from 'vitest'
 import { createRequire } from 'node:module'
 import { pathToFileURL } from 'node:url'
@@ -13,7 +15,8 @@ it('exposes a resource-only provider through DSH native tools in exactly its own
   const ctx = new Context()
   try {
     await ctx.plugin(Prompt)
-    await ctx.plugin(Tools, { mode: 'native' })
+    await ctx.plugin(Tools)
+  await ctx.plugin(NativeExecutor)
     await ctx.plugin(Resources)
     const agent = { id: 'agent-a', session: { id: 'session-a' } }, other = { id: 'agent-b' }
     const scope = createScope(ctx, agent)
@@ -35,11 +38,11 @@ it('exposes a resource-only provider through DSH native tools in exactly its own
     expect(assembly.sections.find(section => section.name === `mcp:${server.id}`).text).toContain('literal {{fixture}} instructions')
     expect(assembly.sections.find(section => section.name === `mcp:${toolOnly.id}`).text).toContain('tool-only instructions')
     expect((await ctx.systemPrompt.assemble({ scope: other })).sections.some(section => section.name === `mcp:${server.id}`)).toBe(false)
-    const result = await ctx.tools.execute({ name: 'read_mcp_resource', arguments: { server: server.id, uri: 'fixture://case' },
+    const result = await executeNativeTool(ctx.tools, { name: 'read_mcp_resource', arguments: { server: server.id, uri: 'fixture://case' },
       agent, callId: 'native-resource', signal: new AbortController().signal })
     expect(result.isError).toBe(false)
     expect(JSON.stringify(result)).toContain('case data')
-    expect((await ctx.tools.execute({ name: 'read_mcp_resource', arguments: { server: personal.id, uri: 'fixture://case' },
+    expect((await executeNativeTool(ctx.tools, { name: 'read_mcp_resource', arguments: { server: personal.id, uri: 'fixture://case' },
       agent, callId: 'personal-resource', signal: new AbortController().signal })).isError).toBe(false)
     run.stopConfirmation = { fenced: true }
     scopes.sync(agent, servers)

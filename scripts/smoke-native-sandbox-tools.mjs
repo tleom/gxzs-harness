@@ -6,6 +6,7 @@ import fs from 'node:fs'
 import { randomUUID, createHash } from 'node:crypto'
 import { createRequire } from 'node:module'
 import { pathToFileURL } from 'node:url'
+import { executeNativeTool } from './test-native-tool.mjs'
 
 const require = createRequire('/opt/workbench/profiles/workbench/package.json')
 const nativeVersion = JSON.parse(fs.readFileSync('/opt/workbench/profiles/workbench/node_modules/@deepseek-ai/dsh-ssh/package.json', 'utf8')).version
@@ -46,7 +47,7 @@ const plugin = async (stageName, implementation, config) => {
 const text = result => (result.content ?? []).filter(item => item.type === 'text').map(item => item.text).join('\n')
 const execute = async (name, args, agent) => {
   stage = name
-  const result = await ctx.tools.execute({ callId: `fixture-${randomUUID()}`, name, arguments: args, agent, signal: AbortSignal.timeout(Math.max(20_000, (args.timeoutMs ?? args.timeout_ms ?? 0) + 10_000)) })
+  const result = await executeNativeTool(ctx.tools, { callId: `fixture-${randomUUID()}`, name, arguments: args, agent, signal: AbortSignal.timeout(Math.max(20_000, (args.timeoutMs ?? args.timeout_ms ?? 0) + 10_000)) })
   if (result.isError) console.log(JSON.stringify({ event: 'fixture_tool_failed', tool: name,
     timed_out: /timeout|timed out/i.test(text(result)), disconnected: /disconnect|socket|connection/i.test(text(result)) }))
   assert.notEqual(result.isError, true, `fixture_${name}_failed`)
@@ -59,6 +60,7 @@ try {
   await plugin('session-projections', Projections)
   await plugin('system-prompt', SystemPrompt)
   await plugin('tool-runtime', ToolRuntime)
+  await plugin('native-tool-executor', await native('dsh-tool-executor-native'))
   await plugin('sandbox-policy', SandboxPolicy, { mode: 'danger-full-access', workspaceRoot: directory })
   stage = 'ssh-create'
   ssh = new WorkbenchSsh(ctx, {
@@ -77,7 +79,8 @@ try {
   await plugin('bash-executor', BashExecutor)
   await plugin('shell-env', ShellEnv)
   await plugin('jobs', Jobs)
-  await plugin('tool-jobs', ToolJobs)
+  // This direct tool probe owns collection; completion must not start a model turn.
+  await plugin('tool-jobs', ToolJobs, { completionDelivery: 'quiet' })
   await plugin('bash-tool', BashTool)
   await plugin('fs-tools', FsTools)
   await plugin('search-tools', SearchTools, { sampleOverCapGlobResults: false })
@@ -87,15 +90,12 @@ try {
   // Exercise the optional native PTY tools through the same remote subprocess
   // provider as production, including retained shell state and exact-Agent access.
   await plugin('agents', (await native('dsh-agent')).default)
+  await plugin('agent-loop', (await native('dsh-agent-loop')).default, { agents: [] })
   await plugin('persistent-terminal-registry', (await native('dsh-terminal')).default)
   await plugin('persistent-terminal-bash', await native('dsh-terminal-bash'))
   await plugin('persistent-terminal-tools', await native('dsh-tool-terminal'))
-  const session = ctx.sessions.create(undefined, { meta: { cwd: directory } })
-  const agent = { id: session.id, ctx, session, options: {}, status: 'idle' }
-  ctx.agents.register(agent)
-  const otherSession = ctx.sessions.create(undefined, { meta: { cwd: directory } })
-  const other = { id: otherSession.id, ctx, session: otherSession, options: {}, status: 'idle' }
-  ctx.agents.register(other)
+  const agent = await ctx.agentLoop.create(randomUUID(), {}, { cwd: directory })
+  const other = await ctx.agentLoop.create(randomUUID(), {}, { cwd: directory })
   const opened = await execute('terminal_open', { type: 'shell', name: 'native-pty-fixture' }, agent)
   const sessionId = opened.value.sessionId
   assert.equal(ctx.terminals.hasOwnerActivity(agent), true)
@@ -106,7 +106,7 @@ try {
   assert.ok(text(retained).split(/\r?\n/).includes(canonicalDirectory))
   assert.equal((await execute('terminal_list', {}, agent)).value.length, 1)
   assert.deepEqual((await execute('terminal_list', {}, other)).value, [])
-  const denied = await ctx.tools.execute({ callId: randomUUID(), name: 'terminal_read', arguments: { sessionId }, agent: other, signal: AbortSignal.timeout(5000) })
+  const denied = await executeNativeTool(ctx.tools, { callId: randomUUID(), name: 'terminal_read', arguments: { sessionId }, agent: other, signal: AbortSignal.timeout(5000) })
   assert.equal(denied.isError, true)
   const background = await execute('terminal_send', { sessionId, text: 'sleep 0.2; printf "native-pty-background\\n"', run_in_background: true }, agent)
   assert.equal(background.value.kind, 'background')
@@ -215,8 +215,8 @@ try {
   assert.equal(fs.existsSync(directory), false, 'Sandbox fixture must remain invisible on the host')
 } catch (error) {
   failure = stage
-  failureType = ['Error', 'TypeError', 'ReferenceError', 'RangeError', 'AssertionError'].includes(error?.name) ? error.name : 'Other'
-  failureCode = ['ERR_ASSERTION', 'ENOENT', 'EACCES', 'ECONNREFUSED', 'ETIMEDOUT', 'UNSUPPORTED_SCHEMA'].includes(error?.code) ? error.code : undefined
+  failureType = ['Error', 'TypeError', 'ReferenceError', 'RangeError', 'AssertionError', 'ToolExecutorUnavailableError', 'ToolBatchExecutionError'].includes(error?.name) ? error.name : 'Other'
+  failureCode = ['ERR_ASSERTION', 'ENOENT', 'EACCES', 'ECONNREFUSED', 'ETIMEDOUT', 'UNSUPPORTED_SCHEMA', 'TOOL_EXECUTOR_UNAVAILABLE'].includes(error?.code) ? error.code : undefined
   process.exitCode = 1
 } finally {
   if (created) {

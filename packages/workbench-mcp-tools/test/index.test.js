@@ -489,7 +489,7 @@ describe('platform MCP proxy tools', () => {
     expect(bridge.snapshot(agent).authorityKey).toBe('t:1\0run-2')
     run = { ...run, stopConfirmation: { fenced: true } }
     expect(bridge.snapshot(agent)).toMatchObject({ ready: false, tools: [], authorityKey: '' })
-    expect((await assemble({}, { scope: agent }, async () => ({ tools: [{ name: 'search' }], sections: [] }))).tools).toEqual([])
+    expect(await ctx.tools.register.mock.calls.find(([definition]) => definition.name === 'search')[1].when({ agent })).toBe(false)
     run = { ...run, stopConfirmation: undefined }
     run = { ...run, ownerId: 'foreign' }
     expect(bridge.snapshot(agent)).toMatchObject({ ready: false, tools: [], authorityKey: '' })
@@ -766,7 +766,8 @@ describe('platform MCP proxy tools', () => {
     await apply(ctx)
     expect(agent.ctx.tools.restrict).toHaveBeenCalledWith({ deny: ['maps_weather'] })
     const assemble = ctx.on.mock.calls.find(([event]) => event === 'system-prompt/assemble')[1]
-    const next = async () => ({ tools: [{ name: 'read' }, { name: 'maps_weather' }], sections: [] })
+    const enabled = () => ctx.tools.register.mock.calls.find(([definition]) => definition.name === 'maps_weather')[1].when({ agent })
+    const next = async () => ({ tools: [{ name: 'read' }, ...(await enabled() ? [{ name: 'maps_weather' }] : [])], sections: [] })
     expect((await assemble({}, { scope: agent }, next)).tools).toEqual([{ name: 'read' }])
     run = { ...run, mcpTools: [weather] }
     ctx.on.mock.calls.find(([event]) => event === 'agent/inbox/claimed')[1]({ agent })

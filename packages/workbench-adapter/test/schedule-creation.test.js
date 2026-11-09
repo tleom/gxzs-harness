@@ -14,10 +14,10 @@ function fixture(path = ':memory:') {
   const database = new WorkbenchDatabase(path); databases.push(database)
   const owner = { ownerId: 'owner' }
   const chat = database.createChat({ ownerId: owner.ownerId, sessionId: 'session', selection: {} })
-  const create = vi.fn(async (_session, request) => ({ id: 'schedule-one', ...request }))
+  const create = vi.fn(async (request) => ({ id: 'schedule-one', ...request }))
   const service = { requireChat: (who, id) => database.getChat(who.ownerId, id) }
-  const gateway = new WorkbenchSchedules({ native: { create }, database, service })
-  const request = { request_key: 'logical-request', title: '提醒', prompt: '内容', every_seconds: 60, notify_enabled: false }
+  const gateway = new WorkbenchSchedules({ ownerId: 'owner', native: { create }, database, service })
+  const request = { request_key: 'logical-request', title: '提醒', prompt: '内容', timing: { kind: 'every', every_seconds: 60 }, target: { kind: 'session', sessionId: chat.sessionId }, notify_enabled: false }
   return { database, owner, chat, create, service, gateway, request }
 }
 it('reuses the durable result after a lost HTTP response and database reopen', async () => {
@@ -27,11 +27,11 @@ it('reuses the durable result after a lost HTTP response and database reopen', a
   const first = await h.gateway.create(h.owner, h.chat.id, h.request)
   databases.pop().close()
   const reopened = new WorkbenchDatabase(path); databases.push(reopened)
-  const recovered = new WorkbenchSchedules({ native: { create: h.create }, database: reopened,
+  const recovered = new WorkbenchSchedules({ ownerId: 'owner', native: { create: h.create }, database: reopened,
     service: { requireChat: (owner, id) => reopened.getChat(owner.ownerId, id) } })
   expect(await recovered.create(h.owner, h.chat.id, h.request)).toEqual(first)
   expect(h.create).toHaveBeenCalledOnce()
-  expect(h.create.mock.calls[0][1]).not.toHaveProperty('request_key')
+  expect(h.create.mock.calls[0][0]).not.toHaveProperty('request_key')
   await expect(recovered.create(h.owner, h.chat.id, { ...h.request, title: '另一个任务' })).rejects.toMatchObject({ status: 409 })
 })
 it('coalesces simultaneous retries and finishes recording after the response connection closes', async () => {
@@ -42,6 +42,7 @@ it('coalesces simultaneous retries and finishes recording after the response con
   const first = h.gateway.create(h.owner, h.chat.id, h.request, connection.signal)
   connection.abort()
   const second = h.gateway.create(h.owner, h.chat.id, h.request)
+  await vi.waitFor(() => expect(release).toBeTypeOf('function'))
   release({ id: 'schedule-one' })
   expect(await first).toEqual(await second)
   expect(h.create).toHaveBeenCalledOnce()
@@ -50,7 +51,7 @@ it('does not repeat an uncertain native write, including after rebuilding the ad
   const h = fixture()
   h.create.mockRejectedValueOnce(new Error('storage outcome unknown'))
   await expect(h.gateway.create(h.owner, h.chat.id, h.request)).rejects.toThrow('storage outcome unknown')
-  const recovered = new WorkbenchSchedules({ native: { create: h.create }, database: h.database, service: h.service })
+  const recovered = new WorkbenchSchedules({ ownerId: 'owner', native: { create: h.create }, database: h.database, service: h.service })
   await expect(recovered.create(h.owner, h.chat.id, h.request)).rejects.toThrow('创建结果尚未确认')
   expect(h.create).toHaveBeenCalledOnce()
 })

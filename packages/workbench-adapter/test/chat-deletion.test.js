@@ -7,7 +7,7 @@ import { pathToFileURL } from 'node:url'
 import { createHash } from 'node:crypto'
 import { ChatDeletion } from '../src/chat-deletion.js'
 import { WorkbenchDatabase } from '../src/persistence.js'
-import { agentDeletionSource, persistenceDeletionSource, queryDeletionSource, projectionDeletionSource, domainDeletionSource, jsonStorageDeletionSource, scheduleDeletionSource, workspaceChangesDeletionSource } from '../../../scripts/prepare-session-deletion.mjs'
+import { agentDeletionSource, persistenceDeletionSource, queryDeletionSource, projectionDeletionSource, domainDeletionSource, jsonStorageDeletionSource, workspaceChangesDeletionSource } from '../../../scripts/prepare-session-deletion.mjs'
 
 const require = createRequire(new URL('../../../profiles/workbench/package.json', import.meta.url))
 const native = name => import(pathToFileURL(require.resolve('@deepseek-ai/' + name)).href)
@@ -243,7 +243,7 @@ it('physically removes platform rows with cascade and retains only an idempotenc
 it.each([
   ['dsh-agent', agentDeletionSource], ['dsh-session-persistence-jsonl', persistenceDeletionSource], ['dsh-session-query-sqlite', queryDeletionSource],
   ['dsh-session-projection-cache', projectionDeletionSource], ['dsh-storage-domain', domainDeletionSource], ['dsh-storage-json', jsonStorageDeletionSource],
-  ['dsh-schedule', scheduleDeletionSource], ['dsh-workspace-changes', workspaceChangesDeletionSource],
+  ['dsh-workspace-changes', workspaceChangesDeletionSource],
 ])('pins the permanent deletion extension to reviewed %s source', async (name, transform) => {
   const source = await readFile(require.resolve('@deepseek-ai/' + name), 'utf8')
   expect(transform(source)).toBe(source)

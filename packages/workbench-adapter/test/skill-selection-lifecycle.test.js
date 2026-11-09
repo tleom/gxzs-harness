@@ -1,3 +1,4 @@
+import * as NativeExecutor from '@deepseek-ai/dsh-tool-executor-native'
 import assert from 'node:assert/strict'
 import { afterEach, test } from 'vitest'
 import { createRequire } from 'node:module'
@@ -61,7 +62,7 @@ class Model extends LlmAdapter {
 async function fixture(script = []) {
   const ctx = new Context(), db = new WorkbenchDatabase(':memory:'), owner = { ownerId: 't:1' }
   ctx.provide('workingDirectory', { ensure: async agent => agent.session.header.cwd, get: session => session.header.cwd })
-  for (const plugin of [LlmRuntime, Sessions, Projections, Prompts, Tools, Agents, Skills, Goals, Commands, GoalCommand, GoalDriver]) await ctx.plugin(plugin)
+  for (const plugin of [LlmRuntime, Sessions, Projections, Prompts, Tools, NativeExecutor, Agents, Skills, Goals, Commands, GoalCommand, GoalDriver]) await ctx.plugin(plugin)
   await ctx.plugin(PlanMode, { section: 'Prepare a plan.' }); await ctx.plugin(AgentLoop, { agents: [] }); await ctx.plugin(SkillTool)
   const model = new Model(script); ctx.llm.registerAdapter(['mock'], model)
   const agent = await ctx.agentLoop.create(`skills-${crypto.randomUUID()}`, { provider: 'mock', model: 'mock' }, { cwd: '/workspace/conversations/chat' })
