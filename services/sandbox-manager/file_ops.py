@@ -126,10 +126,16 @@ def read_file(fd, name, max_bytes=MAX_BYTES):
         info = os.fstat(stream.fileno())
         if not stat.S_ISREG(info.st_mode) or info.st_size > max_bytes:
             raise ValueError("Only regular files up to %d MiB are supported" % (max_bytes // (1024 * 1024)))
-        data = stream.read(max_bytes + 1)
-        if len(data) > max_bytes:
-            raise ValueError("File exceeds %d MiB" % (max_bytes // (1024 * 1024)))
-        return data
+        # Avoid reserving the full limit for small files. Read one extra byte
+        # to detect growth after the size check.
+        data = io.BytesIO()
+        remaining = max_bytes + 1
+        while chunk := stream.read(min(64 * 1024, remaining)):
+            remaining -= len(chunk)
+            if remaining == 0:
+                raise ValueError("File exceeds %d MiB" % (max_bytes // (1024 * 1024)))
+            data.write(chunk)
+        return data.getvalue()
 
 
 def version(data):
