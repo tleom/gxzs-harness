@@ -4,7 +4,7 @@ const FIELDS = {
   subagent: new Set(['maxDepth', 'maxActiveSubagents']),
   'subagent-model-selection-settings': new Set(['enabled', 'allowedModels']),
   'ui-conversation': new Set(['busyEnter']),
-  'ui-chat': new Set(['transcriptView', 'collapseTiming']),
+  'ui-chat': new Set(['transcriptView', 'collapseTiming', 'foldedReplies']),
 }
 
 /** Owner Host transport for native settings; configuration and revisions stay in DSH. */
