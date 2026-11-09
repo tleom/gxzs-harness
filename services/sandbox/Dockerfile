@@ -36,11 +36,11 @@ ARG KASMVNC_VERSION=1.5.0
 ARG KASMVNC_SHA256=770fd3df51510beecc89666879d82faf411276e68c6e11df612f736b891b5f71
 ENV DEBIAN_FRONTEND=noninteractive PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 \
     PUPPETEER_SKIP_DOWNLOAD=1 PUPPETEER_EXECUTABLE_PATH=/usr/bin/google-chrome \
-    CHROME_BIN=/usr/bin/google-chrome LANG=C.UTF-8 PYTHONIOENCODING=utf-8 MPLBACKEND=Agg
+    CHROME_BIN=/usr/bin/google-chrome LANG=C.UTF-8 TZ=Asia/Shanghai PYTHONIOENCODING=utf-8 MPLBACKEND=Agg
 RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources \
     && apt-get -o Acquire::Retries=3 -o Acquire::https::Timeout=30 update \
     && apt-get -o Acquire::Retries=3 -o Acquire::https::Timeout=30 install -y --no-install-recommends \
-      openssh-server tini bubblewrap ca-certificates curl unzip zip jq ripgrep git file \
+      openssh-server tini bubblewrap ca-certificates tzdata curl unzip zip jq ripgrep git file \
       xauth x11-utils x11-xserver-utils xsettingsd \
       libreoffice-writer libreoffice-calc libreoffice-impress libreoffice-draw libreoffice-math python3-uno \
       poppler-utils fontconfig fonts-noto-cjk fonts-noto-color-emoji fonts-dejavu-core fonts-liberation \
@@ -49,6 +49,8 @@ RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.l
       ffmpeg libimage-exiftool-perl p7zip-full unrar-free gcc libc6-dev graphviz librsvg2-bin \
       imagemagick sqlite3 antiword libmagic1 libcairo2 libpango-1.0-0 libpangoft2-1.0-0 libharfbuzz-subset0 \
     && ln -sf /usr/bin/chromium /usr/bin/google-chrome \
+    && ln -snf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime \
+    && printf '%s\n' 'Asia/Shanghai' > /etc/timezone \
     && mkdir -p /run/sshd /workspace /opt/user-env \
     && chown 1000:1000 /workspace /opt/user-env \
     && fc-cache -f && rm -rf /var/lib/apt/lists/*

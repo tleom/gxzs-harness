@@ -449,7 +449,7 @@ function runWorker({ chromium, input = process.stdin, output = process.stdout, e
       if (closed) { await browser.close(); throw new Error('browser_closed') }
       browser.on('disconnected', () => fatal('沙盒浏览器已退出，请重新打开浏览器'))
       context = await browser.newContext({ viewport: display ? null : { width: value.width, height: value.height },
-        ...(!display ? { deviceScaleFactor: 1 } : {}), locale: 'zh-CN', acceptDownloads: true, serviceWorkers: 'allow' })
+        ...(!display ? { deviceScaleFactor: 1 } : {}), locale: 'zh-CN', timezoneId: 'Asia/Shanghai', acceptDownloads: true, serviceWorkers: 'allow' })
       if (closed) { await context.close(); throw new Error('browser_closed') }
       if (display) {
         await context.exposeBinding('__workbenchInputChanged', () => { revision++ })

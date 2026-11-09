@@ -20,7 +20,7 @@ chmod 600 "$host_key" "$ssh_dir/authorized_keys"
 # the image's search paths and UTF-8 locale for the helper and its child tools.
 /usr/sbin/sshd -p "${GXZS_SANDBOX_SSH_PORT:-2222}" -h "$host_key" \
   -o "PidFile=$ssh_dir/sshd.pid" -o "AuthorizedKeysFile=$ssh_dir/authorized_keys" \
-  -o "SetEnv=PATH=$PATH NODE_PATH=${NODE_PATH:-} LANG=${LANG:-C.UTF-8}" \
+  -o "SetEnv=PATH=$PATH NODE_PATH=${NODE_PATH:-} LANG=${LANG:-C.UTF-8} TZ=${TZ:-Asia/Shanghai}" \
   -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no -o UsePAM=no \
   -o PermitRootLogin=no -o StrictModes=yes -o PrintMotd=no \
   -o AllowTcpForwarding=no -o AllowStreamLocalForwarding=no -o AllowAgentForwarding=no \

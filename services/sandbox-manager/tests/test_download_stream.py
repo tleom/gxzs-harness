@@ -88,6 +88,36 @@ def test_large_file_metadata_allows_download_without_relaxing_in_memory_reads(so
         file_ops.read_file(-777, source.name)
 
 
+def test_small_file_read_does_not_allocate_the_maximum_file_size(source):
+    content = b'{"status":"completed"}'
+    source.write_bytes(content)
+    tracemalloc.start()
+    try:
+        assert file_ops.read_file(-777, source.name) == content
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < 1024 * 1024
+
+
+def test_file_read_rejects_growth_past_the_limit_after_stat(source, monkeypatch):
+    content = b'x' * (64 * 1024)
+    source.write_bytes(content)
+    assert file_ops.read_file(-777, source.name, max_bytes=len(content)) == content
+
+    native_fstat = os.fstat
+
+    def stat_then_grow(fd):
+        info = native_fstat(fd)
+        with source.open('ab') as stream:
+            stream.write(b'x')
+        return info
+
+    monkeypatch.setattr(os, 'fstat', stat_then_grow)
+    with pytest.raises(ValueError, match='File exceeds'):
+        file_ops.read_file(-777, source.name, max_bytes=len(content))
+
+
 @pytest.mark.parametrize('cancel', [False, True])
 def test_large_download_snapshot_stream_and_temporary_cleanup(source, monkeypatch, cancel):
     with source.open('wb') as output:
