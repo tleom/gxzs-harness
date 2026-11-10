@@ -101,6 +101,7 @@ export function buildCatalog(snapshot) {
   }
   return {
     authorityKey: typeof snapshot.authorityKey === 'string' && snapshot.authorityKey.length <= 4096 ? snapshot.authorityKey : null,
+    continuityKey: typeof snapshot.continuityKey === 'string' && snapshot.continuityKey.length <= 4096 ? snapshot.continuityKey : null,
     revision: String(snapshot.revision ?? ''), ready: snapshot.ready === true,
     byId, plugins: [...plugins.values()],
   }

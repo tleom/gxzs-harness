@@ -53,6 +53,30 @@ async function setup(mode = 'native', taskReply) {
   }
 }
 
+for (const mode of ['native', 'ptc']) test(`${mode}: loaded tools survive the next authorized run without replaying discovery`, async () => {
+  const h = await setup(mode); const plugin = await h.remount()
+  const agent = await h.create()
+  await h.send(agent)
+  assert.equal(h.calls.length, 1)
+  h.setRun({ ...h.getRun(), status: 'completed' })
+  h.ctx.toolDiscovery.refresh(agent)
+  assert.equal(h.ctx.tools.get(h.personalName, agent), undefined, 'completed runs grant no execution')
+  h.setRun({ ...h.getRun(), id: 'run-2', status: 'running' })
+  await plugin.dispose(); await h.remount()
+  h.adapter.script = [call(h.personalName, { query: 'next turn' }, mode), response()]
+  await h.send(agent)
+  assert.equal(h.calls.length, 2)
+  assert.equal(h.calls[1].run_id, 'run-2', 'dispatch must use fresh run authority')
+  assert.equal(h.calls[1].arguments.query, 'next turn')
+  assert.equal(h.adapter.requests.length, 5, 'no additional discovery/model round trip')
+
+  h.setRun({ ...h.getRun(), id: 'run-3', mcpTools: [] })
+  h.ctx.toolDiscovery.refresh(agent)
+  h.adapter.script = [call(h.personalName, { query: 'revoked' }, mode), response()]
+  await h.send(agent)
+  assert.equal(h.calls.length, 2, 'a remembered name never grants revoked authority')
+})
+
 for (const mode of ['native', 'ptc']) test(`${mode}: publication reorder reaches runtime and model without losing active tools or duplicating history`, async () => {
   const h = await setup(mode)
   const tool = (name, order_num) => ({ ...catalog[0], id: `global:mcp:${name}:lookup`,

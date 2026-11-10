@@ -28,6 +28,7 @@ export async function apply(ctx, supplied = {}) {
     const restored = projection.stateOf(agent.session)
     state = {
       agent, authorityKey: restored?.authorityKey ?? null,
+      continuityKey: restored?.continuityKey ?? restored?.authorityKey ?? null,
       active: new Map((restored?.tools ?? []).map(tool => [tool.id, tool])),
       pending: new Map(), catalogKey: undefined, catalog: undefined,
       maskStamp: undefined, liftMask: undefined, step: undefined, unpersisted: false, assembled: undefined,
@@ -62,7 +63,7 @@ export async function apply(ctx, supplied = {}) {
       if (!snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot)) throw new Error('Invalid catalog snapshot')
     }
     catch { snapshot = { authorityKey: null, revision: '', ready: false, tools: [] } }
-    const key = JSON.stringify([snapshot.authorityKey ?? null, snapshot.revision ?? '', snapshot.ready === true])
+    const key = JSON.stringify([snapshot.authorityKey ?? null, snapshot.continuityKey ?? null, snapshot.revision ?? '', snapshot.ready === true])
     if (key !== state.catalogKey) {
       try { state.catalog = buildCatalog(snapshot, config); state.catalogKey = key }
       catch (error) {
@@ -75,8 +76,14 @@ export async function apply(ctx, supplied = {}) {
       }
     }
     const catalog = state.catalog
+    const continuityKey = catalog.continuityKey ?? catalog.authorityKey
+    if (state.continuityKey !== continuityKey) {
+      state.unpersisted ||= state.active.size > 0
+      state.continuityKey = continuityKey; state.active.clear(); state.pending.clear()
+    }
     if (state.authorityKey !== catalog.authorityKey) {
-      state.authorityKey = catalog.authorityKey; state.active.clear(); state.pending.clear(); state.unpersisted = false; state.deniedCount = 0
+      state.unpersisted ||= state.active.size > 0
+      state.authorityKey = catalog.authorityKey; state.pending.clear(); state.deniedCount = 0
     }
     if (catalog.ready) {
       const matching = new Map()
@@ -84,6 +91,7 @@ export async function apply(ctx, supplied = {}) {
         const tool = catalog.byId.get(id)
         if (matchesEntry(tool, entry)) matching.set(id, entry)
       }
+      state.unpersisted ||= matching.size !== state.active.size
       state.active = matching
     }
     installMask(state, prepareMask(state, catalog.ready ? state.active : new Map()))
@@ -357,7 +365,8 @@ export async function apply(ctx, supplied = {}) {
     if (state.unpersisted) {
       // Session forbids append from inside its event publication. This native
       // request hook runs after step/end and before the provider sees schemas.
-      appendPluginRecord(state.agent.session, ACTIVE_EVENT, { version: 1, authorityKey: state.authorityKey, tools: [...state.active.values()] })
+      appendPluginRecord(state.agent.session, ACTIVE_EVENT, { version: 1, authorityKey: state.authorityKey,
+        continuityKey: state.continuityKey, tools: [...state.active.values()] })
       state.unpersisted = false
     }
     return config

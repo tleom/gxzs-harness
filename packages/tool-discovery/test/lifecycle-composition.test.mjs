@@ -132,8 +132,8 @@ async function fixture(script, { delayed = false, complete = false } = {}) {
 }
 const names = request => request.tools.map(tool => tool.name)
 // These tests compose real native lifecycle services with discovery mode enabled.
-test.each([false, true])('scheduled inbox retries catalog and starts each run with fresh discovery (complete=%s)', async complete => {
-  const h = await fixture([search(), toolCall('case_lookup'), 'first done', search(), toolCall('case_lookup'), 'second done'], { delayed: true, complete })
+test.each([false, true])('scheduled inbox revalidates loaded tools for each new run (complete=%s)', async complete => {
+  const h = await fixture([search(), toolCall('case_lookup'), 'first done', toolCall('case_lookup'), 'second done'], { delayed: true, complete })
   try {
     const first = createUserMessage({ source: { kind: 'schedule' }, content: [{ type: 'text', text: 'Check scheduled records' }] })
     h.agent.followup(first)
@@ -142,8 +142,8 @@ test.each([false, true])('scheduled inbox retries catalog and starts each run wi
     await h.setCatalog(catalog); await h.agent.whenIdle(); await h.scheduler.tick()
     const second = createUserMessage({ source: { kind: 'schedule' }, content: [{ type: 'text', text: 'Check next scheduled records' }] })
     h.agent.followup(second); await h.agent.whenIdle()
-    assert.equal(h.model.requests.length, 6)
-    assert.deepEqual(names(h.model.requests[0]), ['mcp', 'tool_search']); assert.deepEqual(names(h.model.requests[3]), ['mcp', 'tool_search'])
+    assert.equal(h.model.requests.length, 5)
+    assert.deepEqual(names(h.model.requests[0]), ['mcp', 'tool_search']); assert.ok(names(h.model.requests[3]).includes('case_lookup'))
     assert.ok(names(h.model.requests[1]).includes('case_lookup')); assert.ok(!names(h.model.requests[1]).includes('unused_lookup'))
     assert.deepEqual(h.calls.map(call => call.run_id), [first.id, second.id])
     for (const id of [first.id, second.id]) assert.equal(h.db.getRun(h.owner.ownerId, id).status, 'completed')
@@ -164,7 +164,8 @@ test.each([false, true])('Goal rounds retain activation and resume revalidates i
     const resumed = await h.service.mutateGoal(h.owner, h.chat.id, 'resume', { ref: h.ctx.goals.get(h.agent) })
     await until(() => h.model.requests.length === (changed ? 7 : 8), 'resumed Goal request')
     assert.notEqual(resumed.run.id, created.run.id)
-    assert.deepEqual(names(h.model.requests[5]), ['mcp', 'tool_search'])
+    if (changed) assert.deepEqual(names(h.model.requests[5]), ['mcp', 'tool_search'])
+    else assert.ok(names(h.model.requests[5]).includes('case_lookup'))
     assert.equal(h.calls.length, changed ? 2 : 3)
     if (!changed) assert.equal(h.calls[2].run_id, resumed.run.id)
     await h.service.mutateGoal(h.owner, h.chat.id, 'pause', { ref: h.ctx.goals.get(h.agent) })
@@ -300,7 +301,7 @@ test('owned child discovery stays scoped and its settled notice reopens only a f
       source: { kind: 'subagent-settled', senderSessionId: child.id, form: 'notice', summary: 'Completed' } })
     h.agent.followup(notice); await h.agent.whenIdle()
     assert.equal(h.model.requests.length, 9)
-    assert.deepEqual(names(h.model.requests[6]), ['mcp', 'tool_search'])
+    assert.ok(names(h.model.requests[6]).includes('case_lookup'))
     assert.ok(names(h.model.requests[7]).includes('case_lookup'))
     assert.ok(!names(h.model.requests[7]).includes('unused_lookup'))
     assert.deepEqual(h.calls.map(call => call.run_id), [original.id, original.id, notice.id])

@@ -43,7 +43,7 @@ class Model extends LlmAdapter {
   }
 }
 
-async function mount(root, { owner = 'owner-a', runOwner = owner, rows = catalog, frozen = catalog,
+async function mount(root, { owner = 'owner-a', runOwner = owner, runId = 'run-1', rows = catalog, frozen = catalog,
   script = [response('case_lookup', { query: 'restored' }), response()] } = {}) {
   const ctx = new Context(), calls = []
   ctx.provide('workingDirectory', { get: () => root, ensure: async () => root })
@@ -52,7 +52,7 @@ async function mount(root, { owner = 'owner-a', runOwner = owner, rows = catalog
   await ctx.plugin(AgentLoop, { agents: [] })
   const model = new Model(script)
   ctx.llm.registerAdapter(['mock'], model)
-  const run = { id: 'run-1', ownerId: runOwner, status: 'running', mcpTools: frozen }
+  const run = { id: runId, ownerId: runOwner, status: 'running', mcpTools: frozen }
   ctx.provide('workbenchRuntime', { ownerId: owner, agents: ctx.agents, executionRun: () => run,
     authorizeMcpCall: async (_sessionId, id, version) => {
       const resource = run.ownerId === owner && run.status === 'running' && run.mcpTools.find(row => row.id === id && row.version === version)
@@ -107,6 +107,8 @@ afterAll(async () => {
 
 const cases = [
   ['same authority', {}, true],
+  ['new authorized run in the same session', { runId: 'run-2' }, true],
+  ['new run with revoked tools', { runId: 'run-2', frozen: [] }, false],
   ['changed owner', { owner: 'owner-b' }, false],
   ['mismatched owner', { owner: 'owner-b', runOwner: 'owner-a' }, false],
   ['changed version', { rows: catalog.map(row => ({ ...row, version: 'v2' })), frozen: catalog.map(row => ({ ...row, version: 'v2' })) }, false],
