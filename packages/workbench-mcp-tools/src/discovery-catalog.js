@@ -105,7 +105,9 @@ export class ToolDiscoveryCatalog extends Service {
     const pluginStamps = [...plugins.values()].sort((a, b) => a.id.localeCompare(b.id))
     const revision = createHash('sha256').update(JSON.stringify([authorityKey, ready, stamps, [...preferred].sort(), pluginStamps]))
       .digest('hex')
-    return { authorityKey, revision, ready, tools, plugins: [...plugins.values()] }
+    // Loading is a session preference; every run still supplies fresh authority.
+    const continuityKey = runtime.ownerId && agent?.session?.id ? `${runtime.ownerId}\0${agent.session.id}` : null
+    return { authorityKey, continuityKey, revision, ready, tools, plugins: [...plugins.values()] }
   }
 
   subscribe(listener) {

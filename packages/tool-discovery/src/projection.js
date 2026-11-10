@@ -11,6 +11,7 @@ const entrySchema = z.object({
 })
 export const activeStateSchema = z.object({
   version: z.literal(1), authorityKey: z.string().max(4096).nullable(),
+  continuityKey: z.string().max(4096).nullable().optional(),
   tools: z.array(entrySchema),
 })
 

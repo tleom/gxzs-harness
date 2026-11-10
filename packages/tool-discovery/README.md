@@ -22,6 +22,7 @@ Provide a Cordis service named `toolDiscoveryCatalog` before mounting this plugi
   snapshot(agent) {
     return {
       authorityKey: 'owner-and-current-run-identity',
+      continuityKey: 'owner-and-session-identity',
       revision: 'changes-with-authorization-names-and-definitions',
       ready: true,
       plugins: [{ id, name, displayName, description, preferred, available }],
@@ -78,7 +79,11 @@ readiness before releasing them. This protects initialization and hot reload.
   native request's snapshot; changed loaded definitions or authorization still
   block that step before it reaches the provider.
 - Restore: intersect persisted hints with current authorization, exact definitions
-  and current visibility. A different authority starts without loaded tools.
+  and current visibility. `continuityKey` preserves loading preferences across new
+  runs in the same owner's session, including cold resume. The current run still
+  supplies all authority; stopped runs expose no tools. A different owner/session,
+  revoked permission or changed definition cannot inherit access. Bridges without
+  `continuityKey` keep the conservative per-authority behavior.
 
 Native function calling and PTC share this lifecycle. Newly found tools cannot
 be called in the same tool-call batch or the same `run_code` execution. Native
