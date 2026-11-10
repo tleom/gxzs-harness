@@ -27,7 +27,7 @@ import { nativePresentation } from '../src/display-events.js'
 // CI must install profiles/workbench before running this contract suite.
 const nativeRequire = createRequire(new URL('../../../profiles/workbench/package.json', import.meta.url))
 const native = async name => import(pathToFileURL(nativeRequire.resolve(`@deepseek-ai/${name}`)).href)
-const [{ Context }, { default: LlmRuntime, LlmAdapter, createUserMessage },
+const [{ Context }, { default: LlmRuntime, LlmAdapter, LlmError, resolveRetryPolicy, createUserMessage },
   { default: SessionStore }, { default: Projections }, { default: SystemPrompt },
   { default: ToolRuntime }, { default: AgentRegistry }, { default: AgentLoop },
   { default: GoalService }, GoalDriver, { default: Commands }, GoalCommand] = await Promise.all([
@@ -303,7 +303,7 @@ it.each(['terminal', 'browser'])('lets the original Agent handle a manually clos
   expect(test.agent.session.snapshotEvents().filter(event => event.type === 'turn/end').map(event => event.data.reason.kind)).toEqual(['completed'])
 })
 
-async function fixture(script, { scheduledClaims = false } = {}) {
+async function fixture(script, { scheduledClaims = false, retryPolicy } = {}) {
   const ctx = new Context()
   // New native skill and terminal consumers share the working-directory owner.
   ctx.provide('workingDirectory', { ensure: async agent => agent.session.header.cwd,
@@ -317,6 +317,10 @@ async function fixture(script, { scheduledClaims = false } = {}) {
   await ctx.plugin(GoalCommand)
   await ctx.plugin(AgentLoop, { agents: [] })
   const model = new FakeModel(script)
+  if (retryPolicy) {
+    model.providerRetryPolicy = () => resolveRetryPolicy(retryPolicy, 'fixture')
+    await ctx.plugin(await native('dsh-llm-retry'))
+  }
   ctx.llm.registerAdapter(['mock'], model)
   const agent = await ctx.agentLoop.create('native-session', { provider: 'mock', model: 'mock' }, { cwd: '/workspace/conversations/native-chat' })
   const owner = { ownerId: 't:1' }
@@ -358,6 +362,93 @@ async function fixture(script, { scheduledClaims = false } = {}) {
   return { ctx, db, agent, owner, chat, model, scheduler, runtime, sessions, controllerCtx, requests, create,
     permit: value => { permitted = value } }
 }
+
+const boundedRetry = { mode: 'normal', maxRetries: 2, backoff: { initialDelayMs: 1, maxDelayMs: 2, jitterRatio: 0 } }
+it('retries a broken response stream in the current step without repeating an already completed tool', async () => {
+  const test = await fixture([], { retryPolicy: boundedRetry })
+  const command = vi.fn(async () => ({ url: 'https://example.com', title: 'Evidence', revision: 1 }))
+  registerBrowserTool(test.ctx, { browsers: { create: async () => {}, require: () => ({ command }) }, runtime: test.runtime, database: test.db, ownerId: test.owner.ownerId })
+  test.model.stream = async function* (options) {
+    this.requests.push(options)
+    if (this.requests.length === 1) {
+      yield { type: 'tool-call-delta', index: 0, id: 'completed-tool', name: 'browser', argumentsDelta: JSON.stringify({ action: 'snapshot' }) }
+      yield { type: 'finish', reason: { kind: 'tool-calls' } }
+      return
+    }
+    if (this.requests.length < 4) {
+      yield { type: 'text-delta', index: 0, text: 'partial response' }
+      throw new LlmError('connection closed during streaming', 'TRANSPORT')
+    }
+    yield { type: 'text-delta', index: 0, text: 'completed response' }
+    yield { type: 'finish', reason: { kind: 'stop' } }
+  }
+  const run = test.create('Read evidence and explain')
+  await test.scheduler.enqueue(run, [{ type: 'text', text: run.query }])
+  await test.scheduler.tick()
+  await test.agent.whenIdle()
+  expect(test.model.requests).toHaveLength(4)
+  expect(command).toHaveBeenCalledTimes(1)
+  expect(test.db.getRun(test.owner.ownerId, run.id).status).toBe('completed')
+  const events = test.agent.session.snapshotEvents()
+  expect(events.filter(event => event.type === 'llm/retry').map(event => event.data.retry)).toEqual([1, 2])
+  expect(events.filter(event => event.type === 'tool/result')).toHaveLength(1)
+  expect(events.filter(event => event.type === 'turn/end').map(event => event.data.reason.kind)).toEqual(['completed'])
+})
+it.each(['TRANSPORT', 'TIMEOUT', 'SERVER', 'RATE_LIMIT'])(
+  'stops only after three native %s failures in the same turn, then accepts a fresh message', async code => {
+    const test = await fixture([...Array.from({ length: 3 }, () => new LlmError('transient failure', code)), 'next message works'], { retryPolicy: boundedRetry })
+    const first = test.create('first')
+    const retryStates = []
+    test.ctx.on('session/event', (_session, event) => {
+      if (event.type === 'llm/retry') {
+        const run = test.db.getRun(test.owner.ownerId, first.id)
+        retryStates.push({ status: run.status, error: run.error })
+      }
+    })
+    await test.scheduler.enqueue(first, [{ type: 'text', text: first.query }])
+    await test.scheduler.tick()
+    await test.agent.whenIdle()
+    expect(test.model.requests).toHaveLength(3)
+    expect(retryStates).toHaveLength(2)
+    for (const state of retryStates) {
+      expect(state.status).toBe('running')
+      expect(state.error).toBeFalsy()
+    }
+    expect(test.db.getRun(test.owner.ownerId, first.id).status).toBe('failed')
+    expect(test.db.getRun(test.owner.ownerId, first.id).error).toContain('transient failure')
+    const events = test.agent.session.snapshotEvents()
+    expect(events.filter(event => event.type === 'llm/retry').map(event => event.data.retry)).toEqual([1, 2])
+    expect(events.filter(event => event.type === 'user/message')).toHaveLength(1)
+    const second = test.create('second')
+    await test.scheduler.enqueue(second, [{ type: 'text', text: second.query }])
+    await vi.waitFor(async () => { await test.scheduler.tick(); expect(test.model.requests).toHaveLength(4) })
+    await test.agent.whenIdle()
+    expect(test.model.requests).toHaveLength(4)
+    expect(test.db.getRun(test.owner.ownerId, second.id).status).toBe('completed')
+  })
+it.each(['AUTH', 'INVALID_REQUEST', 'QUOTA_EXCEEDED'])(
+  'keeps native %s failures terminal without wasting retries', async code => {
+    const test = await fixture([new LlmError('rejected', code)], { retryPolicy: boundedRetry })
+    const run = test.create('rejected')
+    await test.scheduler.enqueue(run, [{ type: 'text', text: run.query }])
+    await test.scheduler.tick()
+    await test.agent.whenIdle()
+    expect(test.model.requests).toHaveLength(1)
+    expect(test.agent.session.snapshotEvents().filter(event => event.type === 'llm/retry')).toEqual([])
+  })
+it('cancels native retry backoff when the user pauses', async () => {
+  const test = await fixture([new LlmError('network lost', 'TRANSPORT'), 'must not execute'], {
+    retryPolicy: { mode: 'normal', maxRetries: 2, backoff: { initialDelayMs: 60_000, maxDelayMs: 60_000 } },
+  })
+  const run = test.create('pause')
+  await test.scheduler.enqueue(run, [{ type: 'text', text: run.query }])
+  await test.scheduler.tick()
+  await vi.waitFor(() => expect(test.agent.session.snapshotEvents().some(event => event.type === 'llm/retry')).toBe(true))
+  await test.sessions.cancel()
+  await test.agent.whenIdle()
+  expect(test.model.requests).toHaveLength(1)
+  expect(test.db.getRun(test.owner.ownerId, run.id).status).toBe('cancelled')
+})
 
 async function registerUserSkills(test, names) {
   const [{ default: Skills }, SkillTool] = await Promise.all([native('dsh-skill'), native('dsh-tool-skill')])

@@ -33,7 +33,10 @@ async function synchronize(settings, models) {
       && previous.defaultSource === revision(settings, 'agent-default-model')) return
     const providers = Object.fromEntries(Object.entries(models.providers).filter(([, p]) => p.enabled !== false).map(([id, p]) => {
       const { enabled, name, models: entries, ...connection } = p
-      return [id, { ...connection, models: entries.filter((m) => m.enabled !== false).map(({ enabled, ...model }) => model) }]
+      // Three consecutive failures: the first attempt plus two automatic retries.
+      // DSH owns transport/server/rate-limit classification and durable retry state.
+      return [id, { ...connection, retryPolicy: { mode: 'normal', maxRetries: 2 },
+        models: entries.filter((m) => m.enabled !== false).map(({ enabled, ...model }) => model) }]
     }))
     await settings.replace('llm-pi-ai', { providers })
     const slash = models.default.indexOf('/')

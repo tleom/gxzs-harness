@@ -20,6 +20,14 @@ function setup() {
 }
 
 describe('database model publication', () => {
+  it('stops every published provider after three failures, including restored unbounded policies', async () => {
+    const { config, client, sessions, settings } = setup()
+    config.models.providers.p.retryPolicy = { mode: 'always' }
+    config.models.providers.other = { models: [{ id: 'builtin', name: 'Other' }], retryPolicy: { mode: 'normal', maxRetries: 10 } }
+    await databaseModelCatalog(client, sessions, {}, settings)
+    for (const provider of Object.values(settings.get('llm-pi-ai').providers))
+      expect(provider.retryPolicy).toEqual({ mode: 'normal', maxRetries: 2 })
+  })
   it.each(['disabled', 'default-syntax', 'default-disabled', 'provider-models', 'model-name', 'null-model'])(
     'keeps an invalid publication out of generic retry codes and native side effects: %s', async kind => {
       const { config, client, sessions, settings } = setup()
