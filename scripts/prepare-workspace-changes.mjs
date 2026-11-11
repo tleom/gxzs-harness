@@ -38,6 +38,23 @@ export async function prepareWorkspaceChanges(profile) {
   }
   return join(dirname(entry),'gxzs-sandbox.js')
 }
+
+/** Read snapshot paths inside the authenticated helper, without a second SSH process. */
+export async function prepareSnapshotPaths(directory) {
+  const version = JSON.parse(await readFile(join(directory, '../package.json'), 'utf8')).version
+  if (version !== '0.2.2-rc.1') throw new Error(`Unverified SSH helper version: ${version}`)
+  const target = join(directory, 'helper.js')
+  const source = await readFile(target, 'utf8')
+  const fallback = 'throw new Error(`Unknown SSH helper operation: ${method}`);'
+  const route = `if (method === "workbench.snapshot-paths") {
+      object.parse(raw);
+      return { home: workbenchHomedir(), tempRoot: workbenchTmpdir() };
+    }`
+  if (source.includes(route)) return
+  if (source.split(fallback).length !== 2) throw new Error('DSH SSH helper dispatch contract changed')
+  await writeFile(target, 'import { homedir as workbenchHomedir, tmpdir as workbenchTmpdir } from "node:os";\n'
+    + source.replace(fallback, route + '\n    ' + fallback))
+}
 if(process.argv[1] && fileURLToPath(import.meta.url)===process.argv[1]) {
   await prepareWorkspaceChanges(process.argv[2] || fileURLToPath(new URL('../profiles/workbench',import.meta.url)))
 }

@@ -3,7 +3,7 @@ import { createRequire } from 'node:module'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { officePreset } from './preset-policy.mjs'
-import { prepareWorkspaceChanges } from '../../scripts/prepare-workspace-changes.mjs'
+import { prepareSnapshotPaths, prepareWorkspaceChanges } from '../../scripts/prepare-workspace-changes.mjs'
 import { prepareSubagentPrompt } from '../../scripts/prepare-subagent-prompt.mjs'
 import { prepareSessionReferences } from '../../scripts/prepare-session-references.mjs'
 import { prepareSessionDeletion } from '../../scripts/prepare-session-deletion.mjs'
@@ -14,16 +14,17 @@ import { prepareDshAgentInbox } from '../../scripts/prepare-dsh-agent-inbox.mjs'
 import { prepareTerminalCleanup } from '../../scripts/prepare-terminal-cleanup.mjs'
 
 const root = dirname(fileURLToPath(import.meta.url))
+const require = createRequire(import.meta.url)
 await prepareSessionDeletion(root)
 await prepareSessionSearch(root)
 await prepareWorkspaceChanges(root)
+await prepareSnapshotPaths(dirname(require.resolve('@deepseek-ai/dsh-ssh')))
 await prepareSubagentPrompt(root)
 await prepareSessionReferences(root)
 await prepareWorkbenchClient(root)
 await prepareDshStreamArguments(root)
 await prepareDshAgentInbox(root)
 await prepareTerminalCleanup(root)
-const require = createRequire(import.meta.url)
 const shipped = join(dirname(require.resolve('@deepseek-ai/dsh-web-app/package.json')), 'presets')
 const patches = [readFileSync(join(root, 'cordis.patch.yml'), 'utf8')]
 for (const name of readdirSync(shipped).filter(name => name.endsWith('.patch.yml')).sort()) {

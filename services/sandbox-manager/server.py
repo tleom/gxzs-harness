@@ -43,6 +43,10 @@ LOCKS = {}
 LOCKS_GUARD = threading.Lock()
 REQUEST_CONTEXT = threading.local()
 OPERATION_CAPACITY = threading.BoundedSemaphore(int(os.environ.get('WORKBENCH_MANAGER_MAX_OPERATIONS', '24')))
+PROVISIONING_WAIT_SECONDS = 6
+PROVISIONING_PROBE_INTERVAL = 0.25
+PROVISIONING_WAITERS = threading.BoundedSemaphore(min(8, max(0, int(
+    os.environ.get('WORKBENCH_MANAGER_MAX_REQUESTS', '32')) // 4)))
 OFFICE_CONVERSIONS = OfficeConversions()
 CONTROL_ACTIONS = frozenset({'stop-binding', 'fence-binding', 'schedule', 'runtime-epoch', 'touch', 'diagnostics'})
 MAX_BODY = 30 * 1024 * 1024
@@ -464,6 +468,29 @@ def finish_legacy_import(key, payload, import_id):
     return {field: result[field] for field in ('id', 'version', 'path', 'conflict') if field in result}
 
 
+def wait_for_host(key, result, *, provisioning):
+    record = HOSTS.root / key / 'host.json'
+    fields = ('owner_id', 'generation', 'instance_id')
+    deadline = time.monotonic() + (PROVISIONING_WAIT_SECONDS if provisioning else PROVISIONING_PROBE_INTERVAL)
+    while True:
+        probe_until = min(deadline, time.monotonic() + PROVISIONING_PROBE_INTERVAL)
+        probes = HOSTS.maintain(key)
+        if probes:
+            wait(probes, timeout=max(0, probe_until - time.monotonic()))
+        # Ready is published atomically before the maintenance worker completes
+        # heartbeat/cleanup. A slow worker must not hide an available Host.
+        try:
+            current = json.loads(record.read_text(encoding='utf-8'))
+        except FileNotFoundError:
+            raise ResourceUnavailable('个人工作环境正在恢复，请稍后重试', 'HOST_NOT_READY', 2) from None
+        if any(current.get(field) != result.get(field) for field in fields):
+            raise ResourceUnavailable('个人工作环境正在恢复，请稍后重试', 'HOST_NOT_READY', 2)
+        if (not provisioning or current.get('ready') or current.get('state') != 'provisioning'
+                or 'profile_upgrade' in current or time.monotonic() >= deadline):
+            return current
+        time.sleep(max(0, probe_until - time.monotonic()))
+
+
 def operation(key, action, payload):
     name, _ = identity(key)
     if action == 'personal-resources' and payload.get('operation') == 'skill_import' and not payload.get('import_id'):
@@ -525,26 +552,19 @@ def operation(key, action, payload):
     if action == 'ensure-host':
         result = HOSTS.ensure(key, payload)
         if not result.get('ready') and result.get('state') in {'provisioning', 'ready'}:
-            # Probe the waiting owner now, after ensure releases its lock. Reuse
-            # the bounded worker pool instead of waiting for the 10-second sweep.
-            probes = HOSTS.maintain(key)
-            # A healthy probe normally finishes immediately. Return its verified
-            # transition in this response instead of imposing another UI retry.
-            # Slow bootstrap keeps running in the bounded pool without blocking
-            # this HTTP request for its full health-check timeout.
-            if probes:
-                wait(probes, timeout=0.25)
-            # Ready is published before heartbeat/cleanup finishes. Host records
-            # are replaced atomically: read that snapshot even after a timeout,
-            # without waiting on a lifecycle lock held by slow recovery work.
-            try:
-                current = json.loads((HOSTS.root / key / 'host.json').read_text(encoding='utf-8'))
-            except FileNotFoundError:
-                raise ResourceUnavailable('个人工作环境正在恢复，请稍后重试', 'HOST_NOT_READY', 2) from None
-            fields = ('owner_id', 'generation', 'instance_id')
-            if any(current.get(field) != result.get(field) for field in fields):
-                raise ResourceUnavailable('个人工作环境正在恢复，请稍后重试', 'HOST_NOT_READY', 2)
-            result = current
+            provisioning = (result['state'] == 'provisioning' and result.get('endpoint')
+                            and 'profile_upgrade' not in result and payload.get('scheduled_wakeup') is not True)
+            if provisioning and PROVISIONING_WAITERS.acquire(blocking=False):
+                # Bootstrap itself needs Manager operations for the MCP catalog.
+                # Reserve HTTP capacity separately and release the operation slot.
+                if getattr(REQUEST_CONTEXT, 'operation_capacity', False):
+                    REQUEST_CONTEXT.operation_capacity = False
+                    OPERATION_CAPACITY.release()
+                try:
+                    return wait_for_host(key, result, provisioning=True)
+                finally:
+                    PROVISIONING_WAITERS.release()
+            return wait_for_host(key, result, provisioning=False)
         return result
     if action == 'replace-host':
         return HOSTS.replace(key, payload)

@@ -271,6 +271,45 @@ def test_ensure_does_not_wait_for_a_slow_startup_probe(server, monkeypatch):
     assert not probe.cancelled()
 
 
+def test_provisioning_reprobes_without_occupying_operation_capacity(server, monkeypatch):
+    from concurrent.futures import Future
+    import threading
+
+    key = str(uuid4())
+    pending = dict(owner_id='tenant:7', generation=1, instance_id='host-1',
+                   state='provisioning', ready=False, endpoint='http://host')
+    ready = dict(pending, state='ready', ready=True)
+    record = server.HOSTS.root / key / 'host.json'
+    record.parent.mkdir()
+    server.HOSTS._save(record, pending)
+    monkeypatch.setattr(server.HOSTS, 'ensure', Mock(return_value=pending))
+    monkeypatch.setattr(server, 'PROVISIONING_PROBE_INTERVAL', 0.01)
+    capacity = threading.BoundedSemaphore(1)
+    monkeypatch.setattr(server, 'OPERATION_CAPACITY', capacity)
+    assert capacity.acquire(blocking=False)
+    server.REQUEST_CONTEXT.operation_capacity = True
+
+    def completed_probe(item):
+        assert item == key
+        # An owner catalog request must be able to enter while ensure waits.
+        assert capacity.acquire(blocking=False)
+        capacity.release()
+        if maintain.call_count == 2:
+            server.HOSTS._save(record, ready)
+        probe = Future()
+        probe.set_result(None)
+        return (probe,)
+
+    maintain = Mock(side_effect=completed_probe)
+    monkeypatch.setattr(server.HOSTS, 'maintain', maintain)
+    try:
+        assert server.operation(key, 'ensure-host', pending) == ready
+        assert maintain.call_count == 2
+        assert server.REQUEST_CONTEXT.operation_capacity is False
+    finally:
+        server.REQUEST_CONTEXT.operation_capacity = False
+
+
 @pytest.mark.parametrize('blocked_work', ['other-owner', 'post-probe', 'lifecycle-lock'])
 def test_ensure_observes_its_own_ready_snapshot_with_bounded_wait(server, monkeypatch, blocked_work):
     import threading

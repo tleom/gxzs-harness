@@ -103,7 +103,7 @@ ENV PATH=/opt/user-env/current/python/bin:/opt/office/python/bin:/opt/user-env/c
 ENV HOME=/home/gxzs USER=gxzs LOGNAME=gxzs
 USER gxzs
 EXPOSE 2222 5004
-HEALTHCHECK --interval=15s --timeout=5s --start-period=15s --retries=3 \
+HEALTHCHECK --interval=15s --timeout=5s --start-period=15s --start-interval=500ms --retries=3 \
   CMD /usr/local/bin/python -I -S -c "import socket; socket.create_connection(('127.0.0.1',2222),2).close()"
 ENTRYPOINT ["/usr/bin/tini", "-g", "--", "/usr/local/bin/start-owner-sandbox"]
 CMD ["shellctl", "serve", "--listen", "0.0.0.0:5004"]
