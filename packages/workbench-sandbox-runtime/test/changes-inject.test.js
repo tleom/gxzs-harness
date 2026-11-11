@@ -2,9 +2,36 @@ import { Context } from '@deepseek-ai/cordis'
 import { createRequire } from 'node:module'
 import { dirname, join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
-import { expect, it } from 'vitest'
-import { inject } from '../src/changes.js'
+import { expect, it, vi } from 'vitest'
+import { apply, inject } from '../src/changes.js'
 import { prepareWorkspaceChanges } from '../../../scripts/prepare-workspace-changes.mjs'
+
+it.each([true, false])('uses authenticated snapshot metadata when supported by SSH helper (%s)', async (supported) => {
+  await prepareWorkspaceChanges(resolve('profiles/workbench'))
+  const ctx = new Context()
+  const paths = { home: '/home/gxzs', tempRoot: '/tmp' }
+  const request = vi.fn(async (method, params, schema) => {
+    expect(method).toBe('workbench.snapshot-paths')
+    expect(params).toEqual({})
+    if (!supported) throw new Error('Unknown SSH helper operation: workbench.snapshot-paths')
+    return schema.parse(paths)
+  })
+  const spawn = vi.fn(() => ({
+    done: Promise.resolve({ exitCode: 0 }),
+    collected: { stdout: { readFrom: () => ({ text: JSON.stringify(paths), lossy: false }) } },
+  }))
+  ctx.provide('ssh', { request })
+  ctx.provide('subprocess', { resolveExecutable: async () => '/usr/local/bin/node', spawn })
+  ctx.provide('fs', {})
+  try {
+    await ctx.plugin({ name: 'test-workspace-changes-paths', inject, apply }, {
+      timeoutMs: 30000, outputMaxBytes: 8388608, maxFiles: 500, maxFileBytes: 2097152, diffTimeoutMs: 100,
+    })
+    expect(ctx.get('workspaceChanges')).toBeDefined()
+    expect(request).toHaveBeenCalledTimes(1)
+    expect(spawn).toHaveBeenCalledTimes(supported ? 0 : 1)
+  } finally { await ctx.fiber.dispose() }
+})
 
 it('allows the native mutation recorder to resolve fs inside the actual Cordis plugin scope', async () => {
   await prepareWorkspaceChanges(resolve('profiles/workbench'))
@@ -14,6 +41,7 @@ it('allows the native mutation recorder to resolve fs inside the actual Cordis p
   const ctx = new Context(), handlers = new Map(), seen = []
   ctx.provide('subprocess', { resolveExecutable: async () => { throw new Error('no git') } })
   ctx.provide('fs', { processPath: target => { seen.push(target); return '/workspace/file.txt' } })
+  ctx.provide('ssh', {})
   const native = createWorkspaceChanges({ homedir: () => '/workspace', tmpdir: () => '/tmp',
     mkdtemp: async () => '/tmp/test', mkdir: async () => {}, rm: async () => {},
     captureFile: async () => ({ kind: 'missing' }) })
