@@ -30,7 +30,7 @@ try {
       console.log(`PASS ${count} concurrent small-file uploads/downloads: exact bytes, independent versions, no Host exit`)
     }
     const path = join(directory, 'upload')
-    const size = 100 * mib
+    const size = 1024 * mib
     const metadata = { operation: 'upload', path: 'probe/large.bin', size, version: null }
     const header = Buffer.from(JSON.stringify(metadata) + '\n')
     const chunk = Buffer.alloc(64 * 1024, 65), hash = createHash('sha256')
@@ -69,7 +69,7 @@ try {
     await assert.rejects(manager.upload('personal-resources', { ...packageUpload,
       metadata: { ...skillMetadata, operation: 'skill_import', name: 'upload-audit', version: 'stale' } }), error => error.status === 409)
     await manager.personalResources({ operation: 'skill_uninstall', name: 'upload-audit', version: imported.version })
-    console.log('PASS streaming files: 100 MiB binary upload/download SHA-256, conflicts, oversize rejection, skill import/version checks')
+    console.log('PASS streaming files: 1 GiB binary upload/download SHA-256, conflicts, oversize rejection, skill import/version checks')
   } else if (phase === 'legacy-skill-json') {
     const download = await manager.download('probe/legacy-skill-json.zip')
     const path = join(directory, 'legacy-skill-json.zip'), file = await open(path, 'wx')
