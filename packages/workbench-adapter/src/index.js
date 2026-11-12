@@ -850,7 +850,7 @@ export function apply(ctx, config) {
       if (!['GET', 'HEAD', 'OPTIONS'].includes(req.method)) leaveRequest = sleepBarrier.enter()
       if (streaming) {
         await withResponseSignal(res, async signal => {
-          upload = await spoolUpload(req, owner.verifyBody, signal, (path === '/images/upload' ? 20 : 100) * 1024 * 1024)
+          upload = await spoolUpload(req, owner.verifyBody, signal, (path === '/files/upload' ? 1024 : path === '/images/upload' ? 20 : 100) * 1024 * 1024)
           if (path === '/images/upload') {
             const { name, mediaType } = upload.metadata
             if (typeof name !== 'string' || name.length > 512 || !['image/png', 'image/jpeg', 'image/gif', 'image/webp'].includes(mediaType)) throw httpError(400, '图片参数无效')

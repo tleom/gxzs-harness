@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { Readable } from 'node:stream'
 import { createHash } from 'node:crypto'
 import { readFile, stat } from 'node:fs/promises'
-import { spoolUpload, MAX_UPLOAD_BYTES } from '../src/upload.js'
+import { spoolUpload, MAX_UPLOAD_BYTES, MAX_WORKSPACE_FILE_BYTES } from '../src/upload.js'
 
 const pending = []
 afterEach(async () => { for (const upload of pending.splice(0)) await upload.dispose() })
@@ -43,6 +43,25 @@ describe('signed streamed uploads', () => {
     pending.push(upload)
     expect(upload.size - upload.offset).toBe(100 * 1024 * 1024)
   }, 30_000)
+  it('accepts a 1 GiB workspace upload using reusable bounded chunks', async () => {
+    const header = Buffer.from(JSON.stringify({ operation: 'upload', size: MAX_WORKSPACE_FILE_BYTES }) + '\n')
+    const chunk = Buffer.alloc(64 * 1024, 65)
+    const digest = createHash('sha256').update(header)
+    const input = (async function* () {
+      yield header
+      for (let n = 0; n < MAX_WORKSPACE_FILE_BYTES / chunk.length; n++) { digest.update(chunk); yield chunk }
+    })()
+    const upload = await spoolUpload(request(input), value => expect(value).toBe(digest.digest('hex')), undefined, MAX_WORKSPACE_FILE_BYTES)
+    pending.push(upload)
+    expect(upload.size - upload.offset).toBe(MAX_WORKSPACE_FILE_BYTES)
+    expect((await stat(upload.path)).size).toBe(upload.size)
+  }, 60_000)
+  it('rejects a workspace frame above 1 GiB plus metadata before reading', async () => {
+    let read = false
+    const input = (async function* () { read = true; yield Buffer.alloc(1) })()
+    await expect(spoolUpload(request(input, { 'content-length': String(MAX_WORKSPACE_FILE_BYTES + 128 * 1024 + 1) }), () => {}, undefined, MAX_WORKSPACE_FILE_BYTES)).rejects.toMatchObject({ status: 413 })
+    expect(read).toBe(false)
+  })
   it('rejects oversized declared input before reading any bytes', async () => {
     let read = false
     const input = (async function* () { read = true; yield Buffer.alloc(1) })()

@@ -80,6 +80,13 @@ def test_binary_upload_exact_bytes_conflict_and_incomplete_cleanup(tmp_path):
     assert [item.name for item in tmp_path.iterdir()] == ['a.bin']
 
 
+def test_legacy_upload_remains_bounded_separately_from_binary_upload(tmp_path, monkeypatch):
+    monkeypatch.setattr(file_ops, 'MAX_BYTES', 2)
+    with pytest.raises(ValueError, match='100 MiB'):
+        save_file(tmp_path, 'json', b'abc', None)
+    assert save_file(tmp_path, 'binary', b'abc', None)['version'] == file_ops.version(b'abc')
+
+
 def test_streamed_file_and_directory_have_correct_contents_and_no_staging_entries(tmp_path):
     directory = tmp_path / 'files'
     directory.mkdir()
@@ -118,6 +125,66 @@ def test_directory_budget_uses_uncompressed_bytes_and_has_no_entry_cap(tmp_path,
     (directory / 'd').write_bytes(b'12')
     with pytest.raises(ValueError, match='1 GiB'):
         file_download.write_download({'path': 'files'}, io.BytesIO(), str(tmp_path))
+
+
+def test_binary_one_gib_upload_stat_overwrite_and_cleanup(tmp_path):
+    size = 1024 ** 3
+    class Source:
+        remaining = size
+        digest = hashlib.sha256()
+        chunk = b'x' * (64 * 1024)
+        def read(self, count):
+            assert count <= 64 * 1024
+            data = self.chunk[:min(count, self.remaining)]
+            self.remaining -= len(data)
+            self.digest.update(data)
+            return data
+    source = Source()
+    payload = {'path': 'large.bin', 'size': size, 'version': None}
+    result = file_ops.upload_stream(payload, source, str(tmp_path))
+    assert (tmp_path / 'large.bin').stat().st_size == size
+    assert result['version'] == source.digest.hexdigest()
+    metadata = file_ops.operate({'operation': 'stat', 'path': 'large.bin'}, str(tmp_path))
+    assert metadata['version'] == result['version']
+    assert file_ops.upload_stream({**payload, 'size': 1}, io.BytesIO(b'y'), str(tmp_path))['conflict']
+    result = file_ops.upload_stream({**payload, 'size': 1, 'version': metadata['version']}, io.BytesIO(b'y'), str(tmp_path))
+    assert result['version'] == hashlib.sha256(b'y').hexdigest()
+    assert (tmp_path / 'large.bin').read_bytes() == b'y'
+    with pytest.raises(ValueError, match='1 GiB'):
+        file_ops.upload_stream({**payload, 'path': 'too-large', 'size': size + 1}, io.BytesIO(), str(tmp_path))
+    assert [item.name for item in tmp_path.iterdir()] == ['large.bin']
+
+
+def test_directory_download_keeps_thousands_of_files_and_empty_directories(tmp_path):
+    directory = tmp_path / 'files'
+    directory.mkdir()
+    (directory / 'empty').mkdir()
+    for index in range(2001):
+        target = directory / str(index % 3) / f'{index}.txt'
+        target.parent.mkdir(exist_ok=True)
+        target.write_bytes(str(index).encode())
+    metadata = file_ops.operate({'operation': 'stat', 'path': 'files'}, str(tmp_path))
+    assert metadata['file_count'] == 2001
+    assert metadata['downloadable'] is True
+    output = io.BytesIO()
+    file_download.write_download({'path': 'files'}, output, str(tmp_path))
+    with zipfile.ZipFile(io.BytesIO(output.getvalue().split(b'\n', 1)[1])) as archive:
+        assert len([item for item in archive.infolist() if not item.is_dir()]) == 2001
+        assert 'empty/' in archive.namelist()
+        for index in range(2001):
+            assert archive.read(f'{index % 3}/{index}.txt') == str(index).encode()
+
+
+def test_directory_download_rejects_real_gib_overflow_before_emitting_bytes(tmp_path):
+    directory = tmp_path / 'files'
+    directory.mkdir()
+    with (directory / 'large').open('wb') as stream:
+        stream.truncate(1024 ** 3 + 1)
+    assert file_ops.operate({'operation': 'stat', 'path': 'files'}, str(tmp_path))['downloadable'] is False
+    output = io.BytesIO()
+    with pytest.raises(ValueError, match='1 GiB'):
+        file_download.write_download({'path': 'files'}, output, str(tmp_path))
+    assert output.getvalue() == b''
 
 
 def test_large_file_download_bypasses_json_read_limit_and_leaves_no_staging_files(tmp_path):
