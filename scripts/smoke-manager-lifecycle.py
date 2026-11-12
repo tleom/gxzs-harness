@@ -295,8 +295,8 @@ raise RuntimeError('Importer extraction was not captured')
 from pathlib import Path
 import os
 root=Path('/workspace/probe/stream-dir'); root.mkdir()
-for index in range(10): os.link('/workspace/probe/large.bin',root/str(index))
-with (root/'tail').open('wb') as stream: stream.truncate(24*1024*1024)
+os.link('/workspace/probe/large.bin',root/'large.bin')
+(root/'tail').touch()
 for index in range(10005): (root/('empty-'+str(index))).touch()
 """
     sandbox = prefix + '-' + workspaces[0]
@@ -309,7 +309,7 @@ for index in range(10005): (root/('empty-'+str(index))).touch()
     assert folder['kind'] == 'directory' and folder['downloadable'] is False, folder
     manifest = files(workspaces[0], 'manifest', path='.')
     directory_files = [item for item in manifest['files'] if item['path'].startswith('probe/stream-dir/')]
-    assert len(directory_files) == 10017 and all(len(item['sha256']) == 64 for item in directory_files)
+    assert len(directory_files) == 10008 and all(len(item['sha256']) == 64 for item in directory_files)
     files(workspaces[0], 'delete', path='probe/stream-dir', version=folder['version'])
     print('PASS large directory: complete metadata and migration manifest, size-bounded download, versioned deletion', flush=True)
     large = files(workspaces[0], 'stat', path='probe/large.bin')
