@@ -14,6 +14,7 @@ import sys
 import uuid
 
 MAX_BYTES = 100 * 1024 * 1024
+MAX_UPLOAD_BYTES = 1024 * 1024 * 1024
 MAX_TREE_BYTES = 1024 * 1024 * 1024
 MAX_MANIFEST_FILE_BYTES = 2 * 1024 * 1024 * 1024
 MAX_MANIFEST_TREE_BYTES = 10 * 1024 * 1024 * 1024
@@ -165,13 +166,19 @@ def delete_file(fd, name, payload):
         before = os.fstat(stream.fileno())
         if not stat.S_ISREG(before.st_mode):
             raise ValueError("Only regular files can be deleted")
-        if before.st_size > MAX_BYTES:
+        if before.st_size > MAX_UPLOAD_BYTES:
             fingerprint = large_file_version(before)
         else:
-            data = stream.read(MAX_BYTES + 1)
-            if len(data) > MAX_BYTES:
+            digest = hashlib.sha256()
+            total = 0
+            while chunk := stream.read(64 * 1024):
+                total += len(chunk)
+                if total > before.st_size:
+                    return conflict()
+                digest.update(chunk)
+            if total != before.st_size:
                 return conflict()
-            fingerprint = version(data)
+            fingerprint = digest.hexdigest()
         if payload.get("version") != fingerprint or file_identity(before) != file_identity(os.fstat(stream.fileno())):
             return conflict()
         try:
@@ -276,10 +283,10 @@ def entry_metadata(fd, name, path, info, *, shallow=False):
         return {"name": name, "path": path, "kind": kind, "size": info.st_size,
                 "modified": info.st_mtime, "version": None, "identity": identity,
                 "downloadable": path != "conversations" and kind in {"directory", "file"}}
-    fingerprint = hash_file(fd, name, info.st_size) if kind == "file" and info.st_size <= MAX_BYTES else None
+    fingerprint = hash_file(fd, name, info.st_size) if kind == "file" and info.st_size <= MAX_UPLOAD_BYTES else None
     downloadable = kind == "file"
     details = {}
-    if kind == "file" and info.st_size > MAX_BYTES:
+    if kind == "file" and info.st_size > MAX_UPLOAD_BYTES:
         fingerprint = large_file_version(info)
     if kind == "directory":
         child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
@@ -493,6 +500,8 @@ def operate(payload, root="/workspace"):
         raise ValueError("The workspace root can only be listed")
     if operation == 'upload':
         data = base64.b64decode(payload['data'], validate=True)
+        if len(data) > MAX_BYTES:
+            raise ValueError('单个文件最大 100 MiB')
         return upload_stream({**payload, 'size': len(data)}, io.BytesIO(data), root)
     if path == ".":
         fd, name = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW), "."
@@ -614,8 +623,8 @@ def upload_stream(payload, source, root="/workspace"):
     size = payload.get('size')
     if not isinstance(path, str) or path in {'.', 'conversations'}:
         raise ValueError('文件路径无效')
-    if type(size) is not int or not 0 <= size <= MAX_BYTES:
-        raise ValueError('单个文件最大 100 MiB')
+    if type(size) is not int or not 0 <= size <= MAX_UPLOAD_BYTES:
+        raise ValueError('单个文件最大 1 GiB')
     fd, name = parent_fd(root, path)
     temporary = '.upload-' + uuid.uuid4().hex
     try:
@@ -623,8 +632,8 @@ def upload_stream(payload, source, root="/workspace"):
             old = os.stat(name, dir_fd=fd, follow_symlinks=False)
         except FileNotFoundError:
             old = None
-        if old is not None and (not stat.S_ISREG(old.st_mode) or old.st_size > MAX_BYTES):
-            raise ValueError('只能覆盖 100 MiB 以内的普通文件')
+        if old is not None and (not stat.S_ISREG(old.st_mode) or old.st_size > MAX_UPLOAD_BYTES):
+            raise ValueError('只能覆盖 1 GiB 以内的普通文件')
         previous = hash_file(fd, name, old.st_size) if old else None
         if 'version' not in payload or payload['version'] != previous:
             return conflict()

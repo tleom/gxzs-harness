@@ -992,7 +992,7 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError('Transfer-Encoding is not supported; send a fixed Content-Length')
             size = int(self.headers.get("Content-Length", "0"))
             binary = self.headers.get('Content-Type', '').split(';', 1)[0].strip().lower() == 'application/octet-stream'
-            limit = (100 * 1024 * 1024 + 128 * 1024 if binary
+            limit = ((1024 if action == 'files' else 100) * 1024 * 1024 + 128 * 1024 if binary
                      else mcp_limit('request_bytes') if parts[2] in {'personal-mcp', 'global-mcp', 'global-memory'}
                      else MAX_SKILL_JSON_BYTES if action in {'personal-resources', 'global-resources'} else MAX_BODY)
             if not 0 <= size <= limit:

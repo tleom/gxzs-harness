@@ -187,7 +187,7 @@ def test_stat_missing_parent_does_not_hide_invalid_root_or_unsafe_traversal(root
 def test_large_file_can_be_deleted_without_reading_its_content(root, monkeypatch):
     target = Path(root) / 'large.bin'
     with target.open('wb') as stream:
-        stream.truncate(1024 * 1024 * 1024)
+        stream.truncate(module.MAX_UPLOAD_BYTES + 1)
     monkeypatch.setattr(module, 'read_file', lambda *args: pytest.fail('large deletion must not read file content'))
     metadata = module.operate({'operation': 'stat', 'path': target.name}, root)
     assert len(metadata['version']) == 64 and metadata['downloadable'] is True
@@ -213,13 +213,17 @@ def test_delete_detects_a_replaced_file_after_open(root, monkeypatch):
     target = Path(root) / 'changed.txt'
     target.write_bytes(b'first')
     metadata = module.operate({'operation': 'stat', 'path': target.name}, root)
-    original = module.version
-    def replace(data):
-        result = original(data)
-        target.unlink()
-        target.write_bytes(b'replacement')
+    original = module.os.fstat
+    replaced = False
+    def replace(fd):
+        nonlocal replaced
+        result = original(fd)
+        if not replaced:
+            replaced = True
+            target.unlink()
+            target.write_bytes(b'replacement')
         return result
-    monkeypatch.setattr(module, 'version', replace)
+    monkeypatch.setattr(module.os, 'fstat', replace)
     assert module.operate({'operation': 'delete', 'path': target.name, 'version': metadata['version']}, root)['conflict']
     assert target.read_bytes() == b'replacement'
 

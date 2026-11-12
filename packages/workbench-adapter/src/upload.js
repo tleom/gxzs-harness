@@ -5,13 +5,14 @@ import { join } from 'node:path'
 import { httpError } from './http.js'
 
 export const MAX_UPLOAD_BYTES = 100 * 1024 * 1024 + 128 * 1024
+export const MAX_WORKSPACE_FILE_BYTES = 1024 * 1024 * 1024
 
 // The assertion is authenticated before reading, and its digest is checked
 // before any sandbox mutation. Only bounded chunks are retained in memory.
 export async function spoolUpload(request, verifyBody, signal, maxFileBytes = 100 * 1024 * 1024) {
   if (request.headers['content-type']?.split(';', 1)[0].trim().toLowerCase() !== 'application/octet-stream') throw httpError(415, '文件上传需要二进制请求')
   const declared = request.headers['content-length']
-  const message = maxFileBytes === 20 * 1024 * 1024 ? '单张图片最大 20 MiB' : '单个文件或技能包最大 100 MiB'
+  const message = maxFileBytes === MAX_WORKSPACE_FILE_BYTES ? '单个文件最大 1 GiB' : maxFileBytes === 20 * 1024 * 1024 ? '单张图片最大 20 MiB' : '技能包最大 100 MiB'
   if (declared !== undefined && (!/^\d+$/.test(declared) || Number(declared) > maxFileBytes + 128 * 1024))
     throw httpError(413, message)
   const directory = await mkdtemp(join(tmpdir(), 'gxzs-upload-'))

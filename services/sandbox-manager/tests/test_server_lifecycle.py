@@ -1038,6 +1038,28 @@ def test_binary_upload_accepts_media_type_case_and_parameters(server, monkeypatc
     assert received == [('files', body)]
 
 
+@pytest.mark.parametrize('action,size,too_large', [
+    ('files', 1024 ** 3 + 128 * 1024, False),
+    ('files', 1024 ** 3 + 128 * 1024 + 1, True),
+    ('personal-resources', 100 * 1024 * 1024 + 128 * 1024 + 1, True),
+])
+def test_binary_upload_route_budgets_precede_body_read(server, monkeypatch, action, size, too_large):
+    operation = Mock()
+    monkeypatch.setattr(server, 'upload_operation', operation)
+    handler = post_handler(server, b'', size, **{'Content-Type': 'application/octet-stream'})
+    handler.path = handler.path.rsplit('/', 1)[0] + '/' + action
+    handler.rfile = Mock(read=Mock(return_value=b''))
+    handler.do_POST()
+    operation.assert_not_called()
+    assert handler.send_response.call_args.args[0] == 400
+    if too_large:
+        handler.rfile.read.assert_not_called()
+        assert json.loads(handler.wfile.getvalue())['error'] == 'Request too large'
+    else:
+        handler.rfile.read.assert_called_once_with(64 * 1024)
+        assert 'Incomplete' in json.loads(handler.wfile.getvalue())['error']
+
+
 def test_complete_body_is_dispatched_once_and_unknown_operation_errors_still_log(server, monkeypatch, caplog):
     body = b'{"action":"acquire"}'
     operation = Mock(return_value={'ok': True})

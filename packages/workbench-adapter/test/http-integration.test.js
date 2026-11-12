@@ -839,3 +839,18 @@ it('authenticates a streamed upload and forwards binary bytes without JSON encod
   expect((await call(handler, key, 'POST', '/files/upload', body, true, 'other', headers)).status).toBe(403)
   expect(context.workbenchFileManager.upload).toHaveBeenCalledOnce()
 })
+
+it('uses the 1 GiB budget only on workspace binary uploads', async () => {
+  const { handler, key, context } = setup()
+  context.workbenchFileManager.upload = vi.fn()
+  const body = Buffer.from('{}\nx')
+  const send = (route, size) => call(handler, key, 'POST', route, body, true, '42', {
+    'content-type': 'application/octet-stream', 'content-length': String(size),
+  })
+  // Admitted by the file route, then rejected as truncated before mutation.
+  expect((await send('/files/upload', 1024 ** 3 + 128 * 1024)).status).toBe(400)
+  expect((await send('/files/upload', 1024 ** 3 + 128 * 1024 + 1)).status).toBe(413)
+  expect((await send('/resources/upload', 100 * 1024 ** 2 + 128 * 1024 + 1)).status).toBe(413)
+  expect((await send('/images/upload', 20 * 1024 ** 2 + 128 * 1024 + 1)).status).toBe(413)
+  expect(context.workbenchFileManager.upload).not.toHaveBeenCalled()
+})
