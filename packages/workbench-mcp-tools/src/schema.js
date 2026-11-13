@@ -4,6 +4,19 @@ import Ajv2019 from 'ajv/dist/2019.js'
 import draft6 from 'ajv/dist/refs/json-schema-draft-06.json' with { type: 'json' }
 import { assertObjectJsonSchema } from '@deepseek-ai/dsh-tools'
 
+function disjointBranches(branches) {
+  if (branches.length < 2) return false
+  const types = branches.map(branch => branch?.type)
+  const supported = new Set(['string', 'number', 'integer', 'boolean', 'null', 'array', 'object'])
+  if (types.every(type => supported.has(type)) && new Set(types).size === types.length
+    && !(types.includes('integer') && types.includes('number'))) return true
+  const forbids = (branch, key) => branch.additionalProperties === false
+    && !Object.keys(branch.patternProperties ?? {}).length && !Object.hasOwn(branch.properties ?? {}, key)
+  return types.every(type => type === 'object') && branches.every((a, i) =>
+    branches.slice(i + 1).every(b => (a.required ?? []).some(key => forbids(b, key))
+      || (b.required ?? []).some(key => forbids(a, key))))
+}
+
 // DSH accepts a smaller schema vocabulary than external MCP servers.
 // Advertise bounds as descriptions and retain their checks before proxy I/O.
 export function adaptInputSchema(source) {
@@ -30,11 +43,13 @@ export function adaptInputSchema(source) {
           if (branches.every(branch => branch?.type === 'object')) {
             const keys = [...new Set(branches.flatMap(branch => Object.keys(branch.properties ?? {})))]
             return { type: 'object', additionalProperties: true,
-              description: [annotations.description, `递归对象，使用与父级相同的结构；字段：${keys.join('、')}。完整约束见 inputSchema ${$ref}`].filter(Boolean).join('\n') }
+              description: [target.description, annotations.description, `递归对象，使用与父级相同的结构；字段：${keys.join('、')}。完整约束见 inputSchema ${$ref}`].filter(Boolean).join('\n') }
           }
           return { description: `递归参数，完整约束见 inputSchema ${$ref}` }
         }
-        return project({ ...target, ...annotations }, requiredProperty, new Set([...references, $ref]))
+        return project({ ...target, ...annotations,
+          ...((target.description || annotations.description) ? { description: [...new Set([target.description, annotations.description].filter(Boolean))].join('\n') } : {}) },
+        requiredProperty, new Set([...references, $ref]))
       }
     }
     const result = { ...schema }
@@ -60,11 +75,10 @@ export function adaptInputSchema(source) {
     // Nullable MCP fields commonly use anyOf. An exact-one union is equivalent
     // only when branch types are disjoint; overlapping unions remain rejected.
     if (Array.isArray(result.anyOf)) {
-      const types = result.anyOf.map(branch => branch?.type)
-      const supported = new Set(['string', 'number', 'integer', 'boolean', 'null', 'array', 'object'])
-      if (types.length >= 2 && types.every(type => supported.has(type))
-        && new Set(types).size === types.length
-        && !(types.includes('integer') && types.includes('number')) && !result.oneOf) {
+      // Closed object alternatives are disjoint when one branch requires a key
+      // forbidden by the other. Preserve that exact structure instead of merging
+      // field/op/value with and/or/not/relation into one permissive object.
+      if (disjointBranches(result.anyOf) && !result.oneOf && !result.type) {
         result.oneOf = result.anyOf
         delete result.anyOf
       }
@@ -92,6 +106,13 @@ export function adaptInputSchema(source) {
         assertObjectJsonSchema({ type: 'object', properties: { value: node } })
         return node
       } catch (error) { if (error?.code !== 'UNSUPPORTED_SCHEMA') throw error }
+      // Unsupported child values must not flatten an otherwise exact condition
+      // union. Re-check exclusivity after widening the children: removed bounds
+      // can make scalar/value-based alternatives overlap.
+      if (Array.isArray(node.oneOf)) {
+        const oneOf = node.oneOf.map(widen)
+        if (disjointBranches(oneOf)) return { oneOf, ...(node.description ? { description: node.description } : {}) }
+      }
       const branches = node.anyOf ?? node.oneOf
       if (Array.isArray(branches) && branches.length && branches.every(branch => branch?.type === 'object')) {
         // Advertise a superset of the object alternatives, not an incorrect
@@ -128,6 +149,8 @@ export function adaptInputSchema(source) {
     assertObjectJsonSchema(schema)
   }
   return { schema, validate: (value) => {
-    if (!validate(value)) throw new Error(`MCP arguments violate schema: ${validator.errorsText(validate.errors)}`)
+    if (!validate(value)) throw Object.assign(new Error(`MCP arguments violate schema: ${validator.errorsText(validate.errors)}`), {
+      schemaErrors: validate.errors.map(error => ({ ...error, params: { ...error.params } })),
+    })
   } }
 }

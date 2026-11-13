@@ -1,24 +1,68 @@
 import { describe, expect, it } from 'vitest'
 import Ajv from 'ajv'
 import { adaptInputSchema } from '../src/schema.js'
+import { validateJsonSchemaValue } from '@deepseek-ai/dsh-tools'
 
 describe('MCP schema projection', () => {
   it('keeps recursive query alternatives discoverable while enforcing their exclusive shapes', () => {
     const source = { type: 'object', properties: { where: { $ref: '#/$defs/where' } }, $defs: { where: { anyOf: [
-      { type: 'object', properties: { field: { type: 'string' }, op: { enum: ['eq', 'gte'], type: 'string' }, value: {} }, required: ['field', 'op'], additionalProperties: false },
+      { type: 'object', properties: { field: { type: 'string' }, op: { enum: ['eq', 'gte'], type: 'string' }, value: { anyOf: [
+        { type: ['string', 'number', 'boolean', 'null'] },
+        { type: 'array', items: { type: ['string', 'number', 'boolean', 'null'] } },
+      ] } }, required: ['field', 'op'], additionalProperties: false },
       { type: 'object', properties: { and: { type: 'array', minItems: 1, items: { $ref: '#/$defs/where' } } }, required: ['and'], additionalProperties: false },
       { type: 'object', properties: { relation: { type: 'object', properties: { entity: { type: 'string' }, where: { $ref: '#/$defs/where' } }, required: ['entity'] } }, required: ['relation'], additionalProperties: false },
     ] } } }
     const adapted = adaptInputSchema(source)
     const where = adapted.schema.properties.where
-    expect(where.type).toBe('object')
-    expect(Object.keys(where.properties)).toEqual(expect.arrayContaining(['field', 'op', 'value', 'and', 'relation']))
-    expect(where.properties.and.items.type).toBe('object')
-    expect(where.properties.relation.properties.where.type).toBe('object')
+    expect(where.oneOf).toHaveLength(3)
+    expect(where.oneOf[1].properties.and.items.type).toBe('object')
+    expect(where.oneOf[2].properties.relation.properties.where.type).toBe('object')
+    expect(validateJsonSchemaValue(adapted.schema, { where: { field: 'sj', op: 'gte', and: [] } })).not.toHaveLength(0)
     expect(() => adapted.validate({ where: { and: [{ field: 'sj', op: 'gte', value: '2026-10-01' }, { relation: { entity: 'zqxx', where: { field: 'zbr', op: 'eq', value: '姓名' } } }] } })).not.toThrow()
     expect(() => adapted.validate({ where: { field: 'sj', op: 'gte', and: [] } })).toThrow('schema')
     expect(() => adapted.validate({ where: { relation: {} } })).toThrow('schema')
     expect(() => adapted.validate({ where: { field: 'sj', op: 'invalid' } })).toThrow('schema')
+    for (const value of [0, false, null, '日期', ['2026-10-01', '2026-11-01']]) {
+      const args = { where: { field: 'sj', op: 'eq', value } }
+      expect(() => adapted.validate(args)).not.toThrow()
+      expect(validateJsonSchemaValue(adapted.schema, args)).toHaveLength(0)
+    }
+  })
+
+  it('does not retain an exact union after unsupported child constraints lose exclusivity', () => {
+    const source = { type: 'object', properties: { choice: { oneOf: [
+      { type: 'object', properties: { value: { const: 1 } }, required: ['value'], additionalProperties: false },
+      { type: 'object', properties: { value: { const: 2 } }, required: ['value'], additionalProperties: false },
+    ] } } }
+    const adapted = adaptInputSchema(source)
+    for (const value of [1, 2]) {
+      expect(() => adapted.validate({ choice: { value } })).not.toThrow()
+      expect(validateJsonSchemaValue(adapted.schema, { choice: { value } })).toHaveLength(0)
+    }
+    expect(() => adapted.validate({ choice: { value: 3 } })).toThrow('schema')
+  })
+
+  it('preserves referenced guidance alongside local descriptions and recursive boundaries', () => {
+    const source = { type: 'object', properties: { relatedWhere: { $ref: '#/$defs/where', description: '筛选最终目标' } },
+      $defs: { where: { description: '每层只选一种结构，日期不得改变', anyOf: [
+        { type: 'object', properties: { field: { type: 'string' } }, required: ['field'], additionalProperties: false },
+        { type: 'object', properties: { and: { type: 'array', items: { $ref: '#/$defs/where' } } }, required: ['and'], additionalProperties: false },
+      ] } } }
+    const result = adaptInputSchema(source).schema.properties.relatedWhere
+    expect(result.description).toContain('每层只选一种结构')
+    expect(result.description).toContain('筛选最终目标')
+    expect(result.oneOf[1].properties.and.items.description).toContain('日期不得改变')
+  })
+
+  it('retains inclusive object unions when a discriminator can be accepted by another branch', () => {
+    const source = { type: 'object', properties: { choice: { anyOf: [
+      { type: 'object', properties: { a: { type: 'string' } }, required: ['a'], additionalProperties: false },
+      { type: 'object', properties: { b: { type: 'string' } }, additionalProperties: true },
+    ] } } }
+    const result = adaptInputSchema(source)
+    expect(result.schema.properties.choice.oneOf).toBeUndefined()
+    expect(() => result.validate({ choice: { a: 'accepted by both' } })).not.toThrow()
   })
 
   it.each([undefined, 'https://json-schema.org/draft/2020-12/schema'])('validates the MCP default 2020-12 dialect (%s)', ($schema) => {
