@@ -34,6 +34,52 @@ function setup({ authorized = true } = {}) {
 }
 
 describe('platform MCP proxy tools', () => {
+  it.each(['backend', 'transport'])('stops Case redispatch and discovery after a %s timeout and restores the next run', async (origin) => {
+    const { ctx, platform, definitions } = setup()
+    const agent = { id: 's1', ctx: { tools: { restrict: () => () => {} } } }
+    const tool = { ...catalogTool, id: 'global:mcp:gxzs-case:case_aggregate', runtime_name: 'global_case_aggregate', scope: 'global', server_id: 'gxzs-case', tool_name: 'case_aggregate' }
+    const plugin = { id: 'global:mcp:gxzs-case', name: 'Case', scope: 'global', version: 'v1', manifest_version: 'm1', available: true }
+    const run = { id: 'run-1', ownerId: 't:1', status: 'running', mcpTools: [tool, catalogTool], selection: { mcp_servers: [plugin] } }
+    ctx.workbenchRuntime.executionRun = () => run
+    ctx.workbenchRuntime.agents = { list: () => [agent] }
+    ctx.workbenchRuntime.authorizeMcp = (_session, id) => ({ ownerId: run.ownerId, runId: run.id, resource: id === tool.id ? tool : catalogTool })
+    platform.json.mockResolvedValueOnce({ plugins: [plugin], tools: [tool, catalogTool] })
+    await apply(ctx, { discovery: true })
+    const definition = [...definitions.values()].find(item => ctx.workbenchRuntime.mcpToolForName(item.name)?.id === tool.id)
+    const exec = { agent, callId: 'first', signal: new AbortController().signal }
+    expect(ctx.toolDiscoveryCatalog.snapshot(agent).tools.some(item => item.id === tool.id)).toBe(true)
+    if (origin === 'backend') platform.json.mockResolvedValueOnce({ isError: true,
+      structuredContent: { code: 'CASE_QUERY_TIMEOUT', recoveryAction: 'stop' },
+      content: [{ type: 'text', text: 'CASE_QUERY_TIMEOUT' }] })
+    else platform.json.mockRejectedValueOnce(new DOMException('provider timed out', 'TimeoutError'))
+    await expect(definition.execute({ query: 'October' }, exec)).rejects.toThrow('CASE_QUERY_TIMEOUT')
+    const calls = platform.json.mock.calls.length
+    await expect(definition.execute({ query: 'changed dates' }, { ...exec, callId: 'second' })).rejects.toThrow('CASE_QUERY_HALTED')
+    expect(platform.json).toHaveBeenCalledTimes(calls)
+    expect(ctx.toolDiscoveryCatalog.snapshot(agent).tools.some(item => item.id === tool.id)).toBe(false)
+    await definitions.get('search').execute({ query: 'unrelated' }, { ...exec, callId: 'unrelated' })
+    run.id = 'run-2'
+    expect(ctx.toolDiscoveryCatalog.snapshot(agent).tools.some(item => item.id === tool.id)).toBe(true)
+    await expect(definition.execute({ query: 'October' }, { ...exec, callId: 'new-run' })).resolves.toBeDefined()
+  })
+
+  it('bounds Case schema corrections before network I/O while preserving caller cancellation', async () => {
+    const { ctx, platform, definitions } = setup()
+    const tool = { ...catalogTool, id: 'global:mcp:gxzs-case:case_search', scope: 'global', server_id: 'gxzs-case', tool_name: 'case_search',
+      inputSchema: { ...catalogTool.inputSchema, minProperties: 1, properties: { query: { type: 'string', minLength: 2 } } } }
+    ctx.workbenchRuntime.authorizeMcp = () => ({ ownerId: 't:1', runId: 'run-1', resource: tool })
+    platform.json.mockResolvedValueOnce({ tools: [tool] })
+    await apply(ctx)
+    const definition = [...definitions.values()][0]
+    const controller = new AbortController()
+    const exec = { agent: { id: 's1' }, callId: 'invalid', signal: controller.signal }
+    for (let i = 0; i < 3; i++) await expect(definition.execute({ query: 'x' }, exec)).rejects.toThrow('INVALID_ARGUMENT')
+    await expect(definition.execute({ query: 'fixed' }, exec)).rejects.toThrow('CASE_QUERY_HALTED')
+    expect(platform.json).toHaveBeenCalledOnce()
+    controller.abort(new DOMException('user stopped', 'AbortError'))
+    await expect(definition.execute({ query: 'fixed' }, exec)).rejects.toMatchObject({ name: 'AbortError' })
+  })
+
   it('restores discovery and call authorization for an unchanged frozen global catalog after restart', async () => {
     const { ctx, platform } = setup()
     const database = new WorkbenchDatabase(':memory:')

@@ -7,6 +7,7 @@ import { adaptInputSchema } from './schema.js'
 import { platformToolNames } from './names.js'
 import { ToolDiscoveryCatalog } from './discovery-catalog.js'
 import { migrateEquivalentManifests } from './manifest-migration.js'
+import { CaseQueryRecovery, caseQueryFailure, isCaseQuery } from './case-query-recovery.js'
 import z from '@deepseek-ai/schemastery'
 import { createHash } from 'node:crypto'
 
@@ -21,6 +22,7 @@ const definitionStamp = value => JSON.stringify(value, (_key, item) => item && t
 
 export async function apply(ctx, config = {}) {
   const registrations = new Map()
+  const caseRecovery = new CaseQueryRecovery(ctx.workbenchRuntime.database)
   const resources = resourceScopes(ctx)
   const journal = ctx.workbenchRuntime.database ? new McpTaskJournal(ctx.workbenchRuntime.database) : undefined
   const recovery = taskRecoveryScopes(ctx, journal, (record, exec) => {
@@ -73,6 +75,7 @@ export async function apply(ctx, config = {}) {
     const resources = new Map((run.mcpTools ?? []).map(resource => [resource.id, resource]))
     for (const { tool } of registrations.values()) {
       const resource = resources.get(tool.id)
+      if (isCaseQuery(tool) && caseRecovery.blocked(run.ownerId, run.id)) continue
       if (resource?.version === tool.version && (resource.manifest_version ?? '') === tool.manifest_version)
         allowed.add(tool.public_name)
     }
@@ -171,7 +174,7 @@ export async function apply(ctx, config = {}) {
         inputSchema: tool.inputSchema,
         outputSchema: tool.outputSchema,
         taskRequired: tool.execution?.taskSupport === 'required',
-        call: (args, exec) => callProxy(ctx, tool, args, exec),
+        call: (args, exec) => callProxy(ctx, tool, args, exec, { caseRecovery }),
         taskCall: (args, exec) => callProxy(ctx, tool, args, exec, { task: true, journal }),
       })
       registrations.set(tool.runtime_name, { tool, definition, dispose: ctx.tools.register(definition, {
@@ -277,7 +280,7 @@ export async function apply(ctx, config = {}) {
   schedule()
 }
 
-async function callProxy(ctx, tool, args, exec, { task = false, recovery, journal } = {}) {
+async function callProxy(ctx, tool, args, exec, { task = false, recovery, journal, caseRecovery } = {}) {
   exec.signal?.throwIfAborted()
   const taskDeadlineMs = mcpDeadline(ctx.workbenchRuntime.mcpPolicy, exec)
   const controlTimeoutMs = Math.ceil((ctx.workbenchRuntime.mcpPolicy?.control_timeout_seconds ?? 15) * 1000)
@@ -297,7 +300,14 @@ async function callProxy(ctx, tool, args, exec, { task = false, recovery, journa
   if ((authorization.resource?.manifest_version ?? '') !== tool.manifest_version)
     throw new Error('MCP tool definition has changed; submit a new task to use the current definition')
   if (typeof exec.callId !== 'string' || !exec.callId.trim()) throw new Error('MCP callId is required to correlate this call')
-  tool.validateArguments(args)
+  const blocked = caseRecovery?.before(authorization, tool, args)
+  if (blocked) return blocked
+  try { tool.validateArguments(args) }
+  catch (error) {
+    if (!caseRecovery || !isCaseQuery(tool)) throw error
+    return caseRecovery.record(authorization, tool, args,
+      caseQueryFailure('INVALID_ARGUMENT', error.message, 'correct_arguments'))
+  }
   if (task) {
     const runtime = ctx.workbenchRuntime
     const server = runtime.mcpPlugins().find(server => server.id === `${tool.scope}:mcp:${tool.server_id}`)
@@ -319,7 +329,8 @@ async function callProxy(ctx, tool, args, exec, { task = false, recovery, journa
         return response.data ?? response
       } })
   }
-  const payload = await ctx.workbenchPlatformClient.json({
+  let payload
+  try { payload = await ctx.workbenchPlatformClient.json({
     owner: { ownerId: authorization.ownerId }, method: 'POST', route: 'mcp/call',
     contentType: 'application/json',
     signal, timeoutMs: Math.max(1, deadlineMs - Date.now()), deadlineMs,
@@ -328,11 +339,18 @@ async function callProxy(ctx, tool, args, exec, { task = false, recovery, journa
       manifest_version: tool.manifest_version, server_id: tool.server_id,
       tool_name: tool.tool_name, request_key: exec.callId, arguments: args, deadline_ms: deadlineMs,
     })),
-  })
+  }) } catch (error) {
+    // Cancellation belongs to the caller. Provider deadlines after dispatch are
+    // terminal for this run, just like the backend's SQL timeout.
+    if (exec.signal?.aborted || !caseRecovery || !isCaseQuery(tool)) throw error
+    if (error?.name !== 'TimeoutError' && error?.code !== 'DEADLINE_EXCEEDED' && error?.status !== 504) throw error
+    return caseRecovery.record(authorization, tool, args,
+      caseQueryFailure('CASE_QUERY_TIMEOUT', '查询请求超时，未取得完整结果；不得将失败解释为零回款'))
+  }
   const response = payload?.data?.result ?? payload?.result ?? payload?.data ?? payload
   // Personal MCP responses have an extra manager envelope; global MCP responses do not.
   const result = Array.isArray(response?.content) ? response : response?.result
-  if (Array.isArray(result?.content)) return result
+  if (Array.isArray(result?.content)) return caseRecovery?.record(authorization, tool, args, result) ?? result
   if (typeof response?.error === 'string') throw new Error(response.error)
   throw new Error('Platform MCP response is missing CallToolResult.content')
 }

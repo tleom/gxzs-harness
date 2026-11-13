@@ -15,14 +15,25 @@ export function adaptInputSchema(source) {
   }
   const project = (schema, requiredProperty, references = new Set()) => {
     if (!schema || typeof schema !== 'object' || Array.isArray(schema)) return schema
-    if (typeof schema.$ref === 'string' && schema.$ref.startsWith('#/') && !references.has(schema.$ref)
+    if (typeof schema.$ref === 'string' && (schema.$ref === '#' || schema.$ref.startsWith('#/'))
       && Object.keys(schema).every(key => ['$ref', 'description', 'default', 'title', '$comment', 'examples'].includes(key))) {
-      const target = schema.$ref.slice(2).split('/').reduce((value, key) => {
+      const target = (schema.$ref === '#' ? [] : schema.$ref.slice(2).split('/')).reduce((value, key) => {
         key = key.replace(/~1/g, '/').replace(/~0/g, '~')
         return value && Object.hasOwn(value, key) ? value[key] : undefined
       }, source)
       if (target && typeof target === 'object' && !Array.isArray(target)) {
         const { $ref, ...annotations } = schema
+        if (references.has($ref)) {
+          // Native tools cannot express recursive refs. Keep the object kind and
+          // available keys at the boundary instead of advertising an opaque value.
+          const branches = target.anyOf ?? target.oneOf ?? [target]
+          if (branches.every(branch => branch?.type === 'object')) {
+            const keys = [...new Set(branches.flatMap(branch => Object.keys(branch.properties ?? {})))]
+            return { type: 'object', additionalProperties: true,
+              description: [annotations.description, `递归对象，使用与父级相同的结构；字段：${keys.join('、')}。完整约束见 inputSchema ${$ref}`].filter(Boolean).join('\n') }
+          }
+          return { description: `递归参数，完整约束见 inputSchema ${$ref}` }
+        }
         return project({ ...target, ...annotations }, requiredProperty, new Set([...references, $ref]))
       }
     }
@@ -81,6 +92,21 @@ export function adaptInputSchema(source) {
         assertObjectJsonSchema({ type: 'object', properties: { value: node } })
         return node
       } catch (error) { if (error?.code !== 'UNSUPPORTED_SCHEMA') throw error }
+      const branches = node.anyOf ?? node.oneOf
+      if (Array.isArray(branches) && branches.length && branches.every(branch => branch?.type === 'object')) {
+        // Advertise a superset of the object alternatives, not an incorrect
+        // oneOf. AJV still checks exclusivity, required fields and every value.
+        const properties = {}
+        for (const key of new Set(branches.flatMap(branch => Object.keys(branch.properties ?? {})))) {
+          const variants = branches.flatMap(branch => Object.hasOwn(branch.properties ?? {}, key)
+            ? [branch.properties[key]] : branch.additionalProperties === false ? [] : [branch.additionalProperties ?? {}])
+          properties[key] = widen(variants.length === 1 ? variants[0] : { anyOf: variants })
+        }
+        const required = (branches[0].required ?? []).filter(key => branches.every(branch => branch.required?.includes(key)))
+        return { type: 'object', properties, ...(required.length ? { required } : {}),
+          additionalProperties: branches.some(branch => branch.additionalProperties !== false),
+          description: [node.description, '选择原始定义中的一种对象结构；组合与必填规则在调用前校验'].filter(Boolean).join('\n') }
+      }
       const result = {}
       if (typeof node.type === 'string' && ['object', 'array', 'string', 'number', 'integer', 'boolean', 'null'].includes(node.type)) result.type = node.type
       if (typeof node.description === 'string') result.description = node.description
