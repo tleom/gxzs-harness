@@ -11,6 +11,10 @@ const signature = (tool, args) => createHash('sha256').update(JSON.stringify([to
   value && typeof value === 'object' && !Array.isArray(value)
     ? Object.fromEntries(Object.entries(value).sort(([a], [b]) => a.localeCompare(b))) : value)).digest('hex')
 
+// Reuse the existing column and retain a previously stored single hash on upgrade.
+const failedSignatures = state => !state?.failed_signature ? []
+  : state.failed_signature.startsWith('[') ? JSON.parse(state.failed_signature) : [state.failed_signature]
+
 export function caseQueryFailure(code, message, recoveryAction = 'stop') {
   const detail = { code, message, retryable: false, recoveryAction,
     recovery: recoveryAction === 'correct_arguments'
@@ -47,7 +51,7 @@ export class CaseQueryRecovery {
     const state = this.state(authorization.ownerId, authorization.runId)
     if (this.blocked(authorization.ownerId, authorization.runId))
       return caseQueryFailure('CASE_QUERY_HALTED', `本任务查询已停止（${state.blocked_code ?? '参数纠错次数已用完'}）；未执行新的数据库查询`)
-    if (state?.failed_signature === signature(tool, args))
+    if (failedSignatures(state).includes(signature(tool, args)))
       return this.record(authorization, tool, args,
         caseQueryFailure('INVALID_ARGUMENT', '相同参数已经失败，未重复执行；请仅修正已指出的参数问题', 'correct_arguments'))
     return undefined
@@ -68,7 +72,8 @@ export class CaseQueryRecovery {
     const failures = (previous?.failures ?? 0) + (failure.code === 'INVALID_ARGUMENT' ? 1 : 0)
     const blockedCode = previous?.blocked_code
       ?? (STOP_CODES.has(failure.code) || failure.recoveryAction === 'stop' ? failure.code : null)
-    const state = { failures, blocked_code: blockedCode, failed_signature: signature(tool, args) }
+    const state = { failures, blocked_code: blockedCode,
+      failed_signature: JSON.stringify([...new Set([...failedSignatures(previous), signature(tool, args)])]) }
     if (this.db) this.db.prepare(`INSERT INTO case_query_recovery(run_id,owner_id,failures,blocked_code,failed_signature)
       VALUES (?,?,?,?,?) ON CONFLICT(run_id) DO UPDATE SET failures=excluded.failures,
       blocked_code=excluded.blocked_code,failed_signature=excluded.failed_signature WHERE owner_id=excluded.owner_id`)

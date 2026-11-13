@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest'
+import Ajv from 'ajv'
 import { adaptInputSchema } from '../src/schema.js'
 
 describe('MCP schema projection', () => {
@@ -182,6 +183,22 @@ describe('MCP schema projection', () => {
     ] } } })
     expect(adapted.schema.properties.where.properties.value.type).toBeUndefined()
     expect(() => adapted.validate({ where: { value: 123, other: true } })).not.toThrow()
+  })
+
+  it.each([false, true])('keeps pattern keys and named values accepted by object alternatives (union=%s)', union => {
+    const pattern = { type: 'object', patternProperties: { '^x_': { type: 'number' }, '^y_': { type: 'boolean' } }, additionalProperties: false }
+    const where = union ? { anyOf: [
+      { type: 'object', properties: { x_value: { type: 'string' } }, additionalProperties: false }, pattern,
+    ] } : pattern
+    const adapted = adaptInputSchema({ type: 'object', properties: { where } })
+    const acceptsProjected = new Ajv({ strict: false }).compile(adapted.schema)
+    const examples = [{ where: { x_value: 12, y_enabled: true } }, ...(union ? [{ where: { x_value: 'text' } }] : [])]
+    for (const value of examples) {
+      expect(() => adapted.validate(value)).not.toThrow()
+      expect(acceptsProjected(value)).toBe(true)
+    }
+    expect(() => adapted.validate({ where: { z_unknown: true } })).toThrow('schema')
+    expect(() => adapted.validate({ where: { x_value: [] } })).toThrow('schema')
   })
 
   it('does not remove unknown constraint keywords or data properties named _req', () => {

@@ -96,6 +96,10 @@ export function adaptInputSchema(source) {
       if (Array.isArray(branches) && branches.length && branches.every(branch => branch?.type === 'object')) {
         // Advertise a superset of the object alternatives, not an incorrect
         // oneOf. AJV still checks exclusivity, required fields and every value.
+        // Pattern keys can also match another branch's named properties. Keep
+        // the whole object open rather than accidentally narrowing those values.
+        if (branches.some(branch => Object.keys(branch.patternProperties ?? {}).length))
+          return { type: 'object', additionalProperties: true, ...(node.description ? { description: node.description } : {}) }
         const properties = {}
         for (const key of new Set(branches.flatMap(branch => Object.keys(branch.properties ?? {})))) {
           const variants = branches.flatMap(branch => Object.hasOwn(branch.properties ?? {}, key)
@@ -111,6 +115,7 @@ export function adaptInputSchema(source) {
       if (typeof node.type === 'string' && ['object', 'array', 'string', 'number', 'integer', 'boolean', 'null'].includes(node.type)) result.type = node.type
       if (typeof node.description === 'string') result.description = node.description
       if (node.type === 'object') {
+        if (Object.keys(node.patternProperties ?? {}).length) return { ...result, additionalProperties: true }
         if (node.properties) result.properties = Object.fromEntries(Object.entries(node.properties).map(([key, child]) => [key, widen(child)]))
         if (Array.isArray(node.required) && node.required.every(key => result.properties?.[key])) result.required = node.required
         result.additionalProperties = node.additionalProperties !== false
