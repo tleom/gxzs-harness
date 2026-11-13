@@ -1,7 +1,26 @@
 import { describe, expect, it } from 'vitest'
+import Ajv from 'ajv'
 import { adaptInputSchema } from '../src/schema.js'
 
 describe('MCP schema projection', () => {
+  it('keeps recursive query alternatives discoverable while enforcing their exclusive shapes', () => {
+    const source = { type: 'object', properties: { where: { $ref: '#/$defs/where' } }, $defs: { where: { anyOf: [
+      { type: 'object', properties: { field: { type: 'string' }, op: { enum: ['eq', 'gte'], type: 'string' }, value: {} }, required: ['field', 'op'], additionalProperties: false },
+      { type: 'object', properties: { and: { type: 'array', minItems: 1, items: { $ref: '#/$defs/where' } } }, required: ['and'], additionalProperties: false },
+      { type: 'object', properties: { relation: { type: 'object', properties: { entity: { type: 'string' }, where: { $ref: '#/$defs/where' } }, required: ['entity'] } }, required: ['relation'], additionalProperties: false },
+    ] } } }
+    const adapted = adaptInputSchema(source)
+    const where = adapted.schema.properties.where
+    expect(where.type).toBe('object')
+    expect(Object.keys(where.properties)).toEqual(expect.arrayContaining(['field', 'op', 'value', 'and', 'relation']))
+    expect(where.properties.and.items.type).toBe('object')
+    expect(where.properties.relation.properties.where.type).toBe('object')
+    expect(() => adapted.validate({ where: { and: [{ field: 'sj', op: 'gte', value: '2026-10-01' }, { relation: { entity: 'zqxx', where: { field: 'zbr', op: 'eq', value: '姓名' } } }] } })).not.toThrow()
+    expect(() => adapted.validate({ where: { field: 'sj', op: 'gte', and: [] } })).toThrow('schema')
+    expect(() => adapted.validate({ where: { relation: {} } })).toThrow('schema')
+    expect(() => adapted.validate({ where: { field: 'sj', op: 'invalid' } })).toThrow('schema')
+  })
+
   it.each([undefined, 'https://json-schema.org/draft/2020-12/schema'])('validates the MCP default 2020-12 dialect (%s)', ($schema) => {
     const source = { ...($schema ? { $schema } : {}), type: 'object', properties: {
       credit: { type: 'string' }, billing: { type: 'string' },
@@ -155,6 +174,31 @@ describe('MCP schema projection', () => {
     { type: 'object', properties: { op: { type: 'string', _req: false } }, required: ['op'] },
   ])('rejects unrepresented or malformed required annotations', (schema) => {
     expect(() => adaptInputSchema(schema)).toThrow('must match')
+  })
+
+  it('does not narrow properties accepted by another object alternative', () => {
+    const adapted = adaptInputSchema({ type: 'object', properties: { where: { anyOf: [
+      { type: 'object', properties: { value: { type: 'string' } }, additionalProperties: false },
+      { type: 'object', properties: { other: { type: 'boolean' } }, additionalProperties: true },
+    ] } } })
+    expect(adapted.schema.properties.where.properties.value.type).toBeUndefined()
+    expect(() => adapted.validate({ where: { value: 123, other: true } })).not.toThrow()
+  })
+
+  it.each([false, true])('keeps pattern keys and named values accepted by object alternatives (union=%s)', union => {
+    const pattern = { type: 'object', patternProperties: { '^x_': { type: 'number' }, '^y_': { type: 'boolean' } }, additionalProperties: false }
+    const where = union ? { anyOf: [
+      { type: 'object', properties: { x_value: { type: 'string' } }, additionalProperties: false }, pattern,
+    ] } : pattern
+    const adapted = adaptInputSchema({ type: 'object', properties: { where } })
+    const acceptsProjected = new Ajv({ strict: false }).compile(adapted.schema)
+    const examples = [{ where: { x_value: 12, y_enabled: true } }, ...(union ? [{ where: { x_value: 'text' } }] : [])]
+    for (const value of examples) {
+      expect(() => adapted.validate(value)).not.toThrow()
+      expect(acceptsProjected(value)).toBe(true)
+    }
+    expect(() => adapted.validate({ where: { z_unknown: true } })).toThrow('schema')
+    expect(() => adapted.validate({ where: { x_value: [] } })).toThrow('schema')
   })
 
   it('does not remove unknown constraint keywords or data properties named _req', () => {
