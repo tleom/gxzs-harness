@@ -34,6 +34,33 @@ function setup({ authorized = true } = {}) {
 }
 
 describe('platform MCP proxy tools', () => {
+  it('localizes the pasted Case shape error before I/O and dispatches a corrected request unchanged', async () => {
+    const { ctx, platform, definitions } = setup()
+    const tool = { ...catalogTool, id: 'global:mcp:gxzs-case:case_aggregate', runtime_name: 'global_case_aggregate',
+      scope: 'global', server_id: 'gxzs-case', tool_name: 'case_aggregate', inputSchema: { type: 'object', additionalProperties: true } }
+    ctx.workbenchRuntime.authorizeMcp = () => ({ ownerId: 't:1', runId: 'run-1', resource: tool })
+    ctx.workbenchRuntime.executionRun = () => ({ id: 'run-1', ownerId: 't:1', status: 'running', mcpTools: [tool] })
+    platform.json.mockResolvedValueOnce({ tools: [tool] })
+    await apply(ctx, { discovery: true })
+    const definition = definitions.get('case_aggregate')
+    const exec = { agent: { id: 's1' }, callId: 'bad-shape', signal: new AbortController().signal }
+    const start = { field: 'sj', op: 'gte', value: '2026-10-01T00:00:00+08:00' }
+    const end = { field: 'sj', op: 'lt', value: '2026-11-01T00:00:00+08:00' }
+    const query = { entity: 'zqxx', filters: { zbr: '刘武益' }, path: ['hkjl'], grain: 'repayment',
+      relatedWhere: { ...start, and: [end] }, metrics: [{ name: '回款金额', op: 'sum', field: 'hkje' }] }
+    await expect(definition.execute(query, exec)).rejects.toThrow('relatedWhere：叶子条件')
+    expect(platform.json.mock.calls.filter(([r]) => r.route === 'mcp/call')).toHaveLength(0)
+    query.relatedWhere = { and: [start, end] }
+    await definition.execute(query, { ...exec, callId: 'fixed-shape' })
+    const dispatched = platform.json.mock.calls.filter(([r]) => r.route === 'mcp/call')
+    expect(dispatched).toHaveLength(1)
+    expect(JSON.parse(dispatched[0][0].body).arguments).toEqual(query)
+    const assemble = ctx.on.mock.calls.find(([event]) => event === 'system-prompt/assemble')[1]
+    const prompt = await assemble({}, { scope: exec.agent }, async () => ({ sections: [] }))
+    expect(prompt.sections.find(s => s.name === 'gxzs:case-query').text).toContain('不为了复算再查明细')
+    ctx.workbenchRuntime.executionRun = () => undefined
+    expect((await assemble({}, { scope: exec.agent }, async () => ({ sections: [] }))).sections).toEqual([])
+  })
   it.each(['backend', 'transport'])('stops Case redispatch and discovery after a %s timeout and restores the next run', async (origin) => {
     const { ctx, platform, definitions } = setup()
     const agent = { id: 's1', ctx: { tools: { restrict: () => () => {} } } }

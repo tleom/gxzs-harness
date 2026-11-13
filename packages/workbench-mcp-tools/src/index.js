@@ -8,6 +8,7 @@ import { platformToolNames } from './names.js'
 import { ToolDiscoveryCatalog } from './discovery-catalog.js'
 import { migrateEquivalentManifests } from './manifest-migration.js'
 import { CaseQueryRecovery, caseQueryFailure, isCaseQuery } from './case-query-recovery.js'
+import { CASE_QUERY_GUIDANCE, caseArgumentMessage, validateCaseArguments } from './case-query-contract.js'
 import z from '@deepseek-ai/schemastery'
 import { createHash } from 'node:crypto'
 
@@ -254,13 +255,15 @@ export async function apply(ctx, config = {}) {
       })
       providers.get(key).tools.push(tool.public_name)
     }
+    const caseGuidance = [...registrations.values()].some(({ tool }) => isCaseQuery(tool) && allowed.has(tool.public_name))
+      ? [{ name: 'gxzs:case-query', text: CASE_QUERY_GUIDANCE, interpolate: false }] : []
     return {
       ...assembly,
-      sections: providers.size ? [...assembly.sections, {
+      sections: providers.size ? [...assembly.sections, ...caseGuidance, {
         name: 'gxzs:mcp-provider-catalog',
         text: `当前可用 MCP 插件（调用名、展示名、用途和已注册子工具）：\n${JSON.stringify([...providers.values()])}\n按任务选择真实子工具；用户说出插件调用名或展示名时，可据此找到对应子工具。`,
         interpolate: false,
-      }] : assembly.sections,
+      }] : [...assembly.sections, ...caseGuidance],
     }
   }, { global: true })
   ctx.effect(() => () => {
@@ -302,11 +305,14 @@ async function callProxy(ctx, tool, args, exec, { task = false, recovery, journa
   if (typeof exec.callId !== 'string' || !exec.callId.trim()) throw new Error('MCP callId is required to correlate this call')
   const blocked = caseRecovery?.before(authorization, tool, args)
   if (blocked) return blocked
-  try { tool.validateArguments(args) }
+  try {
+    if (isCaseQuery(tool)) validateCaseArguments(tool, args)
+    tool.validateArguments(args)
+  }
   catch (error) {
     if (!caseRecovery || !isCaseQuery(tool)) throw error
     return caseRecovery.record(authorization, tool, args,
-      caseQueryFailure('INVALID_ARGUMENT', error.message, 'correct_arguments'))
+      caseQueryFailure('INVALID_ARGUMENT', caseArgumentMessage(error), 'correct_arguments'))
   }
   if (task) {
     const runtime = ctx.workbenchRuntime
