@@ -106,7 +106,7 @@ def prepare_upgrade(*, old_image, candidate_image, owner_id, home_volume,
                     workspace_id, generation, instance_id,
                     manager_container='gxzs-sandbox-manager', user='1000:1000', run=docker):
     if (not IMAGE_ID.fullmatch(old_image) or not IMAGE_ID.fullmatch(candidate_image)
-            or not re.fullmatch(r'[^:\s/]+:[0-9]+', owner_id)
+            or not re.fullmatch(r'(?:gxzs-[1-9][0-9]{0,18}|[^:\s/]+:[0-9]+)', owner_id)
             or not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_.-]{0,254}', home_volume)
             or not re.fullmatch(r'[0-9]+:[0-9]+', user)
             or str(uuid.UUID(workspace_id)) != workspace_id

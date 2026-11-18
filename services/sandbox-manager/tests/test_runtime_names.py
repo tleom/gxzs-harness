@@ -5,8 +5,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from runtime_names import account_names, host_name, volume_prefix
 
 
-def test_account_is_readable_without_losing_leading_zeroes():
-    assert account_names('000000:7', '00066943') == {
+@pytest.mark.parametrize('owner_id', ['000000:7', 'gxzs-7'])
+def test_account_is_readable_without_losing_leading_zeroes(owner_id):
+    assert account_names(owner_id, '00066943') == {
         'account_name': '00066943', 'container_name': 'gxzs-host-00066943',
         'sandbox_name': 'gxzs-sandbox-00066943'}
     assert account_names('000000:1', 'admin')['container_name'] == 'gxzs-host-admin'

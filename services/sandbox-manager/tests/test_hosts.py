@@ -370,7 +370,7 @@ def test_ensure_does_not_renew_stale_degraded_state_without_current_liveness(tmp
         assert error.value.code == 'HOST_NOT_READY'
 
 
-def setup(tmp_path, monkeypatch):
+def setup(tmp_path, monkeypatch, owner_id='t:1'):
     import mcp_runtime
     monkeypatch.setattr(mcp_runtime, 'discover_orphans', Mock(return_value=([], True)))
     for key, value in {
@@ -390,7 +390,7 @@ def setup(tmp_path, monkeypatch):
         if args[0] in {'stop', 'start'} and created:
             created['State']['Running'] = args[0] == 'start'
         if args[0] == 'create':
-            created.update(Id='c' * 64, Image='sha256:test', Config={'Image': 'host:test', 'Labels': {'gxzs.owner': 't:1', 'gxzs.workspace': 'workspace', 'gxzs.generation': '1', 'gxzs.credentials': 'owner-v1'}}, State={'Running': True}, NetworkSettings={'Ports': {'3081/tcp': [{'HostPort': '32001'}]}, 'Networks': {'owner-network': {}}})
+            created.update(Id='c' * 64, Image='sha256:test', Config={'Image': 'host:test', 'Labels': {'gxzs.owner': owner_id, 'gxzs.workspace': 'workspace', 'gxzs.generation': '1', 'gxzs.credentials': 'owner-v1'}}, State={'Running': True}, NetworkSettings={'Ports': {'3081/tcp': [{'HostPort': '32001'}]}, 'Networks': {'owner-network': {}}})
         return SimpleNamespace(returncode=0, stdout='')
     control = Mock(side_effect=docker)
     ensure = Mock()
@@ -405,18 +405,20 @@ def setup(tmp_path, monkeypatch):
     host.native_activity = Mock(return_value=dict(runningAgents=0, pendingMessages=0, runningJobs=0, activeSchedules=0, activeSidebarResources=0, activeSettingsWrites=0))
     host.dependency_degraded = Mock(return_value=False)
     host.failed_transport_activity = Mock(return_value=None)
-    payload = dict(owner_id='t:1', generation=1, instance_id='host-1', platform_token='derived', assertion_key='a2V5', assertion_issuer='gxzs')
+    payload = dict(owner_id=owner_id, generation=1, instance_id='host-1', platform_token='derived', assertion_key='a2V5', assertion_issuer='gxzs')
     return host, control, ensure, payload, created
 
 
-def test_first_use_creates_once_and_reuses_workspace(tmp_path, monkeypatch):
-    host, docker, sandbox, payload, _ = setup(tmp_path, monkeypatch)
+@pytest.mark.parametrize('owner_id', ['t:1', 'gxzs-1'])
+def test_first_use_creates_once_and_reuses_workspace(tmp_path, monkeypatch, owner_id):
+    host, docker, sandbox, payload, _ = setup(tmp_path, monkeypatch, owner_id=owner_id)
     first = host.ensure('workspace', payload)
     second = host.ensure('workspace', payload)
     assert first == second
     assert first['ready'] is False
     assert first['state'] == 'provisioning'
     assert first['initial_creation'] is True
+    assert first['owner_id'] == owner_id
     assert len([call for call in docker.call_args_list if call.args[0] == 'create']) == 1
     assert sandbox.call_count == 2
     assert 'platform_token' not in first

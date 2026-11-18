@@ -7,21 +7,23 @@ import { AssertionVerifier } from '../src/assertion.js'
 const key = Buffer.alloc(32, 7).toString('base64')
 const now = 1_700_000_000
 
-it('accepts the maintenance signing script defaults with the current route and audience', () => {
+it.each(['000000:1', 'gxzs-1'])('accepts the maintenance signing script for %s', (ownerId) => {
   const result = spawnSync(process.execPath, [fileURLToPath(new URL('../../../scripts/sign-request.mjs', import.meta.url))], {
     encoding: 'utf8', windowsHide: true,
-    env: { ...process.env, GXZS_ASSERTION_ISSUER: 'script-test', GXZS_HOST_OWNER_ID: 'tenant:1', GXZS_ASSERTION_SIGNING_KEY: key },
+    env: { ...process.env, GXZS_ASSERTION_ISSUER: 'script-test', GXZS_HOST_OWNER_ID: ownerId, GXZS_ASSERTION_SIGNING_KEY: key },
   })
   expect(result.status, result.stderr).toBe(0)
   expect(new AssertionVerifier({ issuer: 'script-test', signingKey: key }).verify(result.stdout, {
     method: 'GET', target: '/ai/workbench/identity', body: Buffer.alloc(0), contentType: 'application/json', lastEventId: '',
-  })).toMatchObject({ ownerId: 'tenant:1' })
+  })).toMatchObject({ ownerId, userId: '1' })
+  const [, payload] = result.stdout.split('.')
+  expect(JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'))).not.toHaveProperty('tenant_id')
 })
 
 function sign(overrides = {}) {
   const body = overrides.body ?? Buffer.from('{"query":"test"}')
   const claims = {
-    iss: 'gxzs-backend', aud: 'agent-workbench', sub: 'tenant-a:42', tenant_id: 'tenant-a',
+    iss: 'gxzs-backend', aud: 'agent-workbench', sub: '000000:42',
     user_id: '42', name: '用户', iat: now, exp: now + 60, jti: 'request-1', method: 'POST',
     target: '/workbench/chats/abc/runs', body_sha256: createHash('sha256').update(body).digest('hex'),
     content_type: 'application/json', last_event_id: '', ...overrides.claims,
@@ -37,10 +39,32 @@ function request(body) {
 }
 
 describe('gateway assertion verifier', () => {
-  it('accepts a valid request-bound assertion and derives owner identity', () => {
+  it.each([
+    ['000000:42', '42'],
+    ['gxzs-9223372036854775807', '9223372036854775807'],
+  ])('accepts request-bound assertions for %s', (ownerId, userId) => {
     const verifier = new AssertionVerifier({ issuer: 'gxzs-backend', signingKey: key, now: () => now })
-    const { token, body } = sign()
-    expect(verifier.verify(token, request(body))).toEqual({ ownerId: 'tenant-a:42', tenantId: 'tenant-a', userId: '42', name: '用户' })
+    const { token, body } = sign({ claims: { sub: ownerId, user_id: userId } })
+    expect(verifier.verify(token, request(body))).toEqual({ ownerId, userId, name: '用户' })
+  })
+
+  it('accepts assertions issued before the gateway upgrade', () => {
+    const verifier = new AssertionVerifier({ issuer: 'gxzs-backend', signingKey: key, now: () => now })
+    const { token, body } = sign({ claims: { tenant_id: '000000' } })
+    expect(verifier.verify(token, request(body))).toEqual({ ownerId: '000000:42', userId: '42', name: '用户' })
+  })
+
+  it.each([
+    { user_id: '43' },
+    { user_id: 42 },
+    { tenant_id: 'different-tenant' },
+    { sub: 'gxzs-042', user_id: '042' },
+    { sub: 'gxzs-9223372036854775808', user_id: '9223372036854775808' },
+    { sub: 'gxzs-42\n' },
+  ])('rejects an assertion with an invalid bound user %o', (claims) => {
+    const verifier = new AssertionVerifier({ issuer: 'gxzs-backend', signingKey: key, now: () => now })
+    const { token, body } = sign({ claims })
+    expect(() => verifier.verify(token, request(body))).toThrow('身份断言主体无效')
   })
 
   it.each([

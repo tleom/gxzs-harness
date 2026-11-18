@@ -18,7 +18,7 @@ from urllib.request import Request, build_opener, ProxyHandler
 from urllib.error import HTTPError, URLError
 from http.client import IncompleteRead
 from owner_auth import owner_token, assertion_key
-from runtime_names import account_names, host_name, volume_prefix
+from runtime_names import account_names, host_name, match_owner_id, volume_prefix
 from global_skills import mount_arguments as global_skill_mounts, matches_mount, native_root
 
 IDLE_TIMEOUT_SECONDS = 2 * 60 * 60
@@ -101,9 +101,9 @@ class Hosts:
         instance = payload['instance_id']
         generation = int(payload['generation'])
         scheduled_wakeup = payload.get('scheduled_wakeup') is True
-        names = account_names(owner, payload.get('account_name'))
-        if not re.fullmatch(r'[^:\s/]+:\d+', owner) or not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_.-]{0,100}', instance) or generation < 1:
+        if not match_owner_id(owner) or not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_.-]{0,100}', instance) or generation < 1:
             raise ValueError('Invalid host identity')
+        names = account_names(owner, payload.get('account_name'))
         record = self.root / workspace / 'host.json'
         with self.lock(workspace):
             self._retry_mcp_fence(record)

@@ -91,16 +91,18 @@ class DockerFixture:
         raise AssertionError(args)
 
 
-def prepare(run, **kwargs):
+def prepare(run, owner_id='tenant:1', **kwargs):
     return upgrade.prepare_upgrade(old_image=OLD, candidate_image=NEW,
-                                   owner_id='tenant:1', home_volume='test-home', workspace_id=WORKSPACE,
+                                   owner_id=owner_id, home_volume='test-home', workspace_id=WORKSPACE,
                                    generation=1, instance_id='old-host', run=run, **kwargs)
 
 
-def test_extracts_runtime_and_actual_image_as_one_source_before_seeding():
+@pytest.mark.parametrize('owner_id', ['tenant:1', 'gxzs-1'])
+def test_extracts_runtime_and_actual_image_as_one_source_before_seeding(owner_id):
     run = DockerFixture()
-    receipt = prepare(run)
-    assert run.writes == [{'ownerId': 'tenant:1', 'imageId': OLD, 'baseline': BASELINE,
+    run.owner = owner_id
+    receipt = prepare(run, owner_id=owner_id)
+    assert run.writes == [{'ownerId': owner_id, 'imageId': OLD, 'baseline': BASELINE,
                           'baselineSha256': hashlib.sha256(BASELINE.encode()).hexdigest()}]
     assert receipt['imageId'] == OLD
     candidate_create = next(i for i, call in enumerate(run.calls) if call[0] == 'create' and '--name' in call)

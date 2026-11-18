@@ -445,10 +445,13 @@ export function apply(ctx, config) {
         if(!abort.signal.aborted) sendJson(res,200,{data})
       } finally {res.off('close',disconnected)}
     }],
-    ['GET', /^\/identity$/, async ({ owner }, res) => sendJson(res, 200, {
-      user: { id: owner.userId, name: owner.name, email: '' }, workspaceId: owner.tenantId,
-      workspaces: [{ id: owner.tenantId, name: owner.tenantId, current: true }],
-    })],
+    ['GET', /^\/identity$/, async ({ owner }, res) => {
+      const workspaceId = ctx.workbenchFileManager.workspaceId
+      sendJson(res, 200, {
+        user: { id: owner.userId, name: owner.name, email: '' }, workspaceId,
+        workspaces: [{ id: workspaceId, name: '工作台', current: true }],
+      })
+    }],
     ['GET', /^\/catalog$/, async ({ owner, url }, res) => sendJson(res, 200, { data: await buildCatalog(owner, url.searchParams.get('view') === 'models', url.searchParams.get('chat_id')) })],
     ['GET', /^\/native\/settings$/, async (_context, res) => sendJson(res, 200, { data: subagentSettings.describe() })],
     ['POST', /^\/native\/settings\/mutate$/, async ({ owner, body }, res) => sendJson(res, 200, { data: await subagentSettings.mutate(owner, parseJson(body)) })],

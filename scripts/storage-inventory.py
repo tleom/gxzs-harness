@@ -212,7 +212,7 @@ def inventory(state, prefix, workspaces, all_owners, max_owners, socket, budget,
             record = read_json(registry / workspace / 'host.json', 65536)
             owner = record['owner_id']
             if (record['workspace_id'] != workspace or not isinstance(owner, str)
-                    or not re.fullmatch(r'[a-zA-Z0-9_-]{1,64}:[0-9]{1,64}', owner)):
+                    or not re.fullmatch(r'(?:gxzs-[1-9][0-9]{0,18}|[a-zA-Z0-9_-]{1,64}:[0-9]{1,64})', owner)):
                 raise ValueError('invalid_owner_record')
             # Same authority/fallback as ensure_sandbox and hosts._create.
             volumes = record.get('sandbox_volume_prefix') or record.get('sandbox_name') or prefix + '-' + workspace

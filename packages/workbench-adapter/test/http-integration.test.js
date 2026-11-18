@@ -20,7 +20,7 @@ vi.mock('node:fs', async (original) => {
 const cleanups = []
 afterEach(() => cleanups.splice(0).forEach((cleanup) => cleanup()))
 
-function setup({ databasePath = ':memory:', configure = () => {} } = {}) {
+function setup({ databasePath = ':memory:', configure = () => {}, ownerId = 't:42' } = {}) {
   const key = Buffer.alloc(32, 9).toString('base64')
   vi.stubEnv('TEST_ASSERTION_KEY', key)
   const sessions = new Map()
@@ -76,7 +76,7 @@ function setup({ databasePath = ':memory:', configure = () => {} } = {}) {
   apply(context, {
     basePath: '/ai/workbench', databasePath, workspace: '/workspace',
     assertionIssuer: 'gxzs', assertionAudiencePath: '/console/api/workbench', assertionKeyEnv: 'TEST_ASSERTION_KEY',
-    ownerId: 't:42', humanInputTimeoutSeconds: 60,
+    ownerId, humanInputTimeoutSeconds: 60,
   })
   const runtime = context.reflect.provide.mock.calls.find(([name]) => name === 'workbenchRuntime')[1]
   runtime.refreshMcpCatalog = vi.fn(async () => [])
@@ -93,7 +93,7 @@ it('authenticates draft reference reads without creating a persistent conversati
   const route = '/chats/draft/references?query=case'
   expect(await call(handler, key, 'GET', route)).toMatchObject({ status: 200, body: { data: [] } })
   expect((await call(handler, key, 'GET', route, undefined, false)).status).toBe(401)
-  expect((await call(handler, key, 'GET', route, undefined, true, 'other')).status).toBe(403)
+  expect((await call(handler, key, 'GET', route, undefined, true, '43')).status).toBe(403)
   expect((await call(handler, key, 'GET', route + '&workspace_id=foreign')).status).toBe(404)
   expect(context.sessionController.create).not.toHaveBeenCalled()
   expect(context.workbenchFileManager.operate.mock.calls.every(([value]) => value.operation === 'stat')).toBe(true)
@@ -130,17 +130,18 @@ it('serializes absent native changes as null without hiding ownership or diff fa
   const route = `/chats/${chat.id}/changes?seq=10`
   expect(await call(handler, key, 'GET', route)).toMatchObject({ status: 200, body: { data: null } })
   expect((await call(handler, key, 'GET', `${route}&index=0`)).status).toBe(404)
-  expect((await call(handler, key, 'GET', route, undefined, true, 'other')).status).toBe(403)
+  expect((await call(handler, key, 'GET', route, undefined, true, '43')).status).toBe(403)
   expect(summary).toHaveBeenCalledTimes(1)
 })
 
-async function call(handler, key, method, route, value, authenticated = true, userId = '42', extraHeaders = {}, onResponse) {
+async function call(handler, key, method, route, value, authenticated = true, user = '42', extraHeaders = {}, onResponse) {
   const body = value === undefined ? Buffer.alloc(0) : Buffer.isBuffer(value) ? value : Buffer.from(JSON.stringify(value))
   const contentType = extraHeaders['content-type'] ?? 'application/json'
   const now = Math.floor(Date.now() / 1000)
+  const identity = typeof user === 'string' ? { sub: `t:${user}`, user_id: user } : user
   const header = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url')
   const payload = Buffer.from(JSON.stringify({
-    iss: 'gxzs', aud: 'agent-workbench', sub: `t:${userId}`, tenant_id: 't', user_id: userId, name: '用户',
+    iss: 'gxzs', aud: 'agent-workbench', ...identity, name: '用户',
     iat: now, exp: now + 60, jti: randomUUID(), method,
     target: `/console/api/workbench${route}`, body_sha256: createHash('sha256').update(body).digest('hex'),
     content_type: contentType, last_event_id: '',
@@ -281,7 +282,7 @@ describe('authenticated workbench HTTP handler', () => {
     database.transitionRun('t:42', run.id, 'completed')
     const route = `/runs/${run.id}?after=0-0`
     expect((await call(handler, key, 'GET', route, undefined, false)).status).toBe(401)
-    expect((await call(handler, key, 'GET', route, undefined, true, 'other')).status).toBe(403)
+    expect((await call(handler, key, 'GET', route, undefined, true, '43')).status).toBe(403)
     const first = await call(handler, key, 'GET', route)
     expect(first.status).toBe(200)
     expect(first.body.data).toMatchObject({ status: 'completed', history_complete: false,
@@ -576,8 +577,28 @@ describe('authenticated workbench HTTP handler', () => {
   })
 
   it('returns a real assertion-derived identity without a data envelope', async () => {
+    const { handler, key, context } = setup()
+    const workspaceId = context.workbenchFileManager.workspaceId
+    await expect(call(handler, key, 'GET', '/identity')).resolves.toMatchObject({
+      status: 200, body: { user: { id: '42', name: '用户' }, workspaceId, workspaces: [{ id: workspaceId, current: true }] },
+    })
+  })
+
+  it('authenticates a new host through its bound user ID', async () => {
+    const { handler, key } = setup({ ownerId: 'gxzs-42' })
+    const identity = { sub: 'gxzs-42', user_id: '42' }
+    await expect(call(handler, key, 'GET', '/identity', undefined, true, identity)).resolves.toMatchObject({ status: 200 })
+    await expect(call(handler, key, 'GET', '/identity', undefined, true, { ...identity, user_id: '43' })).resolves.toMatchObject({ status: 401 })
+    await expect(call(handler, key, 'GET', '/identity', undefined, true, { ...identity, sub: '000000:42' })).resolves.toMatchObject({ status: 403 })
+  })
+
+  it('loads an existing host conversation after the gateway assertion changes', async () => {
     const { handler, key } = setup()
-    await expect(call(handler, key, 'GET', '/identity')).resolves.toMatchObject({ status: 200, body: { user: { id: '42', name: '用户' }, workspaceId: 't' } })
+    const previous = { sub: 't:42', user_id: '42', tenant_id: 't' }
+    const created = await call(handler, key, 'POST', '/chats', {}, true, previous)
+    await expect(call(handler, key, 'GET', '/chats')).resolves.toMatchObject({
+      status: 200, body: { data: [{ id: created.body.data.id }] },
+    })
   })
 
   it('advertises the implemented personal resource management protocol', async () => {
@@ -720,7 +741,7 @@ describe('authenticated workbench HTTP handler', () => {
     const query = '?path=%2Ftmp%2Frender%2Fa.png'
     for (const route of ['/files/stat', '/files/text', '/files/download']) {
       expect((await call(handler, key, 'GET', route + query, undefined, false)).status).toBe(401)
-      expect((await call(handler, key, 'GET', route + query, undefined, true, 'other')).status).toBe(403)
+      expect((await call(handler, key, 'GET', route + query, undefined, true, '43')).status).toBe(403)
       expect((await call(handler, key, 'GET', route + query)).status).toBe(route.endsWith('/download') ? 404 : 200)
     }
     expect(context.workbenchFileManager.operate).toHaveBeenCalledWith(expect.objectContaining({ path: '/tmp/render/a.png' }), expect.any(AbortSignal))
@@ -791,7 +812,7 @@ it('authenticates submission cancellation and fences a delayed POST', async () =
   const id = created.body.data.id
   const route = `/chats/${id}/runs/stop`
   await expect(call(handler, key, 'POST', route, { request_key: 'slow-request' }, false)).resolves.toMatchObject({ status: 401 })
-  await expect(call(handler, key, 'POST', route, { request_key: 'slow-request' }, true, 'other')).resolves.toMatchObject({ status: 403 })
+  await expect(call(handler, key, 'POST', route, { request_key: 'slow-request' }, true, '43')).resolves.toMatchObject({ status: 403 })
   await expect(call(handler, key, 'POST', route, { request_key: 'slow-request' })).resolves.toMatchObject({ status: 200, body: { data: { accepted: true } } })
   await expect(call(handler, key, 'POST', `/chats/${id}/runs`, { query: 'late message', request_key: 'slow-request' })).resolves.toMatchObject({ status: 409 })
 })
@@ -836,7 +857,7 @@ it('authenticates a streamed upload and forwards binary bytes without JSON encod
   const headers = { 'content-type': 'application/octet-stream', 'content-length': String(body.length) }
   expect(await call(handler, key, 'POST', '/files/upload', body, true, '42', headers)).toMatchObject({ status: 200, body: { data: { version: 'v2' } } })
   await expect(readFile(stagedPath)).rejects.toMatchObject({ code: 'ENOENT' })
-  expect((await call(handler, key, 'POST', '/files/upload', body, true, 'other', headers)).status).toBe(403)
+  expect((await call(handler, key, 'POST', '/files/upload', body, true, '43', headers)).status).toBe(403)
   expect(context.workbenchFileManager.upload).toHaveBeenCalledOnce()
 })
 
