@@ -7,7 +7,7 @@ import { AssertionVerifier } from '../src/assertion.js'
 const key = Buffer.alloc(32, 7).toString('base64')
 const now = 1_700_000_000
 
-it.each(['000000:1', 'gxzs-1'])('accepts the maintenance signing script for %s', (ownerId) => {
+it.each(['gxzs-1'])('accepts the maintenance signing script for %s', (ownerId) => {
   const result = spawnSync(process.execPath, [fileURLToPath(new URL('../../../scripts/sign-request.mjs', import.meta.url))], {
     encoding: 'utf8', windowsHide: true,
     env: { ...process.env, GXZS_ASSERTION_ISSUER: 'script-test', GXZS_HOST_OWNER_ID: ownerId, GXZS_ASSERTION_SIGNING_KEY: key },
@@ -23,7 +23,7 @@ it.each(['000000:1', 'gxzs-1'])('accepts the maintenance signing script for %s',
 function sign(overrides = {}) {
   const body = overrides.body ?? Buffer.from('{"query":"test"}')
   const claims = {
-    iss: 'gxzs-backend', aud: 'agent-workbench', sub: '000000:42',
+    iss: 'gxzs-backend', aud: 'agent-workbench', sub: 'gxzs-42',
     user_id: '42', name: '用户', iat: now, exp: now + 60, jti: 'request-1', method: 'POST',
     target: '/workbench/chats/abc/runs', body_sha256: createHash('sha256').update(body).digest('hex'),
     content_type: 'application/json', last_event_id: '', ...overrides.claims,
@@ -40,7 +40,7 @@ function request(body) {
 
 describe('gateway assertion verifier', () => {
   it.each([
-    ['000000:42', '42'],
+    ['gxzs-42', '42'],
     ['gxzs-9223372036854775807', '9223372036854775807'],
   ])('accepts request-bound assertions for %s', (ownerId, userId) => {
     const verifier = new AssertionVerifier({ issuer: 'gxzs-backend', signingKey: key, now: () => now })
@@ -48,10 +48,10 @@ describe('gateway assertion verifier', () => {
     expect(verifier.verify(token, request(body))).toEqual({ ownerId, userId, name: '用户' })
   })
 
-  it('accepts assertions issued before the gateway upgrade', () => {
+  it('rejects assertions with a removed tenant claim', () => {
     const verifier = new AssertionVerifier({ issuer: 'gxzs-backend', signingKey: key, now: () => now })
     const { token, body } = sign({ claims: { tenant_id: '000000' } })
-    expect(verifier.verify(token, request(body))).toEqual({ ownerId: '000000:42', userId: '42', name: '用户' })
+    expect(() => verifier.verify(token, request(body))).toThrow('身份断言主体无效')
   })
 
   it.each([
@@ -97,7 +97,7 @@ describe('gateway assertion verifier', () => {
     expect(() => verifier.verify(token, request(body))).toThrow('已过期')
   })
 
-  it('accepts only a signed integer deadline without changing legacy identity output', () => {
+  it('accepts only a signed integer deadline alongside the current identity', () => {
     const deadline = (now + 110) * 1000
     const verifier = new AssertionVerifier({ issuer: 'gxzs-backend', signingKey: key, now: () => now })
     const { token, body } = sign({ claims: { request_deadline_ms: deadline } })

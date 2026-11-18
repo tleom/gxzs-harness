@@ -18,7 +18,7 @@ import { createSchedulePlatformFixture } from './smoke-schedule-platform.mjs'
 if (process.platform !== 'linux') throw new Error('Host bootstrap smoke requires the Linux host image')
 
 const root = await mkdtemp(path.join(os.tmpdir(), 'gxzs-host-bootstrap-'))
-const owner = 'bootstrap-smoke:1'
+const owner = 'gxzs-1'
 const workspace = '11111111-1111-4111-8111-111111111111'
 const instance = 'bootstrap-smoke-host'
 const platformToken = 'synthetic-bootstrap-platform-token'
@@ -389,7 +389,7 @@ async function signedRequest(method, route, value) {
   const body = value === undefined ? '' : JSON.stringify(value)
   const contentType = value === undefined ? '' : 'application/json'
   const claims = { iss: 'bootstrap-smoke', aud: 'agent-workbench', sub: owner,
-    tenant_id: 'bootstrap-smoke', user_id: '1', iat: now, exp: now + 60, jti: randomUUID(),
+    user_id: '1', iat: now, exp: now + 60, jti: randomUUID(),
     method, target: `/ai/workbench${route}`, body_sha256: createHash('sha256').update(body).digest('hex'),
     content_type: contentType, last_event_id: '' }
   const encode = value => Buffer.from(JSON.stringify(value)).toString('base64url')

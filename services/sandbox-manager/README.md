@@ -2,11 +2,28 @@
 
 This directory is the runtime owner of per-user sandbox lifecycle and the fixed-workspace file, skill, personal MCP, environment and Office-preview safety rules used by the DSH workbench.
 
-The service is deployed independently from the legacy Dify stack. Its HTTP surface remains private and bearer-authenticated. DSH hosts receive one platform-assigned workspace UUID and cannot choose another workspace through browser payloads.
-
-During migration, the copy under the legacy agent repository remains only to support old workbench export and rollback. After migration acceptance, build and deploy this directory's Dockerfile and remove the legacy stack.
+Build and deploy the independent service from this directory's Dockerfile. Its HTTP surface remains private and bearer-authenticated. DSH hosts receive one platform-assigned workspace UUID and cannot choose another workspace through browser payloads.
 
 Validation uses the POSIX suites mirrored under `services/sandbox-manager/tests`; production rollout additionally requires the live helper, Landlock, network, file manifest and MCP authorization checks.
+
+## GXZS 6.1.0 宿主身份迁移
+
+维护窗口停用所有旧 Workbench 入口。结束正在运行的任务、工具调用和宿主管理操作，停止 manager，备份 MySQL、manager 的 `/state` 和宿主、沙箱卷。保留旧容器供迁移程序核对原有绑定。清单由升级前的 `gxzs_agent_host` 生成，每项提供 `old_owner_id`、`new_owner_id`、`workspace_id`、`generation`、`instance_id`。旧身份为 `000000:<user_id>`，新版为 `gxzs-<user_id>`。工作区 UUID、代次和逻辑实例 ID 以原记录为准。
+
+在 Docker 所在的 Linux 主机使用能够访问本地 Docker socket、状态目录和本地卷的运维账号运行以下命令。参数使用部署的真实目录和容器名，备份目录须单独保护。第一次运行仅校验，核对成功后在同一命令末尾加 `--apply`。
+
+```sh
+python3 scripts/migrate_host_identity.py \
+  --manager-state /实际/manager-state \
+  --manager-container GXZS_MANAGER容器名 \
+  --sandbox-prefix 实际WORKBENCH_SANDBOX_PREFIX \
+  --manifest /受保护目录/host-identity-manifest.json \
+  --backup-dir /受保护目录/gxzs-6.1.0-host-backup
+```
+
+迁移校验并停止清单中的旧 Host 与 Sandbox，备份其 SQLite 后迁移面向 owner 的管理记录、会话索引、任务、草稿和目录操作回执。脚本先归档这两类容器。新版宿主就绪后，管理器可清理归档名称和工作区匹配的旧 Sandbox 容器，关联卷仍保留。旧 Host 的原身份标签继续保存在归档容器中。原工作区 UUID、卷、消息、附件和计划序列继续可用。当前 Workbench SQLite 使用 schema 3。未结束的任务、无法确认的卷、记录冲突或 SQLite 版本差异会阻止迁移。
+
+把备份目录生成的 `host-identity-manifest.json` 交给 GXZS `01_remove_business_tenant.sql` 使用。两个存储都完成迁移后启动新版 manager 和 GXZS，在维护窗口内按现有宿主替换流程递增代次并生成新版凭据，复核原工作区的历史会话、附件、计划以及新会话准入。若迁移中断，维持服务停止状态并使用原清单和备份目录继续。若已启动新版宿主，按切换验收排查其运行状态。
 
 ## 技能导入
 

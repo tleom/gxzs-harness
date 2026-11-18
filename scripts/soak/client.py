@@ -49,11 +49,11 @@ class FixtureClient:
         raw = b'' if body is None else json.dumps(body).encode()
         now = int(time.time())
         owner = row['owner_id']
-        tenant, user = owner.split(':')
+        user = owner.removeprefix('gxzs-')
         key = hmac.new(base64.b64decode(self.config['assertionKey']),
             f"assertion\n{owner}\n{row['generation']}\n{row['instance_id']}".encode(), hashlib.sha256).digest()
         claims = {'iss': 'gxzs-simulator', 'aud': 'agent-workbench', 'sub': owner,
-            'tenant_id': tenant, 'user_id': user, 'name': 'synthetic-owner', 'iat': now, 'exp': now + 60,
+            'user_id': user, 'name': 'synthetic-owner', 'iat': now, 'exp': now + 60,
             'jti': str(uuid.uuid4()), 'method': method, 'target': '/ai/workbench' + path,
             'body_sha256': hashlib.sha256(raw).hexdigest(),
             'content_type': 'application/json' if body is not None else '', 'last_event_id': ''}

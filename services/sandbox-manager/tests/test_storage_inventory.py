@@ -18,7 +18,7 @@ WORKSPACE = '11111111-1111-4111-8111-111111111111'
 SECOND = '22222222-2222-4222-8222-222222222222'
 
 
-def fixture_state(tmp_path, owner_id='000000:123'):
+def fixture_state(tmp_path, owner_id='gxzs-123'):
     state = tmp_path / 'state'
     host = state / 'hosts' / WORKSPACE
     host.mkdir(parents=True)
@@ -45,7 +45,7 @@ def fixture_state(tmp_path, owner_id='000000:123'):
     return state, volumes, calls, collect
 
 
-@pytest.mark.parametrize('owner_id', ['000000:123', 'gxzs-123'])
+@pytest.mark.parametrize('owner_id', ['gxzs-123', 'gxzs-123'])
 def test_inventory_uses_persistent_storage_identity_and_counts_each_mount_once(tmp_path, owner_id):
     state, volumes, calls, collect = fixture_state(tmp_path, owner_id=owner_id)
     before = {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in tmp_path.rglob('*') if p.is_file()}
@@ -133,7 +133,7 @@ def test_duplicate_owner_volume_binding_is_not_double_counted(tmp_path):
     other = state / 'hosts' / SECOND
     other.mkdir()
     record = json.loads((state / 'hosts' / WORKSPACE / 'host.json').read_text())
-    record.update(owner_id='000000:456', workspace_id=SECOND)
+    record.update(owner_id='gxzs-456', workspace_id=SECOND)
     (other / 'host.json').write_text(json.dumps(record))
     result = collect(workspaces=[WORKSPACE, SECOND])
     assert result['status'] == 'partial'

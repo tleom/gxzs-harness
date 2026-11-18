@@ -3,7 +3,7 @@ import { publishedGlobalSkills } from '@gxzs/dsh-workbench-sandbox-skills/global
 import { dirname } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { storageStatus, assertStorageWritable } from './storage-pressure.js'
-import { AssertionVerifier } from './assertion.js'
+import { AssertionVerifier, userIdForOwner } from './assertion.js'
 import { spoolUpload } from './upload.js'
 import { createReadStream } from 'node:fs'
 import { Readable } from 'node:stream'
@@ -910,7 +910,7 @@ export function apply(ctx, config) {
             method: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'].includes(req.method) ? req.method : 'OTHER',
             status: failure.status, code: failure.status === 500 ? 'INTERNAL_ERROR' : `HTTP_${failure.status}`,
             error_type: ['Error', 'TypeError', 'RangeError', 'SyntaxError', 'AbortError', 'TimeoutError'].includes(error?.name) ? error.name : 'Error',
-            owner_id: /^[a-zA-Z0-9_-]{1,64}:[0-9]{1,64}$/.test(config.ownerId) ? config.ownerId : 'configured-owner',
+            owner_id: userIdForOwner(config.ownerId) ? config.ownerId : 'configured-owner',
             ...(Number.isSafeInteger(generation) && generation > 0 ? { generation } : {}),
             suppressed: diagnosticSuppressed }
           diagnosticSuppressed = 0

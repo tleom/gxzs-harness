@@ -370,7 +370,7 @@ def test_ensure_does_not_renew_stale_degraded_state_without_current_liveness(tmp
         assert error.value.code == 'HOST_NOT_READY'
 
 
-def setup(tmp_path, monkeypatch, owner_id='t:1'):
+def setup(tmp_path, monkeypatch, owner_id='gxzs-1'):
     import mcp_runtime
     monkeypatch.setattr(mcp_runtime, 'discover_orphans', Mock(return_value=([], True)))
     for key, value in {
@@ -409,7 +409,7 @@ def setup(tmp_path, monkeypatch, owner_id='t:1'):
     return host, control, ensure, payload, created
 
 
-@pytest.mark.parametrize('owner_id', ['t:1', 'gxzs-1'])
+@pytest.mark.parametrize('owner_id', ['gxzs-1', 'gxzs-77'])
 def test_first_use_creates_once_and_reuses_workspace(tmp_path, monkeypatch, owner_id):
     host, docker, sandbox, payload, _ = setup(tmp_path, monkeypatch, owner_id=owner_id)
     first = host.ensure('workspace', payload)
@@ -497,7 +497,7 @@ def test_scheduled_wakeup_waits_for_inflight_physical_stop(tmp_path, monkeypatch
 def test_account_named_host_keeps_the_logical_instance_and_owner_volumes(tmp_path, monkeypatch):
     host, docker, _, payload, _ = setup(tmp_path, monkeypatch)
     first = host.ensure('workspace', dict(payload, account_name='00066943'))
-    assert first['container_name'] == 'gxzs-host-t.00066943'
+    assert first['container_name'] == 'gxzs-host-00066943'
     assert first['instance_id'] == 'host-1'
     assert first['initial_creation'] is True
     create = next(call.args for call in docker.call_args_list if call.args[0] == 'create')
@@ -506,10 +506,10 @@ def test_account_named_host_keeps_the_logical_instance_and_owner_volumes(tmp_pat
     assert 'sandbox-workspace-files:/workspace:ro' in create
     assert first['sandbox_volume_prefix'] == 'sandbox-workspace'
     assert first['home_volume'] == 'gxzs-dsh-workspace-home'
-    assert not any(value.startswith('gxzs-host-t.00066943-home:') or value.startswith('gxzs-sandbox-t.00066943-') for value in create)
+    assert not any(value.startswith('gxzs-host-00066943-home:') or value.startswith('gxzs-sandbox-00066943-') for value in create)
     assert 'gxzs.instance=host-1' in create
     assert '/srv/manager/hosts/workspace/ssh:/home/gxzs/.ssh:ro' in create
-    host._ssh.assert_called_once_with(host.root / 'workspace', 'gxzs-sandbox-t.00066943')
+    host._ssh.assert_called_once_with(host.root / 'workspace', 'gxzs-sandbox-00066943')
     with pytest.raises(ValueError, match='account binding'):
         host.ensure('workspace', dict(payload, account_name='other'))
 
@@ -590,7 +590,7 @@ def upgrade_setup(tmp_path, monkeypatch):
     data.update(image_digest=image, state='ready', ready=True)
     host._save(record, data)
     docker.reset_mock()
-    begin = dict(operation='begin', owner_id='t:1', generation=1, instance_id='host-1')
+    begin = dict(operation='begin', owner_id='gxzs-1', generation=1, instance_id='host-1')
     return host, docker, payload, containers, record, begin
 
 
@@ -602,7 +602,7 @@ def test_profile_upgrade_fences_durably_and_only_replace_can_resume(tmp_path, mo
     assert proof['image_digest'] == containers['host-1']['Image']
     assert proof['token'] not in record.read_text()
     assert all(not item['State']['Running'] for item in containers.values())
-    host.admission.fence.assert_called_once_with('t:1', 'host-1')
+    host.admission.fence.assert_called_once_with('gxzs-1', 'host-1')
     docker.reset_mock()
     assert host.ensure('workspace', payload)['ready'] is False
     maintain(host)
@@ -643,7 +643,7 @@ def test_profile_upgrade_blocks_new_admission_during_drain(tmp_path, monkeypatch
     assert json.loads(record.read_text())['state'] == 'draining'
     host.admission.pending.return_value = False
     with pytest.raises(ValueError, match='paused new task admission'):
-        host.schedule('workspace', dict(owner_id='t:1', generation=1, instance_id='host-1', run_id='r', chat_id='c', action='acquire'))
+        host.schedule('workspace', dict(owner_id='gxzs-1', generation=1, instance_id='host-1', run_id='r', chat_id='c', action='acquire'))
     host.admission.request.assert_not_called()
     assert not any(call.args[0] == 'stop' for call in docker.call_args_list)
 
@@ -654,12 +654,12 @@ def test_profile_upgrade_drains_real_existing_tickets_without_admitting_new_work
     queue = Admission(str(tmp_path / 'upgrade-admission.db'))
     host.admission = queue
     def schedule(run, action='acquire'):
-        return host.schedule('workspace', dict(owner_id='t:1', generation=1, instance_id='host-1',
+        return host.schedule('workspace', dict(owner_id='gxzs-1', generation=1, instance_id='host-1',
                                               run_id=run, chat_id='same-chat', action=action))
     try:
-        assert queue.request('t:1', 1, 'host-1', 'first', 'same-chat', 'acquire')['state'] == 'running'
-        assert queue.request('t:1', 1, 'host-1', 'pending', 'same-chat', 'acquire')['state'] == 'waiting'
-        assert queue.busy('t:1') == 2
+        assert queue.request('gxzs-1', 1, 'host-1', 'first', 'same-chat', 'acquire')['state'] == 'running'
+        assert queue.request('gxzs-1', 1, 'host-1', 'pending', 'same-chat', 'acquire')['state'] == 'waiting'
+        assert queue.busy('gxzs-1') == 2
         assert host.profile_upgrade('workspace', begin)['fenced'] is False
         with pytest.raises(ValueError, match='paused new task admission'):
             schedule('new-task')
@@ -667,7 +667,7 @@ def test_profile_upgrade_drains_real_existing_tickets_without_admitting_new_work
         schedule('first', 'release')
         assert schedule('pending')['state'] == 'running'
         schedule('pending', 'release')
-        assert queue.busy('t:1') == 0
+        assert queue.busy('gxzs-1') == 0
         assert host.profile_upgrade('workspace', begin)['fenced']
         with pytest.raises(ValueError, match='paused new task admission'):
             schedule('pending')
@@ -814,7 +814,7 @@ def test_identity_mismatch_keeps_existing_workspace(tmp_path, monkeypatch):
     host, _, _, payload, _ = setup(tmp_path, monkeypatch)
     host.ensure('workspace', payload)
     with pytest.raises(ValueError, match='identity changed'):
-        host.ensure('workspace', {**payload, 'owner_id': 't:2'})
+        host.ensure('workspace', {**payload, 'owner_id': 'gxzs-2'})
 
 
 def test_cross_machine_gateway_receives_private_published_address(tmp_path, monkeypatch):
@@ -839,10 +839,10 @@ def test_failed_start_is_tracked_and_retains_owner(tmp_path, monkeypatch):
     with pytest.raises(RuntimeError):
         host.ensure('workspace', payload)
     record = json.loads((host.root / 'workspace' / 'host.json').read_text())
-    assert record['owner_id'] == 't:1'
+    assert record['owner_id'] == 'gxzs-1'
     assert record['ready'] is False
     with pytest.raises(ValueError, match='identity changed'):
-        host.ensure('workspace', {**payload, 'owner_id': 't:2'})
+        host.ensure('workspace', {**payload, 'owner_id': 'gxzs-2'})
 
 
 def test_idle_shutdown_fences_before_reporting_stopped(tmp_path, monkeypatch):
@@ -855,7 +855,7 @@ def test_idle_shutdown_fences_before_reporting_stopped(tmp_path, monkeypatch):
     maintain(host)
     stops = [call.args[-1] for call in docker.call_args_list if call.args[0] == 'stop']
     assert stops == ['host-1', 'sandbox-workspace']
-    host.admission.fence.assert_called_once_with('t:1', 'host-1')
+    host.admission.fence.assert_called_once_with('gxzs-1', 'host-1')
     assert host.heartbeat.call_args.args[1] == 'stopped'
 
 
@@ -948,7 +948,7 @@ def test_stopped_record_reconciles_stale_running_pair_after_admission_is_idle(tm
 
     stops = [call.args[-1] for call in docker.call_args_list if call.args[0] == 'stop']
     assert stops == ['host-1', 'sandbox-workspace']
-    host.admission.fence.assert_called_once_with('t:1', 'host-1')
+    host.admission.fence.assert_called_once_with('gxzs-1', 'host-1')
     host.heartbeat.assert_called_once()
     assert host.heartbeat.call_args.args[1] == 'stopped'
     assert not any(call.args[0] in {'start', 'create', 'rename'} for call in docker.call_args_list)
@@ -1153,7 +1153,7 @@ def test_dead_host_pair_is_fenced_and_restarted_after_liveness_grace(tmp_path, m
     host._ssh.reset_mock()
     maintain(host)
     assert [call.args[-1] for call in docker.call_args_list if call.args[0] == 'stop'] == ['host-1', 'sandbox-workspace']
-    host.admission.fence.assert_called_once_with('t:1', 'host-1', preserve_pending=True)
+    host.admission.fence.assert_called_once_with('gxzs-1', 'host-1', preserve_pending=True)
     sandbox.assert_called_once_with('workspace')
     host._ssh.assert_called_once()
     assert any(call.args[:2] == ('rename', 'host-1') for call in docker.call_args_list)
@@ -1182,7 +1182,7 @@ def test_healthy_recovery_removes_only_verified_stopped_predecessor(tmp_path, mo
         if args[:2] == ('inspect', old_name):
             return SimpleNamespace(returncode=0, stdout=json.dumps([{
                 'Id': 'c' * 64, 'State': {'Running': False},
-                'Config': {'Labels': {'gxzs.owner': 't:1', 'gxzs.workspace': 'workspace', 'gxzs.generation': '1'}},
+                'Config': {'Labels': {'gxzs.owner': 'gxzs-1', 'gxzs.workspace': 'workspace', 'gxzs.generation': '1'}},
             }]))
         return original(*args, **kwargs)
     docker.side_effect = with_predecessors
@@ -1391,7 +1391,7 @@ def test_failed_ssh_keeps_control_routes_live_during_grace_and_recovers_after_dr
     host.failures['host-1'] = 0
     host.failed_transport_activity.return_value['runningAgents'] = 0
     maintain(host)
-    host.admission.fence.assert_called_once_with('t:1', 'host-1', preserve_pending=True)
+    host.admission.fence.assert_called_once_with('gxzs-1', 'host-1', preserve_pending=True)
     assert any(call.args == ('start', 'host-1') for call in docker.call_args_list)
     host.healthy.return_value = True
     host.failed_transport_activity.return_value = None
@@ -1408,7 +1408,7 @@ def test_failed_ssh_recovers_idle_pair_and_preserves_queued_tickets(tmp_path, mo
     stops = [call for call in docker.call_args_list if call.args[0] == 'stop']
     assert [call.args[-1] for call in stops] == ['host-1', 'sandbox-workspace']
     assert all(call.kwargs['check'] is True for call in stops)
-    host.admission.fence.assert_called_once_with('t:1', 'host-1', preserve_pending=True)
+    host.admission.fence.assert_called_once_with('gxzs-1', 'host-1', preserve_pending=True)
     assert any(call.args == ('start', 'host-1') for call in docker.call_args_list)
     assert json.loads(record.read_text()) == {**item, 'ready': False}
     # A new successful readiness probe is required before admitting more work.
@@ -1417,7 +1417,7 @@ def test_failed_ssh_recovers_idle_pair_and_preserves_queued_tickets(tmp_path, mo
     monkeypatch.setattr('hosts.pid_pressure', lambda _info: False)
     host.admission.restore_pending.reset_mock()
     maintain(host)
-    host.admission.restore_pending.assert_called_once_with('t:1', 1, 'host-1')
+    host.admission.restore_pending.assert_called_once_with('gxzs-1', 1, 'host-1')
     assert json.loads(record.read_text()) == item
     maintain(host)
     host.admission.restore_pending.assert_called_once()
@@ -1484,7 +1484,7 @@ def test_failed_ssh_pending_schedule_reports_survive_recovery_without_masking_wr
         host.admission.fence.assert_not_called()
         assert not any(call.args[0] in ('stop', 'rename', 'create') for call in docker.call_args_list)
     else:
-        host.admission.fence.assert_called_once_with('t:1', 'host-1', preserve_pending=True)
+        host.admission.fence.assert_called_once_with('gxzs-1', 'host-1', preserve_pending=True)
         assert any(call.args == ('start', 'host-1') for call in docker.call_args_list)
 
 
@@ -1506,7 +1506,7 @@ def test_schedule_validates_owner_and_stopped_host(tmp_path, monkeypatch):
     host.ensure('workspace', payload)
     request = {**payload, 'run_id': 'r', 'chat_id': 'c', 'action': 'acquire'}
     with pytest.raises(ValueError, match='identity mismatch'):
-        host.schedule('workspace', {**request, 'owner_id': 't:2'})
+        host.schedule('workspace', {**request, 'owner_id': 'gxzs-2'})
     created['State']['Running'] = False
     with pytest.raises(ValueError, match='stopped'):
         host.schedule('workspace', request)
@@ -1528,55 +1528,21 @@ def test_maintenance_and_admission_share_workspace_lock(tmp_path, monkeypatch):
     assert entered.is_set()
 
 
-def migrated_host(tmp_path, monkeypatch):
-    host, docker, _, payload, created = setup(tmp_path, monkeypatch)
-    payload.update(instance_id='gxzs-migration-host-0', run_id='r', chat_id='c', action='acquire')
-    created.update(Config={'Env': [
-        'GXZS_HOST_OWNER_ID=t:1', 'GXZS_HOST_GENERATION=1',
-        'GXZS_HOST_INSTANCE_ID=gxzs-migration-host-0', 'GXZS_SANDBOX_WORKSPACE_ID=workspace',
-    ]}, State={'Running': True})
-    return host, docker, payload, created
-
-
-def test_migrated_host_can_schedule_without_lifecycle_adoption(tmp_path, monkeypatch):
-    host, docker, payload, _ = migrated_host(tmp_path, monkeypatch)
-    host.admission.request.return_value = {'state': 'running'}
-    assert host.schedule('workspace', payload) == {'state': 'running'}
-    host.admission.request.assert_called_once_with('t:1', 1, 'gxzs-migration-host-0', 'r', 'c', 'acquire', False)
-    assert not (host.root / 'workspace' / 'host.json').exists()
-    assert all(call.args[0] == 'inspect' for call in docker.call_args_list)
-
-
-@pytest.mark.parametrize('key,value', [('owner_id', 't:2'), ('generation', 2), ('instance_id', 'gxzs-migration-host-1')])
-def test_migrated_host_rejects_other_identity(tmp_path, monkeypatch, key, value):
-    host, _, payload, _ = migrated_host(tmp_path, monkeypatch)
-    with pytest.raises(ValueError, match='identity mismatch'):
-        host.schedule('workspace', {**payload, key: value})
-    host.admission.request.assert_not_called()
-
-
-def test_migrated_host_rejects_other_workspace_and_stopped_container(tmp_path, monkeypatch):
-    host, _, payload, created = migrated_host(tmp_path, monkeypatch)
-    with pytest.raises(ValueError, match='identity mismatch'):
-        host.schedule('other-workspace', payload)
-    created['State']['Running'] = False
-    with pytest.raises(ValueError, match='stopped'):
-        host.schedule('workspace', payload)
-    host.admission.request.assert_not_called()
-
-
-def test_unregistered_host_does_not_bypass_registration(tmp_path, monkeypatch):
+@pytest.mark.parametrize('instance', ['host-1', 'gxzs-migration-host-0'])
+def test_unregistered_host_does_not_bypass_registration(tmp_path, monkeypatch, instance):
     host, docker, _, payload, _ = setup(tmp_path, monkeypatch)
     with pytest.raises(ValueError, match='not registered'):
-        host.schedule('workspace', {**payload, 'action': 'acquire'})
+        host.schedule('workspace', {**payload, 'instance_id':instance, 'action':'acquire'})
     docker.assert_not_called()
     host.admission.request.assert_not_called()
 
 
 def test_explicit_retry_uses_its_new_admission_ticket(tmp_path, monkeypatch):
-    host, _, payload, _ = migrated_host(tmp_path, monkeypatch)
-    host.schedule('workspace', {**payload, 'ticket_id': 'new-ticket'})
-    host.admission.request.assert_called_once_with('t:1', 1, 'gxzs-migration-host-0', 'new-ticket', 'c', 'acquire', False)
+    host, _, _, payload, _ = setup(tmp_path, monkeypatch)
+    host.ensure('workspace', payload)
+    maintain(host)
+    host.schedule('workspace', {**payload, 'run_id':'r', 'chat_id':'c', 'action':'acquire', 'ticket_id':'new-ticket'})
+    host.admission.request.assert_called_once_with('gxzs-1', 1, 'host-1', 'new-ticket', 'c', 'acquire', False)
 
 
 def test_creation_does_not_wait_for_readiness_under_workspace_lock(tmp_path, monkeypatch):
@@ -1649,8 +1615,8 @@ def test_draining_finishes_previously_queued_tickets_without_admitting_new_work(
     host.ensure('workspace', payload)
     host.admission = Admission(str(tmp_path / 'drain.sqlite3'))
     try:
-        assert host.admission.request('t:1', 1, 'host-1', 'running', 'chat', 'acquire')['state'] == 'running'
-        assert host.admission.request('t:1', 1, 'host-1', 'queued', 'chat', 'acquire')['state'] == 'waiting'
+        assert host.admission.request('gxzs-1', 1, 'host-1', 'running', 'chat', 'acquire')['state'] == 'running'
+        assert host.admission.request('gxzs-1', 1, 'host-1', 'queued', 'chat', 'acquire')['state'] == 'waiting'
         result = host.replace('workspace', {**payload, 'generation': 2, 'instance_id': 'host-2',
                                            'expected_generation': 1, 'expected_instance_id': 'host-1'})
         assert result['state'] == 'draining'
@@ -1662,7 +1628,7 @@ def test_draining_finishes_previously_queued_tickets_without_admitting_new_work(
         with pytest.raises(ValueError, match='draining'):
             host.schedule('workspace', {**schedule, 'run_id': 'queued', 'chat_id': 'other-chat', 'action': 'acquire'})
         host.schedule('workspace', {**schedule, 'run_id': 'queued', 'action': 'release'})
-        assert host.admission.busy('t:1') == 0
+        assert host.admission.busy('gxzs-1') == 0
     finally:
         host.admission.db.close()
 
@@ -1821,7 +1787,7 @@ def test_ssh_installs_keys_as_sandbox_owner_without_chown(tmp_path, monkeypatch)
 @pytest.mark.parametrize('legacy,send_account', [(False, True), (False, False), (True, True)])
 def test_readable_name_is_reused_only_after_old_generation_is_fenced(tmp_path, monkeypatch, send_account, legacy):
     host, docker, payload, containers, record, _ = upgrade_setup(tmp_path, monkeypatch)
-    name = 'gxzs-host-t.admin'
+    name = 'gxzs-host-admin'
     containers[name] = containers.pop('host-1')
     containers['sandbox-workspace']['Config'] = {'Labels': {'gxzs.workspace': 'workspace'}}
     containers['sandbox-workspace']['Id'] = 'd' * 64
@@ -1859,13 +1825,13 @@ def test_readable_name_is_reused_only_after_old_generation_is_fenced(tmp_path, m
     assert host.replace('workspace', replacement) == {'new_generation': True}
     assert sum(call.args[0] == 'rename' for call in docker.call_args_list) == (2 if legacy else 1)
     if legacy:
-        assert 'gxzs-sandbox-t.admin-previous-' + 'd' * 12 in containers
-    host.admission.fence.assert_called_once_with('t:1', 'host-1')
+        assert 'gxzs-sandbox-admin-previous-' + 'd' * 12 in containers
+    host.admission.fence.assert_called_once_with('gxzs-1', 'host-1')
 
 
 def test_name_collision_does_not_stop_or_adopt_another_container(tmp_path, monkeypatch):
     host, docker, payload, containers, record, _ = upgrade_setup(tmp_path, monkeypatch)
-    containers['gxzs-host-t.admin'] = {'Id': 'foreign', 'State': {'Running': True}}
+    containers['gxzs-host-admin'] = {'Id': 'foreign', 'State': {'Running': True}}
     before = record.read_text()
     with pytest.raises(ValueError, match='already allocated'):
         host.replace('workspace', dict(payload, account_name='admin', expected_generation=1, expected_instance_id='host-1', generation=2, instance_id='host-2'))
@@ -1876,7 +1842,7 @@ def test_name_collision_does_not_stop_or_adopt_another_container(tmp_path, monke
 @pytest.mark.parametrize('foreign', ['host', 'sandbox'])
 def test_named_replacement_never_stops_a_container_claimed_by_another_workspace(tmp_path, monkeypatch, foreign):
     host, docker, payload, containers, record, _ = upgrade_setup(tmp_path, monkeypatch)
-    name = 'gxzs-host-t.admin'
+    name = 'gxzs-host-admin'
     containers[name] = containers.pop('host-1')
     containers['sandbox-workspace']['Config'] = {'Labels': {'gxzs.workspace': 'workspace'}}
     data = json.loads(record.read_text())
@@ -1890,14 +1856,14 @@ def test_named_replacement_never_stops_a_container_claimed_by_another_workspace(
 
 
 @pytest.mark.parametrize('generation,owner,running,removed', [
-    ('1', 't:1', False, True), ('2', 't:1', False, True),
-    ('3', 't:1', False, False), ('1', 't:2', False, False),
-    ('1', 't:1', True, False), ('invalid', 't:1', False, False),
+    ('1', 'gxzs-1', False, True), ('2', 'gxzs-1', False, True),
+    ('3', 'gxzs-1', False, False), ('1', 'gxzs-2', False, False),
+    ('1', 'gxzs-1', True, False), ('invalid', 'gxzs-1', False, False),
 ])
 def test_named_generation_cleanup_preserves_foreign_or_live_containers(tmp_path, monkeypatch, generation, owner, running, removed):
     host, docker, _, _, _ = setup(tmp_path, monkeypatch)
     name = 'gxzs-host-admin-previous-' + 'c' * 12
-    item = dict(container_name='gxzs-host-admin', instance_id='logical-g2', generation=2, owner_id='t:1', workspace_id='workspace')
+    item = dict(container_name='gxzs-host-admin', instance_id='logical-g2', generation=2, owner_id='gxzs-1', workspace_id='workspace')
     record = host.root / 'workspace' / 'host.json'
     record.parent.mkdir()
     record.write_text(json.dumps(dict(item, state='ready', ready=True)))
@@ -1923,7 +1889,7 @@ def test_named_sandbox_cleanup_checks_workspace_and_container_identity(tmp_path,
     host, docker, _, _, _ = setup(tmp_path, monkeypatch)
     name = 'gxzs-sandbox-admin-previous-' + 'd' * 12
     item = dict(container_name='gxzs-host-admin', sandbox_name='gxzs-sandbox-admin', instance_id='logical-g2',
-                generation=2, owner_id='t:1', workspace_id='workspace')
+                generation=2, owner_id='gxzs-1', workspace_id='workspace')
     record = host.root / 'workspace' / 'host.json'
     record.parent.mkdir()
     record.write_text(json.dumps(dict(item, state='ready', ready=True)))
@@ -1945,7 +1911,7 @@ def test_named_sandbox_cleanup_checks_workspace_and_container_identity(tmp_path,
 def test_predecessor_cleanup_revalidates_after_docker_inspection(tmp_path, monkeypatch, transition):
     host, docker, _, _, _ = setup(tmp_path, monkeypatch)
     item = dict(container_name='gxzs-host-admin', instance_id='logical-g2', generation=2,
-                owner_id='t:1', workspace_id='workspace', state='ready', ready=True)
+                owner_id='gxzs-1', workspace_id='workspace', state='ready', ready=True)
     record = host.root / 'workspace' / 'host.json'
     record.parent.mkdir()
     record.write_text(json.dumps(item))
@@ -1961,7 +1927,7 @@ def test_predecessor_cleanup_revalidates_after_docker_inspection(tmp_path, monke
             record.write_text(json.dumps(current))
             return SimpleNamespace(returncode=0, stdout=json.dumps([{
                 'Id':'c' * 64, 'State':{'Running':False},
-                'Config':{'Labels':{'gxzs.owner':'t:1','gxzs.workspace':'workspace','gxzs.generation':'2'}},
+                'Config':{'Labels':{'gxzs.owner':'gxzs-1','gxzs.workspace':'workspace','gxzs.generation':'2'}},
             }]))
         raise AssertionError('Stale cleanup must not remove a rollback container')
     docker.side_effect = operate

@@ -3,7 +3,7 @@ import os
 import re
 
 
-OWNER_ID = re.compile(r'(?:gxzs-|(?P<legacy_prefix>[^:\s/]+):)(?P<user_id>[1-9][0-9]{0,18})')
+OWNER_ID = re.compile(r'gxzs-(?P<user_id>[1-9][0-9]{0,18})')
 MAX_USER_ID = 2**63 - 1
 
 
@@ -25,12 +25,7 @@ def account_names(owner, account):
     prefix = os.environ.get('GXZS_RUNTIME_PREFIX', 'gxzs')
     if not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,19}', prefix):
         raise ValueError('Invalid runtime container prefix')
-    legacy_prefix = identity['legacy_prefix']
-    if legacy_prefix and not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_-]{0,19}', legacy_prefix):
-        raise ValueError('Invalid runtime owner prefix')
     suffix = account.lower()
-    if legacy_prefix and legacy_prefix != '000000':
-        suffix = legacy_prefix.lower() + '.' + suffix
     names = {'account_name': account, 'container_name': prefix + '-host-' + suffix,
              'sandbox_name': prefix + '-sandbox-' + suffix}
     if any(len(names[key]) > 63 for key in ('container_name', 'sandbox_name')):

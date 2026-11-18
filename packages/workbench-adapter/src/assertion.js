@@ -5,7 +5,7 @@ const MAX_USER_ID = 9223372036854775807n
 
 export function userIdForOwner(ownerId) {
   if (typeof ownerId !== 'string') return undefined
-  const match = /^(?:gxzs-|[^:\s/]+:)([1-9][0-9]{0,18})$/.exec(ownerId)
+  const match = /^gxzs-([1-9][0-9]{0,18})$/.exec(ownerId)
   if (!match || match[0] !== ownerId || BigInt(match[1]) > MAX_USER_ID) return undefined
   return match[1]
 }
@@ -54,8 +54,7 @@ export class AssertionVerifier {
       if (claims[name] !== value) throw unauthorized(`工作台身份断言未绑定当前请求：${name}`)
 
     const userId = userIdForOwner(claims.sub)
-    const hasLegacyScope = claims.tenant_id !== undefined
-    if (!userId || claims.user_id !== userId || (hasLegacyScope && claims.sub !== `${claims.tenant_id}:${userId}`))
+    if (!userId || claims.user_id !== userId || claims.tenant_id !== undefined)
       throw unauthorized('工作台身份断言主体无效')
     if (claims.request_deadline_ms !== undefined && (!Number.isSafeInteger(claims.request_deadline_ms) || claims.request_deadline_ms < 0))
       throw unauthorized('工作台请求期限无效')
