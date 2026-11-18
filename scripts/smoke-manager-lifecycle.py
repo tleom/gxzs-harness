@@ -22,6 +22,7 @@ prefix = 'gxzs-verify-' + uuid.uuid4().hex[:10]
 manager = prefix + '-manager'
 host_probe = prefix + '-host'
 host_home = prefix + '-host-home'
+owner = 'gxzs-1'
 token = secrets.token_hex(32)
 workspaces = [str(uuid.uuid4()), str(uuid.uuid4())]
 resource_args = []
@@ -163,7 +164,7 @@ try:
         output = docker('run', '--rm', '--network', 'container:' + manager, '--memory',
                         '1g' if phase == 'legacy-skill-json' else '512m', '--cpus', '1',
                         '--entrypoint', 'node', '-v', script + ':/smoke-streaming-files.mjs:ro',
-                        '-e', 'TEST_MANAGER_TOKEN=' + token, '-e', 'GXZS_HOST_OWNER_ID=fixture:1',
+                        '-e', 'TEST_MANAGER_TOKEN=' + token, '-e', 'GXZS_HOST_OWNER_ID=' + owner,
                         '-e', 'GXZS_HOST_GENERATION=1', '-e', 'GXZS_HOST_INSTANCE_ID=streaming-fixture',
                         host_image, '/smoke-streaming-files.mjs', workspaces[0], phase, check=False)
         if output.returncode:
@@ -336,14 +337,16 @@ server.STATE.mkdir(exist_ok=True)
 server.HOSTS.root=server.STATE/'hosts'
 folder=server.HOSTS.root/value['workspace']
 folder.mkdir(parents=True,exist_ok=True)
-(folder/'host.json').write_text(json.dumps({'workspace_id':value['workspace'], 'owner_id':'probe:1', 'home_volume':value['home']}))
+(folder/'host.json').write_text(json.dumps({
+    'workspace_id':value['workspace'], 'owner_id':value['owner'], 'home_volume':value['home'],
+}))
 server.identity=lambda _: (value['sandbox'], 'fixture-only-token')
 server.ensure_network=lambda _: value['network']
 server.ensure(value['workspace'])
 '''
     network = next(iter(before['NetworkSettings']['Networks']))
     docker('exec', '-i', manager, 'python', '-c', provision_home, stdin=json.dumps({
-        'workspace': workspaces[0], 'home': host_home, 'sandbox': fresh_sandbox, 'network': network}))
+        'workspace': workspaces[0], 'owner': owner, 'home': host_home, 'sandbox': fresh_sandbox, 'network': network}))
     docker('run', '--rm', '--network', 'none', '--user', '1000', '--entrypoint', 'node',
            '-v', host_home + ':/srv/dsh', host_image, '-e',
            "const fs=require('node:fs');if(fs.statSync('/srv/dsh').uid!==1000)throw Error('Host home is not owned by node');"
@@ -365,7 +368,7 @@ folder.mkdir(exist_ok=True)
 HOSTS._create_container(value['item'], folder, value['image'], 'none', [], PurePosixPath(value['state']))
 '''
         docker('exec', '-i', manager, 'python', '-c', create_host, stdin=json.dumps({
-            'item': {'instance_id': host_probe, 'owner_id': 'probe:1', 'workspace_id': workspaces[0],
+            'item': {'instance_id': host_probe, 'owner_id': owner, 'workspace_id': workspaces[0],
                      'generation': 1, 'home_volume': host_home}, 'image': host_image, 'state': host_state}))
         sandbox_mounts = json.loads(docker('inspect', prefix + '-' + workspaces[0]).stdout)[0]['Mounts']
         host_mounts = json.loads(docker('inspect', host_probe).stdout)[0]['Mounts']
