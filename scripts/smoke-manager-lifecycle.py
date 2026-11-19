@@ -364,7 +364,14 @@ from server import HOSTS
 value = json.load(sys.stdin)
 folder = Path('/tmp/host-workspace-probe')
 folder.mkdir(exist_ok=True)
-(folder / 'host.env').write_text('')
+(folder / 'host.env').write_text(''.join(
+    f'{key}={value["item"][field]}\\n' for key, field in (
+        ('GXZS_HOST_OWNER_ID', 'owner_id'),
+        ('GXZS_SANDBOX_WORKSPACE_ID', 'workspace_id'),
+        ('GXZS_HOST_GENERATION', 'generation'),
+        ('GXZS_HOST_INSTANCE_ID', 'instance_id'),
+    )
+))
 HOSTS._create_container(value['item'], folder, value['image'], 'none', [], PurePosixPath(value['state']))
 '''
         docker('exec', '-i', manager, 'python', '-c', create_host, stdin=json.dumps({
