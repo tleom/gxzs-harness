@@ -117,9 +117,8 @@ def prepare_upgrade(*, old_image, candidate_image, owner_id, home_volume,
     if inspect('image', candidate_image, run)['Id'] != candidate_image:
         raise ValueError('Candidate image identity does not match')
     volume = inspect('volume', home_volume, run)
-    if (volume.get('Name') != home_volume
-            or (volume.get('Labels') or {}).get('gxzs.owner') != owner_id):
-        raise ValueError('Home volume does not belong to this owner')
+    if volume.get('Name') != home_volume:
+        raise ValueError('Home volume identity changed')
     identity = {'owner_id': owner_id, 'workspace_id': workspace_id, 'generation': generation,
                 'instance_id': instance_id, 'image_digest': old_image, 'home_volume': home_volume}
     fence = manager_operation(manager_container, workspace_id, {
@@ -132,6 +131,8 @@ def prepare_upgrade(*, old_image, candidate_image, owner_id, home_volume,
             raise ValueError('Owner is not durably fenced for the requested original Host identity')
         return receipt
 
+    # Volume creation labels are immutable and survive an offline owner migration.
+    # The authenticated manager fence proves the current owner-to-volume binding.
     checked(fence)
     if run('ps', '--filter', 'volume=' + home_volume, '--format', '{{.ID}}').strip():
         raise ValueError('Stop and drain all containers using this owner home first')

@@ -23,6 +23,8 @@ python3 scripts/migrate_host_identity.py \
 
 迁移校验并停止清单中的旧 Host 与 Sandbox，备份其 SQLite 后迁移面向 owner 的管理记录、会话索引、任务、草稿和目录操作回执。脚本先归档这两类容器。新版宿主就绪后，管理器可清理归档名称和工作区匹配的旧 Sandbox 容器，关联卷仍保留。旧 Host 的原身份标签继续保存在归档容器中。原工作区 UUID、卷、消息、附件和计划序列继续可用。当前 Workbench SQLite 使用 schema 3。未结束的任务、无法确认的卷、记录冲突或 SQLite 版本差异会阻止迁移。
 
+已有 profile 基线证明也在这次离线迁移中校验、备份并改为新 owner；基线原文、镜像摘要、用户设置及文件权限保持不变。校验不通过会在停止容器或写入前退出。后续需要执行 `prepare-profile-upgrade.py` 时，使用迁移后的 owner 和 manager 记录；卷绑定由 manager 的持久维护凭据核验，保留卷上的创建标签不会阻断升级。已有 `profile_upgrade` 维护操作须先完成，再执行身份迁移。
+
 把备份目录生成的 `host-identity-manifest.json` 交给 GXZS `01_remove_business_tenant.sql` 使用。两个存储都完成迁移后启动新版 manager 和 GXZS，在维护窗口内按现有宿主替换流程递增代次并生成新版凭据，复核原工作区的历史会话、附件、计划以及新会话准入。若迁移中断，维持服务停止状态并使用原清单和备份目录继续。若已启动新版宿主，按切换验收排查其运行状态。
 
 ## 技能导入

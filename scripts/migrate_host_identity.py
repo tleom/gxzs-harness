@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -21,6 +22,8 @@ LEGACY_OWNER = re.compile(r'000000:([1-9][0-9]{0,18})')
 NAME = re.compile(r'[a-zA-Z0-9][a-zA-Z0-9_.-]{0,100}')
 CONTAINER_ID = re.compile(r'[0-9a-f]{64}')
 FIELDS = {'old_owner_id', 'new_owner_id', 'workspace_id', 'generation', 'instance_id'}
+BASELINE_PROOF = 'legacy-platform-baseline.json'
+BASELINE_PATCH = 'legacy-platform-baseline.patch.yml'
 
 
 def manifest_entries(path):
@@ -194,6 +197,29 @@ def readonly(path):
     return sqlite3.connect(path.as_uri() + '?mode=ro', uri=True)
 
 
+def profile_identity(home, entry):
+    """Validate the existing profile proof before handing its owner to the new identity."""
+    directory = home / 'profiles' / 'workbench'
+    if directory.resolve() != directory or (home / 'profiles').is_symlink():
+        raise ValueError('Profile directory is outside the registered home')
+    proof, baseline = directory / BASELINE_PROOF, directory / BASELINE_PATCH
+    if proof.is_symlink() or baseline.is_symlink():
+        raise ValueError('Profile baseline must not be a symbolic link')
+    if not proof.exists():
+        if baseline.exists():
+            raise ValueError('Profile baseline has no identity proof')
+        return None
+    metadata = json.loads(proof.read_text(encoding='utf-8'))
+    if (not isinstance(metadata, dict) or metadata.get('schemaVersion') != 1
+            or metadata.get('ownerId') not in (entry['old_owner_id'], entry['new_owner_id'])
+            or metadata.get('sourcePath') != '/opt/workbench/profiles/workbench/cordis.runtime.patch.yml'
+            or not re.fullmatch(r'sha256:[0-9a-f]{64}', str(metadata.get('imageId', '')))
+            or not baseline.is_file()
+            or sha256(baseline.read_bytes()).hexdigest() != metadata.get('baselineSha256')):
+        raise ValueError('Profile baseline identity or content is invalid')
+    return proof, dict(metadata, ownerId=entry['new_owner_id'])
+
+
 def backup(path, destination):
     if destination.is_symlink():
         raise ValueError('Backup destination is a symbolic link')
@@ -232,7 +258,8 @@ def migrate_admission(path, entries):
             db.execute('UPDATE task_admission SET owner=? WHERE owner=?', (entry['new_owner_id'],entry['old_owner_id']))
 
 
-def write_json(path, value):
+def write_json(path, value, preserve=False):
+    original = path.stat() if preserve else None
     with NamedTemporaryFile(dir=path.parent, delete=False) as handle:
         stage = Path(handle.name)
     try:
@@ -240,6 +267,10 @@ def write_json(path, value):
             json.dump(value, output, indent=2)
             output.flush()
             os.fsync(output.fileno())
+        if original is not None:
+            os.chmod(stage, original.st_mode)
+            if hasattr(os, 'chown'):
+                os.chown(stage, original.st_uid, original.st_gid)
         stage.replace(path)
     finally:
         stage.unlink(missing_ok=True)
@@ -277,6 +308,7 @@ def migrate(state, manager_name, prefix, entries, output, apply):
     for entry, plan in zip(entries,plans,strict=True):
         with closing(readonly(plan[2])) as db:
             verify_workbench(db, entry)
+        profile_identity(plan[2].parent, entry)
     outcomes = state/'mcp-outcomes.sqlite3'
     if outcomes.is_symlink():
         raise ValueError('Manager outcomes database is a symbolic link')
@@ -306,7 +338,7 @@ def migrate(state, manager_name, prefix, entries, output, apply):
         raise ValueError('Runtime stop could not be confirmed')
 
     backup(admission,output/'admission.sqlite3')
-    for record, desired, db, _, _ in plans:
+    for entry, (record, desired, db, _, _) in zip(entries, plans, strict=True):
         folder = output/desired['workspace_id']
         if folder.is_symlink():
             raise ValueError('Backup workspace is a symbolic link')
@@ -316,9 +348,20 @@ def migrate(state, manager_name, prefix, entries, output, apply):
             if original['owner_id'] != desired['owner_id']:
                 write_json(folder/'host.json',original)
         backup(db, folder/'workbench.sqlite3')
+        profile = profile_identity(db.parent, entry)
+        if profile:
+            for name in (BASELINE_PROOF, BASELINE_PATCH):
+                destination = folder / name
+                if destination.is_symlink():
+                    raise ValueError('Profile backup is a symbolic link')
+                if not destination.exists():
+                    shutil.copy2(profile[0].parent / name, destination)
     migrate_admission(admission,entries)
     for entry,(record,desired,db,_,items) in zip(entries,plans,strict=True):
         migrate_workbench(db,entry)
+        profile = profile_identity(db.parent, entry)
+        if profile and json.loads(profile[0].read_text(encoding='utf-8')) != profile[1]:
+            write_json(*profile, preserve=True)
         record.parent.mkdir(mode=0o750,parents=True,exist_ok=True)
         write_json(record,desired)
         for item in items:

@@ -164,3 +164,50 @@ def test_preflight_preserves_original_state(offline, tmp_path, case, reason):
     assert json.loads(record.read_text())['owner_id'] == OLD
     assert not output.exists()
     assert not [call for call in calls if call[0] in ('rename','stop')]
+
+
+def profile_fixture(database):
+    profile = database.parent / 'profiles' / 'workbench'
+    profile.mkdir(parents=True)
+    baseline = b'- id: generated-preset\n  disabled: true\n'
+    proof = dict(schemaVersion=1, ownerId=OLD, imageId='sha256:'+'1'*64,
+                 baselineSha256=hashlib.sha256(baseline).hexdigest(),
+                 sourcePath='/opt/workbench/profiles/workbench/cordis.runtime.patch.yml')
+    (profile/migration.BASELINE_PATCH).write_bytes(baseline)
+    (profile/migration.BASELINE_PROOF).write_text(json.dumps(proof))
+    (profile/'cordis.patch.yml').write_text('- id: user-setting\n')
+    return profile, proof
+
+
+def test_migrates_profile_proof_preserving_baseline_settings_permissions_and_backup(offline, tmp_path):
+    state, record, database, entry, containers, calls = offline
+    profile, original = profile_fixture(database)
+    proof = profile/migration.BASELINE_PROOF
+    before = proof.stat()
+    output = tmp_path/'separate-backup'
+    migration.migrate(state, 'fixture-manager', 'workspace-fixture', [entry], output, True)
+    assert json.loads(proof.read_text()) == dict(original, ownerId=NEW)
+    assert json.loads((output/WORKSPACE/migration.BASELINE_PROOF).read_text()) == original
+    assert (output/WORKSPACE/migration.BASELINE_PATCH).read_bytes() == (profile/migration.BASELINE_PATCH).read_bytes()
+    assert (proof.stat().st_uid, proof.stat().st_gid, proof.stat().st_mode) == (before.st_uid, before.st_gid, before.st_mode)
+    assert (profile/'cordis.patch.yml').read_text() == '- id: user-setting\n'
+    migration.migrate(state, 'fixture-manager', 'workspace-fixture', [entry], output, True)
+    assert json.loads((output/WORKSPACE/migration.BASELINE_PROOF).read_text()) == original
+
+
+@pytest.mark.parametrize('failure', ['owner', 'digest', 'missing-proof'])
+def test_rejects_unverified_profile_before_stopping_or_mutating(offline, tmp_path, failure):
+    state, record, database, entry, containers, calls = offline
+    profile, proof = profile_fixture(database)
+    if failure == 'owner':
+        proof['ownerId'] = '000000:43'
+    elif failure == 'digest':
+        proof['baselineSha256'] = '0'*64
+    (profile/migration.BASELINE_PROOF).write_text(json.dumps(proof))
+    if failure == 'missing-proof':
+        (profile/migration.BASELINE_PROOF).unlink()
+    output = tmp_path/'unused-backup'
+    with pytest.raises(ValueError, match='Profile baseline'):
+        migration.migrate(state, 'fixture-manager', 'workspace-fixture', [entry], output, True)
+    assert not output.exists() and json.loads(record.read_text())['owner_id'] == OLD
+    assert not [call for call in calls if call[0] in ('rename','stop')]
