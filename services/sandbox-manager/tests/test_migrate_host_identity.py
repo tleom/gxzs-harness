@@ -211,3 +211,58 @@ def test_rejects_unverified_profile_before_stopping_or_mutating(offline, tmp_pat
         migration.migrate(state, 'fixture-manager', 'workspace-fixture', [entry], output, True)
     assert not output.exists() and json.loads(record.read_text())['owner_id'] == OLD
     assert not [call for call in calls if call[0] in ('rename','stop')]
+
+
+def uncertain_outcomes(state):
+    path = state/'mcp-outcomes.sqlite3'
+    rows = [('call-completed', WORKSPACE, 'run-1', 1), ('call-deleted', WORKSPACE, 'deleted-run', 2)]
+    with closing(sqlite3.connect(path)) as db, db:
+        db.execute('CREATE TABLE unconfirmed_calls(call_id TEXT PRIMARY KEY, workspace TEXT, binding TEXT, started_at INTEGER)')
+        db.executemany('INSERT INTO unconfirmed_calls VALUES (?,?,?,?)', rows)
+    return path, rows
+
+
+def test_stopped_host_preserves_uncertain_completed_and_deleted_runs(offline, tmp_path):
+    state, record, database, entry, containers, calls = offline
+    outcomes, original = uncertain_outcomes(state)
+    before = outcomes.read_bytes()
+    for item in containers:
+        item['State']['Running'] = False
+    output = tmp_path/'separate-backup'
+    migration.migrate(state, 'fixture-manager', 'workspace-fixture', [entry], output, False)
+    assert not output.exists()
+    migration.migrate(state, 'fixture-manager', 'workspace-fixture', [entry], output, True)
+    assert outcomes.read_bytes() == before
+    for path in [outcomes, output/outcomes.name]:
+        with closing(sqlite3.connect(path)) as db:
+            assert db.execute('SELECT * FROM unconfirmed_calls ORDER BY started_at').fetchall() == original
+    with closing(sqlite3.connect(database)) as db:
+        assert db.execute('SELECT owner_id,status FROM runs').fetchone() == (NEW, 'completed')
+    migration.migrate(state, 'fixture-manager', 'workspace-fixture', [entry], output, True)
+    assert outcomes.read_bytes() == before
+
+
+@pytest.mark.parametrize('live', ['host', 'sandbox', 'admission', 'queued', 'running', 'waiting_input', 'stopping'])
+def test_uncertain_outcome_does_not_allow_active_execution(offline, tmp_path, live):
+    state, record, database, entry, containers, calls = offline
+    outcomes, _ = uncertain_outcomes(state)
+    before = outcomes.read_bytes()
+    for item in containers:
+        item['State']['Running'] = False
+    if live in {'host','sandbox'}:
+        containers[1 if live == 'host' else 2]['State']['Running'] = True
+        reason = 'Stop Host and Sandbox'
+    elif live == 'admission':
+        with closing(sqlite3.connect(state/'admission.sqlite3')) as db, db:
+            db.execute("UPDATE task_admission SET state='running'")
+        reason = 'Drain active manager admission'
+    else:
+        with closing(sqlite3.connect(database)) as db, db:
+            db.execute('UPDATE runs SET status=?', (live,))
+        reason = 'Drain active Workbench runs'
+    output = tmp_path/'unused-backup'
+    with pytest.raises(ValueError, match=reason):
+        migration.migrate(state, 'fixture-manager', 'workspace-fixture', [entry], output, True)
+    assert not output.exists() and outcomes.read_bytes() == before
+    assert json.loads(record.read_text())['owner_id'] == OLD
+    assert not [call for call in calls if call[0] in ('rename','stop')]

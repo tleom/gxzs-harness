@@ -314,9 +314,14 @@ def migrate(state, manager_name, prefix, entries, output, apply):
         raise ValueError('Manager outcomes database is a symbolic link')
     if outcomes.is_file():
         with closing(readonly(outcomes)) as db:
-            if any(db.execute('SELECT 1 FROM unconfirmed_calls WHERE workspace=? LIMIT 1', (workspace,)).fetchone()
-                   for workspace in pending):
-                raise ValueError('Confirm outstanding tool stops before migration')
+            for entry, plan in zip(entries, plans, strict=True):
+                if (db.execute('SELECT 1 FROM unconfirmed_calls WHERE workspace=? LIMIT 1',
+                               (entry['workspace_id'],)).fetchone()
+                        and any(item['State']['Running'] for item in plan[4])):
+                    raise ValueError('Stop Host and Sandbox before preserving historical MCP uncertainty')
+        # These markers record uncertain effects, including completed or deleted
+        # runs. Stopping execution cannot confirm those effects. Keep the markers
+        # unchanged: their workspace and binding identities survive this migration.
     if not apply:
         print(f'Validated {len(plans)} host mappings without changing them.')
         return
@@ -338,6 +343,8 @@ def migrate(state, manager_name, prefix, entries, output, apply):
         raise ValueError('Runtime stop could not be confirmed')
 
     backup(admission,output/'admission.sqlite3')
+    if outcomes.is_file():
+        backup(outcomes, output/'mcp-outcomes.sqlite3')
     for entry, (record, desired, db, _, _) in zip(entries, plans, strict=True):
         folder = output/desired['workspace_id']
         if folder.is_symlink():
