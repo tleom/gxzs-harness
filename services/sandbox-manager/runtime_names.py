@@ -3,20 +3,29 @@ import os
 import re
 
 
+OWNER_ID = re.compile(r'gxzs-(?P<user_id>[1-9][0-9]{0,18})')
+MAX_USER_ID = 2**63 - 1
+
+
+def match_owner_id(owner):
+    if not isinstance(owner, str):
+        return None
+    match = OWNER_ID.fullmatch(owner)
+    if match and int(match['user_id']) <= MAX_USER_ID:
+        return match
+    return None
+
+
 def account_names(owner, account):
     if account is None:
         return {}
-    tenant, user = owner.split(':', 1)
-    if not user.isdecimal() or not isinstance(account, str) or not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_-]{0,29}', account):
+    identity = match_owner_id(owner)
+    if not identity or not isinstance(account, str) or not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_-]{0,29}', account):
         raise ValueError('Invalid runtime account name')
     prefix = os.environ.get('GXZS_RUNTIME_PREFIX', 'gxzs')
     if not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,19}', prefix):
         raise ValueError('Invalid runtime container prefix')
-    if not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_-]{0,19}', tenant):
-        raise ValueError('Invalid runtime account tenant')
-    # A dot cannot occur in either identifier, so tenant boundaries cannot
-    # collide with a default-tenant account such as "000001-admin".
-    suffix = account.lower() if tenant == '000000' else tenant.lower() + '.' + account.lower()
+    suffix = account.lower()
     names = {'account_name': account, 'container_name': prefix + '-host-' + suffix,
              'sandbox_name': prefix + '-sandbox-' + suffix}
     if any(len(names[key]) > 63 for key in ('container_name', 'sandbox_name')):

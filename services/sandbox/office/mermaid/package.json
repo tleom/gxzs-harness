@@ -3,10 +3,11 @@
   "version": "1.0.0",
   "private": true,
   "dependencies": {
-    "@mermaid-js/mermaid-cli": "11.17.0"
+    "@mermaid-js/mermaid-cli": "12.2.0"
   },
   "overrides": {
-    "dompurify": "3.4.16",
+    "dompurify": "3.4.17",
+    "mermaid": "12.3.0",
     "katex": "0.18.7"
   }
 }

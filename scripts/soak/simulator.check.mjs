@@ -58,7 +58,7 @@ test('synthetic platform forwards the manager-owned MCP policy after authenticat
   t.after(async () => { manager.closeAllConnections(); await new Promise(resolve => manager.close(resolve)) })
   const output = await mkdtemp(path.join(os.tmpdir(), 'gxzs-sim-platform-'))
   t.after(() => rm(output, { recursive: true }))
-  const owner = 'soak1017:910001', instance = 'fixture-instance'
+  const owner = 'gxzs-910001', instance = 'fixture-instance'
   await writeFile(path.join(output, 'bindings.json'), JSON.stringify([{ owner_id: owner, workspace_id: 'fixture-workspace', generation: 1, instance_id: instance }]))
   const config = path.join(output, 'config.json')
   await writeFile(config, JSON.stringify({ token, output, host: '127.0.0.1', port: 0,

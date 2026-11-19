@@ -32,7 +32,7 @@ const result = spawnSync(cli, ['--profile', 'workbench', '--dump-config'], {
     DSH_HOME: home,
     DSH_TELEMETRY_DISABLED: '1',
     GXZS_ASSERTION_ISSUER: 'config-check',
-    GXZS_HOST_OWNER_ID: 'config-check:1',
+    GXZS_HOST_OWNER_ID: 'gxzs-1',
     GXZS_HOST_GENERATION: '1',
     GXZS_HOST_INSTANCE_ID: 'config-check-host-1',
     GXZS_SANDBOX_MANAGER_URL: 'http://sandbox-manager.internal:5010',

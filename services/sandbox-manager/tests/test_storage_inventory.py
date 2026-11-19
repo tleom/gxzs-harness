@@ -18,11 +18,11 @@ WORKSPACE = '11111111-1111-4111-8111-111111111111'
 SECOND = '22222222-2222-4222-8222-222222222222'
 
 
-def fixture_state(tmp_path):
+def fixture_state(tmp_path, owner_id='gxzs-123'):
     state = tmp_path / 'state'
     host = state / 'hosts' / WORKSPACE
     host.mkdir(parents=True)
-    record = dict(owner_id='000000:123', workspace_id=WORKSPACE, home_volume='old-host-home',
+    record = dict(owner_id=owner_id, workspace_id=WORKSPACE, home_volume='old-host-home',
                   sandbox_name='friendly-container', sandbox_volume_prefix='immutable-workspace')
     (host / 'host.json').write_text(json.dumps(record))
     (state / 'shared.sqlite3').write_bytes(b'shared')
@@ -45,13 +45,15 @@ def fixture_state(tmp_path):
     return state, volumes, calls, collect
 
 
-def test_inventory_uses_persistent_storage_identity_and_counts_each_mount_once(tmp_path):
-    state, volumes, calls, collect = fixture_state(tmp_path)
+@pytest.mark.parametrize('owner_id', ['gxzs-123', 'gxzs-123'])
+def test_inventory_uses_persistent_storage_identity_and_counts_each_mount_once(tmp_path, owner_id):
+    state, volumes, calls, collect = fixture_state(tmp_path, owner_id=owner_id)
     before = {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in tmp_path.rglob('*') if p.is_file()}
     result = collect()
     assert result['status'] == 'complete'
     assert len(calls) == 4
     assert len(result['roots']) == 6
+    assert result['owners'][0]['owner_id'] == owner_id
     assert result['owners'][0]['observed_counts']['apparent_bytes'] == 40 + len((state / 'hosts' / WORKSPACE / 'host.json').read_bytes())
     shared = next(r for r in result['roots'] if r['category'] == 'manager_shared_state')
     assert shared['counts']['apparent_bytes'] == 6
@@ -131,7 +133,7 @@ def test_duplicate_owner_volume_binding_is_not_double_counted(tmp_path):
     other = state / 'hosts' / SECOND
     other.mkdir()
     record = json.loads((state / 'hosts' / WORKSPACE / 'host.json').read_text())
-    record.update(owner_id='000000:456', workspace_id=SECOND)
+    record.update(owner_id='gxzs-456', workspace_id=SECOND)
     (other / 'host.json').write_text(json.dumps(record))
     result = collect(workspaces=[WORKSPACE, SECOND])
     assert result['status'] == 'partial'

@@ -1,6 +1,11 @@
 packages:
   - packages/*
 
+overrides:
+  '@modelcontextprotocol/client@2.2.0': 2.3.0
+  'undici@8.11.2': 8.12.2
+  'zod@^4': 4.6.7
+
 allowBuilds:
   '@deepseek-ai/dsh-subprocess-local': true
   esbuild: true

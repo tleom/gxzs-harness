@@ -38,6 +38,8 @@ class DockerFixture:
         self.calls = []
         self.writes = []
         self.owner = 'tenant:1'
+        self.volume_owner = None
+        self.bound_volume = 'test-home'
         self.running = b''
         self.container_image = OLD
         self.content = archive()
@@ -50,7 +52,7 @@ class DockerFixture:
         if args[:2] == ('image', 'inspect'):
             return json.dumps([{'Id': args[2]}]).encode()
         if args[:2] == ('volume', 'inspect'):
-            return json.dumps([{'Name': 'test-home', 'Labels': {'gxzs.owner': self.owner}}]).encode()
+            return json.dumps([{'Name': 'test-home', 'Labels': {'gxzs.owner': self.volume_owner or self.owner}}]).encode()
         if args[:2] == ('container', 'inspect'):
             return json.dumps([{'Image': self.container_image}]).encode()
         if args[0] == 'ps':
@@ -65,7 +67,7 @@ class DockerFixture:
             return json.dumps({'fenced': self.fenced, 'phase': 'prepared' if self.completed else 'preparing',
                                'token': 'fixture-fence', 'owner_id': self.owner, 'workspace_id': WORKSPACE,
                                'generation': 1, 'instance_id': 'old-host', 'image_digest': OLD,
-                               'home_volume': 'test-home'}).encode()
+                               'home_volume': self.bound_volume}).encode()
         if args[0] == 'create':
             if '--name' in args:
                 assert NEW in args
@@ -91,16 +93,18 @@ class DockerFixture:
         raise AssertionError(args)
 
 
-def prepare(run, **kwargs):
+def prepare(run, owner_id='tenant:1', **kwargs):
     return upgrade.prepare_upgrade(old_image=OLD, candidate_image=NEW,
-                                   owner_id='tenant:1', home_volume='test-home', workspace_id=WORKSPACE,
+                                   owner_id=owner_id, home_volume='test-home', workspace_id=WORKSPACE,
                                    generation=1, instance_id='old-host', run=run, **kwargs)
 
 
-def test_extracts_runtime_and_actual_image_as_one_source_before_seeding():
+@pytest.mark.parametrize('owner_id', ['tenant:1', 'gxzs-1'])
+def test_extracts_runtime_and_actual_image_as_one_source_before_seeding(owner_id):
     run = DockerFixture()
-    receipt = prepare(run)
-    assert run.writes == [{'ownerId': 'tenant:1', 'imageId': OLD, 'baseline': BASELINE,
+    run.owner = owner_id
+    receipt = prepare(run, owner_id=owner_id)
+    assert run.writes == [{'ownerId': owner_id, 'imageId': OLD, 'baseline': BASELINE,
                           'baselineSha256': hashlib.sha256(BASELINE.encode()).hexdigest()}]
     assert receipt['imageId'] == OLD
     candidate_create = next(i for i, call in enumerate(run.calls) if call[0] == 'create' and '--name' in call)
@@ -110,11 +114,13 @@ def test_extracts_runtime_and_actual_image_as_one_source_before_seeding():
     assert run.calls[-2][0:2] == ('rm', '-f')
 
 
-@pytest.mark.parametrize('failure', ['foreign-owner', 'active-home', 'mismatched-image', 'static-patch', 'symlink'])
+@pytest.mark.parametrize('failure', ['foreign-owner', 'foreign-volume', 'active-home', 'mismatched-image', 'static-patch', 'symlink'])
 def test_rejects_unsafe_provenance_or_home_before_any_owner_write(failure):
     run = DockerFixture()
     if failure == 'foreign-owner':
         run.owner = 'tenant:2'
+    elif failure == 'foreign-volume':
+        run.bound_volume = 'another-home'
     elif failure == 'active-home':
         run.running = b'live-host\n'
     elif failure == 'mismatched-image':
@@ -128,6 +134,13 @@ def test_rejects_unsafe_provenance_or_home_before_any_owner_write(failure):
     assert not run.writes
     if any(call[0] == 'create' for call in run.calls):
         assert run.calls[-1] == ('rm', CONTAINER)
+
+
+def test_migrated_owner_uses_verified_manager_binding_with_original_volume_label():
+    run = DockerFixture()
+    run.owner, run.volume_owner = 'gxzs-1', '000000:1'
+    prepare(run, owner_id='gxzs-1')
+    assert run.completed and run.writes[0]['ownerId'] == 'gxzs-1'
 
 
 def test_rejects_mutable_image_tags_and_does_not_accept_a_caller_baseline():

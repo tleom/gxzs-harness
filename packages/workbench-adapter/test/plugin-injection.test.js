@@ -7,10 +7,12 @@ afterEach(async () => { for (const ctx of contexts.splice(0)) await ctx.fiber.di
 
 it('activates with the published Cordis service dependencies without the optional client catalog', async () => {
   const ctx = new Context(); contexts.push(ctx)
-  const apply = vi.fn(scope => {
+  const applied = vi.fn()
+  const apply = scope => {
     for (const name of inject) expect(scope[name]).toBe(ctx[name])
     expect(scope.get('clientModules')).toBeUndefined()
-  })
+    applied()
+  }
   const services = [...inject]
   expect(services).not.toContain('required')
   expect(services).not.toContain('optional')
@@ -19,8 +21,8 @@ it('activates with the published Cordis service dependencies without the optiona
   for (const name of services) ctx.provide(name, { name })
   const probe = ctx.plugin({ name: 'workbench-injection-probe', inject, apply })
   await new Promise(resolve => setTimeout(resolve, 0))
-  expect(apply).not.toHaveBeenCalled()
+  expect(applied).not.toHaveBeenCalled()
   await ctx.plugin({ name: 'final-required-service', apply: scope => { scope.provide(finalService, { name: finalService }) } })
   await probe.await()
-  await vi.waitFor(() => expect(apply).toHaveBeenCalledOnce())
+  await vi.waitFor(() => expect(applied).toHaveBeenCalledOnce())
 })

@@ -18,7 +18,7 @@ from urllib.request import Request, build_opener, ProxyHandler
 from urllib.error import HTTPError, URLError
 from http.client import IncompleteRead
 from owner_auth import owner_token, assertion_key
-from runtime_names import account_names, host_name, volume_prefix
+from runtime_names import account_names, host_name, match_owner_id, volume_prefix
 from global_skills import mount_arguments as global_skill_mounts, matches_mount, native_root
 
 IDLE_TIMEOUT_SECONDS = 2 * 60 * 60
@@ -101,9 +101,9 @@ class Hosts:
         instance = payload['instance_id']
         generation = int(payload['generation'])
         scheduled_wakeup = payload.get('scheduled_wakeup') is True
-        names = account_names(owner, payload.get('account_name'))
-        if not re.fullmatch(r'[^:\s/]+:\d+', owner) or not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_.-]{0,100}', instance) or generation < 1:
+        if not match_owner_id(owner) or not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_.-]{0,100}', instance) or generation < 1:
             raise ValueError('Invalid host identity')
+        names = account_names(owner, payload.get('account_name'))
         record = self.root / workspace / 'host.json'
         with self.lock(workspace):
             self._retry_mcp_fence(record)
@@ -338,6 +338,12 @@ class Hosts:
         env_file = folder / 'host.env'
         if not env_file.exists():
             raise ValueError('Host runtime configuration is missing; replacement is required')
+        environment = dict(line.split('=', 1) for line in env_file.read_text(encoding='utf-8').splitlines()
+                           if '=' in line)
+        expected = {'GXZS_HOST_OWNER_ID': item['owner_id'], 'GXZS_SANDBOX_WORKSPACE_ID': item['workspace_id'],
+                    'GXZS_HOST_GENERATION': str(item['generation']), 'GXZS_HOST_INSTANCE_ID': item['instance_id']}
+        if any(environment.get(key) != value for key, value in expected.items()):
+            raise ValueError('Host runtime configuration identity changed; ensure the current generation first')
         memory = os.environ.get('GXZS_HOST_MEMORY', '1g')
         font_root = os.environ.get('GXZS_HOST_FONTS_DIR', '')
         font_mount = []
@@ -984,32 +990,11 @@ class Hosts:
     def schedule(self, workspace, payload):
         with self.lock(workspace):
             record = self.root / workspace / 'host.json'
-            info = None
-            managed = record.exists()
-            if managed:
-                item = json.loads(record.read_text())
-            else:
-                # Migrated hosts were registered by the platform before Hosts
-                # owned provisioning. Verify their actual container binding;
-                # do not enroll them into automatic restart/idle shutdown.
-                instance = payload['instance_id']
-                if not re.fullmatch(r'gxzs-migration-host-\d+', instance):
-                    raise ValueError('Scheduling host is not registered')
-                result = self.docker('inspect', instance, check=False)
-                if result.returncode:
-                    raise ValueError('Scheduling host is not registered')
-                info = json.loads(result.stdout)[0]
-                env = dict(value.split('=', 1) for value in info['Config'].get('Env', []) if '=' in value)
-                expected = {
-                    'GXZS_HOST_OWNER_ID': payload['owner_id'],
-                    'GXZS_HOST_GENERATION': str(int(payload['generation'])),
-                    'GXZS_HOST_INSTANCE_ID': instance,
-                    'GXZS_SANDBOX_WORKSPACE_ID': workspace,
-                }
-                if any(env.get(key) != value for key, value in expected.items()):
-                    raise ValueError('Scheduling host identity mismatch')
-                item = dict(owner_id=payload['owner_id'], generation=int(payload['generation']), instance_id=instance)
-            if (item['owner_id'], item['generation'], item['instance_id']) != (payload['owner_id'], int(payload['generation']), payload['instance_id']):
+            if not record.exists():
+                raise ValueError('Scheduling host is not registered')
+            item = json.loads(record.read_text())
+            if (not match_owner_id(item['owner_id']) or (item['owner_id'], item['generation'], item['instance_id'])
+                    != (payload['owner_id'], int(payload['generation']), payload['instance_id'])):
                 raise ValueError('Scheduling host identity mismatch')
             if item.get('mcp_fence_pending') and payload['action'] == 'acquire':
                 raise ResourceUnavailable('个人工作环境正在完成工具回收，请稍后重试', 'MCP_FENCE_PENDING', 2)
@@ -1022,12 +1007,11 @@ class Hosts:
             if item.get('state') in {'draining', 'fencing', 'stopped'} and payload['action'] == 'acquire' and not draining_ticket:
                 raise ValueError('Host is draining; new task admission is paused')
             if payload['action'] != 'release':
-                if info is None:
-                    info = json.loads(self.docker('inspect', host_name(item)).stdout)[0]
+                info = json.loads(self.docker('inspect', host_name(item)).stdout)[0]
                 self._verify_named_container(item, info)
                 if not info['State']['Running']:
                     raise ValueError('Scheduling host is stopped')
-            if managed and payload['action'] == 'acquire' and item.get('ready') is not True and not draining_ticket:
+            if payload['action'] == 'acquire' and item.get('ready') is not True and not draining_ticket:
                 raise ResourceUnavailable('个人工作环境正在恢复，任务等待准入', 'HOST_NOT_READY', 2)
             if payload['action'] == 'acquire':
                 assert_storage_writable(self.root)

@@ -3,7 +3,7 @@ import { publishedGlobalSkills } from '@gxzs/dsh-workbench-sandbox-skills/global
 import { dirname } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { storageStatus, assertStorageWritable } from './storage-pressure.js'
-import { AssertionVerifier } from './assertion.js'
+import { AssertionVerifier, userIdForOwner } from './assertion.js'
 import { spoolUpload } from './upload.js'
 import { createReadStream } from 'node:fs'
 import { Readable } from 'node:stream'
@@ -445,10 +445,13 @@ export function apply(ctx, config) {
         if(!abort.signal.aborted) sendJson(res,200,{data})
       } finally {res.off('close',disconnected)}
     }],
-    ['GET', /^\/identity$/, async ({ owner }, res) => sendJson(res, 200, {
-      user: { id: owner.userId, name: owner.name, email: '' }, workspaceId: owner.tenantId,
-      workspaces: [{ id: owner.tenantId, name: owner.tenantId, current: true }],
-    })],
+    ['GET', /^\/identity$/, async ({ owner }, res) => {
+      const workspaceId = ctx.workbenchFileManager.workspaceId
+      sendJson(res, 200, {
+        user: { id: owner.userId, name: owner.name, email: '' }, workspaceId,
+        workspaces: [{ id: workspaceId, name: '工作台', current: true }],
+      })
+    }],
     ['GET', /^\/catalog$/, async ({ owner, url }, res) => sendJson(res, 200, { data: await buildCatalog(owner, url.searchParams.get('view') === 'models', url.searchParams.get('chat_id')) })],
     ['GET', /^\/native\/settings$/, async (_context, res) => sendJson(res, 200, { data: subagentSettings.describe() })],
     ['POST', /^\/native\/settings\/mutate$/, async ({ owner, body }, res) => sendJson(res, 200, { data: await subagentSettings.mutate(owner, parseJson(body)) })],
@@ -907,7 +910,7 @@ export function apply(ctx, config) {
             method: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'].includes(req.method) ? req.method : 'OTHER',
             status: failure.status, code: failure.status === 500 ? 'INTERNAL_ERROR' : `HTTP_${failure.status}`,
             error_type: ['Error', 'TypeError', 'RangeError', 'SyntaxError', 'AbortError', 'TimeoutError'].includes(error?.name) ? error.name : 'Error',
-            owner_id: /^[a-zA-Z0-9_-]{1,64}:[0-9]{1,64}$/.test(config.ownerId) ? config.ownerId : 'configured-owner',
+            owner_id: userIdForOwner(config.ownerId) ? config.ownerId : 'configured-owner',
             ...(Number.isSafeInteger(generation) && generation > 0 ? { generation } : {}),
             suppressed: diagnosticSuppressed }
           diagnosticSuppressed = 0

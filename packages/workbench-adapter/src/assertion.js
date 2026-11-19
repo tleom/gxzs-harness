@@ -1,6 +1,14 @@
 import { createHash, createHmac, timingSafeEqual } from 'node:crypto'
 
-const REQUIRED = ['iss', 'aud', 'sub', 'tenant_id', 'user_id', 'iat', 'exp', 'jti', 'method', 'target', 'body_sha256', 'content_type', 'last_event_id']
+const REQUIRED = ['iss', 'aud', 'sub', 'user_id', 'iat', 'exp', 'jti', 'method', 'target', 'body_sha256', 'content_type', 'last_event_id']
+const MAX_USER_ID = 9223372036854775807n
+
+export function userIdForOwner(ownerId) {
+  if (typeof ownerId !== 'string') return undefined
+  const match = /^gxzs-([1-9][0-9]{0,18})$/.exec(ownerId)
+  if (!match || match[0] !== ownerId || BigInt(match[1]) > MAX_USER_ID) return undefined
+  return match[1]
+}
 
 export class AssertionVerifier {
   constructor({ issuer, audience = 'agent-workbench', signingKey, clockSkewSeconds = 5, replayCache, now = () => Math.floor(Date.now() / 1000) }) {
@@ -45,7 +53,9 @@ export class AssertionVerifier {
     for (const [name, value] of Object.entries(expectedClaims))
       if (claims[name] !== value) throw unauthorized(`工作台身份断言未绑定当前请求：${name}`)
 
-    if (claims.sub !== `${claims.tenant_id}:${claims.user_id}`) throw unauthorized('工作台身份断言主体无效')
+    const userId = userIdForOwner(claims.sub)
+    if (!userId || claims.user_id !== userId || claims.tenant_id !== undefined)
+      throw unauthorized('工作台身份断言主体无效')
     if (claims.request_deadline_ms !== undefined && (!Number.isSafeInteger(claims.request_deadline_ms) || claims.request_deadline_ms < 0))
       throw unauthorized('工作台请求期限无效')
     if (this.replayCache.consume(claims.jti, claims.exp + this.clockSkewSeconds, now) === false) throw unauthorized('工作台身份断言已被使用')
@@ -54,8 +64,7 @@ export class AssertionVerifier {
         if (digest !== claims.body_sha256) throw unauthorized('工作台身份断言未绑定当前请求：body_sha256')
       } } : {}),
       ownerId: claims.sub,
-      tenantId: String(claims.tenant_id),
-      userId: String(claims.user_id),
+      userId,
       name: typeof claims.name === 'string' ? claims.name : '',
       ...(claims.request_deadline_ms === undefined ? {} : { deadlineMs: claims.request_deadline_ms }),
     }

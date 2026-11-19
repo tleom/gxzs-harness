@@ -52,9 +52,9 @@ def manager(path,body=None):
 def bindings():
  return {row['owner_id']:row for row in json.loads((root/'output/bindings.json').read_text())}
 def signed(row,method,path,body=None,timeout=45):
- raw=b'' if body is None else json.dumps(body).encode();now=int(time.time());owner=row['owner_id'];tenant,user=owner.split(':')
+ raw=b'' if body is None else json.dumps(body).encode();now=int(time.time());owner=row['owner_id'];user=owner.removeprefix('gxzs-')
  key=hmac.new(base64.b64decode(config['assertionKey']),f"assertion\n{owner}\n{row['generation']}\n{row['instance_id']}".encode(),hashlib.sha256).digest()
- claims={'iss':'gxzs-simulator','aud':'agent-workbench','sub':owner,'tenant_id':tenant,'user_id':user,'name':'synthetic-owner','iat':now,'exp':now+60,'jti':str(uuid.uuid4()),'method':method,'target':'/ai/workbench'+path,'body_sha256':hashlib.sha256(raw).hexdigest(),'content_type':'application/json' if body is not None else '', 'last_event_id':''}
+ claims={'iss':'gxzs-simulator','aud':'agent-workbench','sub':owner,'user_id':user,'name':'synthetic-owner','iat':now,'exp':now+60,'jti':str(uuid.uuid4()),'method':method,'target':'/ai/workbench'+path,'body_sha256':hashlib.sha256(raw).hexdigest(),'content_type':'application/json' if body is not None else '', 'last_event_id':''}
  encode=lambda value:base64.urlsafe_b64encode(value).decode().rstrip('=')
  message=encode(json.dumps({'alg':'HS256','typ':'JWT'}).encode())+'.'+encode(json.dumps(claims).encode())
  token=message+'.'+encode(hmac.new(key,message.encode(),hashlib.sha256).digest())
@@ -113,7 +113,7 @@ else:
  if args.action=='owners':
   assert 1<=args.owners<=30
   def ensure(index):
-   owner='soak1017:'+str(910000+index);workspace=str(uuid.uuid5(uuid.NAMESPACE_DNS,config['prefix']+':'+owner));instance=config['prefix']+'-host-'+str(index)
+   owner='gxzs-'+str(910000+index);workspace=str(uuid.uuid5(uuid.NAMESPACE_DNS,config['prefix']+':'+owner));instance=config['prefix']+'-host-'+str(index)
    payload={'owner_id':owner,'generation':1,'instance_id':instance,'assertion_issuer':'gxzs-simulator','assertion_key':config['assertionKey'],'platform_token':config['token'],'image_digest':config['images']['host']}
    if config.get('accountNames'):payload['account_name']='00066943' if index==1 else 'admin' if index==2 else 'soak_'+str(index)
    row=manager('/sandboxes/'+workspace+'/ensure-host',payload)

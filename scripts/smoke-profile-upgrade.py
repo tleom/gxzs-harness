@@ -36,7 +36,7 @@ const expected=await readFile('/opt/workbench/profiles/workbench/cordis.runtime.
 const proof=JSON.parse(await readFile(directory+'/legacy-platform-baseline.json','utf8'));
 assert.equal(await readFile(directory+'/legacy-platform-baseline.patch.yml','utf8'),expected);
 assert.equal(proof.sourcePath,'/opt/workbench/profiles/workbench/cordis.runtime.patch.yml');
-const result=await migratePlatformPatch(directory,{ownerId:'profile-smoke:1'});
+const result=await migratePlatformPatch(directory,{ownerId:process.argv[1]});
 assert.equal(result.retained,1); assert.ok(result.removed>0);
 assert.equal(await readFile(directory+'/.cordis.patch.before-bundle-layout-v1.yml','utf8'),original);
 assert.match(await readFile(directory+'/cordis.patch.yml','utf8'),/owner-kept/);
@@ -72,7 +72,10 @@ def main(image, manager_image):
     workspace = str(uuid.uuid4())
     old_host = 'gxzs-profile-upgrade-old-' + uuid.uuid4().hex
     manager = 'gxzs-profile-upgrade-manager-' + uuid.uuid4().hex
-    upgrade.docker('volume', 'create', '--label', 'gxzs.owner=profile-smoke:1', volume)
+    owner = 'gxzs-1'
+    binding = {'owner_id': owner, 'generation': 1, 'instance_id': old_host}
+    owner_label = 'gxzs.owner=' + owner
+    upgrade.docker('volume', 'create', '--label', owner_label, volume)
     upgrade.docker('volume', 'create', state)
     mount = 'type=volume,source=' + volume + ',destination=/srv/dsh'
     state_mount = 'type=volume,source=' + state + ',destination=/state'
@@ -80,11 +83,10 @@ def main(image, manager_image):
         upgrade.docker('run', '--rm', '--network', 'none', '--user', '0:0', '--mount', mount,
                        '--entrypoint', 'node', pinned, '-e', INITIALIZE)
         upgrade.docker('create', '--name', old_host, '--network', 'none', '--mount', mount,
-                       '--label', 'gxzs.owner=profile-smoke:1', '--label', 'gxzs.workspace=' + workspace,
+                       '--label', owner_label, '--label', 'gxzs.workspace=' + workspace,
                        '--label', 'gxzs.generation=1', '--label', 'gxzs.credentials=owner-v1',
                        '--entrypoint', '/bin/true', pinned)
-        record = {'owner_id': 'profile-smoke:1', 'workspace_id': workspace, 'generation': 1,
-                  'instance_id': old_host, 'image_digest': pinned, 'desired_image_digest': pinned,
+        record = {**binding, 'workspace_id': workspace, 'image_digest': pinned, 'desired_image_digest': pinned,
                   'home_volume': volume, 'state': 'stopped', 'ready': False}
         upgrade.docker('run', '--rm', '-i', '--network', 'none', '--mount', state_mount,
                        '--entrypoint', 'python', manager_pinned, '-I', '-S', '-c', STATE,
@@ -103,9 +105,8 @@ def main(image, manager_image):
                 if attempt == 49:
                     raise
                 time.sleep(0.2)
-        arguments = {'old_image': pinned, 'candidate_image': pinned, 'owner_id': 'profile-smoke:1',
-                     'home_volume': volume, 'workspace_id': workspace, 'generation': 1,
-                     'instance_id': old_host, 'manager_container': manager}
+        arguments = {**binding, 'old_image': pinned, 'candidate_image': pinned,
+                     'home_volume': volume, 'workspace_id': workspace, 'manager_container': manager}
         try:
             upgrade.prepare_upgrade(**arguments, user='0:0')
             raise AssertionError('Wrong UID:GID must not prepare a proof')
@@ -140,11 +141,11 @@ def main(image, manager_image):
         first = upgrade.prepare_upgrade(**arguments)
         assert upgrade.prepare_upgrade(**arguments) == first
         upgrade.docker('exec', '-i', manager, '/usr/local/bin/python', '-I', '-S', '-c', ENSURE, workspace,
-                       stdin=json.dumps({'owner_id': 'profile-smoke:1', 'generation': 1, 'instance_id': old_host}).encode())
+                       stdin=json.dumps(binding).encode())
         assert upgrade.inspect('container', old_host, upgrade.docker)['State']['Running'] is False
         result = json.loads(upgrade.docker('run', '--rm', '--network', 'none', '--user', '1000:1000',
                                           '--mount', mount, '--entrypoint', 'node', pinned,
-                                          '--input-type=module', '-e', VERIFY))
+                                          '--input-type=module', '-e', VERIFY, owner))
         assert result['baselineSha256'] == first['baselineSha256']
         print(json.dumps({'check': 'immutable-image-profile-upgrade', 'imageId': pinned,
                           'sourcePath': upgrade.RUNTIME_PATCH, **result, 'originalAndCredentialsPreserved': True,
