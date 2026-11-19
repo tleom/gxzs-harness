@@ -338,6 +338,12 @@ class Hosts:
         env_file = folder / 'host.env'
         if not env_file.exists():
             raise ValueError('Host runtime configuration is missing; replacement is required')
+        environment = dict(line.split('=', 1) for line in env_file.read_text(encoding='utf-8').splitlines()
+                           if '=' in line)
+        expected = {'GXZS_HOST_OWNER_ID': item['owner_id'], 'GXZS_SANDBOX_WORKSPACE_ID': item['workspace_id'],
+                    'GXZS_HOST_GENERATION': str(item['generation']), 'GXZS_HOST_INSTANCE_ID': item['instance_id']}
+        if any(environment.get(key) != value for key, value in expected.items()):
+            raise ValueError('Host runtime configuration identity changed; ensure the current generation first')
         memory = os.environ.get('GXZS_HOST_MEMORY', '1g')
         font_root = os.environ.get('GXZS_HOST_FONTS_DIR', '')
         font_mount = []

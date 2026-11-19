@@ -594,6 +594,69 @@ def upgrade_setup(tmp_path, monkeypatch):
     return host, docker, payload, containers, record, begin
 
 
+def test_failed_replacement_cannot_recover_with_old_env_and_retry_reaches_ready(tmp_path, monkeypatch):
+    host, docker, payload, containers, record, _ = upgrade_setup(tmp_path, monkeypatch)
+    previous_home = json.loads(record.read_text())['home_volume']
+    template = copy.deepcopy(containers['host-1'])
+    containers['sandbox-workspace']['Config'] = {'Labels': {'gxzs.workspace': 'workspace'}}
+    original = docker.side_effect
+
+    def operate(*args, **kwargs):
+        if args[0] == 'create':
+            name = args[args.index('--name') + 1]
+            item = copy.deepcopy(template)
+            item.update(Image='sha256:test', State={'Running': False})
+            item['Config'] = {'Image': 'host:test', 'Labels': dict(
+                args[index + 1].split('=', 1) for index, value in enumerate(args) if value == '--label')}
+            containers[name] = item
+            return SimpleNamespace(returncode=0, stdout='')
+        if args[0] == 'start':
+            containers[args[-1]]['State']['Running'] = True
+            return SimpleNamespace(returncode=0, stdout='')
+        return original(*args, **kwargs)
+
+    docker.side_effect = operate
+    host.ensure_sandbox.side_effect = RuntimeError('temporary sandbox preparation failure')
+    replacement = dict(payload, expected_generation=1, expected_instance_id='host-1',
+                       generation=2, instance_id='host-2', platform_token='new-platform-token')
+    with pytest.raises(RuntimeError, match='sandbox preparation'):
+        host.replace('workspace', replacement)
+    assert json.loads(record.read_text())['generation'] == 2
+    assert 'GXZS_HOST_GENERATION=1\n' in record.with_name('host.env').read_text()
+
+    host.ensure_sandbox.side_effect = lambda _: containers['sandbox-workspace']['State'].update(Running=True)
+    host.failures['host-2'] = time.time() - 10
+    maintain(host)
+    assert 'host-2' not in containers
+    assert not any(call.args[0] == 'create' for call in docker.call_args_list)
+
+    assert host.replace('workspace', replacement)['state'] == 'provisioning'
+    env = dict(line.split('=', 1) for line in record.with_name('host.env').read_text().splitlines())
+    assert env['GXZS_HOST_GENERATION'] == '2' and env['GXZS_HOST_INSTANCE_ID'] == 'host-2'
+    assert env['GXZS_PLATFORM_INTERNAL_TOKEN'] == 'new-platform-token'
+    maintain(host)
+    ready = host.replace('workspace', replacement)
+    assert ready['ready'] and ready['state'] == 'ready' and ready['generation'] == 2
+    assert ready['home_volume'] == previous_home
+    assert sum(call.args[0] == 'create' for call in docker.call_args_list) == 1
+
+
+@pytest.mark.parametrize('field', ['GXZS_HOST_OWNER_ID', 'GXZS_SANDBOX_WORKSPACE_ID',
+                                 'GXZS_HOST_GENERATION', 'GXZS_HOST_INSTANCE_ID'])
+def test_create_refuses_environment_for_another_binding(tmp_path, monkeypatch, field):
+    host, docker, _, payload, _ = setup(tmp_path, monkeypatch)
+    current = host.ensure('workspace', payload)
+    folder = host.root / 'workspace'
+    path = folder / 'host.env'
+    env = dict(line.split('=', 1) for line in path.read_text().splitlines())
+    env[field] = 'stale-binding'
+    path.write_text(''.join(key + '=' + value + '\n' for key, value in env.items()))
+    docker.reset_mock()
+    with pytest.raises(ValueError, match='configuration identity changed'):
+        host._create_container(current, folder, 'host:test', 'owner-network', [], tmp_path)
+    docker.assert_not_called()
+
+
 def test_profile_upgrade_fences_durably_and_only_replace_can_resume(tmp_path, monkeypatch):
     host, docker, payload, containers, record, begin = upgrade_setup(tmp_path, monkeypatch)
     proof = host.profile_upgrade('workspace', begin)
