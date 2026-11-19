@@ -25,6 +25,8 @@ python3 scripts/migrate_host_identity.py \
 
 已有 profile 基线证明也在这次离线迁移中校验、备份并改为新 owner；基线原文、镜像摘要、用户设置及文件权限保持不变。校验不通过会在停止容器或写入前退出。后续需要执行 `prepare-profile-upgrade.py` 时，使用迁移后的 owner 和 manager 记录；卷绑定由 manager 的持久维护凭据核验，保留卷上的创建标签不会阻断升级。已有 `profile_upgrade` 维护操作须先完成，再执行身份迁移。
 
+`mcp-outcomes.sqlite3` 的历史不确定结果标记不会因任务结束而消失。涉及这些标记的 Host 和 Sandbox 必须先通过原生休眠交接确认无待处理消息、任务及写入，再停止；迁移仍校验 admission 和 Workbench runs 无活动。标记随状态一起备份并原样保留，workspace/binding 不变；不会将历史结果改记为已确认。
+
 把备份目录生成的 `host-identity-manifest.json` 交给 GXZS `01_remove_business_tenant.sql` 使用。两个存储都完成迁移后启动新版 manager 和 GXZS，在维护窗口内按现有宿主替换流程递增代次并生成新版凭据，复核原工作区的历史会话、附件、计划以及新会话准入。若迁移中断，维持服务停止状态并使用原清单和备份目录继续。若已启动新版宿主，按切换验收排查其运行状态。
 
 ## 技能导入
