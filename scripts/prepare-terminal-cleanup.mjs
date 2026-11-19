@@ -34,12 +34,39 @@ ${original.split('\n').map(line => '\t' + line).join('\n')}
   return source.slice(0, begin) + replacement + source.slice(finish)
 }
 
+/** A confirmed remote termination may close the output before its EOF arrives. */
+export function terminalOutputCloseSource(source) {
+  const additions = [
+    ['\t\tterminal.output.once("error", this.onTerminalError);',
+      '\t\tterminal.output.once("error", this.onTerminalError);\n\t\tterminal.output.once("close", this.onTerminalClose);'],
+    ['\tonTerminalError = (error) => {', `\t// GXZS: settle close-only output while completion still waits for process.done.
+\tonTerminalClose = () => {
+\t\tif (!this.terminal.output.readableEnded && !this.terminal.output.errored) this.onTerminalEnd();
+\t};
+\tonTerminalError = (error) => {`],
+    ['\t\tthis.terminal.output.off("error", this.onTerminalError);',
+      '\t\tthis.terminal.output.off("error", this.onTerminalError);\n\t\tthis.terminal.output.off("close", this.onTerminalClose);'],
+  ]
+  for (const [before, after] of additions) {
+    if (source.includes(after)) continue
+    if (source.split(before).length !== 2)
+      throw new Error('Native terminal output contract changed; review upstream before patching')
+    source = source.replace(before, after)
+  }
+  return source
+}
+
 export async function prepareTerminalCleanup(profile) {
   const require = createRequire(join(profile, 'package.json'))
-  const metadata = JSON.parse(await readFile(require.resolve('@deepseek-ai/dsh-subprocess-local/package.json'), 'utf8'))
-  if (metadata.version !== '0.2.2-rc.1') throw new Error('Unverified native terminal cleanup version')
-  const entry = require.resolve('@deepseek-ai/dsh-subprocess-local')
-  await writeFile(entry, terminalCleanupSource(await readFile(entry, 'utf8')))
+  for (const [name, patch] of [
+    ['@deepseek-ai/dsh-subprocess-local', terminalCleanupSource],
+    ['@deepseek-ai/dsh-terminal-bash', terminalOutputCloseSource],
+  ]) {
+    const metadata = JSON.parse(await readFile(require.resolve(`${name}/package.json`), 'utf8'))
+    if (metadata.version !== '0.2.2-rc.1') throw new Error('Unverified native terminal cleanup version')
+    const entry = require.resolve(name)
+    await writeFile(entry, patch(await readFile(entry, 'utf8')))
+  }
 }
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1])
   await prepareTerminalCleanup(process.argv[2] || fileURLToPath(new URL('../profiles/workbench', import.meta.url)))
