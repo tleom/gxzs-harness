@@ -6,6 +6,14 @@ Build and deploy the independent service from this directory's Dockerfile. Its H
 
 Validation uses the POSIX suites mirrored under `services/sandbox-manager/tests`; production rollout additionally requires the live helper, Landlock, network, file manifest and MCP authorization checks.
 
+## GXZS 内网授权地址
+
+部署时把 `WORKBENCH_MCP_API_URL` 设为 GXZS 后端的内网基址，例如
+`http://backend.internal:8080`。manager 会在该地址后追加 `/internal/ai/mcp/authorize`。
+`GXZS_HOST_PLATFORM_URL` 使用同一个内网基址加 `/internal/workbench`。
+切换对外域名时，这两个服务间调用地址继续使用内网基址。
+更新部署环境变量后，重新创建 manager，并从工作台发起一次 MCP 工具调用验证授权。
+
 ## GXZS 6.1.0 宿主身份迁移
 
 维护窗口停用所有旧 Workbench 入口。结束正在运行的任务、工具调用和宿主管理操作，停止 manager，备份 MySQL、manager 的 `/state` 和宿主、沙箱卷。保留旧容器供迁移程序核对原有绑定。清单由升级前的 `gxzs_agent_host` 生成，每项提供 `old_owner_id`、`new_owner_id`、`workspace_id`、`generation`、`instance_id`。旧身份为 `000000:<user_id>`，新版为 `gxzs-<user_id>`。工作区 UUID、代次和逻辑实例 ID 以原记录为准。

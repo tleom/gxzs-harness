@@ -56,10 +56,24 @@ it('does not extend leave confirmation or navigation revisions to unrelated cont
   expect(browserAction({action:'key',key:'Enter',before_unload:'stay'})).toEqual({action:'key',key:'Enter',before_unload:'stay'})
 })
 it('accepts an inferred HTTP fallback only for the same HTTPS destination', () => {
-  expect(browserAction({action:'navigate',url:'https://xcmggx.com:8080/app?q=1',fallback_url:'http://xcmggx.com:8080/app?q=1'}))
-    .toEqual({action:'navigate',url:'https://xcmggx.com:8080/app?q=1',fallback_url:'http://xcmggx.com:8080/app?q=1'})
-  for (const fallback_url of ['http://other.test/app?q=1','file:///app','http://u:p@xcmggx.com/app?q=1','http://xcmggx.com/other','https://xcmggx.com/app?q=1'])
-    expect(()=>browserAction({action:'navigate',url:'https://xcmggx.com/app?q=1',fallback_url})).toThrow()
+  const request = {
+    action: 'navigate',
+    url: 'https://workbench.test:8080/app?q=1',
+    fallback_url: 'http://workbench.test:8080/app?q=1',
+  }
+  expect(browserAction(request)).toEqual(request)
+  const rejectedFallbacks = [
+    'http://other.test/app?q=1',
+    'file:///app',
+    'http://u:p@workbench.test/app?q=1',
+    'http://workbench.test/other',
+    'https://workbench.test/app?q=1',
+  ]
+  for (const fallback_url of rejectedFallbacks) {
+    expect(() =>
+      browserAction({ action: 'navigate', url: 'https://workbench.test/app?q=1', fallback_url }),
+    ).toThrow()
+  }
 })
 it('starts the browser in the authenticated conversation directory',async()=>{
   const create=vi.fn(()=>({command:vi.fn(async()=>{}),done:new Promise(()=>{}),dispose:vi.fn()}))
