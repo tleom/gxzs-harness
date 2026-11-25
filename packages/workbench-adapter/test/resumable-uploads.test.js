@@ -30,6 +30,24 @@ it('releases a fixed-path upload slot without discarding a pending publication',
   expect(await store.status(fourth)).toMatchObject({ publishing: true })
 })
 
+it('releases an upload rejected before publication because its assembled digest is invalid', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'gxzs-invalid-upload-'))
+  roots.push(root)
+  const store = new ResumableUploads(root)
+  const id = 'a'.repeat(32)
+  const bytes = Buffer.from('different than declared')
+  const metadata = { path: 'output.bin', version: null, size: bytes.length, digest: hash(Buffer.from('declared')) }
+  const publish = vi.fn()
+  await store.begin(id, metadata)
+  await store.part(id, 0, bytes, hash(bytes))
+  await store.requestCommit(id)
+  await store.commit(id, publish, async () => null).catch(error => store.failedCommit(id, error))
+  expect((await store.status(id)).failure).toMatchObject({ status: 409 })
+  expect(publish).not.toHaveBeenCalled()
+  await store.discard(id)
+  await expect(store.status(id)).rejects.toMatchObject({ status: 404 })
+})
+
 it('retains completed parts across restart and publishes validated bytes only once', async () => {
   const root = await mkdtemp(join(tmpdir(), 'gxzs-part-test-'))
   roots.push(root)

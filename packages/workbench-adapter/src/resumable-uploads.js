@@ -108,8 +108,9 @@ export class ResumableUploads {
     return this.serial(id, async () => {
       const directory = this.directory(id)
       const manifest = await readJson(join(directory, 'upload.json'))
-      if (manifest && !await readJson(join(directory, 'commit.json'))
-        && !await readJson(join(directory, 'publish.json')))
+      if (!manifest || await readJson(join(directory, 'commit.json'))) return
+      const queued = await readJson(join(directory, 'publish.json'))
+      if (!queued || await readJson(join(directory, 'failure.json')))
         await rm(directory, { recursive: true, force: true })
     })
   }
