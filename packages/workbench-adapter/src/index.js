@@ -1,10 +1,11 @@
 import z from '@deepseek-ai/schemastery'
 import { publishedGlobalSkills } from '@gxzs/dsh-workbench-sandbox-skills/global'
-import { dirname } from 'node:path'
+import { dirname, join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { storageStatus, assertStorageWritable } from './storage-pressure.js'
 import { AssertionVerifier, userIdForOwner } from './assertion.js'
 import { spoolUpload } from './upload.js'
+import { ResumableUploads, uploadPartBytes } from './resumable-uploads.js'
 import { createReadStream } from 'node:fs'
 import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
@@ -28,6 +29,7 @@ import { registerRunResourceContext } from './resource-mentions.js'
 import { prepareNativeFiles } from './attachments.js'
 import { WorkbenchWorkspaces } from './workspaces.js'
 import { streamWorkspaceEvents } from './workspace-events.js'
+import { openWorkbenchStreams } from './streams.js'
 import { WorkbenchSchedules } from './schedules.js'
 import { WorkbenchSubagents } from './subagents.js'
 import { WorkbenchTerminals } from './terminals.js'
@@ -90,6 +92,8 @@ export function apply(ctx, config) {
   } })
   const runtime = new WorkbenchRuntime(ctx, database, config.ownerId)
   const storage = () => storageStatus({ home: config.databasePath === ':memory:' ? undefined : dirname(config.databasePath), workspace: config.workspace })
+  const stagedUploads = new ResumableUploads(config.databasePath === ':memory:' ? undefined
+    : join(dirname(config.databasePath), '.workbench-uploads'))
   const workspaces = new WorkbenchWorkspaces({ controller: ctx.workspaceController, database, root: resolveWorkspacePath(config.workspace, 'conversations'), fileManager: ctx.workbenchFileManager, sessions: ctx.sessionController })
   const scheduler = new TaskScheduler({ database, sessions: ctx.sessionController, platformClient: ctx.workbenchPlatformClient, ownerId: config.ownerId, agents: ctx.agents, modelSettings: ctx.settings, goals: ctx.goals,
     assertStorageWritable: () => assertStorageWritable(storage()),
@@ -335,6 +339,7 @@ export function apply(ctx, config) {
         ...(ctx.sessionReferenceResolver.listSessionCandidates && ctx.get('fileReferences')?.listObserved ? { native_subagent_reference_protocol: 1 } : {}),
         ...(ctx.get('settingsController') ? { native_subagent_settings_protocol: 1, native_prompt_mode_protocol: 1 } : {}) } : {}),
       control_protocol: 1, goal_events_protocol: 1, compact_events_protocol: 1, resources_protocol: 1, command_resources_protocol: 1, plugin_mentions_protocol: 2, scoped_skills_protocol: 1, submission_control_protocol: 1,
+      ...(config.databasePath !== ':memory:' ? { resumable_upload_protocol: 1 } : {}),
       default_selection: { model: catalog.default ? `${catalog.default.provider}/${catalog.default.model}` : models[0]?.id ?? '', tools: [], skills: [], knowledge: [], model_parameters: {}, tool_parameters: {} },
       models, plugins: mcpCatalog.plugins, tools: mcpCatalog.tools.map((tool) => ({
         id: tool.id, name: tool.name, display_name: tool.display_name,
@@ -388,7 +393,76 @@ export function apply(ctx, config) {
     res.end(Buffer.from(result.bytes))
   })
 
+  const sharedStreams = new Map()
+  const publishController = new AbortController()
+  const publishing = new Set()
+  let publishTail = Promise.resolve()
+  const queuePublication = (id, owner, target) => {
+    if (publishing.has(id) || publishController.signal.aborted) return
+    publishing.add(id)
+    const leave = sleepBarrier.enter()
+    publishTail = publishTail.then(async () => {
+      const { signal } = publishController
+      try {
+        signal.throwIfAborted()
+        assertStorageWritable(storage())
+        await stagedUploads.commit(id, upload => service.directories.writeFile(owner, upload.metadata.path,
+          () => ctx.workbenchFileManager.upload('files', upload, signal)),
+        path => ctx.workbenchFileManager.operate({ operation: 'stat', path }, signal), signal, target)
+      } catch (error) {
+        if (!signal.aborted)
+          await stagedUploads.failedCommit(id, error).catch(() => ctx.logger?.warn('Workbench upload receipt could not be saved'))
+      } finally {
+        publishing.delete(id)
+        leave()
+      }
+    })
+  }
+  const sharedStreamPath = /^\/streams\/events\/([a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12})$/
+  const uploadPath = /^\/uploads\/([a-f\d]{32})$/
+  const uploadPartPath = /^\/uploads\/([a-f\d]{32})\/parts\/(0|[1-9]\d{0,2})$/
   const routes = [
+    ['GET', sharedStreamPath, (context, res, match) => {
+      const key = `${context.owner.ownerId}:${match[1]}`
+      if (sharedStreams.has(key)) throw httpError(409, '工作台订阅已经连接')
+      if (sharedStreams.size >= 16) throw httpError(429, '工作台订阅较多，请稍后重试')
+      const stream = openWorkbenchStreams({ context: { owner: context.owner, json: { sources: [] } },
+        res, routes, onClose: () => sharedStreams.delete(key) })
+      if (!res.destroyed && !res.writableEnded) sharedStreams.set(key, stream)
+    }],
+    ['PUT', sharedStreamPath, ({ owner, json }, res, match) => {
+      const stream = sharedStreams.get(`${owner.ownerId}:${match[1]}`)
+      if (!stream) throw httpError(404, '工作台订阅已结束')
+      stream.replace(json.sources)
+      sendJson(res, 200, { data: true })
+    }],
+    ['POST', uploadPath, async ({ json }, res, match) => {
+      assertStorageWritable(storage())
+      sendJson(res, 200, { data: await stagedUploads.begin(match[1], { ...json,
+        path: json.bind_after_upload === true ? null : managerPath(json.path) }) })
+    }],
+    ['GET', uploadPath, async (_context, res, match) =>
+      sendJson(res, 200, { data: await stagedUploads.status(match[1]) })],
+    ['DELETE', uploadPath, async (_context, res, match) => {
+      await stagedUploads.discard(match[1])
+      sendJson(res, 200, { data: true })
+    }],
+    ['PUT', uploadPartPath, async ({ req, body, url }, res, match) => {
+      if (req.headers['content-type']?.split(';', 1)[0] !== 'application/octet-stream')
+        throw httpError(415, '文件分片需要二进制请求')
+      assertStorageWritable(storage())
+      await stagedUploads.part(match[1], Number(match[2]), body, url.searchParams.get('sha256'))
+      sendJson(res, 200, { data: true })
+    }],
+    ['POST', /^\/uploads\/([a-f\d]{32})\/commit$/, async ({ owner, json }, res, match) => {
+      assertStorageWritable(storage())
+      const result = await stagedUploads.requestCommit(match[1],
+        json.path === undefined ? undefined : { path: managerPath(json.path), version: json.version })
+      if (result.publishing) queuePublication(match[1], owner, result.target)
+      if (!res.destroyed) sendJson(res, result.publishing ? 202 : 200, { data: {
+        publishing: Boolean(result.publishing), completed: result.completed,
+      } })
+    }],
     ['GET', /^\/native\/sessions$/, async ({ owner }, res) => {
       const controller = new AbortController()
       const close = () => controller.abort()
@@ -629,6 +703,10 @@ export function apply(ctx, config) {
         || (json.operation === 'skill_import_status' && result?.status === 'completed')) ctx.emit('workbench/resources-changed')
       if (!res.destroyed) sendJson(res, 200, { data: result })
     }],
+    ['POST', /^\/submissions\/deliver$/, async ({ owner, json }, res) =>
+      sendJson(res, 202, { data: await service.deliverSubmission(owner, json) })],
+    ['POST', /^\/submissions\/stop$/, async ({ owner, json }, res) =>
+      sendJson(res, 200, { data: await service.stopDurableSubmission(owner, json) })],
     ['GET', /^\/chats$/, async ({ owner }, res) => sendJson(res, 200, { data: service.listChats(owner) })],
     ['POST', /^\/chats$/, async ({ owner, json }, res) => {
       const catalog = await databaseModelCatalog(ctx.workbenchPlatformClient, ctx.sessionController, owner, ctx.settings)
@@ -841,6 +919,8 @@ export function apply(ctx, config) {
         return requestPolicy.request_bytes
       }
       const body = streaming ? Buffer.alloc(0) : await readBody(req,
+        sharedStreamPath.test(path) ? 420 * 1024 :
+        uploadPartPath.test(path) ? uploadPartBytes :
         path === '/resources' ? Math.max(SKILL_JSON_BYTES, requestPolicy?.request_bytes ?? 0)
           : path === '/mcp/request' ? requestPolicy?.request_bytes ?? await loadPolicy() : undefined,
         path === '/resources' && !requestPolicy ? loadPolicy : undefined)
@@ -850,7 +930,7 @@ export function apply(ctx, config) {
       })
       if (owner.ownerId !== config.ownerId) throw httpError(403, '当前用户不属于此工作台宿主')
       sleepBarrier.assertAwake()
-      if (!['GET', 'HEAD', 'OPTIONS'].includes(req.method)) leaveRequest = sleepBarrier.enter()
+      if (!['GET', 'HEAD', 'OPTIONS'].includes(req.method) && !sharedStreamPath.test(path)) leaveRequest = sleepBarrier.enter()
       if (streaming) {
         await withResponseSignal(res, async signal => {
           upload = await spoolUpload(req, owner.verifyBody, signal, (path === '/files/upload' ? 1024 : path === '/images/upload' ? 20 : 100) * 1024 * 1024)
@@ -926,8 +1006,17 @@ export function apply(ctx, config) {
   }
 
   ctx.effect(() => {
+    const purgeUploads = () => stagedUploads.sweep().catch(() => ctx.logger?.warn('Workbench upload cleanup failed'))
+    void recovery.then(async () => {
+      for (const { id, target } of await stagedUploads.pendingCommits())
+        queuePublication(id, { ownerId: config.ownerId }, target)
+    }).catch(() => ctx.logger?.warn('Workbench queued upload recovery failed'))
+    const uploadCleanup = setInterval(purgeUploads, 30 * 60_000)
+    uploadCleanup.unref?.()
     const disposeRoute = ctx.webServer.register({ kind: 'prefix', path: config.basePath, handler })
     return () => {
+      publishController.abort()
+      clearInterval(uploadCleanup)
       clearTimeout(recoveryTimer)
       scheduler.close()
       sidebarLeases.dispose()
@@ -936,6 +1025,7 @@ export function apply(ctx, config) {
       disposeRoute?.()
       scheduleNotifications.close()
       scheduleWakeups.close()
+      for (const stream of sharedStreams.values()) stream.close()
       database.close()
     }
   }, 'gxzs workbench adapter')

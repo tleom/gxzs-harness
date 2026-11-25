@@ -851,7 +851,7 @@ describe('followup and control service', () => {
   })
   it('persists capacity-waiting tasks without sending them to DSH and allows cancellation', async () => {
     const { service, owner, chat, database, sessionController } = setup()
-    service.scheduler = { enqueue: (run, content) => database.saveSubmission(owner.ownerId, run.id, content) }
+    service.scheduler = { tick: vi.fn() }
     const run = await service.submitRun(owner, chat.id, { query: 'wait for capacity' })
     expect(database.submission(owner.ownerId, run.id).dispatched).toBe(false)
     expect(sessionController.prompt).not.toHaveBeenCalled()
@@ -867,7 +867,7 @@ describe('followup and control service', () => {
     const active = await service.submitRun(owner, chat.id, { query: 'active' })
     database.transitionRun(owner.ownerId, active.id, 'running')
     sessionController.prompt.mockClear()
-    service.scheduler = { enqueue: (run, content) => database.saveSubmission(owner.ownerId, run.id, content) }
+    service.scheduler = { tick: vi.fn() }
     const next = await service.submitRun(owner, chat.id, { query: 'supplement' })
     activateNative(test, active.id)
     expect(sessionController.prompt).not.toHaveBeenCalled()

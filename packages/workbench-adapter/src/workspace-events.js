@@ -1,6 +1,7 @@
 // Snapshot transport over DSH-owned workspace/list notifications. Only one
 // projection may be in flight; slow readers retain a single dirty bit.
 export function streamWorkspaceEvents({ workspaces, owner, res, subscribe, heartbeatMs = 15000, drainTimeoutMs = 30000 }) {
+  if (res.destroyed || res.writableEnded) return
   const abort = new AbortController()
   let dirty = true, pumping = false, blocked = false, closed = false
   let previousSnapshot

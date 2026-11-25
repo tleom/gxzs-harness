@@ -16,7 +16,7 @@ import { decodeCursor } from './cursor.js'
 import { resolveWorkspacePath } from './paths.js'
 import { forkChat } from './fork-chat.js'
 import { inputSupplement, toAnswer } from './human-input.js'
-import { requireDatabaseModel } from './database-models.js'
+import { databaseModelCatalog, requireDatabaseModel } from './database-models.js'
 import { currentExecutionRun, fenceMcpExecutions } from './scheduler.js'
 import { nativeTurn } from './native-turn.js'
 import { fitsHistoryResponse, hasEarlierContent, historyWindow, historyWindowFor, loadNativeHistoryPage, smallerHistoryWindow } from './history-page.js'
@@ -29,7 +29,7 @@ import { dispatchRunPrompt } from './native-prompt.js'
 import { goalFailureReason, presentRunEvent, resumeGoalSelection, runFailure } from './run-failure.js'
 import { ownedSessionRoots } from './owned-session-roots.js'
 import { DirectoryLifecycle } from './directory-lifecycle.js'
-import { WorkbenchDrafts, dateDirectory } from './drafts.js'
+import { WorkbenchDrafts, dateDirectory, isDraftId } from './drafts.js'
 import { presentContextPressure } from './context-usage.js'
 
 export class WorkbenchService {
@@ -234,17 +234,22 @@ export class WorkbenchService {
 
   async updateConfig(owner, chatId, body) {
     return this.withChatMutation(chatId, async () => {
-      const chat = this.requireChat(owner, chatId)
-      const selection = normalizeSelection(body.selection)
-      if (JSON.stringify(selection) === JSON.stringify(chat.selection)) return this.getChat(owner, chatId)
-      if (body.version !== chat.version) throw httpError(409, '配置版本已改变，请刷新后重试')
-      // Legacy chat selections are display preferences, not MCP authority.
-      const route = splitModel(selection.model)
-      await requireDatabaseModel(this.platformClient, this.sessions, owner, selection.model, this.modelSettings)
-      await this.sessions.selectModel({ sessionId: chat.sessionId, ...route, ...(selection.model_parameters.reasoning_effort ? { reasoningEffort: selection.model_parameters.reasoning_effort } : {}) })
-      this.database.updateChatConfig(owner.ownerId, chatId, chat.version, selection)
+      await this.updateConfigLocked(owner, chatId, body.selection, body.version)
       return this.getChat(owner, chatId)
     })
+  }
+
+  async updateConfigLocked(owner, chatId, input, version) {
+    const chat = this.requireChat(owner, chatId)
+    const selection = normalizeSelection(input)
+    if (isDeepStrictEqual(selection, chat.selection)) return chat
+    if (version !== chat.version) throw httpError(409, '配置版本已改变，请刷新后重试')
+    // Legacy chat selections are display preferences, not MCP authority.
+    const route = splitModel(selection.model)
+    await requireDatabaseModel(this.platformClient, this.sessions, owner, selection.model, this.modelSettings)
+    await this.sessions.selectModel({ sessionId: chat.sessionId, ...route, ...(selection.model_parameters.reasoning_effort ? { reasoningEffort: selection.model_parameters.reasoning_effort } : {}) })
+    this.database.updateChatConfig(owner.ownerId, chatId, chat.version, selection)
+    return this.requireChat(owner, chatId)
   }
 
   fork(owner, sourceRunId, body) { return this.directories.run(owner, () => forkChat(this, owner, sourceRunId, body)) }
@@ -358,7 +363,13 @@ export class WorkbenchService {
 
   getChat(owner, chatId, includeEvents = false) {
     const chat = this.requireChat(owner, chatId)
-    return { ...this.chatSummary(owner, chat), selection: chat.selection, runs: this.database.listRunReferences(owner.ownerId, chat.id).filter(run => !run.nativeChild).map((run) => this.getRun(owner, run.id, includeEvents)) }
+    const runs = this.database.listRunReferences(owner.ownerId, chat.id).filter(run => !run.nativeChild).map((run) => this.getRun(owner, run.id, includeEvents))
+    return this.chatWithRuns(owner, chat, runs)
+  }
+
+  chatWithRuns(owner, chat, runs) {
+    const draft = this.database.draftForChat(owner.ownerId, chat.id)
+    return { ...this.chatSummary(owner, chat), ...(draft?.bound ? { submission_draft_id: draft.id } : {}), selection: chat.selection, runs }
   }
 
   async historyPage(owner, chatId, cursor, signal, nativeLive = false) {
@@ -516,10 +527,97 @@ export class WorkbenchService {
     return this.withChatMutation(chatId, () => this.admitRun(owner, chatId, body))
   }
 
-  async admitRun(owner, chatId, body, command) {
+  async deliverSubmission(owner, body) {
+    const { chat_id: chatId, draft_id: draftId, queue_draft_id: queueDraftId, request_key: key } = body
+    if (!validRequestKey(key) || (chatId === undefined) === (draftId === undefined)
+      || (draftId !== undefined && !isDraftId(draftId))
+      || (chatId !== undefined && (typeof chatId !== 'string' || !Number.isSafeInteger(body.version))))
+      throw httpError(400, '消息提交标识无效')
+    if (draftId && (body.silent_resume || body.continue_run_id || body.retry_of))
+      throw httpError(400, '新对话不能继续已有任务')
+    if (typeof body.query !== 'string' || (!body.silent_resume && !body.query.trim() && !body.files?.length))
+      throw httpError(400, '消息内容不能为空')
+    if (queueDraftId !== undefined) {
+      if (!chatId || !isDraftId(queueDraftId)) throw httpError(400, '草稿队列标识无效')
+      const source = this.drafts.get(owner, queueDraftId)
+      if (!source?.bound || source.chatId !== chatId) throw httpError(409, '草稿队列与当前会话不匹配')
+    }
+    const stopKey = submissionStopKey(chatId || draftId, key)
+    const stopped = () => this.database.getHostReceipt(owner.ownerId, stopKey)
+    const draft = draftId && this.drafts.get(owner, draftId)
+    const knownTarget = chatId || (draft?.bound ? draft.chatId : undefined)
+    if (knownTarget) {
+      const receipt = this.database.findRunByRequestKey(owner.ownerId, knownTarget, key)
+      if (receipt) return this.submissionResult(owner, this.requireChat(owner, knownTarget), this.getRun(owner, receipt.id, false))
+    }
+    if (stopped()) throw submissionStopped()
+    let selection = body.selection
+    if (draftId && selection?.model === '') {
+      const { default: model } = await databaseModelCatalog(this.platformClient, this.sessions, owner, this.modelSettings)
+      if (!model) throw httpError(503, '工作台默认模型尚未就绪')
+      selection = { ...selection, model: `${model.provider}/${model.model}` }
+    }
+    const proposed = selection ? normalizeSelection(selection) : undefined
+    if (draftId && !proposed) throw httpError(400, '请选择模型')
+    if (draftId && !draft?.bound)
+      await requireDatabaseModel(this.platformClient, this.sessions, owner, proposed.model, this.modelSettings)
+    if (stopped()) throw submissionStopped()
+    const target = draftId ? (await this.createChat(owner, this.workspace, proposed, body.workspace_id,
+      undefined, draftId, { kind: 'message', prompt: body.query, has_attachments: Boolean(body.files?.length) })).id : chatId
+    return this.withChatMutation(target, async () => {
+      let chat = this.requireChat(owner, target)
+      const receipt = this.database.findRunByRequestKey(owner.ownerId, target, key)
+      if (receipt) return this.submissionResult(owner, chat, this.getRun(owner, receipt.id, false))
+      if (stopped()) throw submissionStopped()
+      if (!draftId && body.version !== chat.version
+        && (proposed === undefined || !isDeepStrictEqual(proposed, chat.selection)))
+        throw httpError(409, '配置版本已改变，请刷新后重试')
+      if (proposed) chat = await this.updateConfigLocked(owner, target, proposed, draftId ? chat.version : body.version)
+      const run = await this.admitRun(owner, target, { ...body, version: chat.version }, undefined, stopped)
+      return this.submissionResult(owner, chat, run)
+    })
+  }
+
+  submissionResult(owner, chat, run) {
+    return { chat: this.chatWithRuns(owner, chat, []), run }
+  }
+
+  async stopDurableSubmission(owner, { target_id: targetId, request_key: key }) {
+    const draft = isDraftId(targetId)
+    if (!validRequestKey(key) || (!draft && (typeof targetId !== 'string' || !/^[\w-]{1,80}$/.test(targetId))))
+      throw httpError(400, '消息停止标识无效')
+    // This receipt also fences delayed delivery when the draft has no chat yet.
+    this.database.saveHostReceipt(owner.ownerId, submissionStopKey(targetId, key), { cancelled: true })
+    const chatId = draft ? this.drafts.get(owner, targetId)?.chatId : targetId
+    const chat = chatId && this.database.getChat(owner.ownerId, chatId)
+    if (!chat) return { state: 'cancelled' }
+
+    const existing = this.database.findRunByRequestKey(owner.ownerId, chatId, key)
+    const terminal = run => {
+      if (!run || ['cancelled', 'discarded', 'interrupted'].includes(run.status)) return { state: 'cancelled' }
+      if (['completed', 'failed', 'steered'].includes(run.status))
+        return { state: 'delivered', delivery: this.submissionResult(owner, chat, this.getRun(owner, run.id, false)) }
+      return { state: 'pending' }
+    }
+    if (existing) {
+      const result = terminal(existing)
+      if (result.state !== 'pending') return result
+    }
+    try {
+      return terminal((await this.stopSubmission(owner, chatId, key)).run)
+    } catch (error) {
+      if (error?.code === 'STALE_RUN') {
+        const latest = this.database.findRunByRequestKey(owner.ownerId, chatId, key)
+        return terminal(latest)
+      }
+      throw error
+    }
+  }
+
+  async admitRun(owner, chatId, body, command, stopped) {
     let chat = this.requireChat(owner, chatId)
     const requestKey = typeof body.request_key === 'string' ? body.request_key : undefined
-    if (requestKey !== undefined && (requestKey.length === 0 || requestKey.length > 128 || requestKey.includes('\0')))
+    if (requestKey !== undefined && !validRequestKey(requestKey))
       throw httpError(400, 'request_key 格式无效')
     // A submission key is an immutable receipt, including failed executions.
     // Explicit retries submit a new key and retain parent_run_id for lineage.
@@ -538,8 +636,10 @@ export class WorkbenchService {
     if (silentResume && files.length) throw httpError(400, '后台继续不能携带附件，请发送新消息')
     if (silentResume && mentions.skills.length) throw httpError(400, '后台继续不能新增技能引用，请发送带技能标签的新消息')
     if (!query.trim() && !files.length) throw httpError(400, '消息内容不能为空')
-    const cancelled = () => requestKey && this.database.getCommandReceipt(owner.ownerId, chatId, `run-stop:${requestKey}`)
-    const checkCancelled = () => { if (cancelled()) throw httpError(409, '消息已取消') }
+    const cancelled = () => stopped?.() || (requestKey && this.database.getCommandReceipt(owner.ownerId, chatId, `run-stop:${requestKey}`))
+    const checkCancelled = () => {
+      if (cancelled()) throw stopped ? submissionStopped() : httpError(409, '消息已取消')
+    }
     checkCancelled()
     await requireDatabaseModel(this.platformClient, this.sessions, owner, chat.selection.model, this.modelSettings)
     let parentRunId = body.retry_of ?? body.continue_run_id ?? body.parent_run_id ?? this.database.listRunReferences(owner.ownerId, chatId)
@@ -567,25 +667,29 @@ export class WorkbenchService {
     const agent = this.agents.get(chat.sessionId)
     const selectedSkills = await this.selectedSkills(mentions, agent)
     admitted.content = await this.resourceContent(admitted.content, mentions, mentionTools, agent, selectedSkills, body.mention_positions)
-    checkCancelled()
-    const { run, created } = this.database.createRun({
-      ownerId: owner.ownerId, chatId, sessionId: chat.sessionId, query, attachments: admitted.attachments, mcpTools,
-      selection: { ...chat.selection, mcp_servers: mcpServers, ...(silentResume ? { silent_resume: true } : {}),
-        ...(!silentResume && body.mode ? { prompt_mode: body.mode } : {}), resource_mentions: mentions,
-        mentioned_resources: await this.mentionSnapshot(mentions, mentionTools, agent, body.mention_positions, query),
-        skill_names: await this.skillNames(agent), skill_invocations: skillInvocationClaims(selectedSkills), ...(command ? { command } : {}) }, requestKey,
-      parentRunId,
-    })
-    if (!created) return this.getRun(owner, run.id)
-    this.database.appendEvent(owner.ownerId, run.id, { event: 'workbench_status', status: 'queued' })
-    if (this.scheduler) {
+    const selection = {
+      ...chat.selection, mcp_servers: mcpServers, ...(silentResume ? { silent_resume: true } : {}),
+      ...(!silentResume && body.mode ? { prompt_mode: body.mode } : {}), resource_mentions: mentions,
+      mentioned_resources: await this.mentionSnapshot(mentions, mentionTools, agent, body.mention_positions, query),
+      skill_names: await this.skillNames(agent), skill_invocations: skillInvocationClaims(selectedSkills), ...(command ? { command } : {}),
+    }
+    // The receipt and the payload the scheduler recovers must survive together.
+    const { run, created } = this.database.transaction(() => {
       checkCancelled()
-      try { await this.scheduler.enqueue(run, admitted.content) }
-      catch (error) {
-        this.database.transitionRun(owner.ownerId, run.id, 'failed', `任务提交失败：${error?.message ?? error}`)
-        this.database.appendEvent(owner.ownerId, run.id, { event: 'workbench_end', status: 'failed', error: `任务提交失败：${error?.message ?? error}` })
-        throw error
+      const receipt = this.database.createRun({
+        ownerId: owner.ownerId, chatId, sessionId: chat.sessionId, query, attachments: admitted.attachments, mcpTools,
+        selection, requestKey, parentRunId,
+      })
+      if (receipt.created) {
+        const { id } = receipt.run
+        if (this.scheduler) this.database.saveSubmission(owner.ownerId, id, admitted.content)
+        this.database.appendEvent(owner.ownerId, id, { event: 'workbench_status', status: 'queued' })
       }
+      return receipt
+    })()
+    if (!created) return this.getRun(owner, run.id)
+    if (this.scheduler) {
+      void this.scheduler.tick()
       return runDto(this.database.getRun(owner.ownerId, run.id))
     }
     try {
@@ -1553,6 +1657,18 @@ function splitModel(value) {
   if (typeof value !== 'string' || value.indexOf('/') <= 0 || value.endsWith('/')) throw httpError(400, '模型标识无效')
   const position = value.indexOf('/')
   return { provider: value.slice(0, position), model: value.slice(position + 1) }
+}
+
+function validRequestKey(value) {
+  return typeof value === 'string' && value.length > 0 && value.length <= 128 && !value.includes('\0')
+}
+
+function submissionStopKey(target, key) {
+  return `submission-stop:${target}:${key}`
+}
+
+function submissionStopped() {
+  return httpError(409, '消息已取消', 'SUBMISSION_CANCELLED')
 }
 
 function normalizeSelection(value) {

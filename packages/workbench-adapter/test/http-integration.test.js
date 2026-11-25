@@ -166,6 +166,168 @@ async function call(handler, key, method, route, value, authenticated = true, us
   return response
 }
 
+it('replays a durable submission against the same draft and run receipt', async () => {
+  const { handler, key, context } = setup()
+  const draft = `draft:${randomUUID()}`
+  const target = '/submissions/deliver'
+  const body = { draft_id: draft, selection: { model: '' }, query: 'durable text', request_key: 'receipt-1', files: [] }
+  const first = await call(handler, key, 'POST', target, body)
+  expect(first).toMatchObject({ status: 202, body: { data: {
+    chat: { runs: [], selection: { model: 'p/m' } }, run: { query: 'durable text' },
+  } } })
+  context.workbenchPlatformClient.json.mockRejectedValue(new Error('model service unavailable after admission'))
+  const second = await call(handler, key, 'POST', target, body)
+  expect(second.body?.data?.run?.id).toBe(first.body.data.run.id)
+  const chat = await call(handler, key, 'GET', `/chats/${first.body.data.chat.id}`)
+  expect(chat.body.data.submission_draft_id).toBe(draft)
+  expect(chat.body.data.runs).toHaveLength(1)
+  expect((await call(handler, key, 'POST', target, body, true, '43')).status).toBe(403)
+})
+
+it('accepts a durable queue draft reference only for its bound chat', async () => {
+  const { handler, key } = setup()
+  const route = '/submissions/deliver'
+  const draft = `draft:${randomUUID()}`
+  const first = await call(handler, key, 'POST', route, {
+    draft_id: draft, request_key: 'bind', query: 'first', selection: { model: '' },
+  })
+  expect(first).toMatchObject({ status: 202, body: { data: { chat: { submission_draft_id: draft } } } })
+  const { id, version } = first.body.data.chat
+  const message = { chat_id: id, request_key: 'following', query: 'following', version }
+  const wrong = await call(handler, key, 'POST', route, { ...message, queue_draft_id: `draft:${randomUUID()}` })
+  expect(wrong.status).toBe(409)
+  const following = await call(handler, key, 'POST', route, { ...message, queue_draft_id: draft })
+  expect(following).toMatchObject({ status: 202, body: { data: {
+    chat: { submission_draft_id: draft, id }, run: { query: 'following' },
+  } } })
+})
+
+it('rolls back the run receipt when its dispatch payload cannot be persisted, allowing replay', async () => {
+  const { handler, key, context } = setup()
+  const runtime = context.reflect.provide.mock.calls.find(([name]) => name === 'workbenchRuntime')[1]
+  const chat = (await call(handler, key, 'POST', '/chats', {})).body.data
+  const body = { chat_id: chat.id, version: chat.version, request_key: 'queue-write-failure', query: 'keep one message' }
+  vi.spyOn(runtime.database, 'saveSubmission').mockImplementationOnce(() => { throw new Error('injected queue write failure') })
+  expect((await call(handler, key, 'POST', '/submissions/deliver', body)).status).toBe(500)
+  expect(runtime.database.listRuns('gxzs-42', chat.id)).toEqual([])
+  expect(runtime.database.submissions('gxzs-42')).toEqual([])
+
+  const result = await call(handler, key, 'POST', '/submissions/deliver', body)
+  expect(result).toMatchObject({ status: 202, body: { data: { run: { query: body.query } } } })
+  const replay = await call(handler, key, 'POST', '/submissions/deliver', body)
+  expect(replay.body.data.run.id).toBe(result.body.data.run.id)
+  expect(runtime.database.listRuns('gxzs-42', chat.id)).toHaveLength(1)
+})
+
+it('fences a durable submission stopped during final skill discovery', async () => {
+  const { handler, key, context } = setup()
+  const chat = (await call(handler, key, 'POST', '/chats', {})).body.data
+  const body = { chat_id: chat.id, version: chat.version, request_key: 'stop-during-skills', query: 'leave no queued run' }
+  let release, markStarted
+  const started = new Promise(resolve => { markStarted = resolve })
+  const hold = new Promise(resolve => { release = resolve })
+  context.skills.list.mockImplementationOnce(async () => {
+    markStarted()
+    await hold
+    return []
+  })
+  const submission = call(handler, key, 'POST', '/submissions/deliver', body)
+  try {
+    await started
+    const stop = await call(handler, key, 'POST', '/submissions/stop', { target_id: chat.id, request_key: body.request_key })
+    expect(stop).toMatchObject({ status: 200, body: { data: { state: 'cancelled' } } })
+  } finally {
+    release()
+  }
+  expect(await submission).toMatchObject({ status: 409, body: { code: 'SUBMISSION_CANCELLED' } })
+  expect((await call(handler, key, 'GET', `/chats/${chat.id}`)).body.data.runs).toEqual([])
+})
+
+it('fences a delayed durable draft delivery when the stop arrived before the chat was bound', async () => {
+  const { handler, key } = setup()
+  const draftId = `draft:${randomUUID()}`
+  const requestKey = 'stop-before-draft'
+  expect(await call(handler, key, 'POST', '/submissions/stop', {
+    target_id: draftId, request_key: requestKey,
+  })).toMatchObject({ status: 200, body: { data: { state: 'cancelled' } } })
+  expect(await call(handler, key, 'POST', '/submissions/deliver', {
+    draft_id: draftId, request_key: requestKey, selection: { model: '' }, query: 'do not admit it',
+  })).toMatchObject({ status: 409, body: { code: 'SUBMISSION_CANCELLED' } })
+  expect(await call(handler, key, 'GET', '/chats')).toMatchObject({ status: 200, body: { data: [] } })
+})
+
+it('does not materialize a draft when a stop arrives while its model is being resolved', async () => {
+  const { handler, key, context } = setup()
+  let release, markStarted
+  const started = new Promise(resolve => { markStarted = resolve })
+  const hold = new Promise(resolve => { release = resolve })
+  context.workbenchPlatformClient.json.mockImplementation(async ({ route }) => {
+    if (route !== 'workbench/config') return { tools: [] }
+    markStarted()
+    await hold
+    return publishedModels()
+  })
+  const draft = `draft:${randomUUID()}`
+  const submission = call(handler, key, 'POST', '/submissions/deliver', {
+    draft_id: draft, request_key: 'stop-during-model', selection: { model: '' }, query: 'cancel during discovery',
+  })
+  try {
+    await started
+    expect(await call(handler, key, 'POST', '/submissions/stop', {
+      target_id: draft, request_key: 'stop-during-model',
+    })).toMatchObject({ status: 200, body: { data: { state: 'cancelled' } } })
+  } finally {
+    release()
+  }
+  expect(await submission).toMatchObject({ status: 409, body: { code: 'SUBMISSION_CANCELLED' } })
+  expect(await call(handler, key, 'GET', '/chats')).toMatchObject({ status: 200, body: { data: [] } })
+})
+
+it('updates shared read subscriptions without opening another HTTP stream', async () => {
+  const { handler, key } = setup()
+  const route = `/streams/events/${randomUUID()}`
+  let connection
+  const response = await call(handler, key, 'GET', route, undefined, true, '42', {}, res => { connection = res })
+  expect(response.headers['content-type']).toContain('text/event-stream')
+  expect(response.chunks.join('')).toContain('"ready":true')
+  expect((await call(handler, key, 'PUT', route, { sources: [{ id: '1', path: 'files' }] })).status).toBe(400)
+  expect((await call(handler, key, 'PUT', route, { sources: [] }, true, '43')).status).toBe(403)
+  const id = randomUUID()
+  const sources = [{ id: '2', path: `runs/${id}/events` }]
+  expect((await call(handler, key, 'PUT', route, { sources })).status).toBe(200)
+  await vi.waitFor(() => expect(response.chunks.join('')).toContain('"id":"2","status":404'))
+  connection.emit('close')
+  expect((await call(handler, key, 'PUT', route, { sources: [] })).status).toBe(404)
+})
+
+it('accepts upload publication before the sandbox write and serves the same receipt afterwards', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'gxzs-publish-'))
+  let finish
+  const writing = new Promise(resolve => { finish = resolve })
+  const upload = vi.fn(async () => { await writing; return result })
+  const body = Buffer.from('test')
+  const digest = createHash('sha256').update(body).digest('hex')
+  const result = { path: 'conversations/report.txt', version: digest }
+  const route = `/uploads/${'a'.repeat(32)}`
+  const { handler, key } = setup({ databasePath: join(root, 'workbench.sqlite3'),
+    configure: context => { context.workbenchFileManager.upload = upload },
+  })
+  cleanups.push(() => rmSync(root, { recursive: true, force: true }))
+  try {
+    expect((await call(handler, key, 'POST', route, { path: result.path, version: null, size: body.length, digest })).status).toBe(200)
+    expect((await call(handler, key, 'PUT', `${route}/parts/0?sha256=${digest}`, body, true, '42',
+      { 'content-type': 'application/octet-stream' })).status).toBe(200)
+    expect(await call(handler, key, 'POST', `${route}/commit`, {})).toMatchObject({ status: 202, body: { data: { publishing: true } } })
+    await vi.waitFor(() => expect(upload).toHaveBeenCalledOnce())
+    expect((await call(handler, key, 'GET', route)).body.data.publishing).toBe(true)
+    expect((await call(handler, key, 'POST', `${route}/commit`, {})).status).toBe(202)
+    finish()
+    await vi.waitFor(async () => expect((await call(handler, key, 'GET', route)).body.data.completed).toEqual(result))
+    expect(await call(handler, key, 'POST', `${route}/commit`, {})).toMatchObject({ status: 200, body: { data: { completed: result } } })
+    expect(upload).toHaveBeenCalledOnce()
+  } finally { finish() }
+})
+
 describe('authenticated workbench HTTP handler', () => {
   it('invalidates the skill catalog when status polling confirms asynchronous publication', async () => {
     const { handler, key, context } = setup()

@@ -56,6 +56,7 @@ export class WorkbenchDatabase {
         state_json TEXT NOT NULL,
         PRIMARY KEY(owner_id, draft_id)
       );
+      CREATE INDEX IF NOT EXISTS chat_drafts_chat ON chat_drafts(owner_id, json_extract(state_json, '$.chatId')) WHERE json_valid(state_json);
       CREATE INDEX IF NOT EXISTS chat_drafts_chat ON chat_drafts(owner_id, json_extract(state_json, '$.chatId'));
       CREATE TABLE IF NOT EXISTS chat_deletions (
         chat_id TEXT PRIMARY KEY,
@@ -305,7 +306,7 @@ export class WorkbenchDatabase {
   }
 
   draftForChat(ownerId, chatId) {
-    const row = this.db.prepare("SELECT state_json FROM chat_drafts WHERE owner_id=? AND json_extract(state_json, '$.chatId')=?")
+    const row = this.db.prepare("SELECT state_json FROM chat_drafts WHERE owner_id=? AND json_valid(state_json) AND json_extract(state_json, '$.chatId')=?")
       .get(ownerId, chatId)
     return row ? JSON.parse(row.state_json) : undefined
   }
