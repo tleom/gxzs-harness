@@ -6,6 +6,7 @@ const TERMINAL = new Set(['completed', 'failed', 'cancelled', 'interrupted', 'di
 
 export function streamRunEvents({ database, eventBus, ownerId, runId, cursor, req, res,
   heartbeatMs = 15_000, drainTimeoutMs = 30_000, pageSize = 256 }) {
+  if (res.destroyed || res.writableEnded) return
   const run = database.getRunState(ownerId, runId)
   if (!run) throw httpError(404, '任务不存在')
   let sequence = decodeCursor(cursor)

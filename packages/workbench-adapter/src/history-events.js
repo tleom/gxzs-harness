@@ -6,6 +6,7 @@ export function streamHistoryEvents(options) {
 }
 
 export async function streamNativeEvents({ follow, res, heartbeatMs = 15000, drainTimeoutMs = 30000 }) {
+  if (res.destroyed || res.writableEnded) return
   const abort = new AbortController()
   let heartbeat, drainTimeout, releaseDrain
   const close = () => { abort.abort(); releaseDrain?.() }
