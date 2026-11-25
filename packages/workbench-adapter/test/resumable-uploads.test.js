@@ -12,6 +12,24 @@ afterEach(async () => {
 
 const hash = bytes => createHash('sha256').update(bytes).digest('hex')
 
+it('releases a fixed-path upload slot without discarding a pending publication', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'gxzs-cancel-upload-'))
+  roots.push(root)
+  const store = new ResumableUploads(root)
+  const bytes = Buffer.from('fixed destination')
+  const metadata = { path: 'output.bin', version: null, size: bytes.length, digest: hash(bytes) }
+  const [first, second, third, fourth] = ['a', 'b', 'c', 'd'].map(char => char.repeat(32))
+  for (const id of [first, second, third]) await store.begin(id, metadata)
+  await expect(store.begin(fourth, metadata)).rejects.toMatchObject({ status: 429 })
+  await store.discard(first)
+  await expect(store.status(first)).rejects.toMatchObject({ status: 404 })
+  await store.begin(fourth, metadata)
+  await store.part(fourth, 0, bytes, metadata.digest)
+  await store.requestCommit(fourth)
+  await store.discard(fourth)
+  expect(await store.status(fourth)).toMatchObject({ publishing: true })
+})
+
 it('retains completed parts across restart and publishes validated bytes only once', async () => {
   const root = await mkdtemp(join(tmpdir(), 'gxzs-part-test-'))
   roots.push(root)

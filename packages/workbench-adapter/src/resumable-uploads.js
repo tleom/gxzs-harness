@@ -108,7 +108,7 @@ export class ResumableUploads {
     return this.serial(id, async () => {
       const directory = this.directory(id)
       const manifest = await readJson(join(directory, 'upload.json'))
-      if (manifest?.path === null && !await readJson(join(directory, 'commit.json'))
+      if (manifest && !await readJson(join(directory, 'commit.json'))
         && !await readJson(join(directory, 'publish.json')))
         await rm(directory, { recursive: true, force: true })
     })
