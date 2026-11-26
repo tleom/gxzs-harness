@@ -1695,6 +1695,8 @@ export function runDto(run, events = [], pending = null) {
   const mentioned = run.selection?.mentioned_resources ?? []
   return {
     id: run.id, chat_id: run.chatId, revision_id: run.id, version: 1, query: run.query,
+    // Both clients generate compact UUIDv4 keys. Keep internal receipt keys private.
+    ...(/^[a-f0-9]{12}4[a-f0-9]{3}[89ab][a-f0-9]{15}$/.test(run.requestKey ?? '') ? { client_request_id: run.requestKey } : {}),
     created_at: run.createdAt / 1000,
     ...(run.selection?.prompt_mode ? { prompt_mode: run.selection.prompt_mode } : {}),
     can_fork: ['completed', 'failed', 'cancelled', 'interrupted'].includes(run.status) && Number.isSafeInteger(forkEnd) && forkEnd >= 0,

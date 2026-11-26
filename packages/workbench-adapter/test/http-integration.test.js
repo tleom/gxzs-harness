@@ -219,6 +219,22 @@ it('rolls back the run receipt when its dispatch payload cannot be persisted, al
   expect(runtime.database.listRuns('gxzs-42', chat.id)).toHaveLength(1)
 })
 
+it('correlates the same client message in its receipt and chat history', async () => {
+  const { handler, key } = setup({ configure(context) {
+    context.sessionQuery = { observeSession: async () => ({ events: [], [Symbol.dispose]() {} }) }
+    context.sessionController.page = async () => ({ records: [], hasMore: false })
+  } })
+  const chat = (await call(handler, key, 'POST', '/chats', {})).body.data
+  const requestKey = randomUUID().replaceAll('-', '')
+  const message = { chat_id: chat.id, version: chat.version, request_key: requestKey, query: 'same message' }
+  const result = await call(handler, key, 'POST', '/submissions/deliver', message)
+  expect(result).toMatchObject({ status: 202, body: { data: { run: { client_request_id: requestKey } } } })
+  const history = await call(handler, key, 'GET', `/chats/${chat.id}/history?native=1`)
+  expect(history).toMatchObject({ status: 200, body: { data: { runs: [
+    { id: result.body.data.run.id, client_request_id: requestKey },
+  ] } } })
+})
+
 it('fences a durable submission stopped during final skill discovery', async () => {
   const { handler, key, context } = setup()
   const chat = (await call(handler, key, 'POST', '/chats', {})).body.data
