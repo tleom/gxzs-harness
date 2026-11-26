@@ -1,4 +1,5 @@
 import { symbols } from '@deepseek-ai/cordis'
+import { resolveRetryPolicy } from '@deepseek-ai/dsh-llm'
 import { httpError } from './http.js'
 
 /** The published database catalog owns visibility, names and defaults.
@@ -8,6 +9,12 @@ const writes = new WeakMap()
 const nativeCatalogs = new WeakMap()
 const identity = service => service[symbols.original] ?? service
 const revision = (settings, name) => settings.describe().find(item => item.ns === name)?.revision
+// pi-ai rejects malformed tool arguments before dispatching the step's tools.
+const modelRetryPolicy = {
+  mode: 'normal',
+  maxRetries: 2,
+  retryableCodes: [...new Set([...resolveRetryPolicy().retryableCodes, 'MALFORMED_RESPONSE'])],
+}
 
 function nativeCatalog(sessions, settings, models) {
   const key = identity(sessions)
@@ -33,9 +40,7 @@ async function synchronize(settings, models) {
       && previous.defaultSource === revision(settings, 'agent-default-model')) return
     const providers = Object.fromEntries(Object.entries(models.providers).filter(([, p]) => p.enabled !== false).map(([id, p]) => {
       const { enabled, name, models: entries, ...connection } = p
-      // Three consecutive failures: the first attempt plus two automatic retries.
-      // DSH owns transport/server/rate-limit classification and durable retry state.
-      return [id, { ...connection, retryPolicy: { mode: 'normal', maxRetries: 2 },
+      return [id, { ...connection, retryPolicy: modelRetryPolicy,
         models: entries.filter((m) => m.enabled !== false).map(({ enabled, ...model }) => model) }]
     }))
     await settings.replace('llm-pi-ai', { providers })

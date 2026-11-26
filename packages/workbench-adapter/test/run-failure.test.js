@@ -35,6 +35,20 @@ it('formats old persisted terminal events consistently without rewriting their o
   expect(goalFailureReason({ phase: 'active', activation: 'disarmed' }, { status: 'failed', error: rejected })).toContain('模型服务拒绝')
   expect(goalFailureReason({ phase: 'paused' }, { status: 'failed', error: rejected })).toBeNull()
 })
+
+it('keeps malformed question arguments out of live and replayed failure text', () => {
+  const error = 'Tool call "ask_user_question": Unterminated string in JSON\n\nReceived arguments:\n{"question":"unfinished}'
+  const code = 'MALFORMED_RESPONSE'
+  const event = { event: 'workbench_end', error_code: code, error }
+  const display = presentRunEvent(event)
+  expect(display).toEqual({ ...event, error: '本次提问生成失败，请重试。' })
+  expect(presentRunEvent(display)).toEqual(display)
+  expect(runFailure({ code, message: error })).toEqual({ code, message: display.error })
+  expect(runFailure({ code, message: error.replace('ask_user_question', 'other_tool') }).message)
+    .toBe('模型返回的内容格式有误，请重试。')
+  expect(event.error).toBe(error)
+})
+
 it('uses current model preferences on goal resume while preserving frozen resources', () => {
   expect(resumeGoalSelection({ model: 'old/model', model_parameters: { reasoning_effort: 'off' }, resource_context: 'Original resources' },
     { model: 'selected/model', model_parameters: { reasoning_effort: 'high' } })).toEqual({ model: 'selected/model', model_parameters: { reasoning_effort: 'high' }, resource_context: 'Original resources', silent_resume: false, is_continuation: true, command: 'goal' })

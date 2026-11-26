@@ -703,10 +703,6 @@ export function apply(ctx, config) {
         || (json.operation === 'skill_import_status' && result?.status === 'completed')) ctx.emit('workbench/resources-changed')
       if (!res.destroyed) sendJson(res, 200, { data: result })
     }],
-    ['POST', /^\/submissions\/deliver$/, async ({ owner, json }, res) =>
-      sendJson(res, 202, { data: await service.deliverSubmission(owner, json) })],
-    ['POST', /^\/submissions\/stop$/, async ({ owner, json }, res) =>
-      sendJson(res, 200, { data: await service.stopDurableSubmission(owner, json) })],
     ['GET', /^\/chats$/, async ({ owner }, res) => sendJson(res, 200, { data: service.listChats(owner) })],
     ['POST', /^\/chats$/, async ({ owner, json }, res) => {
       const catalog = await databaseModelCatalog(ctx.workbenchPlatformClient, ctx.sessionController, owner, ctx.settings)
