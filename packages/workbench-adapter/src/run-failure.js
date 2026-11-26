@@ -1,11 +1,17 @@
 import { presentContextEvent } from './context-usage.js'
 import { resourceTextHash } from './resource-mentions.js'
 
+const questionFailureMessage = '本次提问生成失败，请重试。'
+
 /** Recognize provider facts, never infer content rejection from arbitrary prose. */
 export function runFailure(value) {
   if (!value) return undefined
   const message = typeof value === 'string' ? value : value.message ?? String(value)
   let code = typeof value === 'object' ? value.code : undefined
+  if (code === 'MALFORMED_RESPONSE') {
+    const question = message === questionFailureMessage || message.startsWith('Tool call "ask_user_question":')
+    return { code, message: question ? questionFailureMessage : '模型返回的内容格式有误，请重试。' }
+  }
   let providerMessage = message
   const jsonStart = message.indexOf('{')
   if (jsonStart >= 0 && message.length <= 100_000) {

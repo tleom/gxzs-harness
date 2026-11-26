@@ -9,6 +9,7 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { WorkbenchDatabase } from '../src/persistence.js'
 import { TaskScheduler } from '../src/scheduler.js'
 import { WorkbenchService } from '../src/service.js'
+import { databaseModelCatalog } from '../src/database-models.js'
 import { WorkbenchSchedules } from '../src/schedules.js'
 import { WorkbenchRuntime } from '../src/runtime.js'
 import { createAssistantStreamProjector, projectInboxClaim, projectSessionEvent, reconcileNativeSessions, settleNativeIdle } from '../src/projection.js'
@@ -22,6 +23,7 @@ import WorkbenchFileSystem from '../../workbench-sandbox-runtime/src/fs.js'
 import { registerBrowserTool } from '../src/browser-tool.js'
 import { registerTerminalTool } from '../src/terminal-tool.js'
 import { nativePresentation } from '../src/display-events.js'
+import { publishedModels } from './model-fixture.js'
 
 // Exercise the exact published DSH version installed by the production profile.
 // CI must install profiles/workbench before running this contract suite.
@@ -364,8 +366,24 @@ async function fixture(script, { scheduledClaims = false, retryPolicy } = {}) {
 }
 
 const boundedRetry = { mode: 'normal', maxRetries: 2, backoff: { initialDelayMs: 1, maxDelayMs: 2, jitterRatio: 0 } }
-it('retries a broken response stream in the current step without repeating an already completed tool', async () => {
-  const test = await fixture([], { retryPolicy: boundedRetry })
+const malformedQuestion = 'Tool call "ask_user_question": Unterminated string in JSON\n\nReceived arguments:\n{"question":"unfinished}'
+async function publishedModelRetry() {
+  let retryPolicy
+  await databaseModelCatalog({ json: async () => publishedModels() },
+    { modelCatalog: async () => ({ groups: [{ id: 'p', models: [{ id: 'm' }] }] }) }, {}, {
+      describe: () => [],
+      replace(namespace, value) {
+        if (namespace === 'llm-pi-ai') retryPolicy = value.providers.p.retryPolicy
+      },
+    })
+  return { ...retryPolicy, backoff: boundedRetry.backoff }
+}
+
+it.each([
+  ['TRANSPORT', 'connection closed during streaming'],
+  ['MALFORMED_RESPONSE', malformedQuestion],
+])('retries a %s response in the current step without repeating an already completed tool', async (code, message) => {
+  const test = await fixture([], { retryPolicy: await publishedModelRetry() })
   const command = vi.fn(async () => ({ url: 'https://example.com', title: 'Evidence', revision: 1 }))
   registerBrowserTool(test.ctx, { browsers: { create: async () => {}, require: () => ({ command }) }, runtime: test.runtime, database: test.db, ownerId: test.owner.ownerId })
   test.model.stream = async function* (options) {
@@ -377,7 +395,7 @@ it('retries a broken response stream in the current step without repeating an al
     }
     if (this.requests.length < 4) {
       yield { type: 'text-delta', index: 0, text: 'partial response' }
-      throw new LlmError('connection closed during streaming', 'TRANSPORT')
+      throw new LlmError(message, code)
     }
     yield { type: 'text-delta', index: 0, text: 'completed response' }
     yield { type: 'finish', reason: { kind: 'stop' } }
@@ -394,6 +412,26 @@ it('retries a broken response stream in the current step without repeating an al
   expect(events.filter(event => event.type === 'tool/result')).toHaveLength(1)
   expect(events.filter(event => event.type === 'turn/end').map(event => event.data.reason.kind)).toEqual(['completed'])
 })
+
+it('stops after two malformed question retries and publishes the short failure message', async () => {
+  const code = 'MALFORMED_RESPONSE'
+  const test = await fixture(Array.from({ length: 3 }, () => new LlmError(malformedQuestion, code)),
+    { retryPolicy: await publishedModelRetry() })
+  const run = test.create('Ask for missing information')
+  await test.scheduler.enqueue(run, [{ type: 'text', text: run.query }])
+  await test.scheduler.tick()
+  await test.agent.whenIdle()
+
+  expect(test.model.requests).toHaveLength(3)
+  const events = test.agent.session.snapshotEvents()
+  expect(events.filter(event => event.type === 'llm/retry').map(event => event.data.retry)).toEqual([1, 2])
+  expect(events.filter(event => event.type === 'tool/call')).toHaveLength(0)
+  expect(test.db.getRun(test.owner.ownerId, run.id)).toMatchObject({ status: 'failed', error: malformedQuestion })
+  expect(test.db.allEvents(test.owner.ownerId, run.id)).toContainEqual(expect.objectContaining({
+    event: 'workbench_end', status: 'failed', error_code: code, error: '本次提问生成失败，请重试。',
+  }))
+})
+
 it.each(['TRANSPORT', 'TIMEOUT', 'SERVER', 'RATE_LIMIT'])(
   'stops only after three native %s failures in the same turn, then accepts a fresh message', async code => {
     const test = await fixture([...Array.from({ length: 3 }, () => new LlmError('transient failure', code)), 'next message works'], { retryPolicy: boundedRetry })
