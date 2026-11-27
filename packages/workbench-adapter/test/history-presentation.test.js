@@ -154,18 +154,29 @@ it('keeps the vendored publication fold identical to the pinned native package e
   const executable=value=>value.replace(/^\/\/# sourceMappingURL=.*\r?\n?/gm,'')
   expect(executable(await readFile(new URL('../src/dsh/client-assistant-stream.js',import.meta.url),'utf8'))).toBe(executable(await readFile(original,'utf8')))
 })
-it('restores partial text and replaces it once the native committed settlement is released',()=>{
+it('replaces live text with the durable message before the transient stream ends',()=>{
   const view=new HistoryPresentation('session',()=>run)
   const opening=view.accept(snapshot([],{revision:2,activeAttempt:{attemptId:'a',turn:1,step:1,startedAfterSeq:5,nextIndex:1,
     stream:[{type:'text-chunks',time0:1,index:0,dt:[],texts:['before']} ]}}))
   expect(opening.events[0].event.data).toMatchObject({text:'before',native_attempt:'a'})
   const delta=view.accept(frame({type:'chunk',attemptId:'a',revision:3,index:1,time:2,chunk:{type:'text-delta',index:0,text:' after'}}))
   expect(delta.events[0].event.data.text).toBe(' after')
-  expect(view.accept(durable(6,'assistant/message',{turn:1,step:1,message:{content:[{type:'text',text:'before after'}]}})).events).toEqual([])
-  const settled=view.accept(frame({type:'end',attemptId:'a',revision:4,index:2,outcome:{kind:'committed',eventType:'assistant/message',seq:6}}))
+  const settled=view.accept(durable(6,'assistant/message',{turn:1,step:1,message:{content:[{type:'text',text:'before after and full tail'}]}}))
   expect(settled.retire_attempts).toContain('a')
   expect(settled.events.map(item=>item.event.event)).toEqual(['workbench_assistant_final','workbench_activity'])
-  expect(settled.events[1].event).toMatchObject({_id:'history:session:6:1',data:{text:'before after'}})
+  expect(settled.events[1].event).toMatchObject({_id:'history:session:6:1',data:{text:'before after and full tail'}})
+  const late=view.accept(frame({type:'chunk',attemptId:'a',revision:4,index:2,time:3,chunk:{type:'text-delta',index:0,text:' and full tail'}}))
+  expect(late.events).toEqual([])
+  const end=view.accept(frame({type:'end',attemptId:'a',revision:5,index:3,outcome:{kind:'committed',eventType:'assistant/message',seq:6}}))
+  expect(end).toMatchObject({events:[],retire_attempts:[]})
+})
+
+it('does not reintroduce temporary text when the opening window already contains the durable message',()=>{
+  const view=new HistoryPresentation('session',()=>run)
+  const message=durable(6,'assistant/message',{turn:1,step:1,message:{content:[{type:'text',text:'full reply'}]}})
+  const opening=view.accept(snapshot([message],{revision:2,activeAttempt:{attemptId:'a',turn:1,step:1,startedAfterSeq:5,nextIndex:1,
+    stream:[{type:'text-chunks',time0:1,index:0,dt:[],texts:['partial']}]}}))
+  expect(opening.events.map(item=>item.event.data?.text).filter(Boolean)).toEqual(['full reply'])
 })
 it('preserves custom plugin display names in historical and live native tool records',()=>{
   const view=new HistoryPresentation('session',()=>run)

@@ -158,7 +158,7 @@ it('cancels one native history follower without interrupting another and reopens
   }
 })
 
-it('carries a real native oversized snapshot and settlement through the Workbench service without full-run reads', async () => {
+it('publishes the complete native reply on a live follow before a delayed transient end', async () => {
   const {ctx,session,services}=await fixture()
   const database=new WorkbenchDatabase(':memory:')
   const owner={ownerId:'owner'}
@@ -181,11 +181,15 @@ it('carries a real native oversized snapshot and settlement through the Workbenc
     expect(opening.runs).toHaveLength(1)
     expect(opening.display.events.at(-1).event.data).toMatchObject({text:'partial',native_attempt:'real'})
     const committed=session.append('assistant/message',{turn:2,step:1,message:createMessage({role:'assistant',content:[{type:'text',text:'partial complete'}],source:{kind:'model',provider:'fixture',model:'fixture'}}),stream:[]},{surfaceOp:'append'})
-    expect((await stream.next()).value.display.events).toEqual([])
-    ctx.emit('agent/assistant-stream',{agent:{session},frame:{type:'end',attemptId:'real',revision:3,index:1,outcome:{kind:'committed',eventType:'assistant/message',seq:committed.seq}}})
-    const final=(await stream.next()).value.display
+    const update=(await stream.next()).value
+    expect(update.value.event).toMatchObject({seq:committed.seq,type:'assistant/message'})
+    const final=update.display
     expect(final.retire_attempts).toContain('real')
     expect(final.events.at(-1).event.data.text).toBe('partial complete')
+    session.append('turn/end',{turn:2,reason:{kind:'completed'}})
+    expect((await stream.next()).value.display.events.at(-1).event).toMatchObject({event:'workbench_turn',phase:'end',turn:2})
+    ctx.emit('agent/assistant-stream',{agent:{session},frame:{type:'end',attemptId:'real',revision:3,index:1,outcome:{kind:'committed',eventType:'assistant/message',seq:committed.seq}}})
+    expect((await stream.next()).value.display).toMatchObject({events:[],retire_attempts:[]})
   } finally {
     abort.abort(); await stream.return(); database.close()
   }
