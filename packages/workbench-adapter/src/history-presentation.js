@@ -12,7 +12,8 @@ export class HistoryPresentation {
     this.resolveMessage = resolveMessage
     this.resolveStreamRun = resolveStreamRun
     this.stream = new ClientAssistantStream()
-    this.attempts = new Map()
+    this.attempt = undefined
+    this.lastAssistantSeq = -1
     this.tools = new Map()
     this.preparations = new Map()
     this.compactions = new Map()
@@ -21,18 +22,27 @@ export class HistoryPresentation {
 
   accept(frame) {
     const display = { replace: frame.type === 'snapshot', events: [], retire_attempts: [] }
+    const retire = attemptId => {
+      if (this.attempt?.attemptId !== attemptId) return
+      this.attempt = undefined
+      this.preparations.delete(attemptId)
+      display.retire_attempts.push(attemptId)
+    }
     // A reconnect snapshot can replay thousands of chunks from the same turn.
     // Resolve its immutable view once per frame, not once per chunk. Keeping the
     // map local also re-observes changed bindings/presentation on the next frame.
     const runs = new Map(), streamRuns = new Map()
     const project = entry => {
       const event = entry.event
+      const message = event.type === 'assistant/message'
+      if (message && event.seq <= this.lastAssistantSeq) return
       if (event.type === 'compaction/summary') this.compactions.set(event.data.compactionId, event.data)
       if (Number.isInteger(event.data?.turn)) this.turn = event.data.turn
       const turn = event.data?.turn ?? this.turn
       // A live chunk uses only run.id. Decoding its frozen MCP catalog on every
       // token makes generation compete with health/catalog requests on the Host.
       const live = event.type === 'assistant/live-chunk'
+      if (live && event.data.attemptId !== this.attempt?.attemptId) return
       const cache = live ? streamRuns : runs
       if (!cache.has(turn)) cache.set(turn, live ? this.resolveStreamRun(turn) : this.resolveRun(turn))
       const run = cache.get(turn)
@@ -65,9 +75,12 @@ export class HistoryPresentation {
         } })
         return
       }
-      if (event.type === 'assistant/message') {
-        const attempt = this.attempts.get(`${event.data.turn}:${event.data.step}`)
-        if (attempt) display.retire_attempts.push(attempt)
+      if (message) {
+        this.lastAssistantSeq = event.seq
+        const attempt = this.attempt
+        if (attempt && (event.surfaceOp == null || event.surfaceOp === 'append')
+          && attempt.turn === event.data.turn && attempt.step === event.data.step && event.seq > attempt.startedAfterSeq)
+          retire(attempt.attemptId)
       }
       if (event.type === 'tool/call') this.tools.set(`${run.id}:${event.data.callId}`, event.data.name)
       const callId = event.data?.message?.source?.callId ?? event.data?.message?.content?.[0]?.toolCallId
@@ -77,29 +90,32 @@ export class HistoryPresentation {
     }
     if (frame.type === 'snapshot') {
       this.turn = undefined
-      this.attempts.clear(); this.tools.clear()
+      this.lastAssistantSeq = -1
+      this.tools.clear()
       this.preparations.clear()
       this.compactions.clear()
       this.revision = frame.assistantStream?.revision ?? 0
-      const opening = frame.assistantStream?.activeAttempt
-      if (opening) this.attempts.set(`${opening.turn}:${opening.step}`, opening.attemptId)
+      this.attempt = frame.assistantStream?.activeAttempt
       for (const entry of this.stream.replace(frame.records, frame.assistantStream)) project(entry)
       return display
     }
     let result
-    if (frame.type === 'event') result = this.stream.acceptDurable(frame)
-    else if (frame.type === 'assistant-stream') {
+    if (frame.type === 'event') {
+      result = this.stream.acceptDurable(frame)
+      // The committed message contains the complete reply. Keep validating the
+      // transient stream, and publish the durable text as soon as it arrives.
+      if (frame.event.type === 'assistant/message' && !result) project(frame)
+    } else if (frame.type === 'assistant-stream') {
       const value = frame.frame
       if (value.revision !== this.revision + 1) throw new Error('Native assistant stream requires a fresh baseline')
       this.revision = value.revision
-      if (value.type === 'start') this.attempts.set(`${value.turn}:${value.step}`, value.attemptId)
+      if (value.type === 'start') this.attempt = value
       result = this.stream.acceptFrame(value)
     }
     if (result?.type === 'rebaseline') throw new Error('Native assistant stream requires a fresh baseline')
     if (result?.entry) project(result.entry)
-    if (result?.type === 'abandonment' || result?.type === 'settlement') display.retire_attempts.push(result.attemptId)
-    if (result?.retireAttemptId) display.retire_attempts.push(result.retireAttemptId)
-    for (const attemptId of display.retire_attempts) this.preparations.delete(attemptId)
+    if (result?.type === 'abandonment' || result?.type === 'settlement') retire(result.attemptId)
+    if (result?.retireAttemptId) retire(result.retireAttemptId)
     return display
   }
 }
